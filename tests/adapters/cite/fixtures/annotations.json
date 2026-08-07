@@ -1,0 +1,19 @@
+{
+  "total_count": 2,
+  "annotations": [
+    {
+      "id": "101",
+      "page": 0,
+      "raw_text": "must document material risks.",
+      "annotation_label": {"text": "requirement", "label_type": "TOKEN_LABEL"},
+      "structural": false
+    },
+    {
+      "id": "102",
+      "page": 0,
+      "raw_text": "quote that is absent",
+      "annotation_label": {"text": "requirement", "label_type": "TOKEN_LABEL"},
+      "structural": false
+    }
+  ]
+}

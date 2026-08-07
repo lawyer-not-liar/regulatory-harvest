@@ -1,0 +1,26 @@
+{
+  "mcp": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "tools": [
+        {"name": "list_documents", "description": "List documents", "inputSchema": {"type": "object"}},
+        {"name": "get_document_text", "description": "Get document text", "inputSchema": {"type": "object"}},
+        {"name": "list_annotations", "description": "List annotations", "inputSchema": {"type": "object"}},
+        {"name": "list_relationships", "description": "List relationships", "inputSchema": {"type": "object"}}
+      ]
+    }
+  },
+  "graphql": {
+    "data": {
+      "__schema": {
+        "mutationType": {
+          "fields": [
+            {"name": "addAnnotation"},
+            {"name": "addRelationship"}
+          ]
+        }
+      }
+    }
+  }
+}

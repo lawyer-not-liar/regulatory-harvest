@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install uv
+      - run: uv sync --frozen --all-extras --dev
+      - run: uv run pytest -q
+      - run: uv run ruff check .
+      - run: uv run mypy src
+      - run: uv build
+      - name: Verify wheel-only offline and evaluation workflows
+        if: matrix.python-version == '3.13'
+        shell: bash
+        run: |
+          WHEEL_PATH=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          VERIFY_ENV="$RUNNER_TEMP/regulatory-harvest-venv"
+          OFFLINE_COPY="$RUNNER_TEMP/regulatory-harvest-offline"
+          EVAL_OUTPUT="$RUNNER_TEMP/legalbench-evaluation.json"
+          python -m venv "$VERIFY_ENV"
+          "$VERIFY_ENV/bin/python" -m pip install "$WHEEL_PATH"
+          cp -R examples/offline "$OFFLINE_COPY"
+          (
+            cd "$OFFLINE_COPY"
+            "$VERIFY_ENV/bin/harvest" run --request request.json --output runs
+            "$VERIFY_ENV/bin/harvest" validate runs/offline-example/bundle.json --json
+            "$VERIFY_ENV/bin/harvest" report runs/offline-example/bundle.json --output runs/offline-example/report.md
+          )
+          "$VERIFY_ENV/bin/harvest" eval legalbench-rag \
+            --dataset tests/fixtures/legalbench-mini \
+            --predictions tests/fixtures/legalbench-mini/predictions.jsonl \
+            --output "$EVAL_OUTPUT" \
+            --json

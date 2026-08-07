@@ -1,0 +1,7 @@
+Synthetic Deployment Documentation Rule
+
+Section 1. Before deployment, a controller must document the material risks identified in its assessment and the measures selected to address them.
+
+Section 2. The controller must retain the documentation for two years after the deployment ends.
+
+This text is a synthetic software fixture. It is not law and must not be used as legal authority.

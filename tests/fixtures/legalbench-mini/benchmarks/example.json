@@ -1,0 +1,14 @@
+{
+  "tests": [
+    {
+      "query": "What must a controller document?",
+      "snippets": [
+        {
+          "file_path": "rule.txt",
+          "span": [13, 42]
+        }
+      ],
+      "tags": ["synthetic"]
+    }
+  ]
+}

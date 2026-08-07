@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "regulatory-harvest"
+version = "0.1.0"
+description = "Evidence-grounded, storage-neutral regulatory research"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Regulatory Harvest contributors" }]
+maintainers = [{ name = "Regulatory Harvest maintainers" }]
+keywords = ["legal research", "regulatory research", "retrieval", "citations"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Legal Industry",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+dependencies = [
+  "beautifulsoup4>=4.12",
+  "httpx>=0.27",
+  "pydantic>=2.8",
+  "pypdf>=5.0",
+]
+
+[project.optional-dependencies]
+cite = []
+dev = [
+  "hypothesis>=6.112",
+  "mypy>=1.11",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "respx>=0.21",
+  "ruff>=0.6",
+]
+evaluation = []
+openai = ["openai>=2.15,<3"]
+tavily = []
+
+[project.scripts]
+harvest = "regulatory_harvest.cli:main"
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.112",
+  "mypy>=1.11",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "respx>=0.21",
+  "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/regulatory_harvest"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "/.hypothesis",
+  "/.mypy_cache",
+  "/.pytest_cache",
+  "/.ruff_cache",
+  "/.venv",
+  "/build",
+  "/dist",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config"
+asyncio_mode = "auto"
+markers = [
+  "live: opt-in tests against an explicitly configured external service",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["regulatory_harvest"]
+mypy_path = "src"

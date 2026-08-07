@@ -1,0 +1,22 @@
+{
+  "request_id": "offline-example",
+  "question": "What documentation does the synthetic example require before deployment?",
+  "jurisdictions": [
+    "US"
+  ],
+  "as_of": "2026-08-05",
+  "source_inputs": [
+    {
+      "location": "example-rule.txt",
+      "title": "Synthetic Deployment Documentation Rule",
+      "jurisdiction": "US",
+      "authority_type": "synthetic example",
+      "citation": "Synthetic Rule 1",
+      "source_quality": "unknown",
+      "license_assertion": "Apache-2.0"
+    }
+  ],
+  "context": "Demonstration only. The source is synthetic and is not law.",
+  "excluded_topics": [],
+  "output_instructions": null
+}

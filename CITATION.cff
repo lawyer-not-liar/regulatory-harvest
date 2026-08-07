@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use Regulatory Harvest, cite the software and the authorities you independently verify."
+title: "Regulatory Harvest"
+type: software
+version: 0.1.0
+authors:
+  - name: "Regulatory Harvest contributors"
+license: Apache-2.0
+abstract: "A storage-neutral toolkit for evidence-grounded regulatory research bundles."
+keywords:
+  - regulatory research
+  - legal research
+  - citations
+  - retrieval

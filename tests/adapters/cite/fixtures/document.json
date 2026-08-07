@@ -1,0 +1,19 @@
+{
+  "summary": {
+    "slug": "public-rule",
+    "title": "Public Rule",
+    "description": "Synthetic public-domain style fixture; not legal advice.",
+    "page_count": 1,
+    "file_type": "application/pdf",
+    "created": "2026-08-01T12:00:00+00:00"
+  },
+  "text": {
+    "document_slug": "public-rule",
+    "page_count": 1,
+    "total_chars": 45,
+    "char_offset": 0,
+    "text": "\r\nA controller must document material risks.  \r\n",
+    "next_offset": null,
+    "truncated": false
+  }
+}

@@ -1,0 +1,4 @@
+Example Public Rule
+
+A controller must document risks before deployment.
+
