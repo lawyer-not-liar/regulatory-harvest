@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib.resources import files
 from typing import Literal
 
 from regulatory_harvest import __version__
-from regulatory_harvest.analysis import AnalysisDraft, build_analysis
+from regulatory_harvest.analysis import AnalysisDraft, build_analysis, ensure_coverage_gaps
 from regulatory_harvest.models import (
     FetchStatus,
     Gap,
@@ -102,9 +103,9 @@ def _model_request(
     sources: list[SourceRecord],
 ) -> ModelRequest:
     instructions = (
-        "Identify the regulatory issues in the supplied sources."
-        if operation == "map"
-        else "Build evidence-grounded findings and propose exact source quotes."
+        files("regulatory_harvest.analysis.prompts")
+        .joinpath(f"{operation}-v1.md")
+        .read_text(encoding="utf-8")
     )
     return ModelRequest(
         operation=operation,
@@ -139,9 +140,12 @@ async def map_stage(
                     message="No model provider was configured; analysis stages were skipped.",
                     jurisdiction=jurisdiction,
                 )
-            )
+        )
         return StageOutcome(bundle=bundle, status=StageStatus.SKIPPED)
 
+    bundle.gaps = [
+        gap for gap in bundle.gaps if gap.code != "MODEL_PROVIDER_NOT_CONFIGURED"
+    ]
     response = await model_provider.complete(
         _model_request("map", bundle.request, bundle.sources)
     )
@@ -166,7 +170,9 @@ async def build_stage(
     bundle.issues = built.issues
     bundle.findings = built.findings
     bundle.citations = built.citations
+    bundle.gaps = built.gaps
     bundle.review_items = built.review_items
+    bundle.brief = built.brief
     bundle.manifest.provider_metadata["model_provider"] = response.provider_name
     bundle.manifest.provider_metadata["model"] = response.model_name
     return StageOutcome(bundle=bundle)
@@ -201,6 +207,8 @@ def note_stage(bundle: ResearchBundle) -> StageOutcome:
             )
         )
         gap_keys.add(source_gap_key)
+
+    bundle.gaps = ensure_coverage_gaps(bundle.issues, bundle.findings, bundle.gaps)
 
     current_validation = bundle.validation or validate_bundle(bundle)
     review_codes = {
@@ -252,4 +260,4 @@ def export_stage(bundle: ResearchBundle) -> StageOutcome:
     return StageOutcome(bundle=bundle)
 
 
-STAGE_IMPLEMENTATION_VERSION = f"{__version__}:combine-v1"
+STAGE_IMPLEMENTATION_VERSION = f"{__version__}:combine-v2-adaptive-brief"

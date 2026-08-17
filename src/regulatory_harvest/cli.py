@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from regulatory_harvest.api import (
+    render_audit,
     render_report,
     run_research_sync,
     validate_research_bundle,
@@ -56,6 +57,7 @@ def _parser() -> argparse.ArgumentParser:
     report_parser = subparsers.add_parser("report", help="render a bundle as Markdown")
     report_parser.add_argument("bundle", type=Path)
     report_parser.add_argument("--output", type=Path)
+    report_parser.add_argument("--audit-output", type=Path)
     _add_json_flag(report_parser)
 
     cite_parser = subparsers.add_parser("cite", help="exchange records with cite")
@@ -95,6 +97,18 @@ def _parser() -> argparse.ArgumentParser:
     legalbench.add_argument("--config-file", type=Path)
     legalbench.add_argument("--accept-upstream-terms", action="store_true")
     _add_json_flag(legalbench)
+    attorney = eval_subparsers.add_parser(
+        "attorney", help="run local scripted attorney-evaluation fixtures only"
+    )
+    attorney_subparsers = attorney.add_subparsers(dest="attorney_command", required=True)
+    attorney_run = attorney_subparsers.add_parser("run", help="run a local scripted fixture")
+    attorney_run.add_argument("--case", type=Path, required=True)
+    attorney_run.add_argument("--scripted-responses", type=Path)
+    attorney_run.add_argument("--output", type=Path, required=True)
+    _add_json_flag(attorney_run)
+    attorney_verify = attorney_subparsers.add_parser("verify", help="read-only run verification")
+    attorney_verify.add_argument("--output", type=Path, required=True)
+    _add_json_flag(attorney_verify)
     return parser
 
 
@@ -163,13 +177,23 @@ def _validate(args: argparse.Namespace) -> int:
 def _report(args: argparse.Namespace) -> int:
     validation = validate_research_bundle(args.bundle)
     report = render_report(args.bundle)
+    audit = render_audit(args.bundle)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(report, encoding="utf-8")
+    if args.audit_output is not None:
+        args.audit_output.parent.mkdir(parents=True, exist_ok=True)
+        args.audit_output.write_text(audit, encoding="utf-8")
     if args.json_output:
-        payload: dict[str, Any] = {"ok": validation.valid, "report": report}
+        payload: dict[str, Any] = {
+            "audit": audit,
+            "ok": validation.valid,
+            "report": report,
+        }
         if args.output is not None:
             payload["output"] = str(args.output)
+        if args.audit_output is not None:
+            payload["audit_output"] = str(args.audit_output)
         _json_line(payload)
     elif args.output is None:
         print(report)

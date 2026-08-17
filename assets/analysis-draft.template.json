@@ -1,0 +1,727 @@
+{
+  "coverage_contract_version": "proposition-coverage-v2",
+  "issues": [
+    {
+      "issue_id": "issue-requirements-__REPLACE__",
+      "title": "Incident-register requirements",
+      "category": "requirements",
+      "presentation_role": "requirement",
+      "description": "Identify supported register duties and exceptions.",
+      "jurisdictions": [
+        "__REPLACE__"
+      ]
+    },
+    {
+      "issue_id": "issue-deadlines-__REPLACE__",
+      "title": "Incident-register timing",
+      "category": "deadlines",
+      "presentation_role": "requirement",
+      "description": "Identify supported filing triggers and preserve any unresolved interval.",
+      "jurisdictions": [
+        "__REPLACE__"
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "finding_id": "finding-requirements-__REPLACE__",
+      "issue_id": "issue-requirements-__REPLACE__",
+      "title": "Covered operators maintain an incident register subject to a test-data exception",
+      "jurisdiction": "__REPLACE__",
+      "authority": "__REPLACE__",
+      "severity": "info",
+      "practical_implication": "Confirm register coverage before designing the operational response.",
+      "claims": [
+        {
+          "claim_id": "claim-duty-__REPLACE__",
+          "text": "A covered operator must maintain a public incident register.",
+          "kind": "source_supported",
+          "enforcement_roles": [],
+          "confidence": null,
+          "proposed_citations": [
+            {
+              "source_id": "src___REPLACE__",
+              "quote": "A covered operator must maintain a public incident register.",
+              "occurrence": null
+            }
+          ]
+        },
+        {
+          "claim_id": "claim-exception-__REPLACE__",
+          "text": "The operator need not include an incident affecting only test data in the register.",
+          "kind": "source_supported",
+          "enforcement_roles": [],
+          "confidence": null,
+          "proposed_citations": [
+            {
+              "source_id": "src___REPLACE__",
+              "quote": "The operator need not include an incident affecting only test data in the register.",
+              "occurrence": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "finding_id": "finding-deadline-__REPLACE__",
+      "issue_id": "issue-deadlines-__REPLACE__",
+      "title": "Incident-register submission trigger",
+      "jurisdiction": "__REPLACE__",
+      "authority": "__REPLACE__",
+      "severity": "info",
+      "practical_implication": "Confirm the submission interval before setting a filing schedule.",
+      "claims": [
+        {
+          "claim_id": "claim-deadline-__REPLACE__",
+          "text": "A covered operator must submit the incident register after the reporting trigger.",
+          "kind": "source_supported",
+          "enforcement_roles": [],
+          "confidence": null,
+          "proposed_citations": [
+            {
+              "source_id": "src___REPLACE__",
+              "quote": "A covered operator must submit the incident register after the reporting trigger.",
+              "occurrence": null
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "gaps": [
+    {
+      "code": "AUTHORITY_STATUS_NOT_ESTABLISHED___REPLACE__",
+      "message": "The retained authority does not establish operative status or currentness.",
+      "category": "status",
+      "presentation_role": "requirement",
+      "jurisdiction": "__REPLACE__",
+      "source_ids": [
+        "src___REPLACE__"
+      ]
+    },
+    {
+      "code": "COVERED_OPERATOR_SCOPE_NOT_ESTABLISHED___REPLACE__",
+      "message": "The retained authority does not establish the facts needed to determine whether an operator is covered.",
+      "category": "scope",
+      "presentation_role": "covered_entities",
+      "jurisdiction": "__REPLACE__",
+      "source_ids": [
+        "src___REPLACE__"
+      ]
+    },
+    {
+      "code": "REGISTER_SUBMISSION_INTERVAL_NOT_ESTABLISHED___REPLACE__",
+      "message": "The retained authority states the submission trigger but does not establish the submission interval.",
+      "category": "deadlines",
+      "presentation_role": "requirement",
+      "jurisdiction": "__REPLACE__",
+      "source_ids": [
+        "src___REPLACE__"
+      ]
+    },
+    {
+      "code": "ENFORCEMENT_NOT_ESTABLISHED___REPLACE__",
+      "message": "The retained authority does not establish penalties or enforcement mechanisms.",
+      "category": "enforcement",
+      "presentation_role": "penalties_remedies",
+      "jurisdiction": "__REPLACE__",
+      "source_ids": [
+        "src___REPLACE__"
+      ]
+    },
+    {
+      "code": "FACTUAL_CONTEXT_REQUIRED___REPLACE__",
+      "message": "The client facts needed to apply the supported duties have not been confirmed.",
+      "category": "implementation",
+      "presentation_role": "client_facts",
+      "jurisdiction": "__REPLACE__",
+      "source_ids": []
+    }
+  ],
+  "lead_reviews": [],
+  "proposition_coverage": [],
+  "unit_reviews": [
+    {
+      "unit_id": "unit-rule-__REPLACE__",
+      "dimensions": {
+        "authority_status_timing": {
+          "disposition": "gap",
+          "gap_codes": [
+            "AUTHORITY_STATUS_NOT_ESTABLISHED___REPLACE__"
+          ]
+        },
+        "actors_scope_activities": {
+          "disposition": "gap",
+          "gap_codes": [
+            "COVERED_OPERATOR_SCOPE_NOT_ESTABLISHED___REPLACE__"
+          ]
+        },
+        "definitions_categories": {
+          "disposition": "not_present"
+        },
+        "duties_rights_prohibitions": {
+          "disposition": "mapped",
+          "atom_ids": [
+            "atom-duty-__REPLACE__",
+            "atom-submission-duty-__REPLACE__"
+          ]
+        },
+        "triggers_thresholds": {
+          "disposition": "mapped",
+          "atom_ids": [
+            "atom-submission-duty-__REPLACE__",
+            "atom-deadline-__REPLACE__"
+          ]
+        },
+        "conditions_exceptions_defenses": {
+          "disposition": "mapped",
+          "atom_ids": [
+            "atom-exception-__REPLACE__"
+          ]
+        },
+        "deadlines_transitions": {
+          "disposition": "gap",
+          "gap_codes": [
+            "REGISTER_SUBMISSION_INTERVAL_NOT_ESTABLISHED___REPLACE__"
+          ]
+        },
+        "enforcement_remedies_consequences": {
+          "disposition": "gap",
+          "gap_codes": [
+            "ENFORCEMENT_NOT_ESTABLISHED___REPLACE__"
+          ]
+        },
+        "cross_references_dependencies": {
+          "disposition": "mapped",
+          "atom_ids": [
+            "atom-duty-__REPLACE__",
+            "atom-exception-__REPLACE__",
+            "atom-submission-duty-__REPLACE__",
+            "atom-deadline-__REPLACE__"
+          ]
+        }
+      }
+    },
+    {
+      "unit_id": "unit-navigation-__REPLACE__",
+      "dimensions": {
+        "authority_status_timing": {
+          "disposition": "not_material",
+          "rationale": "This navigation unit states no material authority-status or timing proposition."
+        },
+        "actors_scope_activities": {
+          "disposition": "not_material",
+          "rationale": "This navigation unit states no material actor, scope, or activity proposition."
+        },
+        "definitions_categories": {
+          "disposition": "not_material",
+          "rationale": "This navigation unit states no material definition or category proposition."
+        },
+        "duties_rights_prohibitions": {
+          "disposition": "not_material",
+          "rationale": "This navigation unit states no material duty, right, or prohibition."
+        },
+        "triggers_thresholds": {
+          "disposition": "not_material",
+          "rationale": "This navigation unit states no material trigger or threshold."
+        },
+        "conditions_exceptions_defenses": {
+          "disposition": "not_material",
+          "rationale": "This navigation unit states no material condition, exception, or defense."
+        },
+        "deadlines_transitions": {
+          "disposition": "not_material",
+          "rationale": "This navigation unit states no material deadline or transition."
+        },
+        "enforcement_remedies_consequences": {
+          "disposition": "not_material",
+          "rationale": "This navigation unit states no material enforcement, remedy, or consequence."
+        },
+        "cross_references_dependencies": {
+          "disposition": "not_material",
+          "rationale": "This navigation unit states no material cross-reference or dependency."
+        }
+      }
+    }
+  ],
+  "lead_dispositions_v2": [
+    {
+      "lead_id": "lead-duty-__REPLACE__",
+      "disposition": "mapped",
+      "atom_ids": [
+        "atom-duty-__REPLACE__"
+      ]
+    },
+    {
+      "lead_id": "lead-exception-__REPLACE__",
+      "disposition": "mapped",
+      "atom_ids": [
+        "atom-exception-__REPLACE__"
+      ]
+    },
+    {
+      "lead_id": "lead-deadline-__REPLACE__",
+      "disposition": "mapped",
+      "atom_ids": [
+        "atom-submission-duty-__REPLACE__",
+        "atom-deadline-__REPLACE__"
+      ]
+    },
+    {
+      "lead_id": "lead-navigation-__REPLACE__",
+      "disposition": "not_material",
+      "rationale": "This navigation lead states no proposition material to the scoped question."
+    }
+  ],
+  "rule_atoms": [
+    {
+      "atom_id": "atom-duty-__REPLACE__",
+      "unit_ids": [
+        "unit-rule-__REPLACE__"
+      ],
+      "lead_ids": [
+        "lead-duty-__REPLACE__"
+      ],
+      "category": "requirements",
+      "proposition_type": "duty",
+      "materiality": "critical",
+      "elements": {
+        "actor": {
+          "status": "stated",
+          "text": "covered operator",
+          "claim_ids": [
+            "claim-duty-__REPLACE__"
+          ]
+        },
+        "modality": {
+          "status": "stated",
+          "text": "must",
+          "claim_ids": [
+            "claim-duty-__REPLACE__"
+          ]
+        },
+        "operative_action": {
+          "status": "stated",
+          "text": "maintain",
+          "claim_ids": [
+            "claim-duty-__REPLACE__"
+          ]
+        },
+        "object": {
+          "status": "stated",
+          "text": "public incident register",
+          "claim_ids": [
+            "claim-duty-__REPLACE__"
+          ]
+        },
+        "trigger": {
+          "status": "not_applicable"
+        },
+        "threshold": {
+          "status": "not_applicable"
+        },
+        "condition": {
+          "status": "not_applicable"
+        },
+        "exception": {
+          "status": "not_applicable"
+        },
+        "timing": {
+          "status": "not_applicable"
+        },
+        "authority": {
+          "status": "not_applicable"
+        },
+        "route": {
+          "status": "not_applicable"
+        },
+        "consequence": {
+          "status": "not_applicable"
+        },
+        "defined_term": {
+          "status": "not_applicable"
+        },
+        "defined_meaning": {
+          "status": "not_applicable"
+        }
+      },
+      "omission_rationale": "Omission would hide the operative register duty."
+    },
+    {
+      "atom_id": "atom-exception-__REPLACE__",
+      "unit_ids": [
+        "unit-rule-__REPLACE__"
+      ],
+      "lead_ids": [
+        "lead-exception-__REPLACE__"
+      ],
+      "category": "requirements",
+      "proposition_type": "exception",
+      "materiality": "material",
+      "elements": {
+        "actor": {
+          "status": "stated",
+          "text": "operator",
+          "claim_ids": [
+            "claim-exception-__REPLACE__"
+          ]
+        },
+        "modality": {
+          "status": "stated",
+          "text": "need not",
+          "claim_ids": [
+            "claim-exception-__REPLACE__"
+          ]
+        },
+        "operative_action": {
+          "status": "stated",
+          "text": "include",
+          "claim_ids": [
+            "claim-exception-__REPLACE__"
+          ]
+        },
+        "object": {
+          "status": "stated",
+          "text": "test-data-only incident",
+          "claim_ids": [
+            "claim-exception-__REPLACE__"
+          ]
+        },
+        "trigger": {
+          "status": "not_applicable"
+        },
+        "threshold": {
+          "status": "not_applicable"
+        },
+        "condition": {
+          "status": "stated",
+          "text": "incident affects only test data",
+          "claim_ids": [
+            "claim-exception-__REPLACE__"
+          ]
+        },
+        "exception": {
+          "status": "stated",
+          "text": "need not include the incident in the register",
+          "claim_ids": [
+            "claim-exception-__REPLACE__"
+          ]
+        },
+        "timing": {
+          "status": "not_applicable"
+        },
+        "authority": {
+          "status": "not_applicable"
+        },
+        "route": {
+          "status": "not_applicable"
+        },
+        "consequence": {
+          "status": "not_applicable"
+        },
+        "defined_term": {
+          "status": "not_applicable"
+        },
+        "defined_meaning": {
+          "status": "not_applicable"
+        }
+      },
+      "omission_rationale": "Omission would overstate the register duty's scope."
+    },
+    {
+      "atom_id": "atom-submission-duty-__REPLACE__",
+      "unit_ids": [
+        "unit-rule-__REPLACE__"
+      ],
+      "lead_ids": [
+        "lead-deadline-__REPLACE__"
+      ],
+      "category": "requirements",
+      "proposition_type": "duty",
+      "materiality": "material",
+      "elements": {
+        "actor": {
+          "status": "stated",
+          "text": "covered operator",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "modality": {
+          "status": "stated",
+          "text": "must",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "operative_action": {
+          "status": "stated",
+          "text": "submit",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "object": {
+          "status": "stated",
+          "text": "incident register",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "trigger": {
+          "status": "stated",
+          "text": "reporting trigger",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "threshold": {
+          "status": "not_applicable"
+        },
+        "condition": {
+          "status": "not_applicable"
+        },
+        "exception": {
+          "status": "not_applicable"
+        },
+        "timing": {
+          "status": "stated",
+          "text": "after the reporting trigger",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "authority": {
+          "status": "not_applicable"
+        },
+        "route": {
+          "status": "not_applicable"
+        },
+        "consequence": {
+          "status": "not_applicable"
+        },
+        "defined_term": {
+          "status": "not_applicable"
+        },
+        "defined_meaning": {
+          "status": "not_applicable"
+        }
+      },
+      "omission_rationale": "Omission would hide the independently operative submission duty."
+    },
+    {
+      "atom_id": "atom-deadline-__REPLACE__",
+      "unit_ids": [
+        "unit-rule-__REPLACE__"
+      ],
+      "lead_ids": [
+        "lead-deadline-__REPLACE__"
+      ],
+      "category": "deadlines",
+      "proposition_type": "deadline",
+      "materiality": "material",
+      "elements": {
+        "actor": {
+          "status": "stated",
+          "text": "covered operator",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "modality": {
+          "status": "stated",
+          "text": "must",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "operative_action": {
+          "status": "stated",
+          "text": "submit",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "object": {
+          "status": "stated",
+          "text": "incident register",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "trigger": {
+          "status": "stated",
+          "text": "reporting trigger",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "threshold": {
+          "status": "not_applicable"
+        },
+        "condition": {
+          "status": "not_applicable"
+        },
+        "exception": {
+          "status": "not_applicable"
+        },
+        "timing": {
+          "status": "stated",
+          "text": "after the reporting trigger",
+          "claim_ids": [
+            "claim-deadline-__REPLACE__"
+          ]
+        },
+        "authority": {
+          "status": "not_applicable"
+        },
+        "route": {
+          "status": "not_applicable"
+        },
+        "consequence": {
+          "status": "not_applicable"
+        },
+        "defined_term": {
+          "status": "not_applicable"
+        },
+        "defined_meaning": {
+          "status": "not_applicable"
+        }
+      },
+      "omission_rationale": "Omission would hide the filing trigger and the unresolved interval."
+    }
+  ],
+  "rule_relationships": [
+    {
+      "relationship_id": "relationship-exception-__REPLACE__",
+      "relation_type": "exception_to",
+      "source_atom_id": "atom-exception-__REPLACE__",
+      "target_atom_id": "atom-duty-__REPLACE__",
+      "claim_ids": [
+        "claim-duty-__REPLACE__",
+        "claim-exception-__REPLACE__"
+      ]
+    },
+    {
+      "relationship_id": "relationship-deadline-__REPLACE__",
+      "relation_type": "deadline_for",
+      "source_atom_id": "atom-deadline-__REPLACE__",
+      "target_atom_id": "atom-submission-duty-__REPLACE__",
+      "claim_ids": [
+        "claim-deadline-__REPLACE__"
+      ]
+    }
+  ],
+  "brief": {
+    "structure_profile": "regulatory-walk-v1",
+    "executive_summary": [
+      {
+        "kind": "paragraph",
+        "purpose": "legal_analysis",
+        "text": "A covered operator must maintain a public incident register and must submit the incident register after the reporting trigger, but the operator need not include an incident affecting only test data in the register.",
+        "finding_ids": [
+          "finding-requirements-__REPLACE__",
+          "finding-deadline-__REPLACE__"
+        ],
+        "claim_ids": [
+          "claim-duty-__REPLACE__",
+          "claim-exception-__REPLACE__",
+          "claim-deadline-__REPLACE__"
+        ],
+        "atom_ids": [
+          "atom-deadline-__REPLACE__",
+          "atom-duty-__REPLACE__",
+          "atom-exception-__REPLACE__",
+          "atom-submission-duty-__REPLACE__"
+        ],
+        "relationship_ids": [
+          "relationship-deadline-__REPLACE__",
+          "relationship-exception-__REPLACE__"
+        ]
+      },
+      {
+        "kind": "paragraph",
+        "purpose": "limitation",
+        "text": "The supplied materials do not establish operative status, covered-operator scope, enforcement, or a submission interval.",
+        "finding_ids": []
+      }
+    ],
+    "sections": [
+      {
+        "section_id": "key-requirements-__REPLACE__",
+        "title": "Key Requirements",
+        "role": "key_requirements",
+        "blocks": [
+          {
+            "kind": "bullet_list",
+            "purpose": "legal_analysis",
+            "items": [
+              {
+                "text": "A covered operator must maintain the incident register, may omit an incident affecting only test data, and must submit the register after the reporting trigger; the interval is not established.",
+                "finding_ids": [
+                  "finding-requirements-__REPLACE__",
+                  "finding-deadline-__REPLACE__"
+                ],
+                "claim_ids": [
+                  "claim-duty-__REPLACE__",
+                  "claim-exception-__REPLACE__",
+                  "claim-deadline-__REPLACE__"
+                ],
+                "atom_ids": [
+                  "atom-deadline-__REPLACE__",
+                  "atom-duty-__REPLACE__",
+                  "atom-exception-__REPLACE__",
+                  "atom-submission-duty-__REPLACE__"
+                ],
+                "relationship_ids": [
+                  "relationship-deadline-__REPLACE__",
+                  "relationship-exception-__REPLACE__"
+                ]
+              }
+            ]
+          }
+        ],
+        "subsections": []
+      },
+      {
+        "section_id": "penalties-and-enforcement-__REPLACE__",
+        "title": "Penalties and Enforcement",
+        "role": "penalties_enforcement",
+        "blocks": [
+          {
+            "kind": "paragraph",
+            "purpose": "limitation",
+            "text": "Not established: The retained authority does not establish penalties or enforcement mechanisms.",
+            "finding_ids": []
+          }
+        ],
+        "subsections": []
+      },
+      {
+        "section_id": "implementation-workplan-__REPLACE__",
+        "title": "Implementation Workplan",
+        "role": "implementation",
+        "blocks": [
+          {
+            "kind": "numbered_list",
+            "purpose": "application",
+            "items": [
+              {
+                "text": "Confirm the client facts needed to apply each supported register requirement.",
+                "finding_ids": []
+              },
+              {
+                "text": "Assign ownership for the register and separately verify the filing interval.",
+                "finding_ids": [
+                  "finding-requirements-__REPLACE__",
+                  "finding-deadline-__REPLACE__"
+                ]
+              }
+            ]
+          }
+        ],
+        "subsections": []
+      }
+    ]
+  }
+}

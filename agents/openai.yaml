@@ -1,0 +1,4 @@
+interface:
+  display_name: "Regulatory Harvest"
+  short_description: "Cited regulatory research and report evaluation"
+  default_prompt: "Use $regulatory-harvest to research the governing regulation and produce a cited attorney briefing."

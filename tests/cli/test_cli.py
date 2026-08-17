@@ -89,7 +89,11 @@ def test_run_validate_and_report_offline_with_json_contract(tmp_path: Path) -> N
     assert validate.returncode == 0
     assert json.loads(validate.stdout)["valid"] is True
     assert report.returncode == 0
-    assert "Attorney review required" in json.loads(report.stdout)["report"]
+    rendered = json.loads(report.stdout)
+    assert "## Executive Summary" in rendered["report"]
+    assert "### Attorney Review Required" not in rendered["report"]
+    assert "### Attorney Review Required" in rendered["audit"]
+    assert (output / "demo" / "audit.md").is_file()
 
 
 def test_validate_returns_four_for_invalid_bundle(tmp_path: Path) -> None:
@@ -129,5 +133,7 @@ def test_report_revalidates_tampered_bundle_and_returns_four(tmp_path: Path) -> 
     assert run.returncode == 0
     assert rendered.returncode == 4
     assert response["ok"] is False
-    assert "**Validation status:** invalid" in response["report"]
-    assert "BUNDLE_HASH_MISMATCH" in response["report"]
+    assert "**Deterministic validation:** invalid" not in response["report"]
+    assert "BUNDLE_HASH_MISMATCH" not in response["report"]
+    assert "**Deterministic validation:** invalid" in response["audit"]
+    assert "BUNDLE_HASH_MISMATCH" in response["audit"]

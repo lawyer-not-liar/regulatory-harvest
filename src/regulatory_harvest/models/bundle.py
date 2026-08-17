@@ -6,6 +6,7 @@ from pydantic import Field
 
 from .analysis import Finding, Gap, ResearchIssue, ReviewItem
 from .base import StrictModel
+from .brief import AttorneyBrief
 from .request import ResearchRequest
 from .run import RunManifest, ValidationReport
 from .source import CitationSpan, SourceRecord
@@ -20,7 +21,7 @@ DISCLAIMER: Literal[
 
 
 class ResearchBundle(StrictModel):
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: Literal["1.0", "1.1"] = "1.1"
     generator_version: str
     request: ResearchRequest
     manifest: RunManifest
@@ -30,6 +31,7 @@ class ResearchBundle(StrictModel):
     citations: list[CitationSpan] = Field(default_factory=list)
     gaps: list[Gap] = Field(default_factory=list)
     review_items: list[ReviewItem] = Field(default_factory=list)
+    brief: AttorneyBrief | None = None
     validation: ValidationReport | None = None
     disclaimer: Literal[
         "AI-assisted research work product. A qualified attorney must verify the sources, "

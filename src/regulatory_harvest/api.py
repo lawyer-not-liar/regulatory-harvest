@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from regulatory_harvest.analysis import render_markdown
+from regulatory_harvest.analysis import render_audit_markdown, render_markdown
 from regulatory_harvest.combine import (
     CombineDependencies,
     CombineEngine,
@@ -115,3 +115,11 @@ def render_report(bundle: ResearchBundle | Path) -> str:
     rendered = loaded.model_copy(deep=True)
     rendered.validation = report
     return render_markdown(rendered)
+
+
+def render_audit(bundle: ResearchBundle | Path) -> str:
+    loaded = _load_bundle(bundle)
+    report = validate_bundle(loaded, require_bundle_hash=True)
+    rendered = loaded.model_copy(deep=True)
+    rendered.validation = report
+    return render_audit_markdown(rendered)

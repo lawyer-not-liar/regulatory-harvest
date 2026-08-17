@@ -47,10 +47,14 @@ async def test_offline_run_completes_with_visible_analysis_gap(tmp_path) -> None
 
     bundle_data = await store.read("run-1", "bundle.json")
     report_data = await store.read("run-1", "report.md")
+    audit_data = await store.read("run-1", "audit.md")
     assert bundle_data is not None
     assert ResearchBundle.model_validate_json(bundle_data) == result.bundle
     assert report_data is not None
     assert DISCLAIMER in report_data.decode()
+    assert audit_data is not None
+    assert "# Attorney research briefing: Evidence and Validation Audit" in audit_data.decode()
+    assert DISCLAIMER in audit_data.decode()
 
 
 @pytest.mark.asyncio

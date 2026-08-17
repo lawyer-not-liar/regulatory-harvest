@@ -3,7 +3,15 @@
 from pydantic import Field, field_validator
 
 from .base import StrictModel
-from .enums import ClaimKind, ReviewStatus, Severity, SupportStatus
+from .enums import (
+    ClaimKind,
+    EnforcementClaimRole,
+    IssueCategory,
+    PresentationRole,
+    ReviewStatus,
+    Severity,
+    SupportStatus,
+)
 from .request import _non_blank
 
 
@@ -12,6 +20,8 @@ class ResearchIssue(StrictModel):
     title: str
     description: str | None = None
     jurisdictions: list[str] = Field(default_factory=list)
+    category: IssueCategory = IssueCategory.OTHER
+    presentation_role: PresentationRole | None = None
 
     _validate_text = field_validator("issue_id", "title")(_non_blank)
 
@@ -20,6 +30,7 @@ class Claim(StrictModel):
     claim_id: str
     text: str
     kind: ClaimKind
+    enforcement_roles: list[EnforcementClaimRole] = Field(default_factory=list)
     citation_ids: list[str] = Field(default_factory=list)
     support_status: SupportStatus = SupportStatus.INDETERMINATE
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -27,6 +38,15 @@ class Claim(StrictModel):
     external_ids: dict[str, str] = Field(default_factory=dict)
 
     _validate_text = field_validator("claim_id", "text")(_non_blank)
+
+    @field_validator("enforcement_roles")
+    @classmethod
+    def validate_enforcement_roles(
+        cls, values: list[EnforcementClaimRole]
+    ) -> list[EnforcementClaimRole]:
+        if len(set(values)) != len(values):
+            raise ValueError("enforcement_roles must be unique")
+        return values
 
 
 class Finding(StrictModel):
@@ -54,6 +74,8 @@ class Gap(StrictModel):
     gap_id: str
     code: str
     message: str
+    category: IssueCategory = IssueCategory.OTHER
+    presentation_role: PresentationRole | None = None
     jurisdiction: str | None = None
     source_ids: list[str] = Field(default_factory=list)
 
@@ -72,4 +94,3 @@ class ReviewItem(StrictModel):
     status: ReviewStatus = ReviewStatus.PENDING
 
     _validate_text = field_validator("review_id", "code", "message")(_non_blank)
-

@@ -118,6 +118,10 @@ async def test_adding_model_provider_resumes_at_map(tmp_path) -> None:
     assert configured_result.manifest.stage(StageName.MAP).status is StageStatus.COMPLETED
     assert provider.map_calls == 1
     assert provider.build_calls == 1
+    assert not any(
+        gap.code == "MODEL_PROVIDER_NOT_CONFIGURED"
+        for gap in configured_result.bundle.gaps
+    )
 
 
 @pytest.mark.asyncio

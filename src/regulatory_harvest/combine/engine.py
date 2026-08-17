@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 from regulatory_harvest import __version__
-from regulatory_harvest.analysis import render_markdown
+from regulatory_harvest.analysis import render_audit_markdown, render_markdown
 from regulatory_harvest.models import (
     ResearchBundle,
     ResearchRequest,
@@ -402,6 +402,8 @@ class CombineEngine:
         )
         report = render_markdown(bundle).encode("utf-8")
         await store.write_atomic(bundle.manifest.run_id, "report.md", report)
+        audit = render_audit_markdown(bundle).encode("utf-8")
+        await store.write_atomic(bundle.manifest.run_id, "audit.md", audit)
 
     @staticmethod
     def _checkpoint_name(stage: StageName) -> str:

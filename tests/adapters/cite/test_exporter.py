@@ -16,6 +16,8 @@ from regulatory_harvest.models import (
     Claim,
     ClaimKind,
     Finding,
+    Gap,
+    IssueCategory,
     ResearchBundle,
     ResearchIssue,
     ResearchRequest,
@@ -89,10 +91,26 @@ def _bundle() -> ResearchBundle:
                 issue_id="issue-1",
                 title="Risk documentation",
                 jurisdictions=["US"],
+                category=IssueCategory.REQUIREMENTS,
             )
         ],
         findings=[finding],
         citations=[citation],
+        gaps=[
+            Gap(
+                gap_id=f"gap-{category.value}",
+                code=f"COVERAGE_{category.value.upper()}_NOT_ESTABLISHED",
+                message=f"The retained source set did not establish {category.value}.",
+                category=category,
+            )
+            for category in (
+                IssueCategory.STATUS,
+                IssueCategory.SCOPE,
+                IssueCategory.ENFORCEMENT,
+                IssueCategory.DEADLINES,
+                IssueCategory.IMPLEMENTATION,
+            )
+        ],
     )
     bundle.bundle_hash = calculate_bundle_hash(bundle)
     return bundle
