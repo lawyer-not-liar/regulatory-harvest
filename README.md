@@ -1,5 +1,13 @@
 # Regulatory Harvest
 
+> **Experimental beta (`v0.1.0-beta.1`).** The public test, type, lint,
+> package, reproducibility, and privacy gates passed. A final private
+> end-to-end evaluation did not complete because its source-ledger audit
+> exhausted a bounded mechanical retry rule before report grading. No
+> performance, benchmark, or report-quality claim is made. Results are AI
+> Generated and may contain errors. Output must be validated by an attorney
+> before the attorney delivers legal advice.
+
 Regulatory Harvest is an installable research skill for attorneys. Ask a legal question in ordinary language, attach your sources or authorize current web research, and receive a cited Markdown briefing plus a machine-verifiable evidence bundle.
 
 The same skill package is designed for Codex and Claude Desktop. It uses the host agent for research and legal analysis, then passes the work through a deterministic Python engine that normalizes sources, resolves exact quotations, validates citations, records gaps, and seals the result.
@@ -35,7 +43,7 @@ $skill-installer Install the regulatory-harvest skill from this GitHub repositor
 
 For a downloaded release, extract the ZIP and place its `regulatory-harvest` folder under `~/.agents/skills/`. Codex discovers user skills there and can invoke the skill explicitly as `$regulatory-harvest`. See [OpenAI's skill documentation](https://learn.chatgpt.com/docs/build-skills).
 
-### Build the installable ZIP from this private checkout
+### Build the installable ZIP from a source checkout
 
 Until a release artifact exists, a maintainer can build the same universal ZIP locally:
 
