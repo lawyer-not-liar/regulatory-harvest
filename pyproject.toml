@@ -9,7 +9,7 @@ description = "Evidence-grounded, storage-neutral regulatory research"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-authors = [{ name = "Regulatory Harvest contributors" }]
+authors = [{ name = "Regulatory Harvest maintainers" }]
 maintainers = [{ name = "Regulatory Harvest maintainers" }]
 keywords = ["legal research", "regulatory research", "retrieval", "citations"]
 classifiers = [
@@ -28,11 +28,15 @@ dependencies = [
   "beautifulsoup4>=4.12",
   "httpx>=0.27",
   "pydantic>=2.8",
-  "pypdf>=5.0",
+  "pypdf>=6.15.0",
 ]
 
+[project.urls]
+Changelog = "https://github.com/lawyer-not-liar/regulatory-harvest/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/lawyer-not-liar/regulatory-harvest"
+Repository = "https://github.com/lawyer-not-liar/regulatory-harvest.git"
+
 [project.optional-dependencies]
-cite = []
 dev = [
   "hypothesis>=6.112",
   "mypy>=1.11",
@@ -41,9 +45,7 @@ dev = [
   "respx>=0.21",
   "ruff>=0.6",
 ]
-evaluation = []
 openai = ["openai>=2.15,<3"]
-tavily = []
 
 [project.scripts]
 harvest = "regulatory_harvest.cli:main"

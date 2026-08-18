@@ -4,6 +4,8 @@ import tarfile
 import tomllib
 from pathlib import Path
 
+from regulatory_harvest import __version__
+
 ROOT = Path(__file__).parents[1]
 
 
@@ -15,22 +17,40 @@ def test_public_package_metadata_supports_declared_install_surfaces() -> None:
 
     assert project["name"] == "regulatory-harvest"
     assert project["version"] == "0.1.0"
+    assert __version__ == project["version"]
     assert project["requires-python"] == ">=3.11"
     assert project["license"] == "Apache-2.0"
     assert project["scripts"] == {"harvest": "regulatory_harvest.cli:main"}
-    assert {"beautifulsoup4>=4.12", "httpx>=0.27", "pydantic>=2.8", "pypdf>=5.0"} == set(
-        project["dependencies"]
-    )
-    assert set(project["optional-dependencies"]) == {
-        "cite",
-        "dev",
-        "evaluation",
-        "openai",
-        "tavily",
+    assert {
+        "beautifulsoup4>=4.12",
+        "httpx>=0.27",
+        "pydantic>=2.8",
+        "pypdf>=6.15.0",
+    } == set(project["dependencies"])
+    assert set(project["optional-dependencies"]) == {"dev", "openai"}
+    assert project["urls"] == {
+        "Changelog": "https://github.com/lawyer-not-liar/regulatory-harvest/blob/main/CHANGELOG.md",
+        "Homepage": "https://github.com/lawyer-not-liar/regulatory-harvest",
+        "Repository": "https://github.com/lawyer-not-liar/regulatory-harvest.git",
     }
-    assert "urls" not in project
+    assert project["authors"] == [{"name": "Regulatory Harvest maintainers"}]
     assert project["maintainers"] == [{"name": "Regulatory Harvest maintainers"}]
     assert "Intended Audience :: Legal Industry" in project["classifiers"]
+
+
+def test_experimental_beta_release_surfaces_are_coherent() -> None:
+    """The prerelease label must not imply that evaluated runtime bytes changed."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    roadmap = (ROOT / "docs" / "roadmap.md").read_text(encoding="utf-8")
+    readme_words = " ".join(readme.split())
+    roadmap_words = " ".join(roadmap.split())
+
+    assert "v0.1.0-beta.1" in readme
+    assert "packages the unchanged `0.1.0` engine" in readme_words
+    assert "## [0.1.0-beta.1] - 2026-08-17" in changelog
+    assert "LLM supplies substantive judgments" in roadmap_words
+    assert "deterministic code constructs canonical artifacts" in roadmap_words
 
 
 def test_installed_package_exposes_type_marker_and_prompt_resources() -> None:

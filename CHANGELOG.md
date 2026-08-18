@@ -4,6 +4,8 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 
 ## [Unreleased]
 
+## [0.1.0-beta.1] - 2026-08-17
+
 - Added one self-contained Agent Skill package for Codex and Claude Desktop, with supplied-source and current-web research modes.
 - Added a host-agent draft bridge that resolves exact quotations and runs the existing COMBINE validation and export stages without a second model API.
 - Added an attorney-facing matter runner, strict research charter and analysis-draft templates, currentness and authority guidance, and a reproducible universal ZIP builder.
@@ -26,9 +28,8 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 - Made the full Python provider path load the same versioned status-first, issue-category, translation, and attorney-briefing prompt contract.
 - Expanded the clean-room audit to scan untracked, non-ignored candidate files before commit.
 - Added a standard-library deterministic runner so installed skills can prepare, resolve exact citations, validate, report, and seal text or HTML matters without PyPI or preinstalled third-party libraries.
-- Publication authorization, the public remote, and release date remain pending.
-
-## [0.1.0] - Unreleased
+- Prepared the first public experimental beta without a performance,
+  benchmark, or report-quality claim.
 
 ### Added
 
@@ -44,7 +45,8 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 ### Verified
 
 - The local 0.1.0 candidate passed the warning-free test suite on Python 3.11 through 3.14, strict type checking, linting, clean-room audit, source and wheel builds, and a wheel-only offline acceptance run.
-- Public repository creation and package publication remain blocked on the separate manual ownership and authorization gate.
+- The GitHub prerelease packages the unchanged `0.1.0` engine. No PyPI
+  distribution is published.
 
-[Unreleased]: CHANGELOG.md
-[0.1.0]: CHANGELOG.md
+[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.1...HEAD
+[0.1.0-beta.1]: https://github.com/lawyer-not-liar/regulatory-harvest/releases/tag/v0.1.0-beta.1

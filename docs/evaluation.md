@@ -6,10 +6,10 @@ LegalBench-RAG evaluates the retrieval step over its legal-contract datasets. A 
 
 ## Install
 
-The evaluation extra currently adds no packages beyond the base installation:
+The evaluator is included in the base installation:
 
 ```bash
-python -m pip install "regulatory-harvest[evaluation]"
+python -m pip install regulatory-harvest
 ```
 
 ## Obtain and review the dataset separately

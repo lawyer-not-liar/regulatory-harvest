@@ -18,10 +18,11 @@ The client caches capabilities for its lifetime, uses a ten-second default timeo
 
 ## Install and credentials
 
-The `cite` extra is a discoverability marker and currently adds no packages beyond Harvest's base HTTP stack:
+The cite adapter uses Harvest's base HTTP stack and requires no optional
+package extra:
 
 ```bash
-python -m pip install "regulatory-harvest[cite]"
+python -m pip install regulatory-harvest
 ```
 
 Set a bearer token in an environment variable. Do not put a token in shell arguments, request files, target maps, or receipts.
