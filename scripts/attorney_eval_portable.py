@@ -1,0 +1,9052 @@
+#!/usr/bin/env python3
+"""Dependency-free substrate for blind attorney-report evaluation.
+
+The module deliberately exposes ordinary ``dict`` wire values.  Every public
+boundary validates and copies the complete value before using it.  It does not
+import the Regulatory Harvest package, Pydantic, a model SDK, or a provider.
+"""
+
+from __future__ import annotations
+
+import errno
+import hashlib
+import html
+import json
+import math
+import os
+import re
+import stat
+import tempfile
+import unicodedata
+import uuid
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path, PurePosixPath
+from typing import Any, cast
+
+JsonObject = dict[str, object]
+JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+
+EVALUATION_ARTIFACT_SCHEMA_VERSION = "1.3"
+SCORE_INPUT_SCHEMA_VERSION = "1.4"
+EVALUATION_STORAGE_PLATFORM_UNSUPPORTED = "EVALUATION_STORAGE_PLATFORM_UNSUPPORTED"
+EVALUATION_ARTIFACT_SCHEMA_UNSUPPORTED = "EVALUATION_ARTIFACT_SCHEMA_UNSUPPORTED"
+EVALUATION_SCORE_INPUT_SCHEMA_UNSUPPORTED = "EVALUATION_SCORE_INPUT_SCHEMA_UNSUPPORTED"
+EVALUATION_SCORE_INPUT_SOURCE_RECORD_MISMATCH = (
+    "EVALUATION_SCORE_INPUT_SOURCE_RECORD_MISMATCH"
+)
+
+EVAL_EXIT_SUCCESS = 0
+EVAL_EXIT_INPUT = 2
+EVAL_EXIT_INCONCLUSIVE = 3
+EVAL_EXIT_FAIL = 4
+EVAL_EXIT_INTEGRITY = 5
+
+EVALUATION_MODES = frozenset({"current-law", "closed-universe"})
+READINESS_STATUSES = frozenset({"ADMITTED", "CASE_INVALID", "INCONCLUSIVE"})
+MATERIALITIES = frozenset({"critical", "material", "supporting"})
+_REPORT_WIDE_NARRATIVE_DIMENSIONS = frozenset(
+    {
+        "regulatory_walk",
+        "qualification_placement",
+        "requirements_workplan_boundary",
+        "scanability",
+    }
+)
+_MARKDOWN_H2_PATTERN = re.compile(r"^ {0,3}##(?:[ \t]+|$)")
+_MARKDOWN_FENCE_OPEN_PATTERN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_GENERIC_MATERIALITY_RATIONALES = frozenset(
+    {"important", "material", "critical", "significant", "high priority"}
+)
+_AUDIT_RATIONALE_MINIMUM_WORDS = 6
+_AUDIT_RATIONALE_LEGAL_OR_RECORD_ANCHORS = (
+    "authority",
+    "citation",
+    "condition",
+    "consequence",
+    "deadline",
+    "duty",
+    "exception",
+    "ledger",
+    "materiality",
+    "penalty",
+    "proposition",
+    "record",
+    "regulation",
+    "requirement",
+    "right",
+    "source",
+    "statute",
+    "text",
+    "timing",
+    "trigger",
+)
+_AUDIT_RATIONALE_DEFECT_OR_CORRECTION_SIGNALS = (
+    "add",
+    "combine",
+    "combined",
+    "combines",
+    "conflict",
+    "correction",
+    "delete",
+    "duplicate",
+    "edit",
+    "fails",
+    "incorrect",
+    "incomplete",
+    "lacks",
+    "merge",
+    "missing",
+    "needs",
+    "omitted",
+    "overaggregated",
+    "overstates",
+    "repair",
+    "requires",
+    "separate",
+    "split",
+    "understates",
+    "unsupported",
+    "wrong",
+)
+_AUDIT_RATIONALE_STOPWORDS = (
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "been",
+    "being",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "was",
+    "were",
+    "with",
+)
+_AUDIT_RATIONALE_EVALUATOR_METADATA_TERMS = (
+    "audit",
+    "case",
+    "correction",
+    "corrections",
+    "critical",
+    "entries",
+    "entry",
+    "evaluator",
+    "finding",
+    "findings",
+    "fingerprint",
+    "high",
+    "immaterial",
+    "importance",
+    "important",
+    "ledger",
+    "low",
+    "major",
+    "material",
+    "materiality",
+    "materially",
+    "metadata",
+    "minor",
+    "payload",
+    "priority",
+    "proposal",
+    "proposed",
+    "record",
+    "request",
+    "response",
+    "schema",
+    "significant",
+    "source",
+    "supporting",
+    "target",
+    "targets",
+)
+_AUDIT_RATIONALE_ACTION_BOILERPLATE_TERMS = (
+    "add",
+    "added",
+    "adding",
+    "adds",
+    "change",
+    "changed",
+    "changes",
+    "changing",
+    "concrete",
+    "contains",
+    "distinct",
+    "identified",
+    "indeed",
+    "need",
+    "needed",
+    "needing",
+    "needs",
+    "omit",
+    "omission",
+    "omissions",
+    "omits",
+    "omitted",
+    "omitting",
+    "repair",
+    "repaired",
+    "repairing",
+    "repairs",
+    "require",
+    "required",
+    "requires",
+    "requiring",
+    "still",
+    "very",
+)
+_AUDIT_RATIONALE_LEGAL_LOCATORS = (
+    "article",
+    "chapter",
+    "paragraph",
+    "rule",
+    "schedule",
+    "section",
+)
+_AUDIT_RATIONALE_MINIMUM_SOURCE_TERMS = 2
+_AUDIT_RATIONALE_LOCATOR_PATTERN = re.compile(
+    r"\b("
+    + "|".join(_AUDIT_RATIONALE_LEGAL_LOCATORS)
+    + r")\s+([a-z]*\d+[a-z]*(?:[.-][a-z0-9]+)*(?:\([a-z0-9.-]+\))*|"
+    + r"[a-z]|[ivxlcdm]+)(?![a-z0-9(])",
+    re.IGNORECASE,
+)
+COVERAGE_DISPOSITIONS = frozenset(
+    {
+        "COMPLETE",
+        "PARTIAL",
+        "MISSING",
+        "OVERSTATED",
+        "CONTRADICTED",
+        "UNSUPPORTED",
+        "NOT_APPLICABLE",
+    }
+)
+ENTRY_FINDING_CODES = frozenset(
+    {
+        "CRITICAL_LEDGER_ENTRY_MISSING",
+        "MATERIAL_EXCEPTION_MISSING",
+        "CONSEQUENCE_TRIGGER_DETACHED",
+    }
+)
+NARRATIVE_FINDING_CODES = frozenset({"KEY_REQUIREMENTS_ACTION_PLAN"})
+LEDGER_CATEGORIES = frozenset(
+    {
+        "status",
+        "scope",
+        "definition",
+        "requirement",
+        "prohibition",
+        "right",
+        "exception",
+        "deadline",
+        "enforcement",
+        "remedy",
+        "penalty",
+        "appeal",
+        "implementation",
+    }
+)
+JUDGE_OPERATIONS = frozenset(
+    {"admit_case", "build_ledger", "audit_ledger", "repair_ledger", "grade_report", "referee"}
+)
+JUDGE_ISOLATIONS = frozenset({"fresh_context", "sequential_same_context", "scripted_fixture"})
+ISSUE_SEVERITIES = frozenset({"error", "warning", "info"})
+RUN_PHASES = frozenset(
+    {
+        "created",
+        "admission",
+        "ledger-build",
+        "ledger-audit",
+        "ledger-repair",
+        "ledger-referee",
+        "ledger-sealed",
+        "grade-a",
+        "grade-b",
+        "report-referee",
+        "aggregate",
+        "completed",
+        "inconclusive",
+        "case-invalid",
+    }
+)
+TERMINAL_STATUSES = frozenset({"completed", "inconclusive", "case-invalid"})
+NARRATIVE_DIMENSIONS = (
+    "executive_summary",
+    "regulatory_walk",
+    "key_requirements",
+    "penalties_enforcement",
+    "qualification_placement",
+    "requirements_workplan_boundary",
+    "limitations",
+    "scanability",
+)
+SOURCE_ROLES = frozenset({"official_primary", "secondary", "commentary_analysis"})
+SOURCE_QUALITIES = frozenset({"primary", "secondary", "unknown", "unusable"})
+COMPLETENESS_VALUES = frozenset(
+    {"complete", "consolidated", "amending", "partial", "snippet", "unknown"}
+)
+
+RUBRIC_V1: JsonObject = {
+    "version": "attorney-eval-v1",
+    "materiality_weights": {"critical": 5, "material": 3, "supporting": 1},
+    "critical_recall_floor": 1.0,
+    "weighted_recall_floor": 0.90,
+    "claim_precision_floor": 0.95,
+    "walk_average_floor": 3.0,
+    "walk_dimension_floor": 2,
+    "comparison_weights": {"recall": 0.45, "precision": 0.25, "walk": 0.30},
+    "comparison_margin": 5.0,
+}
+
+_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+_SEED_RE = _HASH_RE
+_QUALIFICATION_RESPONSE_MAX_DEPTH = 64
+_WINDOWS_FORBIDDEN_PATH_CHARS = frozenset('<>:"|?*')
+_WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+        "COM¹",
+        "COM²",
+        "COM³",
+        "LPT¹",
+        "LPT²",
+        "LPT³",
+    }
+)
+
+_CASE_ENVELOPE_PATH = "case-envelope.json"
+_READINESS_PATH = "case-readiness.json"
+_RUBRIC_PATH = "evaluation-rubric.json"
+_PROPOSED_LEDGER_PATH = "legal-ledger.proposed.json"
+_LEDGER_AUDIT_PATH = "legal-ledger-audit.json"
+_REPAIRED_LEDGER_PATH = "legal-ledger.repaired.json"
+_REMAINING_AUDIT_PATH = "legal-ledger.remaining-audit.json"
+_LEDGER_REFEREE_PATH = "ledger-referee.json"
+_SEALED_LEDGER_PATH = "legal-ledger.json"
+_REPORT_DISPUTES_PATH = "report-disputes.json"
+_RESULT_PATH = "evaluation-result.json"
+_REPORT_PATH = "evaluation-report.md"
+_TERMINAL_READINESS_PATH = "terminal-readiness.json"
+_MANIFEST_PATH = "run-manifest.json"
+_QUALIFICATION_CASE_PATH = "qualification-case.json"
+_QUALIFICATION_REQUEST_PATH = "admission-request.json"
+_QUALIFICATION_RESPONSE_PATH = "admission-response.json"
+_QUALIFICATION_RECEIPT_PATH = "qualification-receipt.json"
+_QUALIFICATION_MANIFEST_PATH = "manifest.json"
+
+
+class PortableEvaluationInputError(ValueError):
+    """Raised when a caller-supplied wire value violates the frozen contract."""
+
+
+class PortableResponseContractError(PortableEvaluationInputError):
+    """A deterministic response defect that has a public-safe preflight diagnostic."""
+
+    def __init__(self, message: str, *, code: str, related_ids: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.code = code
+        self.related_ids = tuple(sorted(set(related_ids)))
+
+
+class EvaluationIntegrityError(ValueError):
+    """Raised when a run cannot be trusted or safely mutated."""
+
+
+class EvaluationInconclusiveError(ValueError):
+    """Raised when validated evidence cannot be reconciled deterministically."""
+
+
+class EvaluationSourceParityUnprovenError(ValueError):
+    """A two-report case lacks two verified, matching generation capsules."""
+
+
+@dataclass(frozen=True)
+class EvaluationVerification:
+    valid: bool
+    issues: tuple[str, ...]
+    root_hash: str | None
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _ordinary(value: object, *, location: str = "value") -> None:
+    if value is None or type(value) in {str, bool, int}:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise EvaluationIntegrityError(f"{location} contains a non-finite number")
+        return
+    if type(value) is list:
+        for index, item in enumerate(cast(list[object], value)):
+            _ordinary(item, location=f"{location}[{index}]")
+        return
+    if type(value) is dict:
+        for key, item in cast(dict[object, object], value).items():
+            if type(key) is not str:
+                raise EvaluationIntegrityError(f"{location} has a non-string key")
+            _ordinary(item, location=f"{location}.{key}")
+        return
+    raise EvaluationIntegrityError(f"{location} is not ordinary JSON: {type(value).__name__}")
+
+
+def canonical_json_bytes(value: object) -> bytes:
+    """Return the core's exact UTF-8 canonical JSON representation."""
+    _ordinary(value)
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def parse_canonical_json_bytes(data: bytes, *, location: str) -> object:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EvaluationIntegrityError(f"{location} is malformed JSON") from error
+    _ordinary(value, location=location)
+    if canonical_json_bytes(value) != data:
+        raise EvaluationIntegrityError(f"{location} bytes are not canonical JSON")
+    return value
+
+
+def _schema_unsupported(location: str) -> EvaluationIntegrityError:
+    return EvaluationIntegrityError(f"{EVALUATION_ARTIFACT_SCHEMA_UNSUPPORTED}: {location}")
+
+
+def _require_artifact_schema(value: object, *, location: str) -> None:
+    if not isinstance(value, dict):
+        return
+    schema = value.get("schema_version")
+    if schema is not None and schema != EVALUATION_ARTIFACT_SCHEMA_VERSION:
+        raise _schema_unsupported(location)
+
+
+def _require_candidate_grade_schema(value: object, *, location: str) -> None:
+    _require_artifact_schema(value, location=location)
+
+
+def _require_resolved_grade_schemas(value: object, *, location: str) -> None:
+    _require_artifact_schema(value, location=location)
+    if not isinstance(value, dict):
+        return
+    for key in ("grade", "original_grader_1", "original_grader_2"):
+        if key in value:
+            _require_candidate_grade_schema(value[key], location=location)
+
+
+def _require_score_input_schemas(value: object, *, location: str) -> None:
+    if isinstance(value, dict) and value.get("schema_version") != SCORE_INPUT_SCHEMA_VERSION:
+        raise EvaluationIntegrityError(
+            f"{EVALUATION_SCORE_INPUT_SCHEMA_UNSUPPORTED}: {location}"
+        )
+    if isinstance(value, dict) and "resolved_grade" in value:
+        _require_resolved_grade_schemas(value["resolved_grade"], location=location)
+
+
+def _require_result_schemas(value: object, *, location: str) -> None:
+    _require_artifact_schema(value, location=location)
+    if not isinstance(value, dict):
+        return
+    reports = value.get("reports")
+    if isinstance(reports, list):
+        for report in reports:
+            _require_artifact_schema(report, location=location)
+
+
+def _copy_json(value: object) -> object:
+    return json.loads(canonical_json_bytes(value))
+
+
+def _object(value: object, *, location: str) -> JsonObject:
+    if type(value) is not dict or any(
+        type(key) is not str for key in cast(dict[object, object], value)
+    ):
+        raise PortableEvaluationInputError(f"{location} must be an object")
+    return cast(JsonObject, value)
+
+
+def _array(value: object, *, location: str) -> list[object]:
+    if type(value) is not list:
+        raise PortableEvaluationInputError(f"{location} must be an array")
+    return cast(list[object], value)
+
+
+def _shape(
+    value: object,
+    *,
+    required: set[str],
+    optional: set[str] | frozenset[str] = frozenset(),
+    location: str,
+) -> JsonObject:
+    result = _object(value, location=location)
+    keys = set(result)
+    if not required <= keys or not keys <= required | optional:
+        raise PortableEvaluationInputError(f"{location} has an unexpected shape")
+    return result
+
+
+def _string(value: object, *, location: str, nonblank: bool = False) -> str:
+    if type(value) is not str:
+        raise PortableEvaluationInputError(f"{location} must be a string")
+    result = value
+    if nonblank and (not result.strip() or result != result.strip()):
+        raise PortableEvaluationInputError(f"{location} must be nonblank")
+    return result
+
+
+def _optional_string(value: object, *, location: str, nonblank: bool = False) -> str | None:
+    if value is None:
+        return None
+    return _string(value, location=location, nonblank=nonblank)
+
+
+def _exact_content(value: object, *, location: str) -> str:
+    result = _string(value, location=location)
+    if not result.replace("\ufeff", "").strip():
+        raise PortableEvaluationInputError(f"{location} must be nonblank")
+    return result
+
+
+def _optional_exact_content(value: object, *, location: str) -> str | None:
+    if value is None:
+        return None
+    return _exact_content(value, location=location)
+
+
+def _strict_bool(value: object, *, location: str) -> bool:
+    if type(value) is not bool:
+        raise PortableEvaluationInputError(f"{location} must be a boolean")
+    return value
+
+
+def _strict_int(
+    value: object, *, location: str, minimum: int | None = None, maximum: int | None = None
+) -> int:
+    if type(value) is not int:
+        raise PortableEvaluationInputError(f"{location} must be an integer")
+    result = value
+    if minimum is not None and result < minimum:
+        raise PortableEvaluationInputError(f"{location} is below its minimum")
+    if maximum is not None and result > maximum:
+        raise PortableEvaluationInputError(f"{location} exceeds its maximum")
+    return result
+
+
+def _strict_float(value: object, *, location: str) -> float:
+    if type(value) is not float or not math.isfinite(value):
+        raise PortableEvaluationInputError(f"{location} must be a finite float")
+    return value
+
+
+def _enum(value: object, allowed: frozenset[str], *, location: str) -> str:
+    result = _string(value, location=location)
+    if result not in allowed:
+        raise PortableEvaluationInputError(f"{location} has an unsupported value")
+    return result
+
+
+def _hash(value: object, *, location: str) -> str:
+    result = _string(value, location=location)
+    if not _HASH_RE.fullmatch(result):
+        raise PortableEvaluationInputError(f"{location} must be a lowercase SHA-256 digest")
+    return result
+
+
+def _identifier(value: object, *, location: str) -> str:
+    result = _string(value, location=location, nonblank=True)
+    if not _SAFE_IDENTIFIER_RE.fullmatch(result):
+        raise PortableEvaluationInputError(f"{location} is not a safe identifier")
+    return result
+
+
+def _string_list(
+    value: object,
+    *,
+    location: str,
+    identifiers: bool = False,
+    nonblank: bool = False,
+    unique: bool = False,
+) -> list[str]:
+    result = [
+        _identifier(item, location=f"{location}[{index}]")
+        if identifiers
+        else _string(item, location=f"{location}[{index}]", nonblank=nonblank)
+        for index, item in enumerate(_array(value, location=location))
+    ]
+    if unique and len(result) != len(set(result)):
+        raise PortableEvaluationInputError(f"{location} values must be unique")
+    return result
+
+
+def _with_defaults(value: JsonObject, defaults: Mapping[str, object]) -> JsonObject:
+    result = cast(JsonObject, _copy_json(value))
+    for key, default in defaults.items():
+        if key not in result:
+            result[key] = _copy_json(default)
+    return result
+
+
+def _validate_relative_path(artifact_path: str) -> PurePosixPath:
+    if not artifact_path or artifact_path != artifact_path.strip() or "\\" in artifact_path:
+        raise EvaluationIntegrityError("unsafe artifact path")
+    if artifact_path.startswith("/"):
+        raise EvaluationIntegrityError("unsafe artifact path")
+    segments = artifact_path.split("/")
+    for segment in segments:
+        device = segment.split(".", maxsplit=1)[0].rstrip(" .").upper()
+        if (
+            segment in {"", ".", ".."}
+            or any(ord(character) <= 0x1F or ord(character) == 0x7F for character in segment)
+            or any(character in _WINDOWS_FORBIDDEN_PATH_CHARS for character in segment)
+            or segment.endswith((" ", "."))
+            or device in _WINDOWS_RESERVED_DEVICE_NAMES
+        ):
+            raise EvaluationIntegrityError("unsafe artifact path")
+    return PurePosixPath(artifact_path)
+
+
+def _model_fingerprint(value: JsonObject, *, exclude: set[str] | None = None) -> str:
+    payload = cast(JsonObject, _copy_json(value))
+    for name in exclude or set():
+        payload.pop(name, None)
+    return _sha256(canonical_json_bytes(payload))
+
+
+def _validate_issue(value: object, *, location: str) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={"code", "severity", "message"},
+            optional={"related_ids"},
+            location=location,
+        ),
+        {"related_ids": []},
+    )
+    _identifier(result["code"], location=f"{location}.code")
+    _enum(result["severity"], ISSUE_SEVERITIES, location=f"{location}.severity")
+    _string(result["message"], location=f"{location}.message", nonblank=True)
+    _string_list(
+        result["related_ids"], location=f"{location}.related_ids", identifiers=True, unique=True
+    )
+    return result
+
+
+def _validate_requested_authority(value: object, *, location: str) -> JsonObject:
+    result = _shape(
+        value,
+        required={"authority_id", "title", "jurisdiction", "authority_type", "source_ids"},
+        location=location,
+    )
+    _identifier(result["authority_id"], location=f"{location}.authority_id")
+    for field in ("title", "jurisdiction", "authority_type"):
+        _string(result[field], location=f"{location}.{field}", nonblank=True)
+    source_ids = _string_list(
+        result["source_ids"], location=f"{location}.source_ids", identifiers=True, unique=True
+    )
+    if not source_ids:
+        raise PortableEvaluationInputError(f"{location}.source_ids must not be empty")
+    return result
+
+
+def _validate_source(value: object, *, location: str) -> JsonObject:
+    required = {
+        "source_id",
+        "title",
+        "normalized_text",
+        "content_hash",
+        "jurisdiction",
+        "authority_type",
+        "source_role",
+        "source_quality",
+        "completeness",
+        "language",
+    }
+    optional = {
+        "canonical_url",
+        "publisher",
+        "version",
+        "effective_date",
+        "supersession",
+        "relationship_ids",
+    }
+    result = _with_defaults(
+        _shape(value, required=required, optional=optional, location=location),
+        {
+            "canonical_url": None,
+            "publisher": None,
+            "version": None,
+            "effective_date": None,
+            "supersession": None,
+            "relationship_ids": [],
+        },
+    )
+    _identifier(result["source_id"], location=f"{location}.source_id")
+    for field in ("title", "jurisdiction", "authority_type", "language"):
+        _string(result[field], location=f"{location}.{field}", nonblank=True)
+    _exact_content(result["normalized_text"], location=f"{location}.normalized_text")
+    for field in ("canonical_url", "publisher", "version", "effective_date", "supersession"):
+        _optional_string(result[field], location=f"{location}.{field}", nonblank=True)
+    _enum(result["source_role"], SOURCE_ROLES, location=f"{location}.source_role")
+    _enum(result["source_quality"], SOURCE_QUALITIES, location=f"{location}.source_quality")
+    _enum(result["completeness"], COMPLETENESS_VALUES, location=f"{location}.completeness")
+    _string_list(
+        result["relationship_ids"],
+        location=f"{location}.relationship_ids",
+        identifiers=True,
+        unique=True,
+    )
+    if result["content_hash"] != _sha256(cast(str, result["normalized_text"]).encode("utf-8")):
+        raise PortableEvaluationInputError(f"{location}.content_hash does not match source text")
+    return result
+
+
+def _validate_candidate(value: object, *, location: str) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={"candidate_id", "role", "report_text", "report_hash"},
+            optional={"bundle_json", "validation_receipt", "coverage_review"},
+            location=location,
+        ),
+        {"bundle_json": None, "validation_receipt": None, "coverage_review": None},
+    )
+    _identifier(result["candidate_id"], location=f"{location}.candidate_id")
+    _enum(result["role"], frozenset({"candidate", "comparator"}), location=f"{location}.role")
+    report_text = _exact_content(result["report_text"], location=f"{location}.report_text")
+    if result["report_hash"] != _sha256(report_text.encode("utf-8")):
+        raise PortableEvaluationInputError(f"{location}.report_hash does not match report text")
+    for field in ("bundle_json", "validation_receipt", "coverage_review"):
+        if result[field] is not None:
+            _object(result[field], location=f"{location}.{field}")
+    return result
+
+
+def _strict_hash_mapping(value: object, *, location: str, nonempty: bool) -> None:
+    if type(value) is not dict or (nonempty and not value):
+        raise PortableEvaluationInputError(
+            f"{location} must be a{' nonempty' if nonempty else ''} object"
+        )
+    if any(
+        type(identifier) is not str
+        or _SAFE_IDENTIFIER_RE.fullmatch(identifier) is None
+        or type(digest) is not str
+        or _HASH_RE.fullmatch(digest) is None
+        for identifier, digest in cast(JsonObject, value).items()
+    ):
+        raise PortableEvaluationInputError(f"{location} contains an invalid commitment")
+
+
+def _validate_generation_record(value: object, *, location: str) -> JsonObject:
+    required = {
+        "candidate_id",
+        "capture_fingerprint",
+        "client_facts_hash",
+        "generation_isolation",
+        "generator_artifact_hashes",
+        "model_name",
+        "nonce_fingerprint",
+        "provider_name",
+        "report_hash",
+        "request_fingerprint",
+        "response_fingerprint",
+        "response_id",
+        "schema_version",
+        "source_hashes",
+        "usage",
+    }
+    if type(value) is not dict or set(cast(JsonObject, value)) != required:
+        raise PortableEvaluationInputError(f"{location} has an unexpected shape")
+    result = cast(JsonObject, value)
+    if result["schema_version"] != "1.0":
+        raise PortableEvaluationInputError(f"{location} schema version is unsupported")
+    _identifier(result["candidate_id"], location=f"{location}.candidate_id")
+    for field in (
+        "capture_fingerprint",
+        "nonce_fingerprint",
+        "report_hash",
+        "request_fingerprint",
+        "response_fingerprint",
+    ):
+        digest = result[field]
+        if type(digest) is not str or _HASH_RE.fullmatch(digest) is None:
+            raise PortableEvaluationInputError(f"{location}.{field} is invalid")
+    facts_hash = result["client_facts_hash"]
+    if facts_hash is not None and (
+        type(facts_hash) is not str or _HASH_RE.fullmatch(facts_hash) is None
+    ):
+        raise PortableEvaluationInputError(f"{location}.client_facts_hash is invalid")
+    for field in ("model_name", "provider_name"):
+        field_value = result[field]
+        if type(field_value) is not str or not field_value.strip():
+            raise PortableEvaluationInputError(f"{location}.{field} is invalid")
+    if result["generation_isolation"] not in {
+        "fresh_context",
+        "sequential_same_context",
+        "scripted_fixture",
+    }:
+        raise PortableEvaluationInputError(f"{location}.generation_isolation is unsupported")
+    response_id = result["response_id"]
+    if response_id is not None and (
+        type(response_id) is not str or not response_id.strip()
+    ):
+        raise PortableEvaluationInputError(f"{location}.response_id is invalid")
+    _strict_hash_mapping(
+        result["source_hashes"], location=f"{location}.source_hashes", nonempty=True
+    )
+    _strict_hash_mapping(
+        result["generator_artifact_hashes"],
+        location=f"{location}.generator_artifact_hashes",
+        nonempty=True,
+    )
+    usage = result["usage"]
+    if type(usage) is not dict or any(
+        type(key) is not str
+        or _SAFE_IDENTIFIER_RE.fullmatch(key) is None
+        or type(amount) is not int
+        or amount < 0
+        for key, amount in cast(JsonObject, usage).items()
+    ):
+        raise PortableEvaluationInputError(f"{location}.usage is invalid")
+    return result
+
+
+def _validate_generation_provenance(value: object, *, location: str) -> JsonObject:
+    if type(value) is not dict or type(cast(JsonObject, value).get("kind")) is not str:
+        raise PortableEvaluationInputError(
+            f"{location} must distinguish capsule or external provenance"
+        )
+    result = cast(JsonObject, value)
+    if result["kind"] == "external":
+        if set(result) != {"kind"}:
+            raise PortableEvaluationInputError(
+                f"{location} external provenance has an unexpected shape"
+            )
+        return result
+    if result["kind"] != "capsule" or set(result) != {
+        "kind",
+        "capsule_root",
+        "generation_record",
+        "generation_question",
+    }:
+        raise PortableEvaluationInputError(
+            f"{location} capsule provenance has an unexpected shape"
+        )
+    capsule_root = result["capsule_root"]
+    if type(capsule_root) is not str or _HASH_RE.fullmatch(capsule_root) is None:
+        raise PortableEvaluationInputError(f"{location}.capsule_root is invalid")
+    _string(
+        result["generation_question"],
+        location=f"{location}.generation_question",
+        nonblank=True,
+    )
+    _validate_generation_record(result["generation_record"], location=f"{location}.record")
+    return result
+
+
+def validate_case(value: object) -> JsonObject:
+    """Strictly validate and normalize an ``AttorneyEvaluationCase`` wire dict."""
+    result = _with_defaults(
+        _shape(
+            value,
+            required={
+                "case_id",
+                "mode",
+                "question",
+                "jurisdiction",
+                "as_of",
+                "requested_authorities",
+                "sources",
+                "candidates",
+            },
+            optional={"schema_version", "client_facts", "rubric_version"},
+            location="case",
+        ),
+        {"schema_version": "1.0", "client_facts": None, "rubric_version": "attorney-eval-v1"},
+    )
+    if (
+        result["schema_version"] not in {"1.0", "1.1"}
+        or result["rubric_version"] != "attorney-eval-v1"
+    ):
+        raise PortableEvaluationInputError("case schema or rubric version is unsupported")
+    _identifier(result["case_id"], location="case.case_id")
+    _enum(result["mode"], EVALUATION_MODES, location="case.mode")
+    _string(result["question"], location="case.question", nonblank=True)
+    _string(result["jurisdiction"], location="case.jurisdiction", nonblank=True)
+    try:
+        date.fromisoformat(_string(result["as_of"], location="case.as_of"))
+    except ValueError as error:
+        raise PortableEvaluationInputError("case.as_of must be an ISO date") from error
+    _optional_exact_content(result["client_facts"], location="case.client_facts")
+    authorities = [
+        _validate_requested_authority(item, location=f"case.requested_authorities[{index}]")
+        for index, item in enumerate(
+            _array(result["requested_authorities"], location="case.requested_authorities")
+        )
+    ]
+    sources = [
+        _validate_source(item, location=f"case.sources[{index}]")
+        for index, item in enumerate(_array(result["sources"], location="case.sources"))
+    ]
+    candidates = [
+        _validate_candidate(item, location=f"case.candidates[{index}]")
+        for index, item in enumerate(_array(result["candidates"], location="case.candidates"))
+    ]
+    if not authorities or not sources or not 1 <= len(candidates) <= 2:
+        raise PortableEvaluationInputError(
+            "case requires authorities, sources, and one or two reports"
+        )
+    source_ids = [cast(str, item["source_id"]) for item in sources]
+    authority_ids = [cast(str, item["authority_id"]) for item in authorities]
+    candidate_ids = [cast(str, item["candidate_id"]) for item in candidates]
+    if len(source_ids) != len(set(source_ids)) or len(authority_ids) != len(set(authority_ids)):
+        raise PortableEvaluationInputError("source and authority identifiers must be unique")
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise PortableEvaluationInputError("candidate identifiers must be unique")
+    if any(not set(cast(list[str], item["source_ids"])) <= set(source_ids) for item in authorities):
+        raise PortableEvaluationInputError("requested authorities must identify case sources")
+    roles = [item["role"] for item in candidates]
+    if roles.count("candidate") != 1 or roles.count("comparator") > 1:
+        raise PortableEvaluationInputError(
+            "case requires exactly one candidate and at most one comparator"
+        )
+    if result["schema_version"] == "1.1":
+        expected_source_hashes = {
+            cast(str, source["source_id"]): cast(str, source["content_hash"])
+            for source in sources
+        }
+        facts = cast(str | None, result["client_facts"])
+        expected_facts_hash = None if facts is None else _sha256(facts.encode("utf-8"))
+        for index, candidate in enumerate(candidates):
+            provenance = _validate_generation_provenance(
+                candidate["validation_receipt"],
+                location=f"case.candidates[{index}].validation_receipt",
+            )
+            if provenance["kind"] == "external":
+                continue
+            record = cast(JsonObject, provenance["generation_record"])
+            if record["candidate_id"] != candidate["candidate_id"]:
+                raise PortableEvaluationInputError(
+                    "capsule candidate_id must match candidate report"
+                )
+            if record["report_hash"] != candidate["report_hash"]:
+                raise PortableEvaluationInputError(
+                    "capsule report_hash must match candidate report"
+                )
+            if record["source_hashes"] != expected_source_hashes:
+                raise PortableEvaluationInputError(
+                    "capsule source_hashes must exactly match case sources"
+                )
+            if record["client_facts_hash"] != expected_facts_hash:
+                raise PortableEvaluationInputError(
+                    "capsule client_facts_hash must match case client facts"
+                )
+            if provenance["generation_question"] != result["question"]:
+                raise PortableEvaluationInputError(
+                    "capsule generation_question must match case question"
+                )
+    result["requested_authorities"] = authorities
+    result["sources"] = sources
+    result["candidates"] = candidates
+    return result
+
+
+def _qualification_nonblank_string(value: object, *, location: str) -> str:
+    """Mirror full-model trimming only for schema-1.1 qualification text."""
+    normalized = _string(value, location=location).strip()
+    if not normalized:
+        raise PortableEvaluationInputError(f"{location} must be nonblank")
+    return normalized
+
+
+def _qualification_identifier(value: object, *, location: str) -> str:
+    normalized = _qualification_nonblank_string(value, location=location)
+    if _SAFE_IDENTIFIER_RE.fullmatch(normalized) is None:
+        raise PortableEvaluationInputError(f"{location} is not a safe identifier")
+    return normalized
+
+
+def _qualification_identifier_list(value: object, *, location: str) -> list[str]:
+    identifiers = [
+        _qualification_identifier(item, location=f"{location}[{index}]")
+        for index, item in enumerate(_array(value, location=location))
+    ]
+    if len(identifiers) != len(set(identifiers)):
+        raise PortableEvaluationInputError(f"{location} values must be unique")
+    return identifiers
+
+
+def _normalize_qualification_authority(value: object, *, location: str) -> JsonObject:
+    authority = _shape(
+        value,
+        required={"authority_id", "title", "jurisdiction", "authority_type", "source_ids"},
+        location=location,
+    )
+    authority["authority_id"] = _qualification_identifier(
+        authority["authority_id"], location=f"{location}.authority_id"
+    )
+    for field in ("title", "jurisdiction", "authority_type"):
+        authority[field] = _qualification_nonblank_string(
+            authority[field], location=f"{location}.{field}"
+        )
+    authority["source_ids"] = _qualification_identifier_list(
+        authority["source_ids"], location=f"{location}.source_ids"
+    )
+    return authority
+
+
+def _normalize_qualification_source(value: object, *, location: str) -> JsonObject:
+    required = {
+        "source_id",
+        "title",
+        "normalized_text",
+        "content_hash",
+        "jurisdiction",
+        "authority_type",
+        "source_role",
+        "source_quality",
+        "completeness",
+        "language",
+    }
+    optional = {
+        "canonical_url",
+        "publisher",
+        "version",
+        "effective_date",
+        "supersession",
+        "relationship_ids",
+    }
+    source = _shape(value, required=required, optional=optional, location=location)
+    source["source_id"] = _qualification_identifier(
+        source["source_id"], location=f"{location}.source_id"
+    )
+    for field in ("title", "jurisdiction", "authority_type", "language"):
+        source[field] = _qualification_nonblank_string(
+            source[field], location=f"{location}.{field}"
+        )
+    for field in ("canonical_url", "publisher", "version", "effective_date", "supersession"):
+        if field in source and source[field] is not None:
+            source[field] = _qualification_nonblank_string(
+                source[field], location=f"{location}.{field}"
+            )
+    if "relationship_ids" in source:
+        source["relationship_ids"] = _qualification_identifier_list(
+            source["relationship_ids"], location=f"{location}.relationship_ids"
+        )
+    return source
+
+
+def validate_qualification_case(value: object) -> JsonObject:
+    """Validate and copy the candidate-free qualification case contract."""
+    raw = _object(value, location="qualification case")
+    schema_version = raw.get("schema_version", "1.0")
+    if schema_version not in {"1.0", "1.1"}:
+        raise PortableEvaluationInputError("qualification case schema is unsupported")
+    metadata_fields = {"build_binding", "language_treatments"}
+    result = _with_defaults(
+        _shape(
+            raw,
+            required={
+                "case_id",
+                "mode",
+                "question",
+                "jurisdiction",
+                "as_of",
+                "requested_authorities",
+                "sources",
+            }
+            | (metadata_fields if schema_version == "1.1" else set()),
+            optional={"schema_version"},
+            location="qualification case",
+        ),
+        {"schema_version": "1.0"},
+    )
+    if schema_version == "1.1":
+        result["case_id"] = _qualification_identifier(
+            result["case_id"], location="qualification case.case_id"
+        )
+        result["question"] = _qualification_nonblank_string(
+            result["question"], location="qualification case.question"
+        )
+        result["jurisdiction"] = _qualification_nonblank_string(
+            result["jurisdiction"], location="qualification case.jurisdiction"
+        )
+    else:
+        _identifier(result["case_id"], location="qualification case.case_id")
+        _string(result["question"], location="qualification case.question", nonblank=True)
+        _string(
+            result["jurisdiction"],
+            location="qualification case.jurisdiction",
+            nonblank=True,
+        )
+    _enum(result["mode"], EVALUATION_MODES, location="qualification case.mode")
+    try:
+        date.fromisoformat(_string(result["as_of"], location="qualification case.as_of"))
+    except ValueError as error:
+        raise PortableEvaluationInputError(
+            "qualification case.as_of must be an ISO date"
+        ) from error
+    authority_values = _array(
+        result["requested_authorities"],
+        location="qualification case.requested_authorities",
+    )
+    source_values = _array(result["sources"], location="qualification case.sources")
+    if schema_version == "1.1":
+        authority_values = [
+            _normalize_qualification_authority(
+                item,
+                location=f"qualification case.requested_authorities[{index}]",
+            )
+            for index, item in enumerate(authority_values)
+        ]
+        source_values = [
+            _normalize_qualification_source(
+                item,
+                location=f"qualification case.sources[{index}]",
+            )
+            for index, item in enumerate(source_values)
+        ]
+    authorities = [
+        _validate_requested_authority(
+            item,
+            location=f"qualification case.requested_authorities[{index}]",
+        )
+        for index, item in enumerate(authority_values)
+    ]
+    sources = [
+        _validate_source(item, location=f"qualification case.sources[{index}]")
+        for index, item in enumerate(source_values)
+    ]
+    if not authorities or not sources:
+        raise PortableEvaluationInputError(
+            "qualification case requires authorities and sources"
+        )
+    source_ids = [cast(str, item["source_id"]) for item in sources]
+    authority_ids = [cast(str, item["authority_id"]) for item in authorities]
+    if len(source_ids) != len(set(source_ids)):
+        raise PortableEvaluationInputError("qualification source identifiers must be unique")
+    if len(authority_ids) != len(set(authority_ids)):
+        raise PortableEvaluationInputError("qualification authority identifiers must be unique")
+    if any(
+        not set(cast(list[str], item["source_ids"])) <= set(source_ids)
+        for item in authorities
+    ):
+        raise PortableEvaluationInputError(
+            "qualification requested authorities must identify case sources"
+        )
+    if schema_version == "1.1":
+        binding = _validate_qualification_build_binding(result["build_binding"])
+        treatments = [
+            _validate_qualification_language_treatment(
+                item,
+                location=f"qualification case.language_treatments[{index}]",
+            )
+            for index, item in enumerate(
+                _array(
+                    result["language_treatments"],
+                    location="qualification case.language_treatments",
+                )
+            )
+        ]
+        treated_source_ids = [
+            source_id
+            for treatment in treatments
+            for source_id in cast(list[str], treatment["source_ids"])
+        ]
+        if (
+            len(treated_source_ids) != len(set(treated_source_ids))
+            or set(treated_source_ids) != set(source_ids)
+        ):
+            raise PortableEvaluationInputError(
+                "language treatments must identify every source exactly once"
+            )
+        result["build_binding"] = binding
+        result["language_treatments"] = treatments
+    result["requested_authorities"] = authorities
+    result["sources"] = sources
+    return result
+
+
+def _validate_qualification_build_binding(value: object) -> JsonObject:
+    binding = _shape(
+        value,
+        required={"commit", "archive_sha256"},
+        location="qualification case.build_binding",
+    )
+    commit = _string(
+        binding["commit"],
+        location="qualification case.build_binding.commit",
+    )
+    if _COMMIT_RE.fullmatch(commit) is None:
+        raise PortableEvaluationInputError(
+            "qualification case.build_binding.commit is invalid"
+        )
+    _hash(
+        binding["archive_sha256"],
+        location="qualification case.build_binding.archive_sha256",
+    )
+    return binding
+
+
+def _validate_qualification_language_treatment(
+    value: object,
+    *,
+    location: str,
+) -> JsonObject:
+    treatment = _with_defaults(
+        _shape(
+            value,
+            required={"source_ids", "method", "rationale"},
+            optional={"limitations"},
+            location=location,
+        ),
+        {"limitations": None},
+    )
+    source_ids = [
+        _qualification_treatment_source_id(
+            item,
+            location=f"{location}.source_ids[{index}]",
+        )
+        for index, item in enumerate(
+            _array(treatment["source_ids"], location=f"{location}.source_ids")
+        )
+    ]
+    if not source_ids:
+        raise PortableEvaluationInputError(f"{location}.source_ids must not be empty")
+    if len(source_ids) != len(set(source_ids)):
+        raise PortableEvaluationInputError(
+            f"{location}.source_ids values must be unique"
+        )
+    for field in ("method", "rationale"):
+        treatment[field] = _qualification_nonblank_string(
+            treatment[field], location=f"{location}.{field}"
+        )
+    limitations = treatment["limitations"]
+    if limitations is not None:
+        treatment["limitations"] = _qualification_nonblank_string(
+            limitations, location=f"{location}.limitations"
+        )
+    treatment["source_ids"] = source_ids
+    return treatment
+
+
+def _qualification_treatment_source_id(value: object, *, location: str) -> str:
+    """Mirror full-runtime normalization only for treatment source identifiers."""
+    return _qualification_identifier(value, location=location)
+
+
+@dataclass(frozen=True)
+class _NodeIdentity:
+    device: int
+    inode: int
+    mode: int
+    link_count: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True)
+class _PosixAnchor:
+    name: str | None
+    descriptor: int
+    identity: _NodeIdentity
+
+
+def _node_identity(metadata: os.stat_result) -> _NodeIdentity:
+    return _NodeIdentity(
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _same_filesystem_object(left: os.stat_result | _NodeIdentity, right: _NodeIdentity) -> bool:
+    left_device = left.st_dev if isinstance(left, os.stat_result) else left.device
+    left_inode = left.st_ino if isinstance(left, os.stat_result) else left.inode
+    return (left_device, left_inode) == (right.device, right.inode)
+
+
+def _storage_platform() -> str:
+    return os.name
+
+
+def _require_posix_capabilities() -> None:
+    if _storage_platform() != "posix":
+        raise EvaluationIntegrityError(
+            f"{EVALUATION_STORAGE_PLATFORM_UNSUPPORTED}: secure portable storage requires POSIX"
+        )
+    missing = [name for name in ("O_DIRECTORY", "O_NOFOLLOW") if not hasattr(os, name)]
+    if os.scandir not in os.supports_fd:
+        missing.append("scandir(fd)")
+    if missing:
+        raise EvaluationIntegrityError(
+            "secure POSIX storage capabilities are unavailable: " + ", ".join(missing)
+        )
+
+
+def _directory_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _file_flags() -> int:
+    return os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_directory(parent: int | None, name: str) -> int:
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent)
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise EvaluationIntegrityError(
+                f"run path contains a symlink or non-directory component: {name}"
+            ) from error
+        raise
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise EvaluationIntegrityError(f"run path component is not a directory: {name}")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            raise OSError("artifact write made no progress")
+        offset += written
+
+
+def _read_all(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _validate_regular(metadata: os.stat_result, artifact_path: str) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise EvaluationIntegrityError(f"artifact is not a regular file: {artifact_path}")
+    if metadata.st_nlink != 1:
+        raise EvaluationIntegrityError(f"artifact has multiple hard links: {artifact_path}")
+
+
+def _probe_posix_capabilities(directory_descriptor: int) -> None:
+    os.fsync(directory_descriptor)
+    with tempfile.TemporaryDirectory(prefix="regulatory-harvest-storage-probe-") as probe:
+        root = _open_directory(None, probe)
+        child: int | None = None
+        try:
+            os.mkdir("child", mode=0o700, dir_fd=root)
+            child = _open_directory(root, "child")
+            descriptor = os.open(
+                "before",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=child,
+            )
+            try:
+                _write_all(descriptor, b"probe")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            with os.scandir(child) as entries:
+                if {entry.name for entry in entries} != {"before"}:
+                    raise EvaluationIntegrityError("descriptor inventory probe failed")
+            os.replace("before", "after", src_dir_fd=child, dst_dir_fd=child)
+            _validate_regular(os.stat("after", dir_fd=child, follow_symlinks=False), "probe")
+            os.unlink("after", dir_fd=child)
+            os.fsync(child)
+            os.fsync(root)
+        except (NotImplementedError, OSError, TypeError) as error:
+            raise EvaluationIntegrityError(
+                "secure POSIX storage capability probe failed"
+            ) from error
+        finally:
+            if child is not None:
+                os.close(child)
+            with suppress(OSError):
+                os.rmdir("child", dir_fd=root)
+            os.close(root)
+
+
+class _PosixRunStorage:
+    def __init__(self, root_path: Path, anchors: list[_PosixAnchor]) -> None:
+        self.root_path = root_path
+        self.failure_stage = "operation"
+        self._anchors = anchors
+        self._root_descriptor = anchors[-1].descriptor
+        self._closed = False
+
+    @classmethod
+    def open(cls, run_dir: Path, *, initialize: bool) -> _PosixRunStorage:
+        _require_posix_capabilities()
+        try:
+            root_path = Path(os.path.abspath(run_dir.expanduser()))
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise EvaluationIntegrityError("run path cannot be normalized safely") from error
+        anchors: list[_PosixAnchor] = []
+        try:
+            descriptor = _open_directory(None, root_path.anchor)
+            anchors.append(_PosixAnchor(None, descriptor, _node_identity(os.fstat(descriptor))))
+            parts = list(root_path.parts[1:])
+            missing_at: int | None = None
+            for index, segment in enumerate(parts):
+                try:
+                    descriptor = _open_directory(descriptor, segment)
+                except FileNotFoundError:
+                    missing_at = index
+                    break
+                anchors.append(
+                    _PosixAnchor(segment, descriptor, _node_identity(os.fstat(descriptor)))
+                )
+            if missing_at is not None and not initialize:
+                raise EvaluationIntegrityError("run directory does not exist")
+            if initialize:
+                if missing_at is None:
+                    with os.scandir(anchors[-1].descriptor) as entries:
+                        if next(entries, None) is not None:
+                            raise EvaluationIntegrityError("run directory must be empty")
+                _probe_posix_capabilities(anchors[-1].descriptor)
+                for segment in parts[missing_at:] if missing_at is not None else ():
+                    parent = anchors[-1].descriptor
+                    with suppress(FileExistsError):
+                        os.mkdir(segment, mode=0o700, dir_fd=parent)
+                    descriptor = _open_directory(parent, segment)
+                    anchors.append(
+                        _PosixAnchor(segment, descriptor, _node_identity(os.fstat(descriptor)))
+                    )
+                    os.fchmod(descriptor, 0o700)
+                    os.fsync(parent)
+                os.fchmod(anchors[-1].descriptor, 0o700)
+                if missing_at is not None:
+                    with os.scandir(anchors[-1].descriptor) as entries:
+                        if next(entries, None) is not None:
+                            raise EvaluationIntegrityError("run directory must be empty")
+            storage = cls(root_path, anchors)
+            storage.assert_root_identity()
+            return storage
+        except BaseException:
+            for anchor in reversed(anchors):
+                with suppress(OSError):
+                    os.close(anchor.descriptor)
+            raise
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise EvaluationIntegrityError("run storage is closed")
+
+    def assert_root_identity(self) -> None:
+        self._ensure_open()
+        for index, anchor in enumerate(self._anchors):
+            opened = os.fstat(anchor.descriptor)
+            if not stat.S_ISDIR(opened.st_mode) or not _same_filesystem_object(
+                opened, anchor.identity
+            ):
+                raise EvaluationIntegrityError("run directory identity changed")
+            if index == 0:
+                continue
+            parent = self._anchors[index - 1]
+            assert anchor.name is not None
+            named = os.stat(anchor.name, dir_fd=parent.descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(named.st_mode) or not _same_filesystem_object(
+                named, anchor.identity
+            ):
+                raise EvaluationIntegrityError("run directory path identity changed")
+
+    @contextmanager
+    def _artifact_parent(self, artifact_path: str, *, create: bool) -> Iterator[tuple[int, str]]:
+        relative = _validate_relative_path(artifact_path)
+        descriptors: list[int] = []
+        current = self._root_descriptor
+        try:
+            for segment in relative.parts[:-1]:
+                created = False
+                try:
+                    descriptor = _open_directory(current, segment)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    with suppress(FileExistsError):
+                        os.mkdir(segment, mode=0o700, dir_fd=current)
+                    descriptor = _open_directory(current, segment)
+                    created = True
+                descriptors.append(descriptor)
+                if created:
+                    os.fchmod(descriptor, 0o700)
+                    os.fsync(current)
+                current = descriptor
+            yield current, relative.name
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def _read_leaf(self, parent: int, name: str, artifact_path: str) -> bytes:
+        try:
+            descriptor = os.open(name, _file_flags(), dir_fd=parent)
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise EvaluationIntegrityError(
+                    f"artifact path contains a symlink: {artifact_path}"
+                ) from error
+            raise
+        try:
+            before = os.fstat(descriptor)
+            _validate_regular(before, artifact_path)
+            data = _read_all(descriptor)
+            after = os.fstat(descriptor)
+            named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if _node_identity(before) != _node_identity(after) or (
+                before.st_dev,
+                before.st_ino,
+            ) != (named.st_dev, named.st_ino):
+                raise EvaluationIntegrityError(f"artifact changed while reading: {artifact_path}")
+            return data
+        finally:
+            os.close(descriptor)
+
+    def read_artifact(self, artifact_path: str) -> bytes:
+        self.failure_stage = f"artifact read ({artifact_path})"
+        self.assert_root_identity()
+        try:
+            with self._artifact_parent(artifact_path, create=False) as (parent, name):
+                data = self._read_leaf(parent, name, artifact_path)
+        except FileNotFoundError as error:
+            raise EvaluationIntegrityError(f"artifact is missing: {artifact_path}") from error
+        self.assert_root_identity()
+        return data
+
+    def read_optional_artifact(self, artifact_path: str) -> bytes | None:
+        self.assert_root_identity()
+        try:
+            with self._artifact_parent(artifact_path, create=False) as (parent, name):
+                data = self._read_leaf(parent, name, artifact_path)
+        except FileNotFoundError:
+            data = None
+        self.assert_root_identity()
+        return data
+
+    def atomic_write(self, artifact_path: str, data: bytes, *, mutable: bool) -> None:
+        self.failure_stage = f"artifact write ({artifact_path})"
+        self.assert_root_identity()
+        with self._artifact_parent(artifact_path, create=True) as (parent, name):
+            try:
+                existing = self._read_leaf(parent, name, artifact_path)
+            except FileNotFoundError:
+                existing = None
+            self.assert_root_identity()
+            if existing is not None:
+                if existing == data:
+                    return
+                if not mutable:
+                    raise EvaluationIntegrityError(f"immutable artifact differs: {artifact_path}")
+            temporary_name = f".{name}.{uuid.uuid4().hex}.tmp"
+            descriptor: int | None = None
+            try:
+                descriptor = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent,
+                )
+                os.fchmod(descriptor, 0o600)
+                _write_all(descriptor, data)
+                os.fsync(descriptor)
+                self.assert_root_identity()
+                os.replace(temporary_name, name, src_dir_fd=parent, dst_dir_fd=parent)
+                os.fsync(parent)
+                self.assert_root_identity()
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary_name, dir_fd=parent)
+
+    def _scan_directory(self, descriptor: int, prefix: PurePosixPath) -> dict[str, _NodeIdentity]:
+        inventory: dict[str, _NodeIdentity] = {}
+        with os.scandir(descriptor) as entries:
+            names = sorted(entry.name for entry in entries)
+        for name in names:
+            relative = prefix / name
+            relative_text = relative.as_posix()
+            _validate_relative_path(relative_text)
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise EvaluationIntegrityError(f"run inventory contains a symlink: {relative_text}")
+            if stat.S_ISDIR(metadata.st_mode):
+                child = _open_directory(descriptor, name)
+                try:
+                    opened = os.fstat(child)
+                    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                        raise EvaluationIntegrityError("run inventory directory changed")
+                    inventory[f"{relative_text}/"] = _node_identity(opened)
+                    inventory.update(self._scan_directory(child, relative))
+                finally:
+                    os.close(child)
+                continue
+            _validate_regular(metadata, relative_text)
+            child = os.open(name, _file_flags(), dir_fd=descriptor)
+            try:
+                opened = os.fstat(child)
+                _validate_regular(opened, relative_text)
+                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    raise EvaluationIntegrityError("run inventory artifact changed")
+            finally:
+                os.close(child)
+            inventory[relative_text] = _node_identity(opened)
+        return inventory
+
+    def scan_inventory(self) -> dict[str, _NodeIdentity]:
+        self.assert_root_identity()
+        inventory = self._scan_directory(self._root_descriptor, PurePosixPath())
+        self.assert_root_identity()
+        return inventory
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for anchor in reversed(self._anchors):
+            with suppress(OSError):
+                os.close(anchor.descriptor)
+
+
+@contextmanager
+def _open_run_storage(run_dir: Path, *, initialize: bool = False) -> Iterator[_PosixRunStorage]:
+    storage: _PosixRunStorage | None = None
+    try:
+        if _storage_platform() != "posix":
+            raise EvaluationIntegrityError(
+                f"{EVALUATION_STORAGE_PLATFORM_UNSUPPORTED}: secure portable storage requires POSIX"
+            )
+        storage = _PosixRunStorage.open(run_dir, initialize=initialize)
+        yield storage
+    except EvaluationIntegrityError:
+        raise
+    except (NotImplementedError, OSError, TypeError) as error:
+        stage = "open" if storage is None else storage.failure_stage
+        raise EvaluationIntegrityError(f"evaluation storage {stage} failed") from error
+    finally:
+        if storage is not None:
+            storage.close()
+
+
+_ADMISSION_SCHEMA_JSON = '{"$defs":{"AdmissionCheck":{"additionalProperties":false,"properties":{"code":{"enum":["AUTHORITY_ALIGNMENT","OPERATIVE_TEXT","CURRENTNESS_EVIDENCE","LANGUAGE_RESOLUTION","SOURCE_PARITY"],"title":"Code","type":"string"},"material":{"title":"Material","type":"boolean"},"rationale":{"title":"Rationale","type":"string"},"satisfied":{"title":"Satisfied","type":"boolean"},"source_ids":{"items":{"type":"string"},"title":"Source Ids","type":"array"}},"required":["code","satisfied","material","rationale"],"title":"AdmissionCheck","type":"object"},"EvaluationIssue":{"additionalProperties":false,"properties":{"code":{"title":"Code","type":"string"},"message":{"title":"Message","type":"string"},"related_ids":{"items":{"type":"string"},"title":"Related Ids","type":"array"},"severity":{"$ref":"#/$defs/IssueSeverity"}},"required":["code","severity","message"],"title":"EvaluationIssue","type":"object"},"IssueSeverity":{"enum":["error","warning","info"],"title":"IssueSeverity","type":"string"}},"additionalProperties":false,"properties":{"checks":{"items":{"$ref":"#/$defs/AdmissionCheck"},"title":"Checks","type":"array"},"issues":{"items":{"$ref":"#/$defs/EvaluationIssue"},"title":"Issues","type":"array"},"request_fingerprint":{"pattern":"^[0-9a-f]{64}$","title":"Request Fingerprint","type":"string"}},"required":["request_fingerprint","checks"],"title":"CaseAdmissionJudgment","type":"object"}'  # noqa: E501
+_LEDGER_SCHEMA_JSON = '{"$defs":{"LedgerCategory":{"enum":["status","scope","definition","requirement","prohibition","right","exception","deadline","enforcement","remedy","penalty","appeal","implementation"],"title":"LedgerCategory","type":"string"},"LedgerCitation":{"additionalProperties":false,"properties":{"end_char":{"exclusiveMinimum":0,"title":"End Char","type":"integer"},"quote":{"title":"Quote","type":"string"},"source_id":{"title":"Source Id","type":"string"},"start_char":{"minimum":0,"title":"Start Char","type":"integer"}},"required":["source_id","start_char","end_char","quote"],"title":"LedgerCitation","type":"object"},"LedgerEntry":{"additionalProperties":false,"properties":{"actor":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Actor"},"category":{"$ref":"#/$defs/LedgerCategory"},"citations":{"items":{"$ref":"#/$defs/LedgerCitation"},"minItems":1,"title":"Citations","type":"array"},"conditions":{"items":{"type":"string"},"title":"Conditions","type":"array"},"consequence":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Consequence"},"enforcement_route":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Enforcement Route"},"enforcing_authority":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Enforcing Authority"},"exceptions":{"items":{"type":"string"},"title":"Exceptions","type":"array"},"ledger_id":{"title":"Ledger Id","type":"string"},"materiality":{"$ref":"#/$defs/Materiality"},"materiality_rationale":{"title":"Materiality Rationale","type":"string"},"modality":{"title":"Modality","type":"string"},"object":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Object"},"operative_action":{"title":"Operative Action","type":"string"},"proposition":{"title":"Proposition","type":"string"},"relationship_ids":{"items":{"type":"string"},"title":"Relationship Ids","type":"array"},"threshold":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Threshold"},"timing":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Timing"},"trigger":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Trigger"},"walk_order":{"minimum":0,"title":"Walk Order","type":"integer"}},"required":["ledger_id","walk_order","category","materiality","modality","operative_action","proposition","materiality_rationale","citations"],"title":"LedgerEntry","type":"object"},"LedgerGap":{"additionalProperties":false,"properties":{"category":{"$ref":"#/$defs/LedgerCategory"},"gap_id":{"title":"Gap Id","type":"string"},"message":{"title":"Message","type":"string"},"source_ids":{"items":{"type":"string"},"title":"Source Ids","type":"array"}},"required":["gap_id","category","message"],"title":"LedgerGap","type":"object"},"Materiality":{"enum":["critical","material","supporting"],"title":"Materiality","type":"string"}},"additionalProperties":false,"properties":{"case_fingerprint":{"pattern":"^[0-9a-f]{64}$","title":"Case Fingerprint","type":"string"},"entries":{"items":{"$ref":"#/$defs/LedgerEntry"},"title":"Entries","type":"array"},"gaps":{"items":{"$ref":"#/$defs/LedgerGap"},"title":"Gaps","type":"array"},"schema_version":{"const":"1.0","default":"1.0","title":"Schema Version","type":"string"}},"required":["case_fingerprint","entries"],"title":"LegalLedger","type":"object"}'  # noqa: E501
+_LEDGER_AUDIT_SCHEMA_JSON = '{"$defs":{"LedgerCategory":{"enum":["status","scope","definition","requirement","prohibition","right","exception","deadline","enforcement","remedy","penalty","appeal","implementation"],"title":"LedgerCategory","type":"string"},"LedgerCitation":{"additionalProperties":false,"properties":{"end_char":{"exclusiveMinimum":0,"title":"End Char","type":"integer"},"quote":{"title":"Quote","type":"string"},"source_id":{"title":"Source Id","type":"string"},"start_char":{"minimum":0,"title":"Start Char","type":"integer"}},"required":["source_id","start_char","end_char","quote"],"title":"LedgerCitation","type":"object"},"LedgerDispute":{"additionalProperties":false,"properties":{"action":{"enum":["add","edit","delete","split","merge","materiality"],"title":"Action","type":"string"},"dispute_id":{"title":"Dispute Id","type":"string"},"materiality":{"$ref":"#/$defs/Materiality"},"proposed_entries":{"items":{"$ref":"#/$defs/LedgerEntry"},"title":"Proposed Entries","type":"array"},"rationale":{"title":"Rationale","type":"string"},"target_ledger_ids":{"items":{"type":"string"},"title":"Target Ledger Ids","type":"array"}},"required":["dispute_id","action","materiality","rationale"],"title":"LedgerDispute","type":"object"},"LedgerEntry":{"additionalProperties":false,"properties":{"actor":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Actor"},"category":{"$ref":"#/$defs/LedgerCategory"},"citations":{"items":{"$ref":"#/$defs/LedgerCitation"},"minItems":1,"title":"Citations","type":"array"},"conditions":{"items":{"type":"string"},"title":"Conditions","type":"array"},"consequence":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Consequence"},"enforcement_route":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Enforcement Route"},"enforcing_authority":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Enforcing Authority"},"exceptions":{"items":{"type":"string"},"title":"Exceptions","type":"array"},"ledger_id":{"title":"Ledger Id","type":"string"},"materiality":{"$ref":"#/$defs/Materiality"},"materiality_rationale":{"title":"Materiality Rationale","type":"string"},"modality":{"title":"Modality","type":"string"},"object":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Object"},"operative_action":{"title":"Operative Action","type":"string"},"proposition":{"title":"Proposition","type":"string"},"relationship_ids":{"items":{"type":"string"},"title":"Relationship Ids","type":"array"},"threshold":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Threshold"},"timing":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Timing"},"trigger":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Trigger"},"walk_order":{"minimum":0,"title":"Walk Order","type":"integer"}},"required":["ledger_id","walk_order","category","materiality","modality","operative_action","proposition","materiality_rationale","citations"],"title":"LedgerEntry","type":"object"},"Materiality":{"enum":["critical","material","supporting"],"title":"Materiality","type":"string"}},"additionalProperties":false,"properties":{"complete":{"title":"Complete","type":"boolean"},"disputes":{"items":{"$ref":"#/$defs/LedgerDispute"},"title":"Disputes","type":"array"},"request_fingerprint":{"pattern":"^[0-9a-f]{64}$","title":"Request Fingerprint","type":"string"}},"required":["request_fingerprint","complete"],"title":"LedgerAudit","type":"object"}'  # noqa: E501
+_LEDGER_REPAIR_SCHEMA_JSON = '{"$defs":{"LedgerAudit":{"additionalProperties":false,"properties":{"complete":{"title":"Complete","type":"boolean"},"disputes":{"items":{"$ref":"#/$defs/LedgerDispute"},"title":"Disputes","type":"array"},"request_fingerprint":{"pattern":"^[0-9a-f]{64}$","title":"Request Fingerprint","type":"string"}},"required":["request_fingerprint","complete"],"title":"LedgerAudit","type":"object"},"LedgerCategory":{"enum":["status","scope","definition","requirement","prohibition","right","exception","deadline","enforcement","remedy","penalty","appeal","implementation"],"title":"LedgerCategory","type":"string"},"LedgerCitation":{"additionalProperties":false,"properties":{"end_char":{"exclusiveMinimum":0,"title":"End Char","type":"integer"},"quote":{"title":"Quote","type":"string"},"source_id":{"title":"Source Id","type":"string"},"start_char":{"minimum":0,"title":"Start Char","type":"integer"}},"required":["source_id","start_char","end_char","quote"],"title":"LedgerCitation","type":"object"},"LedgerDispute":{"additionalProperties":false,"properties":{"action":{"enum":["add","edit","delete","split","merge","materiality"],"title":"Action","type":"string"},"dispute_id":{"title":"Dispute Id","type":"string"},"materiality":{"$ref":"#/$defs/Materiality"},"proposed_entries":{"items":{"$ref":"#/$defs/LedgerEntry"},"title":"Proposed Entries","type":"array"},"rationale":{"title":"Rationale","type":"string"},"target_ledger_ids":{"items":{"type":"string"},"title":"Target Ledger Ids","type":"array"}},"required":["dispute_id","action","materiality","rationale"],"title":"LedgerDispute","type":"object"},"LedgerEntry":{"additionalProperties":false,"properties":{"actor":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Actor"},"category":{"$ref":"#/$defs/LedgerCategory"},"citations":{"items":{"$ref":"#/$defs/LedgerCitation"},"minItems":1,"title":"Citations","type":"array"},"conditions":{"items":{"type":"string"},"title":"Conditions","type":"array"},"consequence":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Consequence"},"enforcement_route":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Enforcement Route"},"enforcing_authority":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Enforcing Authority"},"exceptions":{"items":{"type":"string"},"title":"Exceptions","type":"array"},"ledger_id":{"title":"Ledger Id","type":"string"},"materiality":{"$ref":"#/$defs/Materiality"},"materiality_rationale":{"title":"Materiality Rationale","type":"string"},"modality":{"title":"Modality","type":"string"},"object":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Object"},"operative_action":{"title":"Operative Action","type":"string"},"proposition":{"title":"Proposition","type":"string"},"relationship_ids":{"items":{"type":"string"},"title":"Relationship Ids","type":"array"},"threshold":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Threshold"},"timing":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Timing"},"trigger":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Trigger"},"walk_order":{"minimum":0,"title":"Walk Order","type":"integer"}},"required":["ledger_id","walk_order","category","materiality","modality","operative_action","proposition","materiality_rationale","citations"],"title":"LedgerEntry","type":"object"},"LedgerGap":{"additionalProperties":false,"properties":{"category":{"$ref":"#/$defs/LedgerCategory"},"gap_id":{"title":"Gap Id","type":"string"},"message":{"title":"Message","type":"string"},"source_ids":{"items":{"type":"string"},"title":"Source Ids","type":"array"}},"required":["gap_id","category","message"],"title":"LedgerGap","type":"object"},"LegalLedger":{"additionalProperties":false,"properties":{"case_fingerprint":{"pattern":"^[0-9a-f]{64}$","title":"Case Fingerprint","type":"string"},"entries":{"items":{"$ref":"#/$defs/LedgerEntry"},"title":"Entries","type":"array"},"gaps":{"items":{"$ref":"#/$defs/LedgerGap"},"title":"Gaps","type":"array"},"schema_version":{"const":"1.0","default":"1.0","title":"Schema Version","type":"string"}},"required":["case_fingerprint","entries"],"title":"LegalLedger","type":"object"},"Materiality":{"enum":["critical","material","supporting"],"title":"Materiality","type":"string"}},"additionalProperties":false,"properties":{"remaining_audit":{"$ref":"#/$defs/LedgerAudit"},"repaired_ledger":{"$ref":"#/$defs/LegalLedger"}},"required":["repaired_ledger","remaining_audit"],"title":"_LedgerRepairResponse","type":"object"}'  # noqa: E501
+_GRADE_SCHEMA_JSON = '{"$defs":{"CoverageDisposition":{"enum":["COMPLETE","PARTIAL","MISSING","OVERSTATED","CONTRADICTED","UNSUPPORTED","NOT_APPLICABLE"],"title":"CoverageDisposition","type":"string"},"EntryFindingCode":{"description":"Closed semantic findings attached to a sealed ledger entry grade.","enum":["CRITICAL_LEDGER_ENTRY_MISSING","MATERIAL_EXCEPTION_MISSING","CONSEQUENCE_TRIGGER_DETACHED"],"title":"EntryFindingCode","type":"string"},"EntryGrade":{"additionalProperties":false,"properties":{"disposition":{"$ref":"#/$defs/CoverageDisposition"},"finding_codes":{"items":{"$ref":"#/$defs/EntryFindingCode"},"title":"Finding Codes","type":"array"},"ledger_id":{"title":"Ledger Id","type":"string"},"rationale":{"title":"Rationale","type":"string"},"report_location":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Report Location"}},"required":["ledger_id","disposition","rationale"],"title":"EntryGrade","type":"object"},"LedgerCategory":{"enum":["status","scope","definition","requirement","prohibition","right","exception","deadline","enforcement","remedy","penalty","appeal","implementation"],"title":"LedgerCategory","type":"string"},"Materiality":{"enum":["critical","material","supporting"],"title":"Materiality","type":"string"},"NarrativeFindingCode":{"description":"Closed semantic findings attached to a narrative rubric dimension.","enum":["KEY_REQUIREMENTS_ACTION_PLAN"],"title":"NarrativeFindingCode","type":"string"},"NarrativeScore":{"additionalProperties":false,"properties":{"dimension":{"enum":["executive_summary","regulatory_walk","key_requirements","penalties_enforcement","qualification_placement","requirements_workplan_boundary","limitations","scanability"],"title":"Dimension","type":"string"},"finding_codes":{"items":{"$ref":"#/$defs/NarrativeFindingCode"},"title":"Finding Codes","type":"array"},"rationale":{"title":"Rationale","type":"string"},"score":{"maximum":4,"minimum":1,"title":"Score","type":"integer"}},"required":["dimension","score","rationale"],"title":"NarrativeScore","type":"object"},"OutOfLedgerClaim":{"additionalProperties":false,"properties":{"category":{"$ref":"#/$defs/LedgerCategory"},"claim_id":{"title":"Claim Id","type":"string"},"claim_text":{"title":"Claim Text","type":"string"},"disposition":{"$ref":"#/$defs/CoverageDisposition"},"materiality":{"$ref":"#/$defs/Materiality"},"rationale":{"title":"Rationale","type":"string"},"related_ledger_ids":{"items":{"type":"string"},"title":"Related Ledger Ids","type":"array"},"report_location":{"title":"Report Location","type":"string"}},"required":["claim_id","claim_text","report_location","disposition","category","materiality","rationale"],"title":"OutOfLedgerClaim","type":"object"}},"additionalProperties":false,"properties":{"anonymous_label":{"enum":["A","B"],"title":"Anonymous Label","type":"string"},"entry_grades":{"items":{"$ref":"#/$defs/EntryGrade"},"title":"Entry Grades","type":"array"},"ledger_fingerprint":{"pattern":"^[0-9a-f]{64}$","title":"Ledger Fingerprint","type":"string"},"narrative_scores":{"items":{"$ref":"#/$defs/NarrativeScore"},"title":"Narrative Scores","type":"array"},"out_of_ledger_claims":{"items":{"$ref":"#/$defs/OutOfLedgerClaim"},"title":"Out Of Ledger Claims","type":"array"},"request_fingerprint":{"pattern":"^[0-9a-f]{64}$","title":"Request Fingerprint","type":"string"},"schema_version":{"const":"1.2","default":"1.2","title":"Schema Version","type":"string"}},"required":["request_fingerprint","anonymous_label","ledger_fingerprint","entry_grades","narrative_scores"],"title":"CandidateGrade","type":"object"}'  # noqa: E501
+_REFEREE_SCHEMA_JSON = '{"$defs":{"CoverageDisposition":{"enum":["COMPLETE","PARTIAL","MISSING","OVERSTATED","CONTRADICTED","UNSUPPORTED","NOT_APPLICABLE"],"title":"CoverageDisposition","type":"string"},"EntryFindingCode":{"description":"Closed semantic findings attached to a sealed ledger entry grade.","enum":["CRITICAL_LEDGER_ENTRY_MISSING","MATERIAL_EXCEPTION_MISSING","CONSEQUENCE_TRIGGER_DETACHED"],"title":"EntryFindingCode","type":"string"},"EntryGrade":{"additionalProperties":false,"properties":{"disposition":{"$ref":"#/$defs/CoverageDisposition"},"finding_codes":{"items":{"$ref":"#/$defs/EntryFindingCode"},"title":"Finding Codes","type":"array"},"ledger_id":{"title":"Ledger Id","type":"string"},"rationale":{"title":"Rationale","type":"string"},"report_location":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Report Location"}},"required":["ledger_id","disposition","rationale"],"title":"EntryGrade","type":"object"},"GradeAlternative":{"additionalProperties":false,"properties":{"absent_claim":{"default":false,"title":"Absent Claim","type":"boolean"},"entry_grade":{"anyOf":[{"$ref":"#/$defs/EntryGrade"},{"type":"null"}],"default":null},"narrative_score":{"anyOf":[{"$ref":"#/$defs/NarrativeScore"},{"type":"null"}],"default":null},"out_of_ledger_claim":{"anyOf":[{"$ref":"#/$defs/OutOfLedgerClaim"},{"type":"null"}],"default":null},"request_fingerprint":{"pattern":"^[0-9a-f]{64}$","title":"Request Fingerprint","type":"string"}},"required":["request_fingerprint"],"title":"GradeAlternative","type":"object"},"LedgerCategory":{"enum":["status","scope","definition","requirement","prohibition","right","exception","deadline","enforcement","remedy","penalty","appeal","implementation"],"title":"LedgerCategory","type":"string"},"LedgerCitation":{"additionalProperties":false,"properties":{"end_char":{"exclusiveMinimum":0,"title":"End Char","type":"integer"},"quote":{"title":"Quote","type":"string"},"source_id":{"title":"Source Id","type":"string"},"start_char":{"minimum":0,"title":"Start Char","type":"integer"}},"required":["source_id","start_char","end_char","quote"],"title":"LedgerCitation","type":"object"},"LedgerEntry":{"additionalProperties":false,"properties":{"actor":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Actor"},"category":{"$ref":"#/$defs/LedgerCategory"},"citations":{"items":{"$ref":"#/$defs/LedgerCitation"},"minItems":1,"title":"Citations","type":"array"},"conditions":{"items":{"type":"string"},"title":"Conditions","type":"array"},"consequence":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Consequence"},"enforcement_route":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Enforcement Route"},"enforcing_authority":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Enforcing Authority"},"exceptions":{"items":{"type":"string"},"title":"Exceptions","type":"array"},"ledger_id":{"title":"Ledger Id","type":"string"},"materiality":{"$ref":"#/$defs/Materiality"},"materiality_rationale":{"title":"Materiality Rationale","type":"string"},"modality":{"title":"Modality","type":"string"},"object":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Object"},"operative_action":{"title":"Operative Action","type":"string"},"proposition":{"title":"Proposition","type":"string"},"relationship_ids":{"items":{"type":"string"},"title":"Relationship Ids","type":"array"},"threshold":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Threshold"},"timing":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Timing"},"trigger":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null,"title":"Trigger"},"walk_order":{"minimum":0,"title":"Walk Order","type":"integer"}},"required":["ledger_id","walk_order","category","materiality","modality","operative_action","proposition","materiality_rationale","citations"],"title":"LedgerEntry","type":"object"},"Materiality":{"enum":["critical","material","supporting"],"title":"Materiality","type":"string"},"NarrativeFindingCode":{"description":"Closed semantic findings attached to a narrative rubric dimension.","enum":["KEY_REQUIREMENTS_ACTION_PLAN"],"title":"NarrativeFindingCode","type":"string"},"NarrativeScore":{"additionalProperties":false,"properties":{"dimension":{"enum":["executive_summary","regulatory_walk","key_requirements","penalties_enforcement","qualification_placement","requirements_workplan_boundary","limitations","scanability"],"title":"Dimension","type":"string"},"finding_codes":{"items":{"$ref":"#/$defs/NarrativeFindingCode"},"title":"Finding Codes","type":"array"},"rationale":{"title":"Rationale","type":"string"},"score":{"maximum":4,"minimum":1,"title":"Score","type":"integer"}},"required":["dimension","score","rationale"],"title":"NarrativeScore","type":"object"},"OutOfLedgerClaim":{"additionalProperties":false,"properties":{"category":{"$ref":"#/$defs/LedgerCategory"},"claim_id":{"title":"Claim Id","type":"string"},"claim_text":{"title":"Claim Text","type":"string"},"disposition":{"$ref":"#/$defs/CoverageDisposition"},"materiality":{"$ref":"#/$defs/Materiality"},"rationale":{"title":"Rationale","type":"string"},"related_ledger_ids":{"items":{"type":"string"},"title":"Related Ledger Ids","type":"array"},"report_location":{"title":"Report Location","type":"string"}},"required":["claim_id","claim_text","report_location","disposition","category","materiality","rationale"],"title":"OutOfLedgerClaim","type":"object"}},"additionalProperties":false,"properties":{"dispute_id":{"title":"Dispute Id","type":"string"},"grade_dispute_fingerprint":{"anyOf":[{"pattern":"^[0-9a-f]{64}$","type":"string"},{"type":"null"}],"default":null,"title":"Grade Dispute Fingerprint"},"rationale":{"title":"Rationale","type":"string"},"replacement_entries":{"items":{"$ref":"#/$defs/LedgerEntry"},"title":"Replacement Entries","type":"array"},"replacement_grade_alternative":{"anyOf":[{"$ref":"#/$defs/GradeAlternative"},{"type":"null"}],"default":null},"selected_disposition":{"anyOf":[{"$ref":"#/$defs/CoverageDisposition"},{"type":"null"}],"default":null},"selected_grade_resolution":{"anyOf":[{"enum":["accept_grader_1","accept_grader_2","replace"],"type":"string"},{"type":"null"}],"default":null,"title":"Selected Grade Resolution"},"selected_ledger_resolution":{"anyOf":[{"enum":["accept_a","accept_b","replace"],"type":"string"},{"type":"null"}],"default":null,"title":"Selected Ledger Resolution"},"source_ids":{"items":{"type":"string"},"title":"Source Ids","type":"array"}},"required":["dispute_id","rationale"],"title":"RefereeDecision","type":"object"}'  # noqa: E501
+
+
+_ADMISSION_SCHEMA = cast(JsonObject, json.loads(_ADMISSION_SCHEMA_JSON))
+_LEDGER_SCHEMA = cast(JsonObject, json.loads(_LEDGER_SCHEMA_JSON))
+_LEDGER_AUDIT_SCHEMA = cast(JsonObject, json.loads(_LEDGER_AUDIT_SCHEMA_JSON))
+_LEDGER_REPAIR_SCHEMA = cast(JsonObject, json.loads(_LEDGER_REPAIR_SCHEMA_JSON))
+_GRADE_SCHEMA = cast(JsonObject, json.loads(_GRADE_SCHEMA_JSON))
+_REFEREE_SCHEMA = cast(JsonObject, json.loads(_REFEREE_SCHEMA_JSON))
+
+
+def _upgrade_grade_schema(schema: JsonObject) -> None:
+    """Mirror the 1.3 evidence fields in the dependency-free response schemas."""
+    definitions = cast(dict[str, JsonObject], schema["$defs"])
+    citation_schema = cast(
+        JsonObject,
+        _copy_json(cast(JsonObject, cast(JsonObject, _LEDGER_SCHEMA["$defs"])["LedgerCitation"])),
+    )
+    definitions["LedgerCitation"] = citation_schema
+
+    entry = definitions["EntryGrade"]
+    cast(JsonObject, entry["properties"])["report_passage"] = {
+        "anyOf": [{"type": "string"}, {"type": "null"}],
+        "title": "Report Passage",
+    }
+    entry["required"] = ["ledger_id", "disposition", "rationale", "report_passage"]
+
+    claim = definitions["OutOfLedgerClaim"]
+    claim_properties = cast(JsonObject, claim["properties"])
+    claim_properties["source_record_fingerprint"] = {
+        "pattern": "^[0-9a-f]{64}$",
+        "title": "Source Record Fingerprint",
+        "type": "string",
+    }
+    claim_properties["evidence_basis"] = {
+        "enum": ["source_spans", "closed_universe_absence"],
+        "title": "Evidence Basis",
+        "type": "string",
+    }
+    claim_properties["evidence_spans"] = {
+        "items": {"$ref": "#/$defs/LedgerCitation"},
+        "title": "Evidence Spans",
+        "type": "array",
+    }
+    claim["required"] = [
+        "claim_id",
+        "claim_text",
+        "report_location",
+        "disposition",
+        "category",
+        "materiality",
+        "source_record_fingerprint",
+        "evidence_basis",
+        "evidence_spans",
+        "rationale",
+    ]
+
+    narrative = definitions["NarrativeScore"]
+    cast(JsonObject, narrative["properties"])["report_passage"] = {
+        "title": "Report Passage",
+        "type": "string",
+    }
+    narrative["required"] = ["dimension", "score", "rationale", "report_passage"]
+
+
+for _response_schema in (_GRADE_SCHEMA, _REFEREE_SCHEMA):
+    _upgrade_grade_schema(_response_schema)
+cast(JsonObject, _GRADE_SCHEMA["properties"])["schema_version"] = {
+    "const": "1.3",
+    "default": "1.3",
+    "title": "Schema Version",
+    "type": "string",
+}
+
+
+def _source_projection(case: JsonObject) -> JsonObject:
+    authorities = [
+        {
+            "authority_id": authority["authority_id"],
+            "title": authority["title"],
+            "jurisdiction": authority["jurisdiction"],
+            "authority_type": authority["authority_type"],
+            "source_ids": list(cast(list[str], authority["source_ids"])),
+        }
+        for authority in cast(list[JsonObject], case["requested_authorities"])
+    ]
+    sources = [
+        {
+            "source_id": source["source_id"],
+            "title": source["title"],
+            "normalized_text": source["normalized_text"],
+            "content_hash": source["content_hash"],
+            "canonical_url": source["canonical_url"],
+            "publisher": source["publisher"],
+            "jurisdiction": source["jurisdiction"],
+            "authority_type": source["authority_type"],
+            "source_role": source["source_role"],
+            "source_quality": source["source_quality"],
+            "completeness": source["completeness"],
+            "language": source["language"],
+            "version": source["version"],
+            "effective_date": source["effective_date"],
+            "supersession": source["supersession"],
+            "relationship_ids": list(cast(list[str], source["relationship_ids"])),
+        }
+        for source in cast(list[JsonObject], case["sources"])
+    ]
+    projection: JsonObject = {
+        "schema_version": case["schema_version"],
+        "mode": case["mode"],
+        "question": case["question"],
+        "jurisdiction": case["jurisdiction"],
+        "as_of": case["as_of"],
+        "requested_authorities": authorities,
+        "sources": sources,
+    }
+    if case["schema_version"] == "1.1" and {
+        "build_binding",
+        "language_treatments",
+    } <= set(case):
+        projection.update(
+            {
+                "build_binding": _copy_json(case["build_binding"]),
+                "language_treatments": _copy_json(case["language_treatments"]),
+            }
+        )
+    return projection
+
+
+def build_source_record(case: object) -> JsonObject:
+    """Project the exact candidate-free legal source record."""
+    if type(case) is not dict:
+        raise PortableEvaluationInputError("source record case must be an object")
+    case_value = cast(JsonObject, case)
+    snapshot = (
+        validate_case(case_value)
+        if "candidates" in case_value
+        else validate_qualification_case(case_value)
+    )
+    return _source_projection(snapshot)
+
+
+def freeze_case(case: object, *, seed_hex: str) -> JsonObject:
+    if not _SEED_RE.fullmatch(seed_hex):
+        raise PortableEvaluationInputError(
+            "seed_hex must be exactly 64 lowercase hexadecimal characters"
+        )
+    case_snapshot = validate_case(case)
+    seed_fingerprint = _sha256(seed_hex.encode("ascii"))
+    candidates = cast(list[JsonObject], case_snapshot["candidates"])
+    ordered = sorted(
+        candidates,
+        key=lambda candidate: (
+            _sha256(f"{seed_fingerprint}:{candidate['candidate_id']}".encode()),
+            cast(str, candidate["candidate_id"]),
+        ),
+    )
+    assignments = [
+        {
+            "anonymous_label": "A" if index == 0 else "B",
+            "candidate_id": candidate["candidate_id"],
+        }
+        for index, candidate in enumerate(ordered)
+    ]
+    return {
+        "schema_version": "1.0",
+        "case": case_snapshot,
+        "assignments": assignments,
+        "case_fingerprint": _model_fingerprint(case_snapshot),
+        "seed_fingerprint": seed_fingerprint,
+    }
+
+
+def _new_request(
+    operation: str,
+    *,
+    system_instructions: str,
+    json_schema: JsonObject,
+    payload: JsonObject,
+    safe_metadata: dict[str, str],
+) -> JsonObject:
+    provisional: JsonObject = {
+        "schema_version": "1.0",
+        "operation": operation,
+        "request_fingerprint": "0" * 64,
+        "system_instructions": system_instructions,
+        "json_schema": cast(JsonObject, _copy_json(json_schema)),
+        "payload": cast(JsonObject, _copy_json(payload)),
+        "safe_metadata": dict(safe_metadata),
+    }
+    fingerprint_payload = {
+        key: value for key, value in provisional.items() if key != "request_fingerprint"
+    }
+    provisional["request_fingerprint"] = _sha256(canonical_json_bytes(fingerprint_payload))
+    return provisional
+
+
+def build_admission_request(source_record: Mapping[str, object]) -> JsonObject:
+    source_projection = _object(
+        _copy_json(dict(source_record)),
+        location="source record",
+    )
+    base_fields = {
+        "schema_version",
+        "mode",
+        "question",
+        "jurisdiction",
+        "as_of",
+        "requested_authorities",
+        "sources",
+    }
+    schema_version = source_projection.get("schema_version")
+    if schema_version == "1.0":
+        expected_fields = base_fields
+        qualification_schema_1_1 = False
+    elif schema_version == "1.1":
+        expected_fields = base_fields | {"build_binding", "language_treatments"}
+        qualification_schema_1_1 = True
+    else:
+        raise PortableEvaluationInputError("source record has an unsupported schema version")
+    if set(source_projection) != expected_fields:
+        raise PortableEvaluationInputError("source record has an unexpected shape")
+    if qualification_schema_1_1:
+        _validate_qualification_source_metadata(source_projection)
+    return _finish_admission_request(
+        source_projection,
+        qualification_schema_1_1=qualification_schema_1_1,
+    )
+
+
+def _build_attorney_admission_request(source_record: Mapping[str, object]) -> JsonObject:
+    """Preserve evaluation schema 1.1 without qualification-only metadata."""
+    source_projection = _object(
+        _copy_json(dict(source_record)),
+        location="source record",
+    )
+    if source_projection.get("schema_version") not in {"1.0", "1.1"} or set(
+        source_projection
+    ) != {
+        "schema_version",
+        "mode",
+        "question",
+        "jurisdiction",
+        "as_of",
+        "requested_authorities",
+        "sources",
+    }:
+        raise PortableEvaluationInputError(
+            "attorney evaluation source record has an unexpected shape"
+        )
+    return _finish_admission_request(
+        source_projection,
+        qualification_schema_1_1=False,
+    )
+
+
+def _finish_admission_request(
+    source_projection: JsonObject,
+    *,
+    qualification_schema_1_1: bool,
+) -> JsonObject:
+    source_record_fingerprint = _sha256(canonical_json_bytes(source_projection))
+    payload: JsonObject = {
+        **source_projection,
+        "source_record_fingerprint": source_record_fingerprint,
+    }
+    system_instructions = (
+        "Assess whether the supplied legal source record is admissible for evaluation. "
+        "Copy this request's request_fingerprint into the judgment. Return each of these "
+        "five checks exactly once, with material=true: AUTHORITY_ALIGNMENT (the requested "
+        "authorities, jurisdictions, authority types, and retained sources align); "
+        "OPERATIVE_TEXT (complete responsive operative text is available); "
+        "CURRENTNESS_EVIDENCE (status and version evidence supports the declared as-of "
+        "date); LANGUAGE_RESOLUTION (each material source language is resolved); and "
+        "SOURCE_PARITY (the common source record is fit to evaluate every candidate). "
+        "For each check, set satisfied from only the supplied source record, give a "
+        "concrete rationale, and identify supporting source_ids. Put any distinct defect "
+        "in issues. Return only the required structured admission judgment."
+    )
+    if qualification_schema_1_1:
+        system_instructions += (
+            " For LANGUAGE_RESOLUTION, assess the supplied language treatment and its "
+            "limitations."
+        )
+    safe_metadata = {
+        "source_record_fingerprint": source_record_fingerprint,
+        "record_scope": "source-only",
+    }
+    if qualification_schema_1_1:
+        safe_metadata.update(
+            {
+                "build_binding": canonical_json_bytes(
+                    source_projection["build_binding"]
+                ).decode("utf-8"),
+                "language_treatments": canonical_json_bytes(
+                    source_projection["language_treatments"]
+                ).decode("utf-8"),
+            }
+        )
+    request_payload: JsonObject = {
+        "schema_version": "1.0",
+        "operation": "admit_case",
+        "system_instructions": system_instructions,
+        "json_schema": _ADMISSION_SCHEMA,
+        "payload": payload,
+        "safe_metadata": safe_metadata,
+    }
+    return {
+        "schema_version": "1.0",
+        "operation": "admit_case",
+        "request_fingerprint": _sha256(canonical_json_bytes(request_payload)),
+        "system_instructions": system_instructions,
+        "json_schema": cast(JsonObject, _copy_json(_ADMISSION_SCHEMA)),
+        "payload": payload,
+        "safe_metadata": dict(safe_metadata),
+    }
+
+
+def _validate_qualification_source_metadata(source_record: JsonObject) -> None:
+    binding = _validate_qualification_build_binding(source_record["build_binding"])
+    if binding != source_record["build_binding"]:
+        raise PortableEvaluationInputError("build_binding is not canonical")
+    raw_treatments = source_record["language_treatments"]
+    treatments = [
+        _validate_qualification_language_treatment(
+            item,
+            location=f"language_treatments[{index}]",
+        )
+        for index, item in enumerate(
+            _array(raw_treatments, location="language_treatments")
+        )
+    ]
+    if treatments != raw_treatments:
+        raise PortableEvaluationInputError("language_treatments are not canonical")
+    sources = _array(source_record["sources"], location="sources")
+    source_ids = [
+        _identifier(
+            _object(source, location=f"sources[{index}]").get("source_id"),
+            location=f"sources[{index}].source_id",
+        )
+        for index, source in enumerate(sources)
+    ]
+    treated_source_ids = [
+        source_id
+        for treatment in treatments
+        for source_id in cast(list[str], treatment["source_ids"])
+    ]
+    if (
+        len(source_ids) != len(set(source_ids))
+        or len(treated_source_ids) != len(set(treated_source_ids))
+        or set(treated_source_ids) != set(source_ids)
+    ):
+        raise PortableEvaluationInputError(
+            "language treatments must identify every source exactly once"
+        )
+
+
+def _qualification_response_schema() -> JsonObject:
+    inner = cast(JsonObject, _copy_json(_ADMISSION_SCHEMA))
+    inner_definitions = cast(JsonObject, inner.pop("$defs"))
+    definitions: JsonObject = {
+        "JudgeIsolation": {
+            "enum": [
+                "fresh_context",
+                "sequential_same_context",
+                "scripted_fixture",
+            ],
+            "title": "JudgeIsolation",
+            "type": "string",
+        },
+        "JudgeOperation": {
+            "enum": [
+                "admit_case",
+                "build_ledger",
+                "audit_ledger",
+                "repair_ledger",
+                "grade_report",
+                "referee",
+            ],
+            "title": "JudgeOperation",
+            "type": "string",
+        },
+        **inner_definitions,
+    }
+    return {
+        "$defs": definitions,
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {
+                "const": "1.0",
+                "default": "1.0",
+                "title": "Schema Version",
+                "type": "string",
+            },
+            "operation": {"$ref": "#/$defs/JudgeOperation"},
+            "request_fingerprint": {
+                "pattern": "^[0-9a-f]{64}$",
+                "title": "Request Fingerprint",
+                "type": "string",
+            },
+            "provider_name": {"title": "Provider Name", "type": "string"},
+            "model_name": {"title": "Model Name", "type": "string"},
+            "judge_isolation": {"$ref": "#/$defs/JudgeIsolation"},
+            "payload": inner,
+            "response_id": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": None,
+                "title": "Response Id",
+            },
+            "usage": {
+                "additionalProperties": {"type": "integer"},
+                "title": "Usage",
+                "type": "object",
+            },
+        },
+        "required": [
+            "operation",
+            "request_fingerprint",
+            "provider_name",
+            "model_name",
+            "judge_isolation",
+            "payload",
+        ],
+        "title": "JudgeResponse",
+        "type": "object",
+    }
+
+
+def _qualification_request(case: JsonObject) -> JsonObject:
+    request = build_admission_request(build_source_record(case))
+    if case["schema_version"] == "1.0":
+        return request
+    request["json_schema"] = _qualification_response_schema()
+    request["request_fingerprint"] = _sha256(
+        canonical_json_bytes(
+            {key: value for key, value in request.items() if key != "request_fingerprint"}
+        )
+    )
+    return request
+
+
+def build_admission_packet(envelope: JsonObject) -> JsonObject:
+    case = validate_case(envelope.get("case"))
+    if envelope.get("case_fingerprint") != _model_fingerprint(case):
+        raise EvaluationIntegrityError("case envelope does not bind its current case data")
+    return _build_attorney_admission_request(build_source_record(case))
+
+
+_REQUIRED_ADMISSION_CHECKS = {
+    "AUTHORITY_ALIGNMENT": "AUTHORITY_MISMATCH",
+    "OPERATIVE_TEXT": "OPERATIVE_TEXT_MISSING",
+    "CURRENTNESS_EVIDENCE": "CURRENTNESS_EVIDENCE_INSUFFICIENT",
+    "LANGUAGE_RESOLUTION": "LANGUAGE_UNRESOLVED",
+    "SOURCE_PARITY": "SOURCE_PARITY_UNPROVEN",
+}
+
+
+def _validate_admission_judgment(value: object) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={"request_fingerprint", "checks"},
+            optional={"issues"},
+            location="admission judgment",
+        ),
+        {"issues": []},
+    )
+    _hash(result["request_fingerprint"], location="admission judgment.request_fingerprint")
+    checks: list[JsonObject] = []
+    for index, item in enumerate(_array(result["checks"], location="admission judgment.checks")):
+        check = _with_defaults(
+            _shape(
+                item,
+                required={"code", "satisfied", "material", "rationale"},
+                optional={"source_ids"},
+                location=f"admission judgment.checks[{index}]",
+            ),
+            {"source_ids": []},
+        )
+        _identifier(check["code"], location=f"admission judgment.checks[{index}].code")
+        _enum(
+            check["code"],
+            frozenset(_REQUIRED_ADMISSION_CHECKS),
+            location=f"admission judgment.checks[{index}].code",
+        )
+        _strict_bool(check["satisfied"], location=f"admission judgment.checks[{index}].satisfied")
+        _strict_bool(check["material"], location=f"admission judgment.checks[{index}].material")
+        _string(
+            check["rationale"],
+            location=f"admission judgment.checks[{index}].rationale",
+            nonblank=True,
+        )
+        _string_list(
+            check["source_ids"],
+            location=f"admission judgment.checks[{index}].source_ids",
+            identifiers=True,
+            unique=True,
+        )
+        checks.append(check)
+    issues = [
+        _validate_issue(item, location=f"admission judgment.issues[{index}]")
+        for index, item in enumerate(_array(result["issues"], location="admission judgment.issues"))
+    ]
+    result["checks"] = checks
+    result["issues"] = issues
+    return result
+
+
+def _source_parity_issues(case: JsonObject) -> list[str]:
+    expected_hashes = {
+        cast(str, source["source_id"]): cast(str, source["content_hash"])
+        for source in cast(list[JsonObject], case["sources"])
+    }
+    client_facts = cast(str | None, case["client_facts"])
+    expected_facts_hash = (
+        None
+        if case["schema_version"] == "1.1" and client_facts is None
+        else _sha256((client_facts or "").encode("utf-8"))
+    )
+    codes: list[str] = []
+    for candidate in cast(list[JsonObject], case["candidates"]):
+        receipt = candidate["validation_receipt"]
+        if case["schema_version"] == "1.1":
+            if type(receipt) is dict and cast(JsonObject, receipt).get("kind") == "external":
+                valid = len(cast(list[JsonObject], case["candidates"])) == 1
+            else:
+                record = (
+                    cast(JsonObject, receipt).get("generation_record")
+                    if type(receipt) is dict
+                    else None
+                )
+                valid = (
+                    type(receipt) is dict
+                    and set(cast(JsonObject, receipt))
+                    == {
+                        "kind",
+                        "capsule_root",
+                        "generation_record",
+                        "generation_question",
+                    }
+                    and cast(JsonObject, receipt)["kind"] == "capsule"
+                    and type(record) is dict
+                    and cast(JsonObject, record).get("source_hashes") == expected_hashes
+                    and cast(JsonObject, record).get("client_facts_hash")
+                    == expected_facts_hash
+                    and cast(JsonObject, receipt).get("generation_question")
+                    == case["question"]
+                )
+        else:
+            valid = (
+                type(receipt) is dict
+                and set(cast(JsonObject, receipt))
+                == {"schema_version", "source_hashes", "client_facts_hash"}
+                and cast(JsonObject, receipt)["schema_version"] == "1.0"
+                and cast(JsonObject, receipt)["source_hashes"] == expected_hashes
+                and cast(JsonObject, receipt)["client_facts_hash"] == expected_facts_hash
+            )
+        if not valid:
+            codes.append("SOURCE_PARITY_UNPROVEN")
+            if candidate["role"] == "comparator":
+                codes.append("COMPARATOR_ACCESS_MISMATCH")
+    return codes
+
+
+def adjudicate_admission(envelope: JsonObject, judgment_value: object) -> JsonObject:
+    request = build_admission_packet(envelope)
+    case = cast(JsonObject, envelope["case"])
+    issue_codes = _source_parity_issues(case)
+    sources = cast(list[JsonObject], case["sources"])
+    sources_by_id = {cast(str, source["source_id"]): source for source in sources}
+    for source in sources:
+        if source["source_role"] == "official_primary" and (
+            not cast(str, source["normalized_text"]).strip() or source["completeness"] == "snippet"
+        ):
+            issue_codes.append("OPERATIVE_TEXT_MISSING")
+        if not set(cast(list[str], source["relationship_ids"])) <= set(sources_by_id):
+            issue_codes.append("SOURCE_RELATIONSHIP_UNKNOWN")
+    for authority in cast(list[JsonObject], case["requested_authorities"]):
+        for source_id in cast(list[str], authority["source_ids"]):
+            source = sources_by_id[source_id]
+            if (
+                source["jurisdiction"] != authority["jurisdiction"]
+                or source["authority_type"] != authority["authority_type"]
+            ):
+                issue_codes.append("AUTHORITY_MISMATCH")
+    return adjudicate_source_record(
+        case_fingerprint=cast(str, envelope["case_fingerprint"]),
+        source_ids=set(sources_by_id),
+        deterministic_issues=issue_codes,
+        request=request,
+        judgment=judgment_value,
+    )
+
+
+def adjudicate_source_record(
+    *,
+    case_fingerprint: str,
+    source_ids: set[str],
+    deterministic_issues: Sequence[str],
+    request: JsonObject,
+    judgment: object,
+) -> JsonObject:
+    """Mirror the core's candidate-independent admission adjudication."""
+    judgment_value = _validate_admission_judgment(judgment)
+    if judgment_value["request_fingerprint"] != request["request_fingerprint"]:
+        raise PortableEvaluationInputError("admission judgment does not bind the exact packet")
+    checks = cast(list[JsonObject], judgment_value["checks"])
+    by_code = {cast(str, check["code"]): check for check in checks}
+    if len(by_code) != len(checks):
+        raise PortableEvaluationInputError("admission judgment contains duplicate checks")
+    missing = sorted(set(_REQUIRED_ADMISSION_CHECKS) - set(by_code))
+    if missing:
+        raise PortableEvaluationInputError("admission judgment is missing required checks")
+    if any(
+        check["material"] is not True
+        for code, check in by_code.items()
+        if code in _REQUIRED_ADMISSION_CHECKS
+    ):
+        raise PortableEvaluationInputError("required admission checks must be material")
+    if any(
+        check["satisfied"] is True
+        and check["material"] is True
+        and (
+            not cast(list[str], check["source_ids"])
+            or not set(cast(list[str], check["source_ids"])) <= source_ids
+        )
+        for check in checks
+    ):
+        raise PortableEvaluationInputError(
+            "satisfied material admission checks require supporting source_ids "
+            "from the case packet"
+        )
+    issue_codes = list(deterministic_issues)
+    for check in checks:
+        code = cast(str, check["code"])
+        if check["satisfied"] is False and check["material"] is True:
+            issue_codes.append(_REQUIRED_ADMISSION_CHECKS.get(code, code))
+    fatal = set(_REQUIRED_ADMISSION_CHECKS.values())
+    for issue in cast(list[JsonObject], judgment_value["issues"]):
+        code = cast(str, issue["code"]).upper().replace("-", "_")
+        if code in fatal or issue["severity"] == "error":
+            issue_codes.append(code)
+    issue_codes = list(dict.fromkeys(issue_codes))
+    readiness: JsonObject = {
+        "status": "CASE_INVALID" if issue_codes else "ADMITTED",
+        "case_fingerprint": case_fingerprint,
+        "judgment_fingerprint": _sha256(canonical_json_bytes(judgment_value)),
+        "issue_codes": issue_codes,
+        "rationale": (
+            f"Case admission failed: {', '.join(issue_codes)}."
+            if issue_codes
+            else "Case passed deterministic and model admission checks."
+        ),
+    }
+    return readiness
+
+
+def _validate_citation(value: object, *, location: str) -> JsonObject:
+    result = _shape(
+        value,
+        required={"source_id", "start_char", "end_char", "quote"},
+        location=location,
+    )
+    _identifier(result["source_id"], location=f"{location}.source_id")
+    start = _strict_int(result["start_char"], location=f"{location}.start_char", minimum=0)
+    end = _strict_int(result["end_char"], location=f"{location}.end_char", minimum=1)
+    if end <= start:
+        raise PortableEvaluationInputError(f"{location} has invalid offsets")
+    _string(result["quote"], location=f"{location}.quote", nonblank=True)
+    return result
+
+
+def _validate_ledger_entry(value: object, *, location: str) -> JsonObject:
+    required = {
+        "ledger_id",
+        "walk_order",
+        "category",
+        "materiality",
+        "modality",
+        "operative_action",
+        "proposition",
+        "materiality_rationale",
+        "citations",
+    }
+    optional = {
+        "actor",
+        "object",
+        "trigger",
+        "threshold",
+        "conditions",
+        "exceptions",
+        "timing",
+        "enforcing_authority",
+        "enforcement_route",
+        "consequence",
+        "relationship_ids",
+    }
+    result = _with_defaults(
+        _shape(value, required=required, optional=optional, location=location),
+        {
+            "actor": None,
+            "object": None,
+            "trigger": None,
+            "threshold": None,
+            "conditions": [],
+            "exceptions": [],
+            "timing": None,
+            "enforcing_authority": None,
+            "enforcement_route": None,
+            "consequence": None,
+            "relationship_ids": [],
+        },
+    )
+    _identifier(result["ledger_id"], location=f"{location}.ledger_id")
+    _strict_int(result["walk_order"], location=f"{location}.walk_order", minimum=0)
+    _enum(result["category"], LEDGER_CATEGORIES, location=f"{location}.category")
+    _enum(result["materiality"], MATERIALITIES, location=f"{location}.materiality")
+    for field in ("modality", "operative_action", "proposition", "materiality_rationale"):
+        _string(result[field], location=f"{location}.{field}", nonblank=True)
+    for field in (
+        "actor",
+        "object",
+        "trigger",
+        "threshold",
+        "timing",
+        "enforcing_authority",
+        "enforcement_route",
+        "consequence",
+    ):
+        _optional_string(result[field], location=f"{location}.{field}", nonblank=True)
+    for field in ("conditions", "exceptions"):
+        _string_list(result[field], location=f"{location}.{field}", nonblank=True)
+    _string_list(
+        result["relationship_ids"],
+        location=f"{location}.relationship_ids",
+        identifiers=True,
+        unique=True,
+    )
+    citations = [
+        _validate_citation(item, location=f"{location}.citations[{index}]")
+        for index, item in enumerate(_array(result["citations"], location=f"{location}.citations"))
+    ]
+    if not citations:
+        raise PortableEvaluationInputError(f"{location}.citations must not be empty")
+    result["citations"] = citations
+    return result
+
+
+def validate_ledger(
+    value: object, *, envelope: JsonObject | None = None
+) -> tuple[JsonObject, list[str]]:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={"case_fingerprint", "entries"},
+            optional={"schema_version", "gaps"},
+            location="legal ledger",
+        ),
+        {"schema_version": "1.0", "gaps": []},
+    )
+    if result["schema_version"] != "1.0":
+        raise PortableEvaluationInputError("legal ledger schema is unsupported")
+    _hash(result["case_fingerprint"], location="legal ledger.case_fingerprint")
+    entries = [
+        _validate_ledger_entry(item, location=f"legal ledger.entries[{index}]")
+        for index, item in enumerate(_array(result["entries"], location="legal ledger.entries"))
+    ]
+    gaps: list[JsonObject] = []
+    for index, item in enumerate(_array(result["gaps"], location="legal ledger.gaps")):
+        gap = _with_defaults(
+            _shape(
+                item,
+                required={"gap_id", "category", "message"},
+                optional={"source_ids"},
+                location=f"legal ledger.gaps[{index}]",
+            ),
+            {"source_ids": []},
+        )
+        _identifier(gap["gap_id"], location=f"legal ledger.gaps[{index}].gap_id")
+        _enum(gap["category"], LEDGER_CATEGORIES, location=f"legal ledger.gaps[{index}].category")
+        _string(gap["message"], location=f"legal ledger.gaps[{index}].message", nonblank=True)
+        _string_list(
+            gap["source_ids"],
+            location=f"legal ledger.gaps[{index}].source_ids",
+            identifiers=True,
+            unique=True,
+        )
+        gaps.append(gap)
+    result["entries"] = entries
+    result["gaps"] = gaps
+    issues: list[str] = []
+    ledger_ids = [cast(str, entry["ledger_id"]) for entry in entries]
+    if ledger_ids and [entry["walk_order"] for entry in entries] != list(range(len(entries))):
+        issues.append("LEDGER_WALK_ORDER_INVALID")
+    if len(ledger_ids) != len(set(ledger_ids)):
+        issues.append("LEDGER_DUPLICATE_ID")
+    gap_ids = [cast(str, gap["gap_id"]) for gap in gaps]
+    if set(ledger_ids) & set(gap_ids):
+        issues.append("LEDGER_IDENTIFIER_COLLISION")
+    if envelope is not None:
+        source_record = build_admission_packet(envelope)["safe_metadata"]
+        assert isinstance(source_record, dict)
+        if result["case_fingerprint"] != source_record["source_record_fingerprint"]:
+            issues.append("LEDGER_CASE_MISMATCH")
+        sources = {
+            cast(str, source["source_id"]): source
+            for source in cast(list[JsonObject], cast(JsonObject, envelope["case"])["sources"])
+        }
+        entries_by_id = {cast(str, entry["ledger_id"]): entry for entry in entries}
+        for gap in gaps:
+            if not set(cast(list[str], gap["source_ids"])) <= set(sources):
+                issues.append("LEDGER_GAP_SOURCE_UNKNOWN")
+        for entry in entries:
+            issues.extend(_ledger_entry_issues(entry, sources, entries_by_id))
+    return result, list(dict.fromkeys(issues))
+
+
+def _ledger_entry_issues(
+    entry: JsonObject,
+    sources: dict[str, JsonObject],
+    entries_by_id: dict[str, JsonObject],
+) -> list[str]:
+    issues: list[str] = []
+    related = set(cast(list[str], entry["relationship_ids"]))
+    if not related <= set(entries_by_id):
+        issues.append("LEDGER_RELATIONSHIP_UNKNOWN")
+    if entry["ledger_id"] in related:
+        issues.append("LEDGER_RELATIONSHIP_SELF")
+    exact = 0
+    commentary = 0
+    seen: set[tuple[object, ...]] = set()
+    for citation in cast(list[JsonObject], entry["citations"]):
+        key = (
+            citation["source_id"],
+            citation["start_char"],
+            citation["end_char"],
+            citation["quote"],
+        )
+        if key in seen:
+            issues.append("LEDGER_CITATION_DUPLICATE")
+        seen.add(key)
+        source = sources.get(cast(str, citation["source_id"]))
+        if source is None:
+            issues.append("LEDGER_CITATION_SOURCE_UNKNOWN")
+            continue
+        text = cast(str, source["normalized_text"])
+        start = cast(int, citation["start_char"])
+        end = cast(int, citation["end_char"])
+        if not 0 <= start < end <= len(text) or text[start:end] != citation["quote"]:
+            issues.append("LEDGER_QUOTE_MISMATCH")
+            continue
+        exact += 1
+        commentary += source["source_role"] == "commentary_analysis"
+    category = cast(str, entry["category"])
+    operative = {
+        "requirement",
+        "prohibition",
+        "right",
+        "deadline",
+        "enforcement",
+        "remedy",
+        "penalty",
+    }
+    if category in operative and exact == 0 and not issues:
+        issues.append("LEDGER_OPERATIVE_CITATION_MISSING")
+    if category in operative and exact > 0 and commentary == exact:
+        issues.append("LEDGER_COMMENTARY_ONLY_SUPPORT")
+    if category in {"requirement", "prohibition", "right"}:
+        if entry["actor"] is None:
+            issues.append("LEDGER_ACTOR_MISSING")
+        if entry["object"] is None:
+            issues.append("LEDGER_OBJECT_MISSING")
+    if category == "deadline" and entry["timing"] is None:
+        issues.append("LEDGER_DEADLINE_TIMING_MISSING")
+    if category == "exception" and not (entry["conditions"] or entry["exceptions"]):
+        issues.append("LEDGER_EXCEPTION_CONDITIONS_MISSING")
+    if category == "enforcement":
+        if entry["enforcing_authority"] is None:
+            issues.append("LEDGER_ENFORCING_AUTHORITY_MISSING")
+        if entry["enforcement_route"] is None:
+            issues.append("LEDGER_ENFORCEMENT_ROUTE_MISSING")
+    if category in {"penalty", "remedy"} and entry["consequence"] is None:
+        issues.append(f"LEDGER_{category.upper()}_CONSEQUENCE_MISSING")
+    if category in {"enforcement", "penalty"}:
+        if not related:
+            issues.append("LEDGER_TRIGGER_LINK_MISSING")
+        elif not any(
+            entries_by_id[item]["category"] in {"requirement", "prohibition"}
+            for item in related
+            if item in entries_by_id
+        ):
+            issues.append("LEDGER_TRIGGER_RELATIONSHIP_INVALID")
+    rationale = " ".join(cast(str, entry["materiality_rationale"]).lower().split())
+    if (
+        rationale in {"important", "material", "critical", "significant", "high priority"}
+        or len(re.findall(r"[a-z0-9]+", rationale)) < 5
+    ):
+        issues.append("LEDGER_MATERIALITY_RATIONALE_INSUFFICIENT")
+    return issues
+
+
+def _validate_evidence_span(
+    sources: dict[str, JsonObject], span: JsonObject, *, location: str
+) -> None:
+    source_id = cast(str, span["source_id"])
+    source = sources.get(source_id)
+    if source is None:
+        raise PortableEvaluationInputError(f"{location} evidence span uses an unknown source")
+    start = cast(int, span["start_char"])
+    end = cast(int, span["end_char"])
+    text = cast(str, source["normalized_text"])
+    if end > len(text) or text[start:end] != span["quote"]:
+        raise PortableEvaluationInputError(f"{location} evidence span is not an exact source slice")
+
+
+def _validate_grade_alternative_evidence(
+    envelope: JsonObject,
+    alternative: JsonObject,
+    label: str,
+) -> None:
+    candidate = _candidate_for_label(envelope, label)
+    report_text = cast(str, candidate["report_text"])
+    source_record = cast(JsonObject, build_admission_packet(envelope)["payload"])
+    sources = {
+        cast(str, item["source_id"]): item
+        for item in cast(list[JsonObject], source_record["sources"])
+    }
+
+    entry = cast(JsonObject | None, alternative.get("entry_grade"))
+    if entry is not None:
+        passage = cast(str | None, entry["report_passage"])
+        if passage is not None and passage not in report_text:
+            raise PortableEvaluationInputError("entry report passage is not exact report text")
+
+    narrative = cast(JsonObject | None, alternative.get("narrative_score"))
+    if narrative is not None and cast(str, narrative["report_passage"]) not in report_text:
+        raise PortableEvaluationInputError("narrative report passage is not exact report text")
+
+    claim = cast(JsonObject | None, alternative.get("out_of_ledger_claim"))
+    if claim is None:
+        return
+    if cast(str, claim["claim_text"]) not in report_text:
+        raise PortableEvaluationInputError("claim report passage is not exact report text")
+    if claim["source_record_fingerprint"] != source_record["source_record_fingerprint"]:
+        raise PortableEvaluationInputError("claim does not bind the source record")
+    for index, span in enumerate(cast(list[JsonObject], claim["evidence_spans"])):
+        _validate_evidence_span(sources, span, location=f"claim[{index}]")
+
+
+def _validate_grade_evidence(envelope: JsonObject, grade: JsonObject, label: str) -> None:
+    if grade["anonymous_label"] != label:
+        raise PortableEvaluationInputError("grade evidence uses the wrong anonymous report")
+    request_fingerprint = cast(str, grade["request_fingerprint"])
+    for entry in cast(list[JsonObject], grade["entry_grades"]):
+        _validate_grade_alternative_evidence(
+            envelope,
+            {
+                "request_fingerprint": request_fingerprint,
+                "entry_grade": entry,
+                "out_of_ledger_claim": None,
+                "narrative_score": None,
+                "absent_claim": False,
+            },
+            label,
+        )
+    for claim in cast(list[JsonObject], grade["out_of_ledger_claims"]):
+        _validate_grade_alternative_evidence(
+            envelope,
+            {
+                "request_fingerprint": request_fingerprint,
+                "entry_grade": None,
+                "out_of_ledger_claim": claim,
+                "narrative_score": None,
+                "absent_claim": False,
+            },
+            label,
+        )
+    for narrative in cast(list[JsonObject], grade["narrative_scores"]):
+        _validate_grade_alternative_evidence(
+            envelope,
+            {
+                "request_fingerprint": request_fingerprint,
+                "entry_grade": None,
+                "out_of_ledger_claim": None,
+                "narrative_score": narrative,
+                "absent_claim": False,
+            },
+            label,
+        )
+
+
+def _validate_ledger_finding(value: object, *, location: str) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={"dispute_id", "action", "materiality", "rationale"},
+            optional={"target_ledger_ids", "proposed_entries"},
+            location=location,
+        ),
+        {"target_ledger_ids": [], "proposed_entries": []},
+    )
+    _identifier(result["dispute_id"], location=f"{location}.dispute_id")
+    _enum(
+        result["action"],
+        frozenset({"add", "edit", "delete", "split", "merge", "materiality"}),
+        location=f"{location}.action",
+    )
+    _enum(result["materiality"], MATERIALITIES, location=f"{location}.materiality")
+    _string(result["rationale"], location=f"{location}.rationale", nonblank=True)
+    targets = _string_list(
+        result["target_ledger_ids"],
+        location=f"{location}.target_ledger_ids",
+        identifiers=True,
+        unique=True,
+    )
+    proposed = [
+        _validate_ledger_entry(item, location=f"{location}.proposed_entries[{index}]")
+        for index, item in enumerate(
+            _array(result["proposed_entries"], location=f"{location}.proposed_entries")
+        )
+    ]
+    result["target_ledger_ids"] = targets
+    result["proposed_entries"] = proposed
+    proposed_ids = [entry["ledger_id"] for entry in proposed]
+    if len(proposed_ids) != len(set(proposed_ids)):
+        raise PortableResponseContractError(
+            f"{location} has duplicate proposed IDs",
+            code="EVALUATION_PROPOSED_ENTRY_INVALID",
+            related_ids=[cast(str, result["dispute_id"])],
+        )
+    action = cast(str, result["action"])
+    valid = {
+        "add": not targets,
+        "edit": (
+            len(targets) == 1
+            and len(proposed) <= 1
+            and (not proposed or proposed[0]["ledger_id"] == targets[0])
+        ),
+        "delete": bool(targets) and not proposed,
+        "split": len(targets) == 1 and len(proposed) != 1,
+        "merge": len(targets) >= 2 and len(proposed) <= 1,
+        "materiality": len(targets) == 1 and not proposed,
+    }[action]
+    if not valid:
+        raise PortableResponseContractError(
+            f"{location} has an invalid initial action payload",
+            code="EVALUATION_AUDIT_ACTION_INVALID",
+            related_ids=[cast(str, result["dispute_id"])],
+        )
+    return result
+
+
+def _validate_ledger_dispute(value: object, *, location: str) -> JsonObject:
+    result = _validate_ledger_finding(value, location=location)
+    targets = cast(list[str], result["target_ledger_ids"])
+    proposed = cast(list[JsonObject], result["proposed_entries"])
+    action = result["action"]
+    valid = {
+        "add": not targets and bool(proposed),
+        "edit": len(targets) == 1 and len(proposed) == 1 and proposed[0]["ledger_id"] == targets[0],
+        "delete": bool(targets) and not proposed,
+        "split": len(targets) == 1 and len(proposed) >= 2,
+        "merge": len(targets) >= 2 and len(proposed) == 1,
+        "materiality": len(targets) == 1 and not proposed,
+    }[cast(str, action)]
+    if not valid:
+        raise PortableEvaluationInputError(f"{location} has an invalid action payload")
+    return result
+
+
+def _concrete_audit_rationale(value: object) -> bool:
+    rationale = cast(str, value)
+    normalized = " ".join(rationale.lower().split())
+    tokens = re.findall(r"[a-z0-9]+", normalized)
+    return (
+        normalized not in _GENERIC_MATERIALITY_RATIONALES
+        and len(tokens) >= _AUDIT_RATIONALE_MINIMUM_WORDS
+        and any(token in _AUDIT_RATIONALE_LEGAL_OR_RECORD_ANCHORS for token in tokens)
+        and any(
+            token in _AUDIT_RATIONALE_DEFECT_OR_CORRECTION_SIGNALS for token in tokens
+        )
+    )
+
+
+def _validate_ledger_audit(
+    value: object,
+    *,
+    transaction_strict: bool,
+    envelope: JsonObject | None = None,
+    proposed_ledger: object | None = None,
+) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={"request_fingerprint", "complete"},
+            optional={"disputes"},
+            location="ledger audit",
+        ),
+        {"disputes": []},
+    )
+    _hash(result["request_fingerprint"], location="ledger audit.request_fingerprint")
+    if _strict_bool(result["complete"], location="ledger audit.complete") is not True:
+        raise PortableResponseContractError(
+            "ledger audit is incomplete", code="EVALUATION_AUDIT_INCOMPLETE"
+        )
+    validator = _validate_ledger_dispute if transaction_strict else _validate_ledger_finding
+    disputes = [
+        validator(item, location=f"ledger audit.disputes[{index}]")
+        for index, item in enumerate(_array(result["disputes"], location="ledger audit.disputes"))
+    ]
+    ids = [dispute["dispute_id"] for dispute in disputes]
+    if len(ids) != len(set(ids)):
+        raise PortableEvaluationInputError("ledger audit has duplicate dispute IDs")
+    if not transaction_strict:
+        if envelope is None or proposed_ledger is None:
+            raise PortableEvaluationInputError(
+                "initial ledger findings require source-only envelope and proposed ledger context"
+            )
+        ledger, ledger_issues = validate_ledger(proposed_ledger, envelope=envelope)
+        if ledger_issues:
+            raise PortableEvaluationInputError(
+                "invalid proposed ledger context: " + ", ".join(ledger_issues)
+            )
+        for dispute in disputes:
+            if not _concrete_audit_rationale(dispute["rationale"]):
+                raise PortableResponseContractError(
+                    f"ledger finding {dispute['dispute_id']} requires a concrete rationale",
+                    code="EVALUATION_AUDIT_RATIONALE_INSUFFICIENT",
+                    related_ids=[cast(str, dispute["dispute_id"])],
+                )
+            _validate_finding_grounding(envelope, ledger, dispute)
+    result["disputes"] = disputes
+    return result
+
+
+def validate_ledger_audit_findings(
+    value: object,
+    *,
+    envelope: JsonObject,
+    proposed_ledger: object,
+) -> JsonObject:
+    """Validate a complete initial audit without requiring executable transactions."""
+    return _validate_ledger_audit(
+        value,
+        transaction_strict=False,
+        envelope=envelope,
+        proposed_ledger=proposed_ledger,
+    )
+
+
+def validate_ledger_audit(value: object) -> JsonObject:
+    """Validate a transaction-strict remaining audit for sealing or refereeing."""
+    return _validate_ledger_audit(value, transaction_strict=True)
+
+
+def _validate_finding_grounding(
+    envelope: JsonObject,
+    proposed_ledger: JsonObject,
+    finding: JsonObject,
+) -> None:
+    _validate_finding_proposed_entries(envelope, proposed_ledger, finding)
+    if finding["action"] != "add":
+        ledger_ids = {
+            cast(str, entry["ledger_id"])
+            for entry in cast(list[JsonObject], proposed_ledger["entries"])
+        }
+        unknown_targets = set(cast(list[str], finding["target_ledger_ids"])) - ledger_ids
+        if unknown_targets:
+            raise PortableResponseContractError(
+                f"{finding['action']} initial ledger finding has an unknown target",
+                code="EVALUATION_AUDIT_TARGET_UNKNOWN",
+                related_ids=sorted(unknown_targets),
+            )
+        return
+    proposed_entries = cast(list[JsonObject], finding["proposed_entries"])
+    if proposed_entries:
+        existing_ids = {
+            cast(str, entry["ledger_id"])
+            for entry in cast(list[JsonObject], proposed_ledger["entries"])
+        }
+        proposed_ids = {
+            cast(str, entry["ledger_id"])
+            for entry in proposed_entries
+        }
+        if existing_ids & proposed_ids:
+            raise PortableResponseContractError(
+                "add initial ledger finding must use new ledger IDs",
+                code="EVALUATION_PROPOSED_ENTRY_INVALID",
+                related_ids=sorted(existing_ids & proposed_ids),
+            )
+        return
+    if not _proposal_free_add_is_source_grounded(
+        envelope, cast(str, finding["rationale"])
+    ):
+        raise PortableResponseContractError(
+            "proposal-free add initial ledger finding requires a source-grounded rationale",
+            code="EVALUATION_SOURCE_BINDING_INVALID",
+            related_ids=[cast(str, finding["dispute_id"])],
+        )
+
+
+def _validate_finding_proposed_entries(
+    envelope: JsonObject,
+    proposed_ledger: JsonObject,
+    finding: JsonObject,
+) -> None:
+    proposed_entries = cast(list[JsonObject], finding["proposed_entries"])
+    if not proposed_entries:
+        return
+    case = cast(JsonObject, envelope["case"])
+    sources = {
+        cast(str, source["source_id"]): source
+        for source in cast(list[JsonObject], case["sources"])
+    }
+    entries_by_id = {
+        cast(str, entry["ledger_id"]): entry
+        for entry in cast(list[JsonObject], proposed_ledger["entries"])
+    }
+    entries_by_id.update(
+        {cast(str, entry["ledger_id"]): entry for entry in proposed_entries}
+    )
+    issue_codes = list(
+        dict.fromkeys(
+            issue
+            for entry in proposed_entries
+            for issue in _ledger_entry_issues(entry, sources, entries_by_id)
+        )
+    )
+    if issue_codes:
+        source_issue_codes = {
+            "LEDGER_CITATION_SOURCE_UNKNOWN",
+            "LEDGER_QUOTE_MISMATCH",
+            "LEDGER_OPERATIVE_CITATION_MISSING",
+        }
+        raise PortableResponseContractError(
+            f"ledger finding {finding['dispute_id']} has invalid proposed entries: "
+            + ",".join(sorted(issue_codes)),
+            code=(
+                "EVALUATION_SOURCE_BINDING_INVALID"
+                if any(issue in source_issue_codes for issue in issue_codes)
+                else "EVALUATION_PROPOSED_ENTRY_INVALID"
+            ),
+            related_ids=[cast(str, finding["dispute_id"])],
+        )
+
+
+def _proposal_free_add_is_source_grounded(
+    envelope: JsonObject, rationale: str
+) -> bool:
+    case = cast(JsonObject, envelope["case"])
+    for source in cast(list[JsonObject], case["sources"]):
+        source_id = cast(str, source["source_id"])
+        source_pattern = re.compile(
+            rf"(?<![A-Za-z0-9_-]){re.escape(source_id)}(?![A-Za-z0-9_-])"
+        )
+        if not source_pattern.search(rationale):
+            continue
+        rationale_locators = _audit_legal_locators(rationale)
+        source_text = f"{source['title']} {source['normalized_text']}"
+        if rationale_locators:
+            return rationale_locators <= _audit_legal_locators(source_text)
+        rationale_terms = _audit_significant_terms(rationale) - set(
+            re.findall(r"[a-z0-9]+", source_id.lower())
+        )
+        source_terms = _audit_significant_terms(
+            f"{source['title']} {source['normalized_text']}"
+        )
+        if len(rationale_terms & source_terms) >= _AUDIT_RATIONALE_MINIMUM_SOURCE_TERMS:
+            return True
+    return False
+
+
+def _audit_legal_locators(value: str) -> set[tuple[str, str]]:
+    return {
+        (match.group(1).casefold(), match.group(2).casefold())
+        for match in _AUDIT_RATIONALE_LOCATOR_PATTERN.finditer(value)
+    }
+
+
+def _audit_significant_terms(value: str) -> set[str]:
+    excluded = {
+        *_AUDIT_RATIONALE_STOPWORDS,
+        *_AUDIT_RATIONALE_EVALUATOR_METADATA_TERMS,
+        *_AUDIT_RATIONALE_ACTION_BOILERPLATE_TERMS,
+        *_AUDIT_RATIONALE_DEFECT_OR_CORRECTION_SIGNALS,
+        *_AUDIT_RATIONALE_LEGAL_LOCATORS,
+    }
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", value.lower())
+        if token not in excluded and any(character.isalpha() for character in token)
+    }
+
+
+def _validate_grade_alternative(value: object, *, location: str) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={"request_fingerprint"},
+            optional={"entry_grade", "out_of_ledger_claim", "narrative_score", "absent_claim"},
+            location=location,
+        ),
+        {
+            "entry_grade": None,
+            "out_of_ledger_claim": None,
+            "narrative_score": None,
+            "absent_claim": False,
+        },
+    )
+    _hash(result["request_fingerprint"], location=f"{location}.request_fingerprint")
+    absent = _strict_bool(result["absent_claim"], location=f"{location}.absent_claim")
+    values = [result["entry_grade"], result["out_of_ledger_claim"], result["narrative_score"]]
+    if (absent and any(item is not None for item in values)) or (
+        not absent and sum(item is not None for item in values) != 1
+    ):
+        raise PortableEvaluationInputError(f"{location} has invalid alternative cardinality")
+    if result["entry_grade"] is not None:
+        result["entry_grade"] = _validate_entry_grade(
+            result["entry_grade"], location=f"{location}.entry_grade"
+        )
+    if result["out_of_ledger_claim"] is not None:
+        result["out_of_ledger_claim"] = _validate_claim(
+            result["out_of_ledger_claim"], location=f"{location}.out_of_ledger_claim"
+        )
+    if result["narrative_score"] is not None:
+        result["narrative_score"] = _validate_narrative(
+            result["narrative_score"], location=f"{location}.narrative_score"
+        )
+    return result
+
+
+def validate_referee_decision(value: object) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={"dispute_id", "rationale"},
+            optional={
+                "selected_disposition",
+                "selected_ledger_resolution",
+                "replacement_entries",
+                "selected_grade_resolution",
+                "grade_dispute_fingerprint",
+                "replacement_grade_alternative",
+                "source_ids",
+            },
+            location="referee decision",
+        ),
+        {
+            "selected_disposition": None,
+            "selected_ledger_resolution": None,
+            "replacement_entries": [],
+            "selected_grade_resolution": None,
+            "grade_dispute_fingerprint": None,
+            "replacement_grade_alternative": None,
+            "source_ids": [],
+        },
+    )
+    _identifier(result["dispute_id"], location="referee decision.dispute_id")
+    _string(result["rationale"], location="referee decision.rationale", nonblank=True)
+    if result["selected_disposition"] is not None:
+        _enum(
+            result["selected_disposition"],
+            COVERAGE_DISPOSITIONS,
+            location="referee decision.selected_disposition",
+        )
+    if result["selected_ledger_resolution"] is not None:
+        _enum(
+            result["selected_ledger_resolution"],
+            frozenset({"accept_a", "accept_b", "replace"}),
+            location="referee decision.selected_ledger_resolution",
+        )
+    if result["selected_grade_resolution"] is not None:
+        _enum(
+            result["selected_grade_resolution"],
+            frozenset({"accept_grader_1", "accept_grader_2", "replace"}),
+            location="referee decision.selected_grade_resolution",
+        )
+    replacements = [
+        _validate_ledger_entry(item, location=f"referee decision.replacement_entries[{index}]")
+        for index, item in enumerate(
+            _array(result["replacement_entries"], location="referee decision.replacement_entries")
+        )
+    ]
+    result["replacement_entries"] = replacements
+    if result["grade_dispute_fingerprint"] is not None:
+        _hash(
+            result["grade_dispute_fingerprint"],
+            location="referee decision.grade_dispute_fingerprint",
+        )
+    if (result["selected_grade_resolution"] is None) != (
+        result["grade_dispute_fingerprint"] is None
+    ):
+        raise PortableEvaluationInputError(
+            "grade resolution and dispute fingerprint must be paired"
+        )
+    if result["replacement_grade_alternative"] is not None:
+        result["replacement_grade_alternative"] = _validate_grade_alternative(
+            result["replacement_grade_alternative"],
+            location="referee decision.replacement_grade_alternative",
+        )
+    if (result["selected_grade_resolution"] == "replace") != (
+        result["replacement_grade_alternative"] is not None
+    ):
+        raise PortableEvaluationInputError("replacement grade alternative coupling is invalid")
+    _string_list(
+        result["source_ids"], location="referee decision.source_ids", identifiers=True, unique=True
+    )
+    return result
+
+
+def _compact(entries: list[JsonObject]) -> list[JsonObject]:
+    result: list[JsonObject] = []
+    for index, entry in enumerate(entries):
+        snapshot = cast(JsonObject, _copy_json(entry))
+        snapshot["walk_order"] = index
+        result.append(snapshot)
+    return result
+
+
+def _apply_ledger_dispute(
+    entries: list[JsonObject], dispute: JsonObject, resolution: str, decision: JsonObject | None
+) -> list[JsonObject]:
+    if resolution == "accept_a":
+        return _compact(entries)
+    proposed = (
+        cast(list[JsonObject], decision["replacement_entries"])
+        if resolution == "replace" and decision is not None
+        else cast(list[JsonObject], dispute["proposed_entries"])
+    )
+    targets = cast(list[str], dispute["target_ledger_ids"])
+    action = cast(str, dispute["action"])
+    indexes = [index for index, entry in enumerate(entries) if entry["ledger_id"] in targets]
+    if action != "add" and len(indexes) != len(targets):
+        raise EvaluationInconclusiveError("ledger dispute identifies an unknown target")
+    if action == "add":
+        existing_ids = {entry["ledger_id"] for entry in entries}
+        if existing_ids & {entry["ledger_id"] for entry in proposed}:
+            raise EvaluationInconclusiveError("add dispute reuses a ledger ID")
+        additions = {cast(int, entry["walk_order"]): entry for entry in proposed}
+        if len(additions) != len(proposed) or any(
+            index not in range(len(entries) + len(proposed)) for index in additions
+        ):
+            raise EvaluationInconclusiveError("add positions are invalid")
+        survivors = iter(entries)
+        return _compact(
+            [
+                additions[index] if index in additions else next(survivors)
+                for index in range(len(entries) + len(proposed))
+            ]
+        )
+    start = min(indexes)
+    end = max(indexes) + 1
+    if indexes != list(range(start, end)):
+        raise EvaluationInconclusiveError("ledger dispute targets must be contiguous")
+    if action == "delete":
+        if resolution == "replace":
+            raise EvaluationInconclusiveError("delete replacement is unsupported")
+        return _compact(entries[:start] + entries[end:])
+    if action == "materiality":
+        if resolution == "replace":
+            raise EvaluationInconclusiveError("materiality replacement is unsupported")
+        result = _compact(entries)
+        result[start]["materiality"] = dispute["materiality"]
+        return result
+    if action == "edit" and (
+        len(proposed) != 1
+        or proposed[0]["ledger_id"] != targets[0]
+        or proposed[0]["walk_order"] != start
+    ):
+        raise EvaluationInconclusiveError("edit replacement is invalid")
+    if action == "split" and [entry["walk_order"] for entry in proposed] != list(
+        range(start, start + len(proposed))
+    ):
+        raise EvaluationInconclusiveError("split replacement positions are invalid")
+    if action == "merge" and (len(proposed) != 1 or proposed[0]["walk_order"] != start):
+        raise EvaluationInconclusiveError("merge replacement is invalid")
+    retained_ids = {entry["ledger_id"] for entry in entries[:start] + entries[end:]}
+    if retained_ids & {entry["ledger_id"] for entry in proposed}:
+        raise EvaluationInconclusiveError("replacement duplicates a retained ledger ID")
+    return _compact(entries[:start] + proposed + entries[end:])
+
+
+def seal_ledger(
+    envelope: JsonObject,
+    ledger_value: object,
+    audit_value: object,
+    referee_value: object | None,
+) -> JsonObject:
+    ledger, issues = validate_ledger(ledger_value, envelope=envelope)
+    if issues:
+        raise EvaluationInconclusiveError("ledger validation failed: " + ", ".join(issues))
+    audit = validate_ledger_audit(audit_value)
+    decision = None if referee_value is None else validate_referee_decision(referee_value)
+    disputes = cast(list[JsonObject], audit["disputes"])
+    material = [item for item in disputes if item["materiality"] in {"material", "critical"}]
+    unresolved = [
+        item
+        for item in material
+        if decision is None or decision["dispute_id"] != item["dispute_id"]
+    ]
+    if unresolved:
+        raise EvaluationInconclusiveError("material ledger dispute requires referee resolution")
+    if decision is not None:
+        matching = [item for item in disputes if item["dispute_id"] == decision["dispute_id"]]
+        if len(matching) != 1 or decision["selected_ledger_resolution"] is None:
+            raise EvaluationInconclusiveError(
+                "referee decision does not identify one ledger dispute"
+            )
+        if (
+            decision["selected_disposition"] is not None
+            or decision["selected_grade_resolution"] is not None
+        ):
+            raise EvaluationInconclusiveError("ledger referee uses the wrong resolution domain")
+        if (decision["selected_ledger_resolution"] == "replace") != bool(
+            decision["replacement_entries"]
+        ):
+            raise EvaluationInconclusiveError("ledger referee replacement coupling is invalid")
+    entries = cast(list[JsonObject], _copy_json(ledger["entries"]))
+    for dispute in disputes:
+        resolution = (
+            cast(str, decision["selected_ledger_resolution"])
+            if decision is not None and decision["dispute_id"] == dispute["dispute_id"]
+            else "accept_b"
+        )
+        entries = _apply_ledger_dispute(entries, dispute, resolution, decision)
+        intermediate = {
+            "schema_version": "1.0",
+            "case_fingerprint": ledger["case_fingerprint"],
+            "entries": entries,
+            "gaps": ledger["gaps"],
+        }
+        _, intermediate_issues = validate_ledger(intermediate, envelope=envelope)
+        if intermediate_issues:
+            raise EvaluationInconclusiveError("ledger dispute produced invalid ledger")
+    final_ledger: JsonObject = {
+        "schema_version": "1.0",
+        "case_fingerprint": build_admission_packet(envelope)["safe_metadata"][
+            "source_record_fingerprint"
+        ],  # type: ignore[index]
+        "entries": entries,
+        "gaps": ledger["gaps"],
+    }
+    source_fingerprint = cast(str, final_ledger["case_fingerprint"])
+    audit_fingerprint = _sha256(
+        canonical_json_bytes({"source_record_fingerprint": source_fingerprint, "audit": audit})
+    )
+    ledger_fingerprint = _sha256(
+        canonical_json_bytes(
+            {
+                "source_record_fingerprint": source_fingerprint,
+                "audit_fingerprint": audit_fingerprint,
+                "ledger": final_ledger,
+                "referee": decision,
+            }
+        )
+    )
+    return {
+        "ledger": final_ledger,
+        "audit_fingerprint": audit_fingerprint,
+        "ledger_fingerprint": ledger_fingerprint,
+    }
+
+
+def _validate_entry_grade(value: object, *, location: str) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={"ledger_id", "disposition", "rationale", "report_passage"},
+            optional={"report_location", "finding_codes"},
+            location=location,
+        ),
+        {"report_location": None, "finding_codes": []},
+    )
+    _identifier(result["ledger_id"], location=f"{location}.ledger_id")
+    _enum(result["disposition"], COVERAGE_DISPOSITIONS, location=f"{location}.disposition")
+    _string(result["rationale"], location=f"{location}.rationale", nonblank=True)
+    _optional_string(
+        result["report_location"], location=f"{location}.report_location", nonblank=True
+    )
+    _optional_string(
+        result["report_passage"], location=f"{location}.report_passage", nonblank=True
+    )
+    if result["disposition"] == "MISSING":
+        if result["report_passage"] is not None:
+            raise PortableEvaluationInputError(
+                f"{location} missing entry grade must omit report passage"
+            )
+    elif result["report_passage"] is None:
+        raise PortableEvaluationInputError(
+            f"{location} nonmissing entry grade requires report passage"
+        )
+    codes = _string_list(result["finding_codes"], location=f"{location}.finding_codes", unique=True)
+    if not set(codes) <= ENTRY_FINDING_CODES:
+        raise PortableEvaluationInputError(f"{location} has an unknown finding code")
+    return result
+
+
+def _validate_claim(value: object, *, location: str) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={
+                "claim_id",
+                "claim_text",
+                "report_location",
+                "disposition",
+                "category",
+                "materiality",
+                "source_record_fingerprint",
+                "evidence_basis",
+                "evidence_spans",
+                "rationale",
+            },
+            optional={"related_ledger_ids"},
+            location=location,
+        ),
+        {"related_ledger_ids": []},
+    )
+    _identifier(result["claim_id"], location=f"{location}.claim_id")
+    for field in ("claim_text", "report_location", "rationale"):
+        _string(result[field], location=f"{location}.{field}", nonblank=True)
+    _enum(result["disposition"], COVERAGE_DISPOSITIONS, location=f"{location}.disposition")
+    _enum(result["category"], LEDGER_CATEGORIES, location=f"{location}.category")
+    _enum(result["materiality"], MATERIALITIES, location=f"{location}.materiality")
+    _hash(
+        result["source_record_fingerprint"],
+        location=f"{location}.source_record_fingerprint",
+    )
+    evidence_basis = _enum(
+        result["evidence_basis"],
+        frozenset({"source_spans", "closed_universe_absence"}),
+        location=f"{location}.evidence_basis",
+    )
+    evidence_spans = [
+        _validate_citation(item, location=f"{location}.evidence_spans[{index}]")
+        for index, item in enumerate(
+            _array(result["evidence_spans"], location=f"{location}.evidence_spans")
+        )
+    ]
+    if evidence_basis == "source_spans" and not evidence_spans:
+        raise PortableEvaluationInputError(
+            f"{location} source_spans evidence basis requires evidence spans"
+        )
+    if evidence_basis == "closed_universe_absence" and result["disposition"] != "UNSUPPORTED":
+        raise PortableEvaluationInputError(
+            f"{location} closed-universe absence is valid only for the UNSUPPORTED disposition"
+        )
+    if result["disposition"] in {"COMPLETE", "PARTIAL"} and evidence_basis != "source_spans":
+        raise PortableEvaluationInputError(
+            f"{location} positive-credit dispositions require source_spans evidence basis"
+        )
+    if evidence_basis == "closed_universe_absence" and evidence_spans:
+        raise PortableEvaluationInputError(
+            f"{location} closed-universe absence must not claim evidence spans"
+        )
+    evidence_identities = [
+        (span["source_id"], span["start_char"], span["end_char"], span["quote"])
+        for span in evidence_spans
+    ]
+    if len(evidence_identities) != len(set(evidence_identities)):
+        raise PortableEvaluationInputError(f"{location}.evidence_spans must be unique")
+    result["evidence_spans"] = evidence_spans
+    _string_list(
+        result["related_ledger_ids"],
+        location=f"{location}.related_ledger_ids",
+        identifiers=True,
+        unique=True,
+    )
+    return result
+
+
+def _validate_narrative(value: object, *, location: str) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={"dimension", "score", "rationale", "report_passage"},
+            optional={"finding_codes"},
+            location=location,
+        ),
+        {"finding_codes": []},
+    )
+    _enum(result["dimension"], frozenset(NARRATIVE_DIMENSIONS), location=f"{location}.dimension")
+    _strict_int(result["score"], location=f"{location}.score", minimum=1, maximum=4)
+    for field in ("rationale", "report_passage"):
+        _string(result[field], location=f"{location}.{field}", nonblank=True)
+    codes = _string_list(result["finding_codes"], location=f"{location}.finding_codes", unique=True)
+    if not set(codes) <= NARRATIVE_FINDING_CODES:
+        raise PortableEvaluationInputError(f"{location} has an unknown finding code")
+    return result
+
+
+def _entry_finding_context_valid(
+    ledger: JsonObject | None, disposition: object, code: str
+) -> bool:
+    if ledger is None:
+        return False
+    if code == "CRITICAL_LEDGER_ENTRY_MISSING":
+        return disposition == "MISSING" and ledger["materiality"] == "critical"
+    if code == "MATERIAL_EXCEPTION_MISSING":
+        return (
+            disposition in {"MISSING", "PARTIAL"}
+            and ledger["category"] == "exception"
+            and ledger["materiality"] in {"material", "critical"}
+        )
+    if code == "CONSEQUENCE_TRIGGER_DETACHED":
+        return (
+            disposition in {"PARTIAL", "OVERSTATED", "CONTRADICTED"}
+            and ledger["category"] in {"penalty", "enforcement", "remedy"}
+            and ledger["consequence"] is not None
+            and (ledger["trigger"] is not None or bool(ledger["relationship_ids"]))
+        )
+    return False
+
+
+def _entry_finding_allowed_context(code: str) -> str:
+    contexts = {
+        "CRITICAL_LEDGER_ENTRY_MISSING": (
+            "disposition in [MISSING]; materiality in [critical]"
+        ),
+        "MATERIAL_EXCEPTION_MISSING": (
+            "disposition in [MISSING, PARTIAL]; category=exception; "
+            "materiality in [critical, material]"
+        ),
+        "CONSEQUENCE_TRIGGER_DETACHED": (
+            "disposition in [PARTIAL, OVERSTATED, CONTRADICTED]; category in "
+            "[enforcement, penalty, remedy]; consequence required; trigger or "
+            "relationship_ids required"
+        ),
+    }
+    return contexts[code]
+
+
+def _narrative_finding_context_valid(score: JsonObject, code: str) -> bool:
+    return (
+        code == "KEY_REQUIREMENTS_ACTION_PLAN"
+        and score["dimension"] in {"key_requirements", "requirements_workplan_boundary"}
+        and cast(int, score["score"]) <= 2
+    )
+
+
+def _narrative_finding_allowed_context(code: str) -> str:
+    if code == "KEY_REQUIREMENTS_ACTION_PLAN":
+        return (
+            "dimension in [key_requirements, requirements_workplan_boundary]; "
+            "score at most 2"
+        )
+    raise PortableEvaluationInputError("unknown narrative finding code")
+
+
+def _grade_issue_diagnostics(
+    sealed: JsonObject, grade: JsonObject, issues: list[str]
+) -> list[str]:
+    context_issue_codes = {
+        "GRADE_ENTRY_FINDING_CONTEXT_INVALID",
+        "GRADE_NARRATIVE_FINDING_CONTEXT_INVALID",
+    }
+    diagnostics = [issue for issue in issues if issue not in context_issue_codes]
+    ledger_entries = cast(list[JsonObject], cast(JsonObject, sealed["ledger"])["entries"])
+    ledger_by_id = {cast(str, entry["ledger_id"]): entry for entry in ledger_entries}
+    for entry_grade in cast(list[JsonObject], grade["entry_grades"]):
+        ledger_id = cast(str, entry_grade["ledger_id"])
+        ledger_entry = ledger_by_id.get(ledger_id)
+        if ledger_entry is None:
+            continue
+        for code in cast(list[str], entry_grade["finding_codes"]):
+            if not _entry_finding_context_valid(
+                ledger_entry, entry_grade["disposition"], code
+            ):
+                diagnostics.append(
+                    "GRADE_ENTRY_FINDING_CONTEXT_INVALID: "
+                    f"ledger_id={ledger_id} finding_code={code} "
+                    f"allowed_context={_entry_finding_allowed_context(code)}."
+                )
+    for score in cast(list[JsonObject], grade["narrative_scores"]):
+        for code in cast(list[str], score["finding_codes"]):
+            if not _narrative_finding_context_valid(score, code):
+                diagnostics.append(
+                    "GRADE_NARRATIVE_FINDING_CONTEXT_INVALID: "
+                    f"dimension={score['dimension']} finding_code={code} "
+                    f"allowed_context={_narrative_finding_allowed_context(code)}."
+                )
+    return diagnostics
+
+
+def validate_grade(sealed_ledger: JsonObject, value: object) -> tuple[JsonObject, list[str]]:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={
+                "request_fingerprint",
+                "anonymous_label",
+                "ledger_fingerprint",
+                "entry_grades",
+                "narrative_scores",
+            },
+            optional={"schema_version", "out_of_ledger_claims"},
+            location="candidate grade",
+        ),
+        {"schema_version": "1.3", "out_of_ledger_claims": []},
+    )
+    if result["schema_version"] != "1.3":
+        raise PortableEvaluationInputError("grade response schema version is unsupported")
+    _hash(result["request_fingerprint"], location="candidate grade.request_fingerprint")
+    _enum(
+        result["anonymous_label"], frozenset({"A", "B"}), location="candidate grade.anonymous_label"
+    )
+    _hash(result["ledger_fingerprint"], location="candidate grade.ledger_fingerprint")
+    entries = [
+        _validate_entry_grade(item, location=f"candidate grade.entry_grades[{index}]")
+        for index, item in enumerate(
+            _array(result["entry_grades"], location="candidate grade.entry_grades")
+        )
+    ]
+    claims = [
+        _validate_claim(item, location=f"candidate grade.out_of_ledger_claims[{index}]")
+        for index, item in enumerate(
+            _array(result["out_of_ledger_claims"], location="candidate grade.out_of_ledger_claims")
+        )
+    ]
+    narratives = [
+        _validate_narrative(item, location=f"candidate grade.narrative_scores[{index}]")
+        for index, item in enumerate(
+            _array(result["narrative_scores"], location="candidate grade.narrative_scores")
+        )
+    ]
+    result["entry_grades"] = entries
+    result["out_of_ledger_claims"] = claims
+    result["narrative_scores"] = narratives
+    ledger_entries = cast(list[JsonObject], cast(JsonObject, sealed_ledger["ledger"])["entries"])
+    ledger_by_id = {cast(str, entry["ledger_id"]): entry for entry in ledger_entries}
+    grade_ids = [cast(str, entry["ledger_id"]) for entry in entries]
+    issues: list[str] = []
+    if len(grade_ids) != len(set(grade_ids)):
+        issues.append("GRADE_DUPLICATE_LEDGER_ID")
+    if set(grade_ids) - set(ledger_by_id):
+        issues.append("GRADE_LEDGER_ENTRY_UNKNOWN")
+    if set(ledger_by_id) - set(grade_ids):
+        issues.append("GRADE_LEDGER_ENTRY_MISSING")
+    if result["ledger_fingerprint"] != sealed_ledger["ledger_fingerprint"]:
+        issues.append("GRADE_LEDGER_FINGERPRINT_MISMATCH")
+    for grade in entries:
+        disposition = grade["disposition"]
+        if disposition == "NOT_APPLICABLE":
+            issues.append("GRADE_NOT_APPLICABLE_UNSUPPORTED")
+        elif (
+            disposition in {"COMPLETE", "PARTIAL", "OVERSTATED", "CONTRADICTED", "UNSUPPORTED"}
+            and grade["report_location"] is None
+        ):
+            issues.append("GRADE_REPORT_LOCATION_MISSING")
+        elif disposition == "MISSING" and grade["report_location"] is not None:
+            issues.append("GRADE_REPORT_LOCATION_UNEXPECTED")
+        ledger = ledger_by_id.get(cast(str, grade["ledger_id"]))
+        codes = cast(list[str], grade["finding_codes"])
+        for code in codes:
+            if ledger is not None and not _entry_finding_context_valid(
+                ledger, disposition, code
+            ):
+                issues.append("GRADE_ENTRY_FINDING_CONTEXT_INVALID")
+    claim_ids = [cast(str, claim["claim_id"]) for claim in claims]
+    if len(claim_ids) != len(set(claim_ids)):
+        issues.append("GRADE_OUT_OF_LEDGER_DUPLICATE_ID")
+    identities: list[tuple[str, str, str, tuple[str, ...]]] = []
+    for claim in claims:
+        if not set(cast(list[str], claim["related_ledger_ids"])) <= set(ledger_by_id):
+            issues.append("GRADE_OUT_OF_LEDGER_RELATIONSHIP_UNKNOWN")
+        if claim["disposition"] in {"MISSING", "NOT_APPLICABLE"}:
+            issues.append("GRADE_OUT_OF_LEDGER_DISPOSITION_INVALID")
+        identities.append(_claim_identity(claim))
+    if len(identities) != len(set(identities)):
+        issues.append("GRADE_OUT_OF_LEDGER_CLAIM_AMBIGUOUS")
+    dimensions = [cast(str, score["dimension"]) for score in narratives]
+    if set(NARRATIVE_DIMENSIONS) - set(dimensions):
+        issues.append("GRADE_NARRATIVE_DIMENSION_MISSING")
+    if len(dimensions) != len(set(dimensions)):
+        issues.append("GRADE_NARRATIVE_DIMENSION_DUPLICATE")
+    for score in narratives:
+        for code in cast(list[str], score["finding_codes"]):
+            if not _narrative_finding_context_valid(score, code):
+                issues.append("GRADE_NARRATIVE_FINDING_CONTEXT_INVALID")
+    return result, list(dict.fromkeys(issues))
+
+
+def _claim_identity(claim: JsonObject) -> tuple[str, str, str, tuple[str, ...]]:
+    def normalize(value: object) -> str:
+        return " ".join(unicodedata.normalize("NFKC", cast(str, value)).casefold().split())
+
+    return (
+        normalize(claim["claim_text"]),
+        normalize(claim["report_location"]),
+        cast(str, claim["category"]),
+        tuple(sorted(cast(list[str], claim["related_ledger_ids"]))),
+    )
+
+
+def _alternative(
+    request_fingerprint: str, kind: str, value: JsonObject | None, subject_id: str | None = None
+) -> JsonObject:
+    result: JsonObject = {
+        "request_fingerprint": request_fingerprint,
+        "entry_grade": None,
+        "out_of_ledger_claim": None,
+        "narrative_score": None,
+        "absent_claim": False,
+    }
+    if value is None:
+        result["absent_claim"] = True
+    else:
+        snapshot = cast(JsonObject, _copy_json(value))
+        if kind == "out_of_ledger_claim" and subject_id is not None:
+            snapshot["claim_id"] = subject_id
+        result[kind] = snapshot
+    return result
+
+
+def _dispute(
+    grade: JsonObject,
+    kind: str,
+    subject: str,
+    materiality: str | None,
+    first: JsonObject,
+    second: JsonObject,
+) -> JsonObject:
+    token = {
+        "entry_grade": "entry",
+        "out_of_ledger_claim": "claim",
+        "narrative_score": "narrative",
+    }[kind]
+    rationale = {
+        "entry_grade": "The blind graders disagree on an outcome-relevant entry-grade field.",
+        "out_of_ledger_claim": (
+            "The blind graders disagree on claim presence or an outcome-relevant claim field."
+        ),
+        "narrative_score": "The blind graders assign different narrative scores.",
+    }[kind]
+    return {
+        "dispute_id": f"grade-{token}-{subject}",
+        "anonymous_label": grade["anonymous_label"],
+        "ledger_fingerprint": grade["ledger_fingerprint"],
+        "kind": kind,
+        "subject_id": subject,
+        "materiality": materiality,
+        "grader_1": first,
+        "grader_2": second,
+        "rationale": rationale,
+    }
+
+
+def material_disputes(
+    sealed: JsonObject, first_value: object, second_value: object
+) -> list[JsonObject]:
+    first, first_issues = validate_grade(sealed, first_value)
+    second, second_issues = validate_grade(sealed, second_value)
+    if first_issues or second_issues or first["anonymous_label"] != second["anonymous_label"]:
+        raise EvaluationInconclusiveError("invalid or mismatched blind grade pair")
+    disputes: list[JsonObject] = []
+    for record in _comparison_records(sealed, first, second):
+        dispute = cast(JsonObject | None, record["dispute"])
+        if dispute is not None:
+            disputes.append(dispute)
+    return disputes
+
+
+def _comparison_records(
+    sealed: JsonObject, first: JsonObject, second: JsonObject
+) -> list[JsonObject]:
+    records: list[JsonObject] = []
+    first_entries = {
+        item["ledger_id"]: item for item in cast(list[JsonObject], first["entry_grades"])
+    }
+    second_entries = {
+        item["ledger_id"]: item for item in cast(list[JsonObject], second["entry_grades"])
+    }
+    for ledger in cast(list[JsonObject], cast(JsonObject, sealed["ledger"])["entries"]):
+        subject = cast(str, ledger["ledger_id"])
+        a = _alternative(
+            cast(str, first["request_fingerprint"]), "entry_grade", first_entries[subject]
+        )
+        b = _alternative(
+            cast(str, second["request_fingerprint"]), "entry_grade", second_entries[subject]
+        )
+        ga = cast(JsonObject, a["entry_grade"])
+        gb = cast(JsonObject, b["entry_grade"])
+        different = (ga["disposition"], ga["finding_codes"]) != (
+            gb["disposition"],
+            gb["finding_codes"],
+        )
+        records.append(
+            {
+                "kind": "entry_grade",
+                "subject_id": subject,
+                "grader_1": a,
+                "grader_2": b,
+                "dispute": _dispute(
+                    first, "entry_grade", subject, cast(str, ledger["materiality"]), a, b
+                )
+                if different
+                else None,
+            }
+        )
+    claims_a = {
+        _claim_identity(item): item
+        for item in cast(list[JsonObject], first["out_of_ledger_claims"])
+    }
+    claims_b = {
+        _claim_identity(item): item
+        for item in cast(list[JsonObject], second["out_of_ledger_claims"])
+    }
+    for index, identity in enumerate(sorted(set(claims_a) | set(claims_b)), start=1):
+        subject = f"matched-claim-{index:04d}"
+        ca, cb = claims_a.get(identity), claims_b.get(identity)
+        a = _alternative(
+            cast(str, first["request_fingerprint"]), "out_of_ledger_claim", ca, subject
+        )
+        b = _alternative(
+            cast(str, second["request_fingerprint"]), "out_of_ledger_claim", cb, subject
+        )
+        different = (
+            ca is None
+            or cb is None
+            or (ca["disposition"], ca["materiality"]) != (cb["disposition"], cb["materiality"])
+        )
+        present = [item for item in (ca, cb) if item is not None]
+        materiality = max(
+            (cast(str, item["materiality"]) for item in present),
+            key={"supporting": 0, "material": 1, "critical": 2}.__getitem__,
+        )
+        records.append(
+            {
+                "kind": "out_of_ledger_claim",
+                "subject_id": subject,
+                "grader_1": a,
+                "grader_2": b,
+                "dispute": _dispute(first, "out_of_ledger_claim", subject, materiality, a, b)
+                if different
+                else None,
+            }
+        )
+    scores_a = {
+        item["dimension"]: item for item in cast(list[JsonObject], first["narrative_scores"])
+    }
+    scores_b = {
+        item["dimension"]: item for item in cast(list[JsonObject], second["narrative_scores"])
+    }
+    for dimension in NARRATIVE_DIMENSIONS:
+        a = _alternative(
+            cast(str, first["request_fingerprint"]), "narrative_score", scores_a[dimension]
+        )
+        b = _alternative(
+            cast(str, second["request_fingerprint"]), "narrative_score", scores_b[dimension]
+        )
+        ga, gb = cast(JsonObject, a["narrative_score"]), cast(JsonObject, b["narrative_score"])
+        different = (ga["score"], ga["finding_codes"]) != (gb["score"], gb["finding_codes"])
+        records.append(
+            {
+                "kind": "narrative_score",
+                "subject_id": dimension,
+                "grader_1": a,
+                "grader_2": b,
+                "dispute": _dispute(first, "narrative_score", dimension, None, a, b)
+                if different
+                else None,
+            }
+        )
+    return records
+
+
+def resolve_grades(
+    sealed: JsonObject,
+    first_value: object,
+    second_value: object,
+    referee_values: Sequence[object] = (),
+) -> JsonObject:
+    first, first_issues = validate_grade(sealed, first_value)
+    second, second_issues = validate_grade(sealed, second_value)
+    if first_issues or second_issues or first["anonymous_label"] != second["anonymous_label"]:
+        raise EvaluationInconclusiveError("invalid or mismatched blind grade pair")
+    records = _comparison_records(sealed, first, second)
+    decisions = [validate_referee_decision(value) for value in referee_values]
+    by_id = {decision["dispute_id"]: decision for decision in decisions}
+    disputes = {
+        cast(JsonObject, record["dispute"])["dispute_id"]: cast(JsonObject, record["dispute"])
+        for record in records
+        if record["dispute"] is not None
+    }
+    if len(by_id) != len(decisions) or set(by_id) != set(disputes):
+        raise EvaluationInconclusiveError("material grade disputes require exact referee decisions")
+    entries: list[JsonObject] = []
+    claims: list[JsonObject] = []
+    narratives: list[JsonObject] = []
+    audit: list[JsonObject] = []
+    ordered_decisions: list[JsonObject] = []
+    for record in records:
+        dispute = cast(JsonObject | None, record["dispute"])
+        decision = None if dispute is None else by_id[dispute["dispute_id"]]
+        if decision is None:
+            selected = cast(JsonObject, record["grader_1"])
+        else:
+            assert dispute is not None
+            if (
+                decision["selected_disposition"] is not None
+                or decision["selected_ledger_resolution"] is not None
+                or decision["replacement_entries"]
+            ):
+                raise EvaluationInconclusiveError(
+                    "grade referee cannot use a legacy resolution domain"
+                )
+            if decision["source_ids"]:
+                raise EvaluationInconclusiveError(
+                    "grade referee may use only the supplied dispute"
+                )
+            if decision["grade_dispute_fingerprint"] != _model_fingerprint(dispute):
+                raise EvaluationInconclusiveError("grade referee dispute fingerprint mismatch")
+            selection = decision["selected_grade_resolution"]
+            if selection == "accept_grader_1":
+                selected = cast(JsonObject, record["grader_1"])
+            elif selection == "accept_grader_2":
+                selected = cast(JsonObject, record["grader_2"])
+            elif selection == "replace":
+                selected = cast(JsonObject, decision["replacement_grade_alternative"])
+                _validate_grade_replacement(sealed, record, selected)
+            else:
+                raise EvaluationInconclusiveError("grade referee did not select a resolution")
+            ordered_decisions.append(decision)
+        if selected["entry_grade"] is not None:
+            entries.append(cast(JsonObject, selected["entry_grade"]))
+        elif selected["out_of_ledger_claim"] is not None:
+            claims.append(cast(JsonObject, selected["out_of_ledger_claim"]))
+        elif selected["narrative_score"] is not None:
+            narratives.append(cast(JsonObject, selected["narrative_score"]))
+        audit.append(
+            {
+                "kind": record["kind"],
+                "subject_id": record["subject_id"],
+                "grader_1": record["grader_1"],
+                "grader_2": record["grader_2"],
+                "selected": selected,
+                "dispute": dispute,
+                "referee": decision,
+            }
+        )
+    grade: JsonObject = {
+        "schema_version": "1.3",
+        "request_fingerprint": first["request_fingerprint"],
+        "anonymous_label": first["anonymous_label"],
+        "ledger_fingerprint": first["ledger_fingerprint"],
+        "entry_grades": entries,
+        "out_of_ledger_claims": claims,
+        "narrative_scores": narratives,
+    }
+    payload: JsonObject = {
+        "grade": grade,
+        "audit": audit,
+        "original_grader_1": first,
+        "original_grader_2": second,
+        "referee_decisions": ordered_decisions,
+    }
+    payload["resolution_fingerprint"] = _sha256(canonical_json_bytes(payload))
+    return payload
+
+
+def _validate_grade_replacement(
+    sealed: JsonObject,
+    record: JsonObject,
+    replacement: JsonObject,
+) -> None:
+    """Keep portable referee replacements inside the exact disputed domain."""
+    kind = cast(str, record["kind"])
+    subject_id = cast(str, record["subject_id"])
+    dispute = cast(JsonObject, record["dispute"])
+    if kind == "entry_grade":
+        entry_value = cast(JsonObject | None, replacement["entry_grade"])
+        if entry_value is None:
+            raise EvaluationInconclusiveError(
+                "replacement kind does not match entry-grade dispute"
+            )
+        if entry_value["ledger_id"] != subject_id:
+            raise EvaluationInconclusiveError("replacement entry subject mismatch")
+        ledger_materiality = next(
+            cast(str, entry["materiality"])
+            for entry in cast(list[JsonObject], cast(JsonObject, sealed["ledger"])["entries"])
+            if entry["ledger_id"] == subject_id
+        )
+        if dispute["materiality"] != ledger_materiality:
+            raise EvaluationInconclusiveError(
+                "entry dispute understates ledger materiality"
+            )
+        return
+    if kind == "narrative_score":
+        narrative_value = cast(JsonObject | None, replacement["narrative_score"])
+        if narrative_value is None:
+            raise EvaluationInconclusiveError(
+                "replacement kind does not match narrative dispute"
+            )
+        if narrative_value["dimension"] != subject_id:
+            raise EvaluationInconclusiveError("replacement narrative subject mismatch")
+        return
+    if replacement["absent_claim"]:
+        return
+    claim_value = cast(JsonObject | None, replacement["out_of_ledger_claim"])
+    if claim_value is None:
+        raise EvaluationInconclusiveError(
+            "replacement kind does not match claim dispute"
+        )
+    if claim_value["claim_id"] != subject_id:
+        raise EvaluationInconclusiveError("replacement claim subject mismatch")
+    original_claims = [
+        cast(JsonObject, alternative["out_of_ledger_claim"])
+        for alternative in (
+            cast(JsonObject, record["grader_1"]),
+            cast(JsonObject, record["grader_2"]),
+        )
+        if alternative["out_of_ledger_claim"] is not None
+    ]
+    if not original_claims or _claim_identity(claim_value) != _claim_identity(
+        original_claims[0]
+    ):
+        raise EvaluationInconclusiveError("replacement claim identity mismatch")
+    materiality_rank = {"supporting": 0, "material": 1, "critical": 2}
+    record_materiality = cast(str, dispute["materiality"])
+    claim_materiality = cast(str, claim_value["materiality"])
+    if materiality_rank[claim_materiality] < materiality_rank[record_materiality]:
+        raise EvaluationInconclusiveError(
+            "replacement claim cannot understate materiality"
+        )
+
+
+_CREDIT = {
+    "COMPLETE": 1.0,
+    "PARTIAL": 0.5,
+    "MISSING": 0.0,
+    "OVERSTATED": 0.0,
+    "CONTRADICTED": 0.0,
+    "UNSUPPORTED": 0.0,
+    "NOT_APPLICABLE": 0.0,
+}
+_SAFETY_CATEGORY = {
+    "status": "STATUS",
+    "requirement": "OBLIGATION",
+    "prohibition": "OBLIGATION",
+    "deadline": "DEADLINE",
+    "enforcement": "ENFORCEMENT",
+    "remedy": "REMEDY",
+    "penalty": "PENALTY",
+}
+
+
+def _validate_deterministic_checks(value: object) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={"anonymous_label", "valid"},
+            optional={"critical_codes", "issues"},
+            location="deterministic checks",
+        ),
+        {"critical_codes": [], "issues": []},
+    )
+    _enum(
+        result["anonymous_label"],
+        frozenset({"A", "B"}),
+        location="deterministic checks.anonymous_label",
+    )
+    _strict_bool(result["valid"], location="deterministic checks.valid")
+    _string_list(
+        result["critical_codes"],
+        location="deterministic checks.critical_codes",
+        identifiers=True,
+        unique=True,
+    )
+    result["issues"] = [
+        _validate_issue(item, location=f"deterministic checks.issues[{index}]")
+        for index, item in enumerate(
+            _array(result["issues"], location="deterministic checks.issues")
+        )
+    ]
+    return result
+
+
+def _derive_deterministic_checks(candidate: JsonObject, label: str) -> JsonObject:
+    if candidate["bundle_json"] is None:
+        issues: list[JsonObject] = [
+            {
+                "code": "NATIVE_BUNDLE_CONTROLS_UNAVAILABLE",
+                "severity": "warning",
+                "message": (
+                    "No native Regulatory Harvest bundle controls were supplied; "
+                    "the report remains subject to source-ledger grading."
+                ),
+                "related_ids": [],
+            }
+        ]
+    else:
+        # The portable substrate cannot truthfully replay Pydantic-native bundle
+        # controls. A supplied native bundle therefore fails closed.
+        issues = [
+            {
+                "code": "NATIVE_BUNDLE_MALFORMED",
+                "severity": "error",
+                "message": (
+                    "The supplied native Regulatory Harvest bundle does not satisfy "
+                    "the public bundle contract."
+                ),
+                "related_ids": [],
+            }
+        ]
+    critical = list(
+        dict.fromkeys(cast(str, issue["code"]) for issue in issues if issue["severity"] == "error")
+    )
+    return {
+        "anonymous_label": label,
+        "valid": not critical,
+        "critical_codes": critical,
+        "issues": issues,
+}
+
+
+def _validate_scoring_source_record(value: object) -> JsonObject:
+    result = _shape(
+        _copy_json(value),
+        required={
+            "schema_version",
+            "mode",
+            "question",
+            "jurisdiction",
+            "as_of",
+            "requested_authorities",
+            "sources",
+            "source_record_fingerprint",
+        },
+        location="scoring source record",
+    )
+    if result["schema_version"] not in {"1.0", "1.1"}:
+        raise PortableEvaluationInputError("scoring source record schema is unsupported")
+    _enum(result["mode"], EVALUATION_MODES, location="scoring source record.mode")
+    for field in ("question", "jurisdiction"):
+        _string(result[field], location=f"scoring source record.{field}", nonblank=True)
+    try:
+        date.fromisoformat(_string(result["as_of"], location="scoring source record.as_of"))
+    except ValueError as error:
+        raise PortableEvaluationInputError(
+            "scoring source record.as_of must be an ISO date"
+        ) from error
+    authorities = [
+        _validate_requested_authority(
+            item,
+            location=f"scoring source record.requested_authorities[{index}]",
+        )
+        for index, item in enumerate(
+            _array(
+                result["requested_authorities"],
+                location="scoring source record.requested_authorities",
+            )
+        )
+    ]
+    sources = [
+        _validate_source(item, location=f"scoring source record.sources[{index}]")
+        for index, item in enumerate(
+            _array(result["sources"], location="scoring source record.sources")
+        )
+    ]
+    if not authorities or not sources:
+        raise PortableEvaluationInputError(
+            "scoring source record must retain authorities and sources"
+        )
+    source_ids = [cast(str, source["source_id"]) for source in sources]
+    authority_ids = [cast(str, authority["authority_id"]) for authority in authorities]
+    if len(source_ids) != len(set(source_ids)) or len(authority_ids) != len(
+        set(authority_ids)
+    ):
+        raise PortableEvaluationInputError("scoring source identifiers must be unique")
+    if any(
+        not set(cast(list[str], authority["source_ids"])) <= set(source_ids)
+        for authority in authorities
+    ):
+        raise PortableEvaluationInputError("scoring authorities identify unknown sources")
+    result["requested_authorities"] = authorities
+    result["sources"] = sources
+    projection = {
+        key: item
+        for key, item in result.items()
+        if key != "source_record_fingerprint"
+    }
+    if result["source_record_fingerprint"] != _sha256(canonical_json_bytes(projection)):
+        raise PortableEvaluationInputError("scoring source record fingerprint is invalid")
+    return result
+
+
+def _validate_scoring_source_binding(
+    sealed: JsonObject,
+    grade: JsonObject,
+    source_record: JsonObject,
+) -> None:
+    fingerprint = source_record["source_record_fingerprint"]
+    ledger = _object(sealed.get("ledger"), location="sealed ledger.ledger")
+    if ledger.get("case_fingerprint") != fingerprint:
+        raise EvaluationInconclusiveError(
+            "sealed ledger does not bind the scoring source record"
+        )
+    sources = {
+        cast(str, source["source_id"]): cast(str, source["normalized_text"])
+        for source in cast(list[JsonObject], source_record["sources"])
+    }
+    for claim in cast(list[JsonObject], grade["out_of_ledger_claims"]):
+        if claim["source_record_fingerprint"] != fingerprint:
+            raise EvaluationInconclusiveError(
+                "out-of-ledger claim does not bind the scoring source record"
+            )
+        for span in cast(list[JsonObject], claim["evidence_spans"]):
+            text = sources.get(cast(str, span["source_id"]))
+            if text is None:
+                raise EvaluationInconclusiveError(
+                    "exact source span identifies an unknown source"
+                )
+            start = cast(int, span["start_char"])
+            end = cast(int, span["end_char"])
+            if end > len(text) or text[start:end] != span["quote"]:
+                raise EvaluationInconclusiveError(
+                    "out-of-ledger evidence is not an exact source span"
+                )
+
+
+def score_report(
+    sealed: JsonObject,
+    resolved: JsonObject,
+    checks_value: object,
+    *,
+    source_record: object,
+) -> JsonObject:
+    checks = _validate_deterministic_checks(checks_value)
+    grade = _object(resolved.get("grade"), location="resolved grade.grade")
+    _, issues = validate_grade(sealed, grade)
+    if issues:
+        raise EvaluationInconclusiveError("invalid resolved grade")
+    expected_resolution_payload = {
+        "grade": grade,
+        "audit": resolved.get("audit"),
+        "original_grader_1": resolved.get("original_grader_1"),
+        "original_grader_2": resolved.get("original_grader_2"),
+        "referee_decisions": resolved.get("referee_decisions"),
+    }
+    if resolved.get("resolution_fingerprint") != _sha256(
+        canonical_json_bytes(expected_resolution_payload)
+    ):
+        raise EvaluationInconclusiveError("resolved grade fingerprint mismatch")
+    if grade["anonymous_label"] != checks["anonymous_label"]:
+        raise EvaluationInconclusiveError("grade and checks anonymous labels differ")
+    try:
+        source_record_snapshot = _validate_scoring_source_record(source_record)
+    except PortableEvaluationInputError as error:
+        raise EvaluationInconclusiveError("malformed scoring source record") from error
+    _validate_scoring_source_binding(sealed, grade, source_record_snapshot)
+    entries_by_id = {
+        entry["ledger_id"]: entry for entry in cast(list[JsonObject], grade["entry_grades"])
+    }
+    recall_denominator = 0
+    recall_numerator = 0.0
+    critical_credits: list[float] = []
+    weights = cast(dict[str, int], RUBRIC_V1["materiality_weights"])
+    ledger_entries = cast(list[JsonObject], cast(JsonObject, sealed["ledger"])["entries"])
+    for ledger in ledger_entries:
+        weight = weights[cast(str, ledger["materiality"])]
+        credit = _CREDIT[cast(str, entries_by_id[ledger["ledger_id"]]["disposition"])]
+        recall_denominator += weight
+        recall_numerator += weight * credit
+        if ledger["materiality"] == "critical":
+            critical_credits.append(credit)
+    weighted_recall = recall_numerator / recall_denominator if recall_denominator else 1.0
+    critical_recall = sum(critical_credits) / len(critical_credits) if critical_credits else 1.0
+    precision_denominator = 0
+    precision_numerator = 0.0
+    for claim in cast(list[JsonObject], grade["out_of_ledger_claims"]):
+        weight = weights[cast(str, claim["materiality"])]
+        precision_denominator += weight
+        precision_numerator += weight * _CREDIT[cast(str, claim["disposition"])]
+    claim_precision = precision_numerator / precision_denominator if precision_denominator else 1.0
+    narrative_values = [
+        cast(int, item["score"]) for item in cast(list[JsonObject], grade["narrative_scores"])
+    ]
+    walk_average = sum(narrative_values) / len(narrative_values)
+    walk_minimum = min(narrative_values)
+    comparison_weights = cast(dict[str, float], RUBRIC_V1["comparison_weights"])
+    normalized_score = 100.0 * (
+        comparison_weights["recall"] * weighted_recall
+        + comparison_weights["precision"] * claim_precision
+        + comparison_weights["walk"] * (walk_average / 4.0)
+    )
+    blocking: list[str] = []
+    critical_defect = False
+    if checks["valid"] is not True:
+        blocking.append("DETERMINISTIC_CHECKS_INVALID")
+        critical_defect = True
+    for code in cast(list[str], checks["critical_codes"]):
+        blocking.append(code)
+        critical_defect = True
+    for issue in cast(list[JsonObject], checks["issues"]):
+        if issue["severity"] == "error":
+            blocking.append(cast(str, issue["code"]))
+    if critical_recall < 1.0:
+        blocking.append("CRITICAL_RECALL_BELOW_FLOOR")
+        critical_defect = True
+    if weighted_recall < 0.90:
+        blocking.append("WEIGHTED_RECALL_BELOW_FLOOR")
+    if claim_precision < 0.95:
+        blocking.append("CLAIM_PRECISION_BELOW_FLOOR")
+    if walk_average < 3.0:
+        blocking.append("WALK_AVERAGE_BELOW_FLOOR")
+    if any(score < 2 for score in narrative_values):
+        blocking.append("WALK_DIMENSION_BELOW_FLOOR")
+    for grade_entry in cast(list[JsonObject], grade["entry_grades"]):
+        ledger = next(
+            item for item in ledger_entries if item["ledger_id"] == grade_entry["ledger_id"]
+        )
+        safety_code = _legal_safety_code(
+            cast(str, grade_entry["disposition"]),
+            cast(str, ledger["category"]),
+            cast(str, ledger["materiality"]),
+        )
+        if safety_code:
+            blocking.append(safety_code)
+            critical_defect = True
+    for claim in cast(list[JsonObject], grade["out_of_ledger_claims"]):
+        safety_code = _legal_safety_code(
+            cast(str, claim["disposition"]),
+            cast(str, claim["category"]),
+            cast(str, claim["materiality"]),
+        )
+        if safety_code:
+            blocking.append(safety_code)
+            critical_defect = True
+    blocking = list(dict.fromkeys(blocking))
+    issue_codes = list(
+        dict.fromkeys(
+            [
+                code
+                for entry in cast(list[JsonObject], grade["entry_grades"])
+                for code in cast(list[str], entry["finding_codes"])
+            ]
+            + [
+                code
+                for item in cast(list[JsonObject], grade["narrative_scores"])
+                for code in cast(list[str], item["finding_codes"])
+            ]
+        )
+    )
+    score: JsonObject = {
+        "schema_version": "1.3",
+        "anonymous_label": grade["anonymous_label"],
+        "absolute_disposition": "PASS" if not blocking else "FAIL",
+        "critical_recall": critical_recall,
+        "weighted_recall": weighted_recall,
+        "claim_precision": claim_precision,
+        "walk_average": walk_average,
+        "walk_minimum": walk_minimum,
+        "normalized_score": normalized_score,
+        "critical_defect": critical_defect,
+        "issue_codes": issue_codes,
+        "blocking_codes": blocking,
+        "ledger_fingerprint": sealed["ledger_fingerprint"],
+        "resolved_grade_fingerprint": resolved["resolution_fingerprint"],
+        "deterministic_checks_fingerprint": _model_fingerprint(checks),
+        "rubric_fingerprint": _model_fingerprint(RUBRIC_V1),
+    }
+    score["score_fingerprint"] = _sha256(canonical_json_bytes(score))
+    return score
+
+
+def _legal_safety_code(disposition: str, category: str, materiality: str) -> str | None:
+    if (
+        disposition not in {"UNSUPPORTED", "OVERSTATED", "CONTRADICTED"}
+        or materiality == "supporting"
+    ):
+        return None
+    token = _SAFETY_CATEGORY.get(category)
+    if token is None:
+        if materiality != "critical":
+            return None
+        token = "LEGAL_CLAIM"
+    return f"{disposition}_{materiality.upper()}_{token}"
+
+
+def _replayed_comparison_report(
+    report_value: object,
+    score_inputs_value: object,
+    *,
+    location: str,
+) -> tuple[JsonObject, JsonObject, JsonObject]:
+    try:
+        report = _validate_report_evaluation(report_value, location=location)
+        _require_score_input_schemas(score_inputs_value, location=f"{location} inputs")
+        score_inputs = _shape(
+            _copy_json(score_inputs_value),
+            required={
+                "schema_version",
+                "anonymous_label",
+                "sealed_ledger",
+                "resolved_grade",
+                "deterministic_checks",
+                "rubric",
+                "source_record",
+            },
+            location=f"{location} inputs",
+        )
+        if score_inputs["schema_version"] != SCORE_INPUT_SCHEMA_VERSION:
+            raise EvaluationInconclusiveError(
+                f"{location} inputs use an unsupported score-input schema"
+            )
+        label = _enum(
+            score_inputs["anonymous_label"],
+            frozenset({"A", "B"}),
+            location=f"{location} inputs.anonymous_label",
+        )
+        if score_inputs["rubric"] != RUBRIC_V1:
+            raise EvaluationInconclusiveError(
+                f"{location} inputs do not retain the canonical rubric"
+            )
+        sealed = _shape(
+            score_inputs["sealed_ledger"],
+            required={"ledger", "audit_fingerprint", "ledger_fingerprint"},
+            location=f"{location} inputs.sealed_ledger",
+        )
+        _hash(
+            sealed["audit_fingerprint"],
+            location=f"{location} inputs.sealed_ledger.audit_fingerprint",
+        )
+        _hash(
+            sealed["ledger_fingerprint"],
+            location=f"{location} inputs.sealed_ledger.ledger_fingerprint",
+        )
+        resolved_artifact = _shape(
+            score_inputs["resolved_grade"],
+            required={
+                "schema_version",
+                "grade",
+                "audit",
+                "resolution_fingerprint",
+                "original_grader_1",
+                "original_grader_2",
+                "referee_decisions",
+            },
+            location=f"{location} inputs.resolved_grade",
+        )
+        _require_resolved_grade_schemas(
+            resolved_artifact,
+            location=f"{location} inputs.resolved_grade",
+        )
+        decisions = _array(
+            resolved_artifact["referee_decisions"],
+            location=f"{location} inputs.resolved_grade.referee_decisions",
+        )
+        replayed_resolution = resolve_grades(
+            sealed,
+            resolved_artifact["original_grader_1"],
+            resolved_artifact["original_grader_2"],
+            decisions,
+        )
+        expected_resolved: JsonObject = {
+            "schema_version": EVALUATION_ARTIFACT_SCHEMA_VERSION,
+            **replayed_resolution,
+        }
+        if resolved_artifact != expected_resolved:
+            raise EvaluationInconclusiveError(
+                f"{location} inputs do not retain the exact resolved-grade replay"
+            )
+        checks = _validate_deterministic_checks(score_inputs["deterministic_checks"])
+        if checks["anonymous_label"] != label:
+            raise EvaluationInconclusiveError(
+                f"{location} inputs do not bind one anonymous label"
+            )
+        source_record = _validate_scoring_source_record(score_inputs["source_record"])
+        replayed = score_report(
+            sealed,
+            replayed_resolution,
+            checks,
+            source_record=source_record,
+        )
+    except PortableEvaluationInputError as error:
+        raise EvaluationInconclusiveError(f"malformed {location} score inputs") from error
+    if report != replayed:
+        raise EvaluationInconclusiveError(
+            f"{location} report does not match replayed score inputs"
+        )
+    return replayed, sealed, source_record
+
+
+def compare_reports(
+    candidate: JsonObject,
+    comparator: JsonObject,
+    *,
+    candidate_inputs: object,
+    comparator_inputs: object,
+) -> JsonObject:
+    candidate_report, candidate_sealed, candidate_source_record = (
+        _replayed_comparison_report(
+            candidate,
+            candidate_inputs,
+            location="candidate",
+        )
+    )
+    comparator_report, comparator_sealed, comparator_source_record = (
+        _replayed_comparison_report(
+            comparator,
+            comparator_inputs,
+            location="comparator",
+        )
+    )
+    if candidate_report["anonymous_label"] == comparator_report["anonymous_label"]:
+        raise EvaluationInconclusiveError("reports must have distinct anonymous labels")
+    if candidate_report["ledger_fingerprint"] != comparator_report["ledger_fingerprint"]:
+        raise EvaluationInconclusiveError("reports must bind the same ledger")
+    if candidate_sealed != comparator_sealed:
+        raise EvaluationInconclusiveError(
+            "reports must use the same strict sealed ledger"
+        )
+    if candidate_source_record != comparator_source_record:
+        raise EvaluationInconclusiveError(
+            "reports must use the same common source record"
+        )
+    candidate_unsafe = candidate_report["absolute_disposition"] == "FAIL"
+    comparator_unsafe = comparator_report["absolute_disposition"] == "FAIL"
+    if candidate_unsafe and comparator_unsafe:
+        return {
+            "disposition": "NEITHER",
+            "winner_label": None,
+            "score_difference": None,
+            "rationale_codes": ["BOTH_REPORTS_UNSAFE"],
+        }
+    if candidate_unsafe:
+        return {
+            "disposition": "COMPARATOR_WIN",
+            "winner_label": comparator_report["anonymous_label"],
+            "score_difference": None,
+            "rationale_codes": ["CANDIDATE_UNSAFE"],
+        }
+    if comparator_unsafe:
+        return {
+            "disposition": "REGULATORY_HARVEST_WIN",
+            "winner_label": candidate_report["anonymous_label"],
+            "score_difference": None,
+            "rationale_codes": ["COMPARATOR_UNSAFE"],
+        }
+    difference = abs(
+        cast(float, candidate_report["normalized_score"])
+        - cast(float, comparator_report["normalized_score"])
+    )
+    if difference < 5.0:
+        return {
+            "disposition": "TIE",
+            "winner_label": None,
+            "score_difference": difference,
+            "rationale_codes": ["COMPARISON_MARGIN_NOT_MET"],
+        }
+    if cast(float, candidate_report["normalized_score"]) > cast(
+        float, comparator_report["normalized_score"]
+    ):
+        disposition = "REGULATORY_HARVEST_WIN"
+        winner = candidate_report["anonymous_label"]
+    else:
+        disposition = "COMPARATOR_WIN"
+        winner = comparator_report["anonymous_label"]
+    return {
+        "disposition": disposition,
+        "winner_label": winner,
+        "score_difference": difference,
+        "rationale_codes": ["COMPARISON_MARGIN_MET"],
+    }
+
+
+def _derive_requirement_matrix(
+    sealed: JsonObject,
+    resolved_by_label: Mapping[str, JsonObject],
+) -> JsonObject:
+    if set(resolved_by_label) not in ({"A"}, {"A", "B"}):
+        raise EvaluationIntegrityError("requirement matrix has invalid report labels")
+    grades: dict[str, dict[str, JsonObject]] = {}
+    for label, resolved in resolved_by_label.items():
+        grade = cast(JsonObject, resolved["grade"])
+        if grade["anonymous_label"] != label:
+            raise EvaluationIntegrityError("requirement matrix report label mismatch")
+        grades[label] = {
+            cast(str, item["ledger_id"]): item
+            for item in cast(list[JsonObject], grade["entry_grades"])
+        }
+
+    def report_finding(label: str, ledger_id: str) -> JsonObject:
+        try:
+            grade = grades[label][ledger_id]
+        except KeyError as error:
+            raise EvaluationIntegrityError(
+                "requirement matrix is missing a resolved ledger grade"
+            ) from error
+        return {
+            "anonymous_label": label,
+            "disposition": grade["disposition"],
+            "report_location": grade["report_location"],
+            "finding_codes": cast(list[JsonValue], _copy_json(grade["finding_codes"])),
+            "rationale": grade["rationale"],
+        }
+
+    entries = cast(list[JsonObject], cast(JsonObject, sealed["ledger"])["entries"])
+    rows: list[JsonObject] = []
+    for entry in sorted(entries, key=lambda item: (item["walk_order"], item["ledger_id"])):
+        ledger_id = cast(str, entry["ledger_id"])
+        citations = [
+            {
+                "source_id": citation["source_id"],
+                "start_char": citation["start_char"],
+                "end_char": citation["end_char"],
+            }
+            for citation in cast(list[JsonObject], entry["citations"])
+        ]
+        rows.append(
+            {
+                "ledger_id": ledger_id,
+                "walk_order": entry["walk_order"],
+                "category": entry["category"],
+                "materiality": entry["materiality"],
+                "proposition": entry["proposition"],
+                "citations": citations,
+                "report_a": report_finding("A", ledger_id),
+                "report_b": report_finding("B", ledger_id) if "B" in grades else None,
+            }
+        )
+    return {"available": True, "unavailable_reason": None, "rows": rows}
+
+
+def _evaluation_result(
+    readiness: JsonObject,
+    reports: list[JsonObject],
+    requirement_matrix: JsonObject,
+    comparison: JsonObject | None,
+    judge_isolation: str,
+) -> JsonObject:
+    result: JsonObject = {
+        "schema_version": "1.3",
+        "rubric": cast(JsonObject, _copy_json(RUBRIC_V1)),
+        "readiness": cast(JsonObject, _copy_json(readiness)),
+        "reports": cast(list[JsonValue], _copy_json(reports)),
+        "requirement_matrix": cast(JsonObject, _copy_json(requirement_matrix)),
+        "comparison": cast(JsonObject | None, _copy_json(comparison)),
+        "judge_isolation": judge_isolation,
+        "result_fingerprint": "0" * 64,
+    }
+    result["result_fingerprint"] = _model_fingerprint(result, exclude={"result_fingerprint"})
+    return result
+
+
+def _validate_evaluation_rubric(value: object) -> JsonObject:
+    location = "AttorneyEvaluationResult.rubric"
+    result = _shape(
+        value,
+        required={
+            "version",
+            "materiality_weights",
+            "critical_recall_floor",
+            "weighted_recall_floor",
+            "claim_precision_floor",
+            "walk_average_floor",
+            "walk_dimension_floor",
+            "comparison_weights",
+            "comparison_margin",
+        },
+        location=location,
+    )
+    if result["version"] != "attorney-eval-v1":
+        raise PortableEvaluationInputError(f"{location}.version is unsupported")
+    materiality_weights = _shape(
+        result["materiality_weights"],
+        required={"critical", "material", "supporting"},
+        location=f"{location}.materiality_weights",
+    )
+    for key, weight in materiality_weights.items():
+        _strict_int(weight, location=f"{location}.materiality_weights.{key}")
+    for field in (
+        "critical_recall_floor",
+        "weighted_recall_floor",
+        "claim_precision_floor",
+        "walk_average_floor",
+        "comparison_margin",
+    ):
+        _strict_float(result[field], location=f"{location}.{field}")
+    _strict_int(
+        result["walk_dimension_floor"],
+        location=f"{location}.walk_dimension_floor",
+    )
+    comparison_weights = _shape(
+        result["comparison_weights"],
+        required={"recall", "precision", "walk"},
+        location=f"{location}.comparison_weights",
+    )
+    for key, weight in comparison_weights.items():
+        _strict_float(weight, location=f"{location}.comparison_weights.{key}")
+    if result != RUBRIC_V1:
+        raise PortableEvaluationInputError("evaluation result must use the canonical rubric")
+    return result
+
+
+def _validate_report_evaluation(value: object, *, location: str) -> JsonObject:
+    _require_artifact_schema(value, location=location)
+    result = _shape(
+        value,
+        required={
+            "schema_version",
+            "anonymous_label",
+            "absolute_disposition",
+            "critical_recall",
+            "weighted_recall",
+            "claim_precision",
+            "walk_average",
+            "walk_minimum",
+            "normalized_score",
+            "critical_defect",
+            "issue_codes",
+            "blocking_codes",
+            "ledger_fingerprint",
+            "resolved_grade_fingerprint",
+            "deterministic_checks_fingerprint",
+            "rubric_fingerprint",
+            "score_fingerprint",
+        },
+        location=location,
+    )
+    _enum(result["anonymous_label"], frozenset({"A", "B"}), location=f"{location}.label")
+    _enum(
+        result["absolute_disposition"],
+        frozenset({"PASS", "FAIL"}),
+        location=f"{location}.disposition",
+    )
+    for field in ("critical_recall", "weighted_recall", "claim_precision"):
+        score = _strict_float(result[field], location=f"{location}.{field}")
+        if not 0.0 <= score <= 1.0:
+            raise PortableEvaluationInputError(f"{location}.{field} is outside its range")
+    walk_average = _strict_float(result["walk_average"], location=f"{location}.walk_average")
+    normalized_score = _strict_float(
+        result["normalized_score"], location=f"{location}.normalized_score"
+    )
+    if not 1.0 <= walk_average <= 4.0 or not 0.0 <= normalized_score <= 100.0:
+        raise PortableEvaluationInputError(f"{location} contains an out-of-range score")
+    _strict_int(result["walk_minimum"], location=f"{location}.walk_minimum", minimum=1, maximum=4)
+    _strict_bool(result["critical_defect"], location=f"{location}.critical_defect")
+    for field in ("issue_codes", "blocking_codes"):
+        _string_list(
+            result[field],
+            location=f"{location}.{field}",
+            identifiers=True,
+            unique=True,
+        )
+    for field in (
+        "ledger_fingerprint",
+        "resolved_grade_fingerprint",
+        "deterministic_checks_fingerprint",
+        "rubric_fingerprint",
+        "score_fingerprint",
+    ):
+        _hash(result[field], location=f"{location}.{field}")
+    if result["score_fingerprint"] != _model_fingerprint(
+        result, exclude={"score_fingerprint"}
+    ):
+        raise PortableEvaluationInputError(f"{location} score fingerprint is invalid")
+    return result
+
+
+def _validate_comparison_evaluation(value: object) -> JsonObject | None:
+    if value is None:
+        return None
+    location = "AttorneyEvaluationResult.comparison"
+    result = _shape(
+        value,
+        required={
+            "disposition",
+            "winner_label",
+            "score_difference",
+            "rationale_codes",
+        },
+        location=location,
+    )
+    _enum(
+        result["disposition"],
+        frozenset(
+            {
+                "REGULATORY_HARVEST_WIN",
+                "COMPARATOR_WIN",
+                "TIE",
+                "NEITHER",
+                "INCONCLUSIVE",
+                "CASE_INVALID",
+            }
+        ),
+        location=f"{location}.disposition",
+    )
+    if result["winner_label"] is not None:
+        _enum(
+            result["winner_label"],
+            frozenset({"A", "B"}),
+            location=f"{location}.winner_label",
+        )
+    if result["score_difference"] is not None:
+        _strict_float(
+            result["score_difference"],
+            location=f"{location}.score_difference",
+        )
+    _string_list(
+        result["rationale_codes"],
+        location=f"{location}.rationale_codes",
+        identifiers=True,
+        unique=True,
+    )
+    return result
+
+
+def _validate_matrix_finding(
+    value: object, *, location: str, expected_label: str
+) -> JsonObject:
+    result = _shape(
+        value,
+        required={
+            "anonymous_label",
+            "disposition",
+            "report_location",
+            "finding_codes",
+            "rationale",
+        },
+        location=location,
+    )
+    if result["anonymous_label"] != expected_label:
+        raise PortableEvaluationInputError(f"{location} has the wrong anonymous label")
+    _enum(result["disposition"], COVERAGE_DISPOSITIONS, location=f"{location}.disposition")
+    _optional_string(
+        result["report_location"],
+        location=f"{location}.report_location",
+        nonblank=True,
+    )
+    codes = _string_list(
+        result["finding_codes"], location=f"{location}.finding_codes", unique=True
+    )
+    if not set(codes) <= ENTRY_FINDING_CODES:
+        raise PortableEvaluationInputError(f"{location} has an unknown finding code")
+    _string(result["rationale"], location=f"{location}.rationale", nonblank=True)
+    return result
+
+
+def _validate_requirement_matrix(value: object) -> JsonObject:
+    result = _shape(
+        value,
+        required={"available", "unavailable_reason", "rows"},
+        location="requirement matrix",
+    )
+    available = _strict_bool(result["available"], location="requirement matrix.available")
+    rows: list[JsonObject] = []
+    for index, item in enumerate(_array(result["rows"], location="requirement matrix.rows")):
+        location = f"requirement matrix.rows[{index}]"
+        row = _shape(
+            item,
+            required={
+                "ledger_id",
+                "walk_order",
+                "category",
+                "materiality",
+                "proposition",
+                "citations",
+                "report_a",
+                "report_b",
+            },
+            location=location,
+        )
+        _identifier(row["ledger_id"], location=f"{location}.ledger_id")
+        _strict_int(row["walk_order"], location=f"{location}.walk_order", minimum=0)
+        _enum(row["category"], LEDGER_CATEGORIES, location=f"{location}.category")
+        _enum(row["materiality"], MATERIALITIES, location=f"{location}.materiality")
+        _string(row["proposition"], location=f"{location}.proposition", nonblank=True)
+        citations = _array(row["citations"], location=f"{location}.citations")
+        if not citations:
+            raise PortableEvaluationInputError(f"{location}.citations must not be empty")
+        for citation_index, citation_value in enumerate(citations):
+            citation_location = f"{location}.citations[{citation_index}]"
+            citation = _shape(
+                citation_value,
+                required={"source_id", "start_char", "end_char"},
+                location=citation_location,
+            )
+            _identifier(citation["source_id"], location=f"{citation_location}.source_id")
+            start = _strict_int(
+                citation["start_char"], location=f"{citation_location}.start_char", minimum=0
+            )
+            end = _strict_int(
+                citation["end_char"], location=f"{citation_location}.end_char", minimum=1
+            )
+            if end <= start:
+                raise PortableEvaluationInputError(f"{citation_location} has invalid offsets")
+        _validate_matrix_finding(
+            row["report_a"], location=f"{location}.report_a", expected_label="A"
+        )
+        if row["report_b"] is not None:
+            _validate_matrix_finding(
+                row["report_b"], location=f"{location}.report_b", expected_label="B"
+            )
+        rows.append(row)
+    result["rows"] = rows
+    if available:
+        if result["unavailable_reason"] is not None:
+            raise PortableEvaluationInputError("available matrix must omit unavailable reason")
+        if [row["walk_order"] for row in rows] != list(range(len(rows))):
+            raise PortableEvaluationInputError(
+                "available matrix rows must use contiguous zero-based walk order"
+            )
+        ledger_ids = [row["ledger_id"] for row in rows]
+        if len(ledger_ids) != len(set(ledger_ids)):
+            raise PortableEvaluationInputError("available matrix rows have duplicate ledger IDs")
+    else:
+        _enum(
+            result["unavailable_reason"],
+            frozenset({"CASE_INVALID", "INCONCLUSIVE"}),
+            location="requirement matrix.unavailable_reason",
+        )
+        if rows:
+            raise PortableEvaluationInputError("unavailable matrix must not contain rows")
+    return result
+
+
+def _validate_evaluation_result(value: object) -> JsonObject:
+    _require_result_schemas(value, location=_RESULT_PATH)
+    try:
+        result = cast(
+            JsonObject,
+            _copy_json(
+                _shape(
+                    value,
+                    required={
+                        "schema_version",
+                        "rubric",
+                        "readiness",
+                        "reports",
+                        "requirement_matrix",
+                        "comparison",
+                        "judge_isolation",
+                        "result_fingerprint",
+                    },
+                    location="AttorneyEvaluationResult",
+                )
+            ),
+        )
+        readiness = _shape(
+            result["readiness"],
+            required={
+                "status",
+                "case_fingerprint",
+                "judgment_fingerprint",
+                "issue_codes",
+                "rationale",
+            },
+            location="AttorneyEvaluationResult.readiness",
+        )
+        status = _enum(
+            readiness["status"], READINESS_STATUSES, location="AttorneyEvaluationResult.status"
+        )
+        _hash(readiness["case_fingerprint"], location="AttorneyEvaluationResult.case_fingerprint")
+        _hash(
+            readiness["judgment_fingerprint"],
+            location="AttorneyEvaluationResult.judgment_fingerprint",
+        )
+        _string_list(
+            readiness["issue_codes"],
+            location="AttorneyEvaluationResult.issue_codes",
+            identifiers=True,
+            unique=True,
+        )
+        _string(
+            readiness["rationale"],
+            location="AttorneyEvaluationResult.rationale",
+            nonblank=True,
+        )
+        reports = [
+            _validate_report_evaluation(
+                item, location=f"AttorneyEvaluationResult.reports[{index}]"
+            )
+            for index, item in enumerate(
+                _array(result["reports"], location="AttorneyEvaluationResult.reports")
+            )
+        ]
+        matrix = _validate_requirement_matrix(result["requirement_matrix"])
+        rubric = _validate_evaluation_rubric(result["rubric"])
+        comparison = _validate_comparison_evaluation(result["comparison"])
+        _enum(
+            result["judge_isolation"],
+            frozenset({"fresh_context", "sequential_same_context"}),
+            location="AttorneyEvaluationResult.judge_isolation",
+        )
+        result["rubric"] = rubric
+        result["reports"] = reports
+        result["requirement_matrix"] = matrix
+        result["comparison"] = comparison
+        labels = [report["anonymous_label"] for report in reports]
+        if reports:
+            if labels not in (["A"], ["A", "B"]):
+                raise PortableEvaluationInputError(
+                    "scored report labels must be unique fixed order A or A, B"
+                )
+            if status != "ADMITTED":
+                raise PortableEvaluationInputError("scored reports require admitted readiness")
+            if matrix["available"] is not True:
+                raise PortableEvaluationInputError("scored reports require an available matrix")
+            has_report_b = len(labels) == 2
+            if any(
+                (row["report_b"] is not None) != has_report_b
+                for row in cast(list[JsonObject], matrix["rows"])
+            ):
+                raise PortableEvaluationInputError(
+                    "matrix report_b presence must match scored report B"
+                )
+        else:
+            if matrix["available"] is True:
+                raise PortableEvaluationInputError("an unscored result cannot expose a matrix")
+            if matrix["unavailable_reason"] != status:
+                raise PortableEvaluationInputError(
+                    "matrix unavailability must match terminal readiness"
+                )
+        _hash(result["result_fingerprint"], location="AttorneyEvaluationResult.fingerprint")
+        return result
+    except EvaluationIntegrityError:
+        raise
+    except (PortableEvaluationInputError, KeyError, TypeError, ValueError) as error:
+        raise EvaluationIntegrityError("malformed AttorneyEvaluationResult") from error
+
+
+def _markdown_table_value(value: str) -> str:
+    escaped: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if character == "\\":
+            escaped.append("\\\\")
+        elif character == "|":
+            escaped.append("\\|")
+        elif character == "\r":
+            escaped.append("\\r")
+        elif character == "\n":
+            escaped.append("\\n")
+        elif unicodedata.category(character) == "Cc":
+            if codepoint <= 0xFF:
+                escaped.append(f"\\x{codepoint:02x}")
+            elif codepoint <= 0xFFFF:
+                escaped.append(f"\\u{codepoint:04x}")
+            else:
+                escaped.append(f"\\U{codepoint:08x}")
+        else:
+            escaped.append(character)
+    return html.escape("".join(escaped), quote=False)
+
+
+def _matrix_finding_cells(finding: JsonObject | None) -> list[str]:
+    if finding is None:
+        return ["Not supplied"] * 4
+    location = (
+        finding["report_location"]
+        if finding["report_location"] is not None
+        else "Not stated"
+    )
+    finding_codes = ", ".join(cast(list[str], finding["finding_codes"])) or "None"
+    return [
+        _markdown_table_value(cast(str, finding["disposition"])),
+        _markdown_table_value(cast(str, location)),
+        _markdown_table_value(finding_codes),
+        _markdown_table_value(cast(str, finding["rationale"])),
+    ]
+
+
+def render_evaluation_report(result: JsonObject) -> str:
+    snapshot = _validate_evaluation_result(result)
+    if snapshot.get("result_fingerprint") != _model_fingerprint(
+        snapshot, exclude={"result_fingerprint"}
+    ):
+        raise EvaluationIntegrityError("evaluation result self-fingerprint mismatch")
+    readiness = cast(JsonObject, snapshot["readiness"])
+    reports = cast(list[JsonObject], snapshot["reports"])
+    lines = ["# Automated Attorney Evaluation", "", "## Disposition", ""]
+    if reports:
+        lines.extend(
+            f"- Anonymous report {report['anonymous_label']}: {report['absolute_disposition']}"
+            for report in reports
+        )
+    else:
+        lines.append(f"- Evaluation: {readiness['status']}")
+    lines.extend(
+        [
+            "",
+            "## Case Readiness",
+            "",
+            f"- Status: {readiness['status']}",
+            f"- Rationale: {readiness['rationale']}",
+            "",
+            "## Critical Defects",
+            "",
+        ]
+    )
+    critical = [
+        (report["anonymous_label"], code)
+        for report in reports
+        for code in cast(list[str], report["blocking_codes"])
+        if report["critical_defect"]
+    ]
+    lines.extend([f"- Report {label}: {code}" for label, code in critical] or ["- None recorded."])
+    lines.extend(
+        [
+            "",
+            "## Requirement-by-Requirement Matrix",
+            "",
+        ]
+    )
+    matrix = cast(JsonObject, snapshot["requirement_matrix"])
+    if matrix["available"] is not True:
+        lines.append(f"- Unavailable: {matrix['unavailable_reason']}.")
+    elif not matrix["rows"]:
+        lines.append("- No sealed ledger entries.")
+    else:
+        lines.extend(
+            [
+                "| Walk | Ledger ID | Category | Materiality | Legal proposition | "
+                "Source pins | A disposition | A location | A findings | A rationale | "
+                "B disposition | B location | B findings | B rationale |",
+                "| ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | "
+                "--- | --- | --- | --- |",
+            ]
+        )
+        for row in cast(list[JsonObject], matrix["rows"]):
+            citations = "<br>".join(
+                f"{_markdown_table_value(cast(str, pin['source_id']))}"
+                f"@{pin['start_char']}:{pin['end_char']}"
+                for pin in cast(list[JsonObject], row["citations"])
+            )
+            cells = [
+                str(row["walk_order"]),
+                _markdown_table_value(cast(str, row["ledger_id"])),
+                _markdown_table_value(cast(str, row["category"])),
+                _markdown_table_value(cast(str, row["materiality"])),
+                _markdown_table_value(cast(str, row["proposition"])),
+                citations,
+                *_matrix_finding_cells(cast(JsonObject, row["report_a"])),
+                *_matrix_finding_cells(cast(JsonObject | None, row["report_b"])),
+            ]
+            lines.append(f"| {' | '.join(cells)} |")
+    lines.extend(
+        [
+            "",
+            "## Score Summary",
+            "",
+            "| Report | Critical recall | Weighted recall | Claim precision |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+    lines.extend(
+        "| "
+        f"{report['anonymous_label']} | "
+        f"{cast(float, report['critical_recall']):.3f} | "
+        f"{cast(float, report['weighted_recall']):.3f} | "
+        f"{cast(float, report['claim_precision']):.3f} |"
+        for report in reports
+    )
+    if not reports:
+        lines.append("| — | — | — | — |")
+    unsupported = [
+        (report["anonymous_label"], code)
+        for report in reports
+        for code in cast(list[str], report["blocking_codes"])
+        if code.startswith(("UNSUPPORTED_", "OVERSTATED_", "CONTRADICTED_"))
+    ]
+    lines.extend(
+        ["", "## Unsupported or Overstated Claims", ""]
+        + ([f"- Report {label}: {code}" for label, code in unsupported] or ["- None recorded."])
+    )
+    lines.extend(
+        [
+            "",
+            "## Regulatory Walk",
+            "",
+            "| Report | Average | Minimum |",
+            "| --- | ---: | ---: |",
+        ]
+    )
+    lines.extend(
+        "| "
+        f"{report['anonymous_label']} | "
+        f"{cast(float, report['walk_average']):.3f} | "
+        f"{report['walk_minimum']} |"
+        for report in reports
+    )
+    if not reports:
+        lines.append("| — | — | — |")
+    lines.extend(["", "## Comparative Result", ""])
+    comparison = cast(JsonObject | None, snapshot["comparison"])
+    if comparison is None:
+        lines.append("- Absolute evaluation only; no comparator was supplied.")
+    else:
+        lines.append(f"- Disposition: {comparison['disposition']}")
+        if comparison["winner_label"] is not None:
+            lines.append(f"- Winning anonymous report: {comparison['winner_label']}")
+    lines.extend(
+        [
+            "",
+            "## Evaluation Limits and Provenance",
+            "",
+            "- Results are AI generated and may contain errors.",
+            "- An attorney must validate the output before delivering legal advice.",
+            "- Detailed blind grades, deterministic checks, score inputs, and judge-call "
+            "provenance remain in the immutable run artifacts.",
+            f"- Aggregate judge isolation: {snapshot['judge_isolation']}.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _artifact_record(path: str, data: bytes) -> JsonObject:
+    _validate_relative_path(path)
+    return {"artifact_path": path, "artifact_hash": _sha256(data)}
+
+
+def _prompt_fingerprint(request: JsonObject) -> str:
+    return _sha256(
+        canonical_json_bytes(
+            {
+                "system_instructions": request["system_instructions"],
+                "json_schema": request["json_schema"],
+            }
+        )
+    )
+
+
+def _pending_call(
+    call_id: str,
+    request: JsonObject,
+    *,
+    attempt: int = 1,
+    retry_count: int = 0,
+    anonymous_label: str | None = None,
+) -> JsonObject:
+    _identifier(call_id, location="judge call.call_id")
+    return {
+        "call_id": call_id,
+        "operation": request["operation"],
+        "anonymous_label": anonymous_label,
+        "attempt": attempt,
+        "prompt_fingerprint": _prompt_fingerprint(request),
+        "request_fingerprint": request["request_fingerprint"],
+        "response_fingerprint": None,
+        "provider_name": None,
+        "model_name": None,
+        "judge_isolation": None,
+        "request_artifact_path": f"judge-requests/{call_id}-attempt-{attempt}.json",
+        "response_artifact_path": None,
+        "diagnostics_artifact_path": None,
+        "state": "pending",
+        "retry_count": retry_count,
+        "terminal_status": "pending",
+    }
+
+
+def _manifest(
+    *,
+    case_fingerprint: str,
+    case_envelope_hash: str,
+    rubric_fingerprint: str,
+    legal_ledger_hash: str | None,
+    result_hash: str | None,
+    judge_calls: list[JsonObject],
+    artifacts: list[JsonObject],
+    state: str,
+    retry_count: int,
+    terminal_status: str | None,
+) -> JsonObject:
+    snapshots = sorted(
+        cast(list[JsonObject], _copy_json(artifacts)),
+        key=lambda item: cast(str, item["artifact_path"]),
+    )
+    payload: JsonObject = {
+        "schema_version": "1.3",
+        "case_fingerprint": case_fingerprint,
+        "case_envelope_hash": case_envelope_hash,
+        "rubric_fingerprint": rubric_fingerprint,
+        "legal_ledger_hash": legal_ledger_hash,
+        "result_hash": result_hash,
+        "judge_calls": cast(list[JsonValue], _copy_json(judge_calls)),
+        "artifacts": snapshots,
+        "artifact_inventory_fingerprint": _sha256(canonical_json_bytes(snapshots)),
+        "state": state,
+        "retry_count": retry_count,
+        "terminal_status": terminal_status,
+        "manifest_fingerprint": "0" * 64,
+    }
+    payload["manifest_fingerprint"] = _model_fingerprint(payload, exclude={"manifest_fingerprint"})
+    return payload
+
+
+def _state_from_manifest(manifest: JsonObject) -> JsonObject:
+    pending = [
+        call
+        for call in cast(list[JsonObject], manifest["judge_calls"])
+        if call["state"] == "pending"
+    ]
+    current = pending[0] if pending else None
+    return {
+        "schema_version": "1.3",
+        "case_fingerprint": manifest["case_fingerprint"],
+        "case_envelope_hash": manifest["case_envelope_hash"],
+        "judge_calls": cast(list[JsonValue], _copy_json(manifest["judge_calls"])),
+        "current_operation": None if current is None else current["operation"],
+        "current_call_id": None if current is None else current["call_id"],
+        "attempt": 0 if current is None else current["attempt"],
+        "state": manifest["state"],
+        "retry_count": manifest["retry_count"],
+        "terminal_status": manifest["terminal_status"],
+        "manifest_fingerprint": manifest["manifest_fingerprint"],
+    }
+
+
+def _write_manifest(storage: _PosixRunStorage, manifest: JsonObject) -> None:
+    data = canonical_json_bytes(manifest)
+    existing = storage.read_optional_artifact(_MANIFEST_PATH)
+    mutable = True
+    if existing is not None:
+        previous = _parse_manifest(existing)
+        if previous["terminal_status"] is not None:
+            mutable = False
+    storage.atomic_write(_MANIFEST_PATH, data, mutable=mutable)
+
+
+def _parse_manifest(data: bytes) -> JsonObject:
+    value = _object(
+        parse_canonical_json_bytes(data, location=_MANIFEST_PATH), location=_MANIFEST_PATH
+    )
+    if value.get("schema_version") != "1.3":
+        raise EvaluationIntegrityError(
+            f"{EVALUATION_ARTIFACT_SCHEMA_UNSUPPORTED}: run-manifest.json"
+        )
+    required = {
+        "schema_version",
+        "case_fingerprint",
+        "case_envelope_hash",
+        "rubric_fingerprint",
+        "legal_ledger_hash",
+        "result_hash",
+        "judge_calls",
+        "artifacts",
+        "artifact_inventory_fingerprint",
+        "state",
+        "retry_count",
+        "terminal_status",
+        "manifest_fingerprint",
+    }
+    if set(value) != required:
+        raise EvaluationIntegrityError("run manifest has an unexpected shape")
+    for name in (
+        "case_fingerprint",
+        "case_envelope_hash",
+        "rubric_fingerprint",
+        "artifact_inventory_fingerprint",
+        "manifest_fingerprint",
+    ):
+        try:
+            _hash(value[name], location=f"manifest.{name}")
+        except PortableEvaluationInputError as error:
+            raise EvaluationIntegrityError("run manifest has a malformed fingerprint") from error
+    for name in ("legal_ledger_hash", "result_hash"):
+        if value[name] is not None:
+            try:
+                _hash(value[name], location=f"manifest.{name}")
+            except PortableEvaluationInputError as error:
+                raise EvaluationIntegrityError(
+                    "run manifest has a malformed fingerprint"
+                ) from error
+    if value["state"] not in RUN_PHASES or (
+        value["terminal_status"] is not None and value["terminal_status"] not in TERMINAL_STATUSES
+    ):
+        raise EvaluationIntegrityError("run manifest has an invalid phase")
+    if value["manifest_fingerprint"] != _model_fingerprint(value, exclude={"manifest_fingerprint"}):
+        raise EvaluationIntegrityError("run manifest self-fingerprint mismatch")
+    artifacts = _array(value["artifacts"], location="manifest.artifacts")
+    expected_inventory = _sha256(canonical_json_bytes(artifacts))
+    if value["artifact_inventory_fingerprint"] != expected_inventory:
+        raise EvaluationIntegrityError("manifest artifact inventory fingerprint mismatch")
+    return value
+
+
+def _ledger_invariant_contract_v1_0() -> JsonObject:
+    """Return a fresh copy of immutable schema-1.0 compatibility data."""
+    return {
+        "schema_version": "1.0",
+        "binding": {
+            "case_fingerprint": "source_record.source_record_fingerprint",
+        },
+        "identity": {
+            "ledger_ids": "unique",
+            "gap_ids": "unique",
+            "entry_gap_ids": "disjoint",
+            "walk_order": "unique_contiguous_zero_based",
+        },
+        "relationships": {
+            "targets": "known_ledger_ids",
+            "self_reference": "forbidden",
+            "trigger_link_categories": ["enforcement", "penalty"],
+            "trigger_target_categories": ["requirement", "prohibition"],
+        },
+        "citations": {
+            "source_ids": "known_retained_sources",
+            "slices": "unique_exact_half_open",
+            "quote": "exact_source_text",
+            "operative_categories_require_exact_support": True,
+            "operative_categories_forbid_commentary_only_support": True,
+        },
+        "required_fields": {
+            "requirement_prohibition_right": ["actor", "object"],
+            "deadline": ["timing"],
+            "exception": ["conditions_or_exceptions"],
+            "enforcement": [
+                "enforcing_authority",
+                "enforcement_route",
+                "trigger_link",
+            ],
+            "penalty": ["consequence", "trigger_link"],
+            "remedy": ["consequence"],
+        },
+        "materiality_rationale": {
+            "minimum_word_tokens": 5,
+            "generic_only": "forbidden",
+        },
+        "repair_closure": {
+            "resolve_every_initial_finding": True,
+            "remaining_audit_request_fingerprint": (
+                "exact_repair_request_fingerprint"
+            ),
+            "complete_true_requires_full_recheck": True,
+            "remaining_disputes": "transaction_ready_only",
+        },
+    }
+
+
+def _ledger_invariant_contract() -> JsonObject:
+    """Return a fresh copy of the mixed deterministic/attested ledger contract."""
+    return {
+        "schema_version": "1.1",
+        "binding": {
+            "case_fingerprint": "source_record.source_record_fingerprint",
+        },
+        "identity": {
+            "ledger_ids": "unique",
+            "gap_ids": "unique",
+            "entry_gap_ids": "disjoint",
+            "walk_order": "unique_contiguous_zero_based",
+        },
+        "relationships": {
+            "targets": "known_ledger_ids",
+            "self_reference": "forbidden",
+            "trigger_link_categories": ["enforcement", "penalty"],
+            "trigger_target_categories": ["requirement", "prohibition"],
+        },
+        "citations": {
+            "source_ids": "known_retained_sources",
+            "slices": "unique_exact_half_open",
+            "quote": "exact_source_text",
+            "operative_categories_require_exact_support": True,
+            "operative_categories_forbid_commentary_only_support": True,
+        },
+        "required_fields": {
+            "requirement_prohibition_right": ["actor", "object"],
+            "deadline": ["timing"],
+            "exception": ["conditions_or_exceptions"],
+            "enforcement": [
+                "enforcing_authority",
+                "enforcement_route",
+                "trigger_link",
+            ],
+            "penalty": ["consequence", "trigger_link"],
+            "remedy": ["consequence"],
+        },
+        "materiality_rationale": {
+            "minimum_word_tokens": 5,
+            "forbidden_exact_normalized_values": [
+                "critical",
+                "high priority",
+                "important",
+                "material",
+                "significant",
+            ],
+        },
+        "repair_closure": {
+            "resolve_every_initial_finding": "evaluator_attestation",
+            "remaining_audit_request_fingerprint": "deterministically_enforced",
+            "complete_true_requires_full_recheck": "evaluator_attestation",
+            "remaining_disputes": (
+                "deterministically_enforced_transaction_ready_only"
+            ),
+        },
+    }
+
+
+def _ledger_contract_mode(request: JsonObject) -> str | None:
+    """Return the recognized invariant-contract generation for one ledger request."""
+    if request.get("operation") not in {
+        "build_ledger",
+        "audit_ledger",
+        "repair_ledger",
+    }:
+        return None
+    instructions = request.get("system_instructions")
+    if type(instructions) is not str:
+        raise EvaluationIntegrityError("ledger request instructions are malformed")
+    if "ledger_invariant_contract" not in instructions:
+        return "pre-contract"
+    payload = _object(request.get("payload"), location="ledger request payload")
+    contract = payload.get("ledger_invariant_contract")
+    if contract == _ledger_invariant_contract_v1_0():
+        return "1.0"
+    if contract == _ledger_invariant_contract():
+        return "1.1"
+    raise EvaluationIntegrityError("ledger request invariant contract is not recognized")
+
+
+def _verify_ledger_contract_mode_consistency(requests: Sequence[JsonObject]) -> None:
+    """Require every ledger request in one replay run to use one recognized mode."""
+    modes = {
+        mode
+        for request in requests
+        if (mode := _ledger_contract_mode(request)) is not None
+    }
+    if len(modes) > 1:
+        raise EvaluationIntegrityError("ledger request invariant-contract modes differ")
+
+
+def _ledger_request_payload(payload: JsonObject, contract_mode: str) -> JsonObject:
+    """Attach only the exact contract generation selected for request replay."""
+    if contract_mode == "pre-contract":
+        return payload
+    if contract_mode == "1.0":
+        payload["ledger_invariant_contract"] = _ledger_invariant_contract_v1_0()
+        return payload
+    if contract_mode == "1.1":
+        payload["ledger_invariant_contract"] = _ledger_invariant_contract()
+        return payload
+    raise EvaluationIntegrityError("ledger request invariant-contract mode is unsupported")
+
+
+def _build_ledger_request(
+    envelope: JsonObject, *, contract_mode: str = "1.1"
+) -> JsonObject:
+    admission = build_admission_packet(envelope)
+    safe = cast(dict[str, str], admission["safe_metadata"])
+    system_instructions = (
+        "Build an atomic legal-requirement ledger from only the supplied source "
+        "record. Check and satisfy every supplied ledger_invariant_contract invariant. "
+        "Copy payload.source_record.source_record_fingerprint exactly into "
+        "case_fingerprint. Use unique ledger and gap IDs and unique contiguous "
+        "zero-based walk_order values. Use only known, non-self relationship IDs and "
+        "known source IDs. Citations must be exact, nonduplicate half-open slices whose "
+        "quote equals the cited source text. Give each operative category exact "
+        "non-commentary support; each requirement, prohibition, or right an actor and "
+        "object; each deadline timing; each exception a condition or exception; each "
+        "enforcement entry an enforcing authority, route, and link to a requirement or "
+        "prohibition; and each penalty or remedy a consequence. Enforcement and penalty "
+        "entries must identify their triggering requirement or prohibition. Give every "
+        "materiality decision a concrete legal or practical rationale. Do not infer "
+        "from, request, or discuss candidate reports. Return only the complete LegalLedger."
+    )
+    if contract_mode == "pre-contract":
+        system_instructions = system_instructions.replace(
+            "Check and satisfy every supplied ledger_invariant_contract invariant. ",
+            "",
+        )
+    return _new_request(
+        "build_ledger",
+        system_instructions=system_instructions,
+        json_schema=_LEDGER_SCHEMA,
+        payload=_ledger_request_payload(
+            {"source_record": admission["payload"]}, contract_mode
+        ),
+        safe_metadata={
+            "record_scope": "source-only",
+            "source_record_fingerprint": safe["source_record_fingerprint"],
+        },
+    )
+
+
+def _audit_action_contract() -> JsonObject:
+    """Return the deterministic initial-finding and remaining-transaction contract."""
+    return {
+        "initial_audit_findings": {
+            "action_payloads": {
+                "add": {
+                    "ledger_id_rule": "new_relative_to_proposed_ledger",
+                    "proposed_entries": "zero_or_more",
+                    "target_ledger_ids": "none",
+                },
+                "delete": {
+                    "proposed_entries": "none",
+                    "target_ledger_ids": "one_or_more",
+                },
+                "edit": {
+                    "ledger_id_rule": "preserve_target_if_proposed",
+                    "proposed_entries": "zero_or_one",
+                    "target_ledger_ids": "exactly_one",
+                },
+                "materiality": {
+                    "proposed_entries": "none",
+                    "target_ledger_ids": "exactly_one",
+                },
+                "merge": {
+                    "proposed_entries": "zero_or_exactly_one",
+                    "target_ledger_ids": "two_or_more",
+                },
+                "split": {
+                    "proposed_entries": "zero_or_two_or_more",
+                    "target_ledger_ids": "exactly_one",
+                },
+            },
+            "actions": ["add", "edit", "delete", "split", "merge", "materiality"],
+            "grounding": {
+                "add_with_proposed_entries": "proposed_entries_are_repair_subject",
+                "candidate_reports_permitted": False,
+                "non_add": "every_target_id_must_exist_in_proposed_ledger",
+                "proposed_entries": {
+                    "context": ["proposed_ledger", "finding_proposed_entries"],
+                    "issue_reporting": "finding_id_and_issue_codes",
+                    "standalone_contiguous_transaction_required": False,
+                    "validation": "existing_exact_source_entry_validation",
+                },
+                "proposal_free_add": {
+                    "accepted_if": [
+                        "known_source_id_and_all_asserted_locators_match_source",
+                        "known_source_id_and_no_locators_and_two_source_terms",
+                    ],
+                    "exact_known_source_id_required": True,
+                    "legal_locator_terms": list(_AUDIT_RATIONALE_LEGAL_LOCATORS),
+                    "locator_identifier_forms": [
+                        "contains_digit",
+                        "single_letter",
+                        "roman_numeral",
+                    ],
+                    "locator_match": {
+                        "all_asserted_locators_must_match": True,
+                        "case_sensitive": False,
+                        "exact_type_and_identifier_required": True,
+                        "fields": ["title", "normalized_text"],
+                        "source_term_fallback_when_any_locator_asserted": False,
+                    },
+                    "source_term_match": {
+                        "action_boilerplate_terms": list(
+                            _AUDIT_RATIONALE_ACTION_BOILERPLATE_TERMS
+                        ),
+                        "alphabetic_character_required": True,
+                        "defect_or_correction_signals_excluded": True,
+                        "evaluator_metadata_terms": list(
+                            _AUDIT_RATIONALE_EVALUATOR_METADATA_TERMS
+                        ),
+                        "fields": ["title", "normalized_text"],
+                        "legal_locator_terms_excluded": True,
+                        "minimum_distinct_terms": _AUDIT_RATIONALE_MINIMUM_SOURCE_TERMS,
+                        "source_id_tokens_excluded": True,
+                        "stopwords": list(_AUDIT_RATIONALE_STOPWORDS),
+                    },
+                },
+            },
+            "rationale": {
+                "defect_or_correction_signals": list(
+                    _AUDIT_RATIONALE_DEFECT_OR_CORRECTION_SIGNALS
+                ),
+                "generic_filler_rejected": True,
+                "legal_or_record_anchors": list(_AUDIT_RATIONALE_LEGAL_OR_RECORD_ANCHORS),
+                "minimum_words": _AUDIT_RATIONALE_MINIMUM_WORDS,
+            },
+            "required_fields": ["dispute_id", "action", "materiality", "rationale"],
+            "transaction_payload_required": False,
+        },
+        "remaining_audit_transactions": {
+            "action_payloads": {
+                "add": {"proposed_entries": "one_or_more", "target_ledger_ids": "none"},
+                "delete": {"proposed_entries": "none", "target_ledger_ids": "one_or_more"},
+                "edit": {
+                    "ledger_id_rule": "preserve_target",
+                    "proposed_entries": "exactly_one",
+                    "target_ledger_ids": "exactly_one",
+                },
+                "materiality": {
+                    "proposed_entries": "none",
+                    "target_ledger_ids": "exactly_one",
+                },
+                "merge": {
+                    "proposed_entries": "exactly_one",
+                    "target_ledger_ids": "two_or_more",
+                },
+                "split": {
+                    "proposed_entries": "two_or_more",
+                    "target_ledger_ids": "exactly_one",
+                },
+            },
+            "transaction_payload_required": True,
+        },
+    }
+
+
+def _finding_code_contract() -> JsonObject:
+    """Return every closed finding code's deterministic allowed context."""
+    return {
+        "entry_finding_codes": {
+            "CONSEQUENCE_TRIGGER_DETACHED": {
+                "allowed_dispositions": ["PARTIAL", "OVERSTATED", "CONTRADICTED"],
+                "ledger_categories": ["enforcement", "penalty", "remedy"],
+                "ledger_fields": {
+                    "consequence": "required",
+                    "trigger_or_relationship_ids": "at_least_one_required",
+                },
+            },
+            "CRITICAL_LEDGER_ENTRY_MISSING": {
+                "allowed_dispositions": ["MISSING"],
+                "ledger_materialities": ["critical"],
+            },
+            "MATERIAL_EXCEPTION_MISSING": {
+                "allowed_dispositions": ["MISSING", "PARTIAL"],
+                "ledger_categories": ["exception"],
+                "ledger_materialities": ["critical", "material"],
+            },
+        },
+        "narrative_finding_codes": {
+            "KEY_REQUIREMENTS_ACTION_PLAN": {
+                "allowed_dimensions": [
+                    "key_requirements",
+                    "requirements_workplan_boundary",
+                ],
+                "maximum_score": 2,
+            }
+        },
+    }
+
+
+def _audit_ledger_request(
+    envelope: JsonObject, ledger: JsonObject, *, contract_mode: str = "1.1"
+) -> JsonObject:
+    source_record = cast(JsonObject, build_admission_packet(envelope)["payload"])
+    system_instructions = (
+        "Adversarially audit the proposed ledger against only the supplied source "
+        "record. Check every supplied ledger_invariant_contract invariant. Copy this "
+        "request's request_fingerprint into the audit. Test every ledger invariant "
+        "expressed by the response schema and the proposed entries: "
+        "identity and walk order, relationships, exact citation slices, operative-source "
+        "support, actor and object, timing, exception conditions, enforcement route and "
+        "trigger links, consequences, and concrete materiality. Set complete=true only "
+        "after the whole source record and ledger have been checked. Return every "
+        "structured finding and no report-based reasoning. Initial findings must use "
+        "the supplied audit_action_contract, be concrete enough for repair, and need "
+        "not be transaction-ready. A proposal-free add must name an exact source_id "
+        "and satisfy the source-grounding rule in that contract. Every supplied "
+        "proposed entry must pass the disclosed exact-source validation."
+    )
+    if contract_mode == "pre-contract":
+        system_instructions = system_instructions.replace(
+            "Check every supplied ledger_invariant_contract invariant. ", ""
+        )
+    return _new_request(
+        "audit_ledger",
+        system_instructions=system_instructions,
+        json_schema=_LEDGER_AUDIT_SCHEMA,
+        payload=_ledger_request_payload(
+            {
+                "source_record": source_record,
+                "proposed_ledger": ledger,
+                "audit_action_contract": _audit_action_contract(),
+            },
+            contract_mode,
+        ),
+        safe_metadata={
+            "record_scope": "source-only",
+            "source_record_fingerprint": cast(str, source_record["source_record_fingerprint"]),
+        },
+    )
+
+
+def _repair_ledger_request(
+    envelope: JsonObject,
+    ledger: JsonObject,
+    audit: JsonObject,
+    *,
+    contract_mode: str = "1.1",
+) -> JsonObject:
+    source_record = cast(JsonObject, build_admission_packet(envelope)["payload"])
+    system_instructions = (
+        "Repair the proposed source-only ledger once. Return the complete repaired "
+        "ledger, preserving payload.source_record.source_record_fingerprint as its "
+        "case_fingerprint and checking every supplied ledger_invariant_contract "
+        "invariant. Perform global walk-order renumbering, new-ID allocation for new "
+        "entries, relationship remapping, exact-citation rechecking, and full closure "
+        "validation before returning. In remaining_audit, "
+        "copy this request's request_fingerprint, set complete=true only after checking "
+        "the complete repair, resolve every initial finding, and include only disputes "
+        "that genuinely remain. Every remaining dispute must be transaction-ready under "
+        "the supplied audit_action_contract."
+    )
+    if contract_mode == "pre-contract":
+        system_instructions = (
+            "Repair the proposed source-only ledger once. Return the complete repaired "
+            "ledger, preserving payload.source_record.source_record_fingerprint as its "
+            "case_fingerprint and satisfying every ledger invariant. In remaining_audit, "
+            "copy this request's request_fingerprint, set complete=true only after checking "
+            "the complete repair, resolve every initial finding, and include only disputes "
+            "that genuinely remain. Every remaining dispute must be transaction-ready under "
+            "the supplied audit_action_contract."
+        )
+    return _new_request(
+        "repair_ledger",
+        system_instructions=system_instructions,
+        json_schema=_LEDGER_REPAIR_SCHEMA,
+        payload=_ledger_request_payload(
+            {
+                "source_record": source_record,
+                "proposed_ledger": ledger,
+                "audit": audit,
+                "audit_action_contract": _audit_action_contract(),
+            },
+            contract_mode,
+        ),
+        safe_metadata={
+            "record_scope": "source-only",
+            "source_record_fingerprint": cast(str, source_record["source_record_fingerprint"]),
+        },
+    )
+
+
+def _candidate_for_label(envelope: JsonObject, label: str) -> JsonObject:
+    assignment = next(
+        item
+        for item in cast(list[JsonObject], envelope["assignments"])
+        if item["anonymous_label"] == label
+    )
+    return next(
+        item
+        for item in cast(list[JsonObject], cast(JsonObject, envelope["case"])["candidates"])
+        if item["candidate_id"] == assignment["candidate_id"]
+    )
+
+
+def _source_spans(envelope: JsonObject, sealed: JsonObject) -> list[JsonObject]:
+    sources = {
+        item["source_id"]: item
+        for item in cast(list[JsonObject], cast(JsonObject, envelope["case"])["sources"])
+    }
+    spans: list[JsonObject] = []
+    seen: set[tuple[object, object, object]] = set()
+    for entry in cast(list[JsonObject], cast(JsonObject, sealed["ledger"])["entries"]):
+        for citation in cast(list[JsonObject], entry["citations"]):
+            key = (citation["source_id"], citation["start_char"], citation["end_char"])
+            if key in seen:
+                continue
+            seen.add(key)
+            source = sources[citation["source_id"]]
+            text = cast(str, source["normalized_text"])
+            start, end = cast(int, citation["start_char"]), cast(int, citation["end_char"])
+            spans.append(
+                {
+                    "source_id": citation["source_id"],
+                    "start_char": start,
+                    "end_char": end,
+                    "quote": text[start:end],
+                }
+            )
+    return spans
+
+
+def _grade_request(
+    envelope: JsonObject, sealed: JsonObject, checks: JsonObject, label: str, legal_hash: str
+) -> JsonObject:
+    candidate = _candidate_for_label(envelope, label)
+    source_record = cast(JsonObject, build_admission_packet(envelope)["payload"])
+    return _new_request(
+        "grade_report",
+        system_instructions=(
+            "Grade exactly one anonymous report against the sealed source-derived ledger. "
+            "Copy this request's request_fingerprint, payload anonymous_label, and sealed "
+            "ledger_fingerprint exactly; use schema_version 1.3. Return one entry_grade for "
+            "every sealed ledger entry and each of the eight narrative dimensions exactly "
+            "once: executive_summary, regulatory_walk, key_requirements, "
+            "penalties_enforcement, qualification_placement, "
+            "requirements_workplan_boundary, limitations, and scanability. A MISSING entry "
+            "must omit report_location; every other content disposition must identify a "
+            "specific report location. Bind each present entry and narrative finding to an "
+            "exact report_passage. Do not use NOT_APPLICABLE. A present out-of-ledger claim "
+            "cannot be MISSING or NOT_APPLICABLE; its claim_text must be an exact report "
+            "passage and it must bind the common source_record_fingerprint plus exact source "
+            "evidence_spans or an explicit closed_universe_absence. Use only finding-code "
+            "enum values allowed by the schema and only when their supplied "
+            "finding_code_contract context is satisfied. A bounded "
+            "closed-record limitation such as 'the supplied record does not establish X' "
+            "is not an affirmative out-of-ledger claim unless the report also asserts that "
+            "X is absent from governing law. Do not infer identity, compare another report, "
+            "or use an answer key."
+        ),
+        json_schema=_GRADE_SCHEMA,
+        payload={
+            "anonymous_report": {
+                "anonymous_label": label,
+                "report_hash": candidate["report_hash"],
+                "report_text": candidate["report_text"],
+            },
+            "sealed_ledger": sealed,
+            "source_record": source_record,
+            "source_spans": _source_spans(envelope, sealed),
+            "deterministic_checks": checks,
+            "rubric": cast(JsonObject, _copy_json(RUBRIC_V1)),
+            "finding_code_contract": _finding_code_contract(),
+        },
+        safe_metadata={
+            "record_scope": "one-anonymous-report",
+            "anonymous_label": label,
+            "legal_ledger_hash": legal_hash,
+            "legal_ledger_fingerprint": cast(str, sealed["ledger_fingerprint"]),
+        },
+    )
+
+
+def _ledger_referee_request(
+    envelope: JsonObject,
+    ledger: JsonObject,
+    dispute: JsonObject,
+) -> JsonObject:
+    targets = set(cast(list[str], dispute["target_ledger_ids"]))
+    relevant = [
+        entry
+        for entry in cast(list[JsonObject], ledger["entries"])
+        if entry["ledger_id"] in targets
+    ]
+    case = cast(JsonObject, envelope["case"])
+    sources = {
+        item["source_id"]: item
+        for item in cast(list[JsonObject], case["sources"])
+    }
+    source_spans: list[JsonObject] = []
+    seen_spans: set[tuple[object, object, object]] = set()
+    entries_for_context = relevant + cast(list[JsonObject], dispute["proposed_entries"])
+    for entry in entries_for_context:
+        for citation in cast(list[JsonObject], entry["citations"]):
+            key = (citation["source_id"], citation["start_char"], citation["end_char"])
+            if key in seen_spans:
+                continue
+            seen_spans.add(key)
+            source = sources[citation["source_id"]]
+            text = cast(str, source["normalized_text"])
+            start = cast(int, citation["start_char"])
+            end = cast(int, citation["end_char"])
+            source_spans.append(
+                {
+                    "source_id": citation["source_id"],
+                    "start_char": start,
+                    "end_char": end,
+                    "quote": text[start:end],
+                }
+            )
+    resolution_contract = {
+        "accept_a": "keep the repaired ledger unchanged for this dispute",
+        "accept_b": "apply the supplied audit dispute to the repaired ledger",
+    }
+    return _new_request(
+        "referee",
+        system_instructions=(
+            "Resolve only the supplied source-ledger dispute from its allowed alternatives. "
+            "Copy the exact dispute_id. Select exactly one allowed ledger resolution. Use "
+            "accept_a keeps the repaired ledger unchanged for this dispute; accept_b applies "
+            "the supplied audit dispute to the repaired ledger. Use replace only with "
+            "complete replacement_entries that satisfy the ledger-entry schema and source "
+            "record. Give a concrete rationale and only known source_ids. Do not consider "
+            "candidate reports or system identity."
+        ),
+        json_schema=_REFEREE_SCHEMA,
+        payload={
+            "dispute": dispute,
+            "relevant_entries": relevant,
+            "resolution_contract": resolution_contract,
+            "source_record": build_admission_packet(envelope)["payload"],
+            "source_spans": source_spans,
+        },
+        safe_metadata={"record_scope": "source-only-dispute", "referee_scope": "ledger"},
+    )
+
+
+def _markdown_h2_section_spans(report_text: str) -> list[tuple[int, int]]:
+    """Locate exact ATX H2 sections while ignoring headings inside code fences."""
+    heading_starts: list[int] = []
+    offset = 0
+    fence_marker: str | None = None
+    fence_minimum = 0
+    for line in report_text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        if fence_marker is not None:
+            closing = re.fullmatch(
+                rf" {{0,3}}{re.escape(fence_marker)}{{{fence_minimum},}}[ \t]*",
+                content,
+            )
+            if closing is not None:
+                fence_marker = None
+                fence_minimum = 0
+            offset += len(line)
+            continue
+        opening = _MARKDOWN_FENCE_OPEN_PATTERN.fullmatch(content)
+        if opening is not None and not (
+            opening.group(1).startswith("`") and "`" in opening.group(2)
+        ):
+            fence_marker = opening.group(1)[0]
+            fence_minimum = len(opening.group(1))
+        elif _MARKDOWN_H2_PATTERN.match(content) is not None:
+            heading_starts.append(offset)
+        offset += len(line)
+    return [
+        (start, heading_starts[index + 1] if index + 1 < len(heading_starts) else len(report_text))
+        for index, start in enumerate(heading_starts)
+    ]
+
+
+def _unique_enclosing_h2_section(
+    report_text: str,
+    passage: str,
+) -> tuple[int, int] | None:
+    """Resolve every exact passage occurrence to one unambiguous H2 section."""
+    sections = _markdown_h2_section_spans(report_text)
+    resolved: set[tuple[int, int]] = set()
+    search_from = 0
+    found = False
+    while True:
+        passage_start = report_text.find(passage, search_from)
+        if passage_start < 0:
+            break
+        found = True
+        passage_end = passage_start + len(passage)
+        containing = [
+            section
+            for section in sections
+            if section[0] <= passage_start and passage_end <= section[1]
+        ]
+        if len(containing) != 1:
+            return None
+        resolved.add(containing[0])
+        if len(resolved) > 1:
+            return None
+        search_from = passage_start + 1
+    if not found or len(resolved) != 1:
+        return None
+    return next(iter(resolved))
+
+
+def _narrative_referee_passages(
+    envelope: JsonObject,
+    dispute: JsonObject,
+) -> list[str]:
+    """Expand narrative evidence without changing exact grader alternatives."""
+    candidate = _candidate_for_label(envelope, cast(str, dispute["anonymous_label"]))
+    report_text = cast(str, candidate["report_text"])
+    if dispute["subject_id"] in _REPORT_WIDE_NARRATIVE_DIMENSIONS:
+        return [report_text]
+    section_spans: set[tuple[int, int]] = set()
+    for name in ("grader_1", "grader_2"):
+        alternative = cast(JsonObject, dispute[name])
+        score = cast(JsonObject | None, alternative["narrative_score"])
+        if score is None:
+            return [report_text]
+        section = _unique_enclosing_h2_section(
+            report_text,
+            cast(str, score["report_passage"]),
+        )
+        if section is None:
+            return [report_text]
+        section_spans.add(section)
+    return [report_text[start:end] for start, end in sorted(section_spans)]
+
+
+def _report_referee_instructions(dispute: JsonObject) -> str:
+    """Return the exact replayable instructions for one report dispute."""
+    instructions = (
+        "Resolve only this blinded material grade dispute using its exact anonymous "
+        "passages, relevant ledger or rubric context, and exact source evidence. Copy "
+        "the exact dispute_id and grade_dispute_fingerprint. Select "
+        "exactly one of accept_grader_1, accept_grader_2, or replace. Use replace only "
+        "with one complete replacement_grade_alternative matching the dispute kind and "
+        "subject. This is a grade dispute. Do not set selected_disposition, "
+        "selected_ledger_resolution, replacement_entries, or source_ids. Give a "
+        "concrete rationale. Treat a bounded closed-record limitation as a limitation, "
+        "not an affirmative out-of-ledger claim, unless it also asserts the proposition "
+        "is absent from governing law. Do not infer candidate identity or inspect any "
+        "other score."
+    )
+    if dispute["kind"] == "narrative_score":
+        instructions += (
+            " For this narrative dispute, anonymous_passages contains the complete "
+            "enclosing H2 section for each exact grader passage, or the complete anonymous "
+            "report when the rubric dimension requires report-wide context or section "
+            "resolution fails safe. The original exact grader passages remain in the two "
+            "alternatives. Judge the named rubric dimension from the expanded anonymous "
+            "context, not only the grader-selected fragments."
+        )
+    return instructions
+
+
+def _report_referee_context(
+    envelope: JsonObject, sealed: JsonObject, dispute: JsonObject
+) -> JsonObject:
+    alternatives = [
+        cast(JsonObject, dispute["grader_1"]),
+        cast(JsonObject, dispute["grader_2"]),
+    ]
+    passages: list[str] = []
+    evidence_spans: list[JsonObject] = []
+    ledger_ids: set[str] = set()
+    kind = cast(str, dispute["kind"])
+    subject_id = cast(str, dispute["subject_id"])
+
+    for alternative in alternatives:
+        entry = cast(JsonObject | None, alternative["entry_grade"])
+        claim = cast(JsonObject | None, alternative["out_of_ledger_claim"])
+        narrative = cast(JsonObject | None, alternative["narrative_score"])
+        if entry is not None:
+            passage = cast(str | None, entry["report_passage"])
+            if passage is not None:
+                passages.append(passage)
+            ledger_ids.add(cast(str, entry["ledger_id"]))
+        elif claim is not None:
+            passages.append(cast(str, claim["claim_text"]))
+            ledger_ids.update(cast(list[str], claim["related_ledger_ids"]))
+            evidence_spans.extend(
+                cast(list[JsonObject], _copy_json(claim["evidence_spans"]))
+            )
+        elif narrative is not None:
+            passages.append(cast(str, narrative["report_passage"]))
+
+    entries = cast(list[JsonObject], cast(JsonObject, sealed["ledger"])["entries"])
+    relevant_entries = [entry for entry in entries if entry["ledger_id"] in ledger_ids]
+    evidence_spans.extend(
+        citation
+        for entry in relevant_entries
+        for citation in cast(list[JsonObject], entry["citations"])
+    )
+
+    unique_passages = list(dict.fromkeys(passages))
+    unique_spans: list[JsonObject] = []
+    seen_spans: set[tuple[object, object, object, object]] = set()
+    for span in evidence_spans:
+        identity = (
+            span["source_id"],
+            span["start_char"],
+            span["end_char"],
+            span["quote"],
+        )
+        if identity not in seen_spans:
+            seen_spans.add(identity)
+            unique_spans.append(cast(JsonObject, _copy_json(span)))
+
+    def alternative_projection(alternative: JsonObject) -> JsonObject:
+        return {
+            "entry_grade": cast(JsonObject | None, _copy_json(alternative["entry_grade"])),
+            "out_of_ledger_claim": cast(
+                JsonObject | None, _copy_json(alternative["out_of_ledger_claim"])
+            ),
+            "narrative_score": cast(
+                JsonObject | None, _copy_json(alternative["narrative_score"])
+            ),
+            "absent_claim": alternative["absent_claim"],
+        }
+
+    label_free_dispute: JsonObject = {
+        "dispute_id": dispute["dispute_id"],
+        "kind": kind,
+        "subject_id": subject_id,
+        "materiality": dispute["materiality"],
+        "grader_1": alternative_projection(alternatives[0]),
+        "grader_2": alternative_projection(alternatives[1]),
+        "rationale": dispute["rationale"],
+    }
+    if kind == "narrative_score":
+        unique_passages = _narrative_referee_passages(envelope, dispute)
+    return {
+        "dispute": label_free_dispute,
+        "anonymous_passages": unique_passages,
+        "relevant_context": {
+            "kind": kind,
+            "ledger_entries": cast(list[JsonValue], _copy_json(relevant_entries)),
+            "rubric_dimension": subject_id if kind == "narrative_score" else None,
+        },
+        "source_spans": unique_spans,
+        "source_record": build_admission_packet(envelope)["payload"],
+        "alternative_meanings": {
+            "accept_grader_1": "select exactly the grader_1 alternative",
+            "accept_grader_2": "select exactly the grader_2 alternative",
+            "replace": (
+                "supply one complete replacement_grade_alternative matching the dispute "
+                "kind and subject"
+            ),
+        },
+    }
+
+
+def _report_referee_request(
+    envelope: JsonObject,
+    sealed: JsonObject,
+    dispute: JsonObject,
+    legal_hash: str,
+) -> JsonObject:
+    return _new_request(
+        "referee",
+        system_instructions=_report_referee_instructions(dispute),
+        json_schema=_REFEREE_SCHEMA,
+        payload=_report_referee_context(envelope, sealed, dispute),
+        safe_metadata={
+            "record_scope": "one-material-dispute",
+            "referee_scope": "report",
+            "grade_dispute_fingerprint": _model_fingerprint(dispute),
+            "legal_ledger_hash": legal_hash,
+        },
+    )
+
+
+def _read_json(storage: _PosixRunStorage, path: str) -> JsonObject:
+    return _object(
+        parse_canonical_json_bytes(storage.read_artifact(path), location=path), location=path
+    )
+
+
+def _commit(
+    storage: _PosixRunStorage,
+    previous: JsonObject,
+    *,
+    files: dict[str, bytes],
+    judge_calls: list[JsonObject],
+    state: str,
+    terminal_status: str | None = None,
+    legal_ledger_hash: str | None = None,
+    result_hash: str | None = None,
+    retry_count: int | None = None,
+) -> JsonObject:
+    records = {
+        item["artifact_path"]: item for item in cast(list[JsonObject], previous["artifacts"])
+    }
+    for path, data in files.items():
+        record = _artifact_record(path, data)
+        if path in records and records[path] != record:
+            raise EvaluationIntegrityError(f"immutable artifact record differs: {path}")
+        records[path] = record
+    manifest = _manifest(
+        case_fingerprint=cast(str, previous["case_fingerprint"]),
+        case_envelope_hash=cast(str, previous["case_envelope_hash"]),
+        rubric_fingerprint=cast(str, previous["rubric_fingerprint"]),
+        legal_ledger_hash=cast(
+            str | None,
+            previous["legal_ledger_hash"] if legal_ledger_hash is None else legal_ledger_hash,
+        ),
+        result_hash=cast(
+            str | None, previous["result_hash"] if result_hash is None else result_hash
+        ),
+        judge_calls=judge_calls,
+        artifacts=list(records.values()),
+        state=state,
+        retry_count=cast(int, previous["retry_count"] if retry_count is None else retry_count),
+        terminal_status=terminal_status,
+    )
+    for path, data in sorted(files.items()):
+        storage.atomic_write(path, data, mutable=False)
+    _write_manifest(storage, manifest)
+    return _state_from_manifest(manifest)
+
+
+def _verify_generation_capsules_for_initialization(
+    case: object,
+    *,
+    generation_capsule_paths: Mapping[str, Path] | None = None,
+    generation_substrate: Any | None = None,
+) -> JsonObject:
+    case_snapshot = validate_case(case)
+    if case_snapshot["schema_version"] != "1.1":
+        raise PortableEvaluationInputError("case schema 1.1 is required for new evaluation runs")
+    candidates = cast(list[JsonObject], case_snapshot["candidates"])
+    capsule_candidates = [
+        candidate
+        for candidate in candidates
+        if type(candidate["validation_receipt"]) is dict
+        and cast(JsonObject, candidate["validation_receipt"]).get("kind") == "capsule"
+    ]
+    if len(candidates) == 2 and len(capsule_candidates) != 2:
+        raise EvaluationSourceParityUnprovenError(
+            "Formal comparison requires two verified generation capsules."
+        )
+    supplied = {} if generation_capsule_paths is None else dict(generation_capsule_paths)
+    if any(
+        type(candidate_id) is not str or not isinstance(path, Path)
+        for candidate_id, path in supplied.items()
+    ):
+        raise PortableEvaluationInputError(
+            "generation capsule paths must map candidate IDs to Path values"
+        )
+    expected_ids = {cast(str, candidate["candidate_id"]) for candidate in capsule_candidates}
+    if set(supplied) != expected_ids:
+        if len(candidates) == 2:
+            raise EvaluationSourceParityUnprovenError(
+                "Formal comparison requires two verified generation capsule paths."
+            )
+        raise PortableEvaluationInputError(
+            "each capsule-backed report requires its generation capsule path"
+        )
+    if capsule_candidates:
+        gen = generation_substrate
+        if gen is None:
+            raise PortableEvaluationInputError(
+                "generation substrate is required to verify capsule-backed reports"
+            )
+        expected_sources = {
+            cast(str, source["source_id"]): cast(str, source["content_hash"])
+            for source in cast(list[JsonObject], case_snapshot["sources"])
+        }
+        client_facts = cast(str | None, case_snapshot["client_facts"])
+        expected_facts_hash = (
+            None if client_facts is None else _sha256(client_facts.encode("utf-8"))
+        )
+        common_generation_instructions: str | None = None
+        for candidate in capsule_candidates:
+            candidate_id = cast(str, candidate["candidate_id"])
+            try:
+                provenance, report_bytes, request = gen.load_completed_generation_capsule_context(
+                    supplied[candidate_id]
+                )
+            except gen.GenerationInputError as error:
+                raise PortableEvaluationInputError("generation capsule is incomplete") from error
+            record = cast(JsonObject, provenance["generation_record"])
+            if record["candidate_id"] != candidate_id:
+                raise PortableEvaluationInputError(
+                    "generation capsule candidate_id does not match candidate report"
+                )
+            if report_bytes != cast(str, candidate["report_text"]).encode("utf-8"):
+                raise PortableEvaluationInputError(
+                    "generation capsule report bytes do not match candidate report"
+                )
+            if record["report_hash"] != candidate["report_hash"]:
+                raise PortableEvaluationInputError(
+                    "generation capsule report hash does not match candidate report"
+                )
+            if record["source_hashes"] != expected_sources:
+                raise EvaluationSourceParityUnprovenError(
+                    "Generation capsule sources do not match the common case evidence."
+                )
+            if record["client_facts_hash"] != expected_facts_hash:
+                raise EvaluationSourceParityUnprovenError(
+                    "Generation capsule client facts do not match the common case evidence."
+                )
+            if request["question"] != case_snapshot["question"]:
+                raise EvaluationSourceParityUnprovenError(
+                    "Generation capsule question does not match the evaluation question."
+                )
+            generation_instructions = cast(str, request["generation_instructions"])
+            if common_generation_instructions is None:
+                common_generation_instructions = generation_instructions
+            elif generation_instructions != common_generation_instructions:
+                raise EvaluationSourceParityUnprovenError(
+                    "Generation capsule instructions do not match across compared reports."
+                )
+            if candidate["validation_receipt"] != provenance:
+                raise PortableEvaluationInputError(
+                    "candidate capsule provenance does not match the verified capsule"
+                )
+    return case_snapshot
+
+
+def initialize_evaluation(
+    case: object,
+    output_dir: Path,
+    *,
+    seed_hex: str,
+    generation_capsule_paths: Mapping[str, Path] | None = None,
+    generation_substrate: Any | None = None,
+) -> JsonObject:
+    case_snapshot = _verify_generation_capsules_for_initialization(
+        case,
+        generation_capsule_paths=generation_capsule_paths,
+        generation_substrate=generation_substrate,
+    )
+    envelope = freeze_case(case_snapshot, seed_hex=seed_hex)
+    request = build_admission_packet(envelope)
+    call = _pending_call("admission", request)
+    files = {
+        _CASE_ENVELOPE_PATH: canonical_json_bytes(envelope),
+        _RUBRIC_PATH: canonical_json_bytes(RUBRIC_V1),
+        cast(str, call["request_artifact_path"]): canonical_json_bytes(request),
+    }
+    manifest = _manifest(
+        case_fingerprint=cast(str, envelope["case_fingerprint"]),
+        case_envelope_hash=_sha256(files[_CASE_ENVELOPE_PATH]),
+        rubric_fingerprint=_model_fingerprint(RUBRIC_V1),
+        legal_ledger_hash=None,
+        result_hash=None,
+        judge_calls=[call],
+        artifacts=[_artifact_record(path, data) for path, data in files.items()],
+        state="admission",
+        retry_count=0,
+        terminal_status=None,
+    )
+    with _open_run_storage(output_dir, initialize=True) as storage:
+        for path, data in sorted(files.items()):
+            storage.atomic_write(path, data, mutable=False)
+        _write_manifest(storage, manifest)
+        storage.assert_root_identity()
+    return _state_from_manifest(manifest)
+
+
+def _data_json(data_by_path: dict[str, bytes], path: str) -> JsonObject:
+    if path not in data_by_path:
+        raise EvaluationIntegrityError(f"protocol artifact is absent: {path}")
+    return _object(parse_canonical_json_bytes(data_by_path[path], location=path), location=path)
+
+
+def _expected_request(
+    request: JsonObject,
+    call: JsonObject,
+    envelope: JsonObject,
+    manifest: JsonObject,
+    data_by_path: dict[str, bytes],
+) -> JsonObject:
+    operation = request.get("operation")
+    if operation == "admit_case":
+        return build_admission_packet(envelope)
+    if operation == "build_ledger":
+        contract_mode = _ledger_contract_mode(request)
+        if contract_mode is None:
+            raise EvaluationIntegrityError("ledger-build request lacks a contract mode")
+        return _build_ledger_request(envelope, contract_mode=contract_mode)
+    if operation == "audit_ledger":
+        contract_mode = _ledger_contract_mode(request)
+        if contract_mode is None:
+            raise EvaluationIntegrityError("ledger-audit request lacks a contract mode")
+        return _audit_ledger_request(
+            envelope,
+            _data_json(data_by_path, _PROPOSED_LEDGER_PATH),
+            contract_mode=contract_mode,
+        )
+    if operation == "repair_ledger":
+        contract_mode = _ledger_contract_mode(request)
+        if contract_mode is None:
+            raise EvaluationIntegrityError("ledger-repair request lacks a contract mode")
+        return _repair_ledger_request(
+            envelope,
+            _data_json(data_by_path, _PROPOSED_LEDGER_PATH),
+            _data_json(data_by_path, _LEDGER_AUDIT_PATH),
+            contract_mode=contract_mode,
+        )
+    if operation == "grade_report":
+        label = call.get("anonymous_label")
+        legal_hash = manifest.get("legal_ledger_hash")
+        if label not in {"A", "B"} or type(legal_hash) is not str:
+            raise EvaluationIntegrityError("grade request lacks bound anonymous evidence")
+        return _grade_request(
+            envelope,
+            _data_json(data_by_path, _SEALED_LEDGER_PATH),
+            _data_json(data_by_path, f"deterministic-checks-{label}.json"),
+            label,
+            legal_hash,
+        )
+    if operation == "referee":
+        metadata = _object(request.get("safe_metadata"), location="request safe_metadata")
+        if metadata.get("referee_scope") == "ledger":
+            remaining = validate_ledger_audit(_data_json(data_by_path, _REMAINING_AUDIT_PATH))
+            material = [
+                item
+                for item in cast(list[JsonObject], remaining["disputes"])
+                if item["materiality"] in {"critical", "material"}
+            ]
+            if len(material) != 1:
+                raise EvaluationIntegrityError("ledger referee lacks exactly one material dispute")
+            return _ledger_referee_request(
+                envelope,
+                _data_json(data_by_path, _REPAIRED_LEDGER_PATH),
+                material[0],
+            )
+        disputes = _data_json(data_by_path, _REPORT_DISPUTES_PATH)
+        try:
+            index = int(cast(str, call["call_id"]).rsplit("-", maxsplit=1)[1]) - 1
+            dispute = cast(list[JsonObject], disputes["disputes"])[index]
+        except (IndexError, KeyError, TypeError, ValueError) as error:
+            raise EvaluationIntegrityError("report referee call is malformed") from error
+        legal_hash = manifest.get("legal_ledger_hash")
+        if index < 0 or type(legal_hash) is not str:
+            raise EvaluationIntegrityError("report referee lacks bound evidence")
+        return _report_referee_request(
+            envelope,
+            _data_json(data_by_path, _SEALED_LEDGER_PATH),
+            dispute,
+            legal_hash,
+        )
+    raise EvaluationIntegrityError("judge request operation is unsupported")
+
+
+def _verify_completed_response_artifact(
+    call: JsonObject,
+    response: JsonObject,
+    envelope: JsonObject,
+    data_by_path: dict[str, bytes],
+) -> None:
+    operation = call["operation"]
+    payload = response["payload"]
+    if operation == "admit_case":
+        expected = adjudicate_admission(envelope, payload)
+        actual = _data_json(data_by_path, _READINESS_PATH)
+    elif operation == "build_ledger":
+        expected, issues = validate_ledger(payload, envelope=envelope)
+        if issues:
+            raise EvaluationIntegrityError("completed ledger response is invalid")
+        actual = _data_json(data_by_path, _PROPOSED_LEDGER_PATH)
+    elif operation == "audit_ledger":
+        expected = validate_ledger_audit_findings(
+            payload,
+            envelope=envelope,
+            proposed_ledger=_data_json(data_by_path, _PROPOSED_LEDGER_PATH),
+        )
+        if expected["request_fingerprint"] != call["request_fingerprint"]:
+            raise EvaluationIntegrityError(
+                "ledger-audit evidence request fingerprint mismatch"
+            )
+        actual = _data_json(data_by_path, _LEDGER_AUDIT_PATH)
+    elif operation == "repair_ledger":
+        repair = _shape(
+            payload,
+            required={"repaired_ledger", "remaining_audit"},
+            location="ledger repair response",
+        )
+        ledger, issues = validate_ledger(repair["repaired_ledger"], envelope=envelope)
+        if issues:
+            raise EvaluationIntegrityError("completed repaired ledger is invalid")
+        audit = validate_ledger_audit(repair["remaining_audit"])
+        if audit["request_fingerprint"] != call["request_fingerprint"]:
+            raise EvaluationIntegrityError(
+                "remaining-audit evidence request fingerprint mismatch"
+            )
+        if ledger != _data_json(data_by_path, _REPAIRED_LEDGER_PATH) or audit != _data_json(
+            data_by_path, _REMAINING_AUDIT_PATH
+        ):
+            raise EvaluationIntegrityError("ledger repair artifacts differ from response")
+        return
+    elif operation == "grade_report":
+        _require_candidate_grade_schema(
+            payload,
+            location=cast(str, call["response_artifact_path"]),
+        )
+        sealed = _data_json(data_by_path, _SEALED_LEDGER_PATH)
+        expected, issues = validate_grade(sealed, payload)
+        if issues:
+            raise EvaluationIntegrityError("completed grade response is invalid")
+        label = cast(str, call["anonymous_label"])
+        _validate_grade_evidence(envelope, expected, label)
+        actual = _data_json(data_by_path, _grade_path(call))
+        _require_candidate_grade_schema(actual, location=_grade_path(call))
+    elif operation == "referee":
+        expected = validate_referee_decision(payload)
+        if call.get("anonymous_label") is None:
+            actual = _data_json(data_by_path, _LEDGER_REFEREE_PATH)
+        else:
+            dispute_artifact = _data_json(data_by_path, _REPORT_DISPUTES_PATH)
+            report_disputes = cast(list[JsonObject], dispute_artifact["disputes"])
+            index = int(cast(str, call["call_id"]).rsplit("-", maxsplit=1)[1]) - 1
+            dispute = report_disputes[index]
+            label = cast(str, dispute["anonymous_label"])
+            _validate_report_referee_decision_evidence(
+                envelope,
+                _data_json(data_by_path, _SEALED_LEDGER_PATH),
+                report_disputes,
+                expected,
+                label,
+                _data_json(data_by_path, f"grader-1-report-{label}.json"),
+                _data_json(data_by_path, f"grader-2-report-{label}.json"),
+            )
+            actual = _data_json(data_by_path, _referee_path(index, dispute))
+    else:
+        raise EvaluationIntegrityError("completed response operation is unsupported")
+    if actual != expected:
+        raise EvaluationIntegrityError("semantic artifact differs from completed response")
+
+
+def _protocol_inventory(
+    manifest: JsonObject, envelope: JsonObject, data_by_path: dict[str, bytes]
+) -> set[str]:
+    calls = cast(list[JsonObject], manifest["judge_calls"])
+    expected = {_CASE_ENVELOPE_PATH, _RUBRIC_PATH}
+    for call in calls:
+        expected.add(cast(str, call["request_artifact_path"]))
+        for key in ("response_artifact_path", "diagnostics_artifact_path"):
+            path = call[key]
+            if type(path) is str:
+                expected.add(path)
+    completed_ids = {cast(str, call["call_id"]) for call in calls if call["state"] == "completed"}
+    admission_completed = "admission" in completed_ids
+    if admission_completed or manifest["state"] == "inconclusive":
+        expected.add(_READINESS_PATH)
+    if manifest["state"] == "inconclusive" and admission_completed:
+        expected.add(_TERMINAL_READINESS_PATH)
+    if "ledger-build" in completed_ids:
+        expected.add(_PROPOSED_LEDGER_PATH)
+    if "ledger-audit" in completed_ids:
+        expected.add(_LEDGER_AUDIT_PATH)
+    if "ledger-repair" in completed_ids:
+        expected.update({_REPAIRED_LEDGER_PATH, _REMAINING_AUDIT_PATH})
+    if "ledger-referee" in completed_ids:
+        expected.add(_LEDGER_REFEREE_PATH)
+    labels = _labels(envelope)
+    if manifest["legal_ledger_hash"] is not None:
+        expected.add(_SEALED_LEDGER_PATH)
+        expected.update(f"deterministic-checks-{label}.json" for label in labels)
+    for label in labels:
+        for number in (1, 2):
+            if f"grade-{label}-{number}" in completed_ids:
+                expected.add(f"grader-{number}-report-{label}.json")
+    if all(f"grade-{label}-{number}" in completed_ids for label in labels for number in (1, 2)):
+        expected.add(_REPORT_DISPUTES_PATH)
+        disputes = cast(
+            list[JsonObject], _data_json(data_by_path, _REPORT_DISPUTES_PATH)["disputes"]
+        )
+        for index, dispute in enumerate(disputes):
+            if f"report-referee-{index + 1}" in completed_ids:
+                expected.add(_referee_path(index, dispute))
+    if manifest["state"] == "completed":
+        for label in labels:
+            expected.update(
+                {
+                    f"resolved-grade-{label}.json",
+                    f"report-score-inputs-{label}.json",
+                    f"report-evaluation-{label}.json",
+                }
+            )
+    if manifest["terminal_status"] is not None:
+        expected.update({_RESULT_PATH, _REPORT_PATH})
+    return expected
+
+
+def _completed_call_ids(manifest: JsonObject) -> set[str]:
+    return {
+        cast(str, call["call_id"])
+        for call in cast(list[JsonObject], manifest["judge_calls"])
+        if call["state"] == "completed"
+    }
+
+
+def _validate_call_record(call: JsonObject) -> None:
+    required = {
+        "call_id",
+        "operation",
+        "anonymous_label",
+        "attempt",
+        "prompt_fingerprint",
+        "request_fingerprint",
+        "response_fingerprint",
+        "provider_name",
+        "model_name",
+        "judge_isolation",
+        "request_artifact_path",
+        "response_artifact_path",
+        "diagnostics_artifact_path",
+        "state",
+        "retry_count",
+        "terminal_status",
+    }
+    if set(call) != required:
+        raise EvaluationIntegrityError("judge call record has an unexpected shape")
+    call_id = _identifier(call["call_id"], location="judge call.call_id")
+    operation = _enum(call["operation"], JUDGE_OPERATIONS, location="judge call.operation")
+    label = _optional_string(call["anonymous_label"], location="judge call.anonymous_label")
+    if label not in {None, "A", "B"}:
+        raise EvaluationIntegrityError("judge call anonymous label is invalid")
+    attempt = _strict_int(call["attempt"], location="judge call.attempt", minimum=1, maximum=2)
+    retry_count = _strict_int(
+        call["retry_count"], location="judge call.retry_count", minimum=0, maximum=1
+    )
+    if retry_count != attempt - 1:
+        raise EvaluationIntegrityError("judge call retry counter is inconsistent")
+    _hash(call["prompt_fingerprint"], location="judge call.prompt_fingerprint")
+    _hash(call["request_fingerprint"], location="judge call.request_fingerprint")
+    request_path = _string(
+        call["request_artifact_path"], location="judge call.request_artifact_path"
+    )
+    if request_path != f"judge-requests/{call_id}-attempt-{attempt}.json":
+        raise EvaluationIntegrityError("judge call request path is inconsistent")
+    state = _enum(
+        call["state"], frozenset({"pending", "completed", "failed"}), location="judge call.state"
+    )
+    response_path = call["response_artifact_path"]
+    diagnostics_path = call["diagnostics_artifact_path"]
+    if state == "pending":
+        if (
+            any(
+                call[key] is not None
+                for key in (
+                    "response_fingerprint",
+                    "provider_name",
+                    "model_name",
+                    "judge_isolation",
+                    "response_artifact_path",
+                    "diagnostics_artifact_path",
+                )
+            )
+            or call["terminal_status"] != "pending"
+        ):
+            raise EvaluationIntegrityError("pending judge call carries completed provenance")
+        return
+    _hash(call["response_fingerprint"], location="judge call.response_fingerprint")
+    _string(call["provider_name"], location="judge call.provider_name", nonblank=True)
+    _string(call["model_name"], location="judge call.model_name", nonblank=True)
+    _enum(call["judge_isolation"], JUDGE_ISOLATIONS, location="judge call.judge_isolation")
+    if response_path != f"judge-responses/{call_id}-attempt-{attempt}.json":
+        raise EvaluationIntegrityError("judge call response path is inconsistent")
+    if state == "completed":
+        if diagnostics_path is not None or call["terminal_status"] != "completed":
+            raise EvaluationIntegrityError("completed judge call has invalid terminal provenance")
+    elif diagnostics_path != f"judge-diagnostics/{call_id}-attempt-{attempt}.json" or call[
+        "terminal_status"
+    ] != ("failed" if attempt == 1 else "inconclusive"):
+        raise EvaluationIntegrityError("failed judge call has invalid diagnostic provenance")
+    if operation == "grade_report" and label is None:
+        raise EvaluationIntegrityError("grade call lacks an anonymous label")
+
+
+def _call_groups(manifest: JsonObject) -> list[list[JsonObject]]:
+    groups: list[list[JsonObject]] = []
+    seen: set[str] = set()
+    for call in cast(list[JsonObject], manifest["judge_calls"]):
+        _validate_call_record(call)
+        call_id = cast(str, call["call_id"])
+        if groups and groups[-1][0]["call_id"] == call_id:
+            groups[-1].append(call)
+        else:
+            if call_id in seen:
+                raise EvaluationIntegrityError("judge call ID is noncontiguous")
+            seen.add(call_id)
+            groups.append([call])
+    for group in groups:
+        if [call["attempt"] for call in group] not in ([1], [1, 2]):
+            raise EvaluationIntegrityError("judge call attempt sequence is invalid")
+        if len(group) == 2 and not (
+            group[0]["state"] == "failed" and group[0]["terminal_status"] == "failed"
+        ):
+            raise EvaluationIntegrityError("judge retry lacks a failed first attempt")
+        if group[-1]["state"] == "failed" and group[-1]["attempt"] != 2:
+            raise EvaluationIntegrityError("nonterminal failed call lacks its retry")
+    retry_total = sum(len(group) - 1 for group in groups)
+    if manifest["retry_count"] != retry_total:
+        raise EvaluationIntegrityError("manifest retry count does not match call evidence")
+    return groups
+
+
+def _verify_transition_sequence(
+    manifest: JsonObject, envelope: JsonObject, data_by_path: dict[str, bytes]
+) -> None:
+    groups = _call_groups(manifest)
+    if not groups:
+        raise EvaluationIntegrityError("judge transition lacks admission")
+    position = 0
+
+    def consume(call_id: str, operation: str, label: str | None = None) -> list[JsonObject]:
+        nonlocal position
+        if position >= len(groups) or groups[position][0]["call_id"] != call_id:
+            raise EvaluationIntegrityError(f"judge transition skipped {call_id}")
+        group = groups[position]
+        first = group[0]
+        if first["operation"] != operation or first["anonymous_label"] != label:
+            raise EvaluationIntegrityError("judge transition operation or label mismatch")
+        position += 1
+        return group
+
+    def incomplete(group: list[JsonObject], phase: str) -> bool:
+        last = group[-1]
+        if last["state"] == "completed":
+            return False
+        if position != len(groups):
+            raise EvaluationIntegrityError("judge transition advanced past an incomplete call")
+        if last["state"] == "pending":
+            if manifest["state"] != phase or manifest["terminal_status"] is not None:
+                raise EvaluationIntegrityError("pending call conflicts with manifest phase")
+        elif not (
+            last["state"] == "failed"
+            and last["attempt"] == 2
+            and manifest["state"] == "inconclusive"
+            and manifest["terminal_status"] == "inconclusive"
+        ):
+            raise EvaluationIntegrityError("failed call conflicts with terminal state")
+        return True
+
+    admission_group = consume("admission", "admit_case")
+    if incomplete(admission_group, "admission"):
+        return
+    readiness = _data_json(data_by_path, _READINESS_PATH)
+    if readiness.get("status") == "CASE_INVALID":
+        if position != len(groups) or manifest["state"] != "case-invalid":
+            raise EvaluationIntegrityError("case-invalid transition did not stop at admission")
+        return
+    if readiness.get("status") != "ADMITTED":
+        raise EvaluationIntegrityError("completed admission lacks admitted readiness")
+    build_group = consume("ledger-build", "build_ledger")
+    if incomplete(build_group, "ledger-build"):
+        return
+    audit_group = consume("ledger-audit", "audit_ledger")
+    if incomplete(audit_group, "ledger-audit"):
+        return
+    audit = validate_ledger_audit_findings(
+        _data_json(data_by_path, _LEDGER_AUDIT_PATH),
+        envelope=envelope,
+        proposed_ledger=_data_json(data_by_path, _PROPOSED_LEDGER_PATH),
+    )
+    if cast(list[JsonObject], audit["disputes"]):
+        repair_group = consume("ledger-repair", "repair_ledger")
+        if incomplete(repair_group, "ledger-repair"):
+            return
+        remaining = validate_ledger_audit(_data_json(data_by_path, _REMAINING_AUDIT_PATH))
+        material = [
+            dispute
+            for dispute in cast(list[JsonObject], remaining["disputes"])
+            if dispute["materiality"] in {"critical", "material"}
+        ]
+        if len(material) > 1:
+            if (
+                position != len(groups)
+                or manifest["state"] != "inconclusive"
+                or manifest["terminal_status"] != "inconclusive"
+            ):
+                raise EvaluationIntegrityError("multiple ledger disputes did not fail closed")
+            return
+        if material:
+            referee_group = consume("ledger-referee", "referee")
+            if incomplete(referee_group, "ledger-referee"):
+                return
+    elif position < len(groups) and groups[position][0]["call_id"] in {
+        "ledger-repair",
+        "ledger-referee",
+    }:
+        raise EvaluationIntegrityError("clean audit was followed by ledger repair")
+    for label in _labels(envelope):
+        for number in (1, 2):
+            group = consume(f"grade-{label}-{number}", "grade_report", label)
+            if incomplete(group, "grade-a" if label == "A" else "grade-b"):
+                return
+    disputes = cast(list[JsonObject], _data_json(data_by_path, _REPORT_DISPUTES_PATH)["disputes"])
+    for index, dispute in enumerate(disputes):
+        group = consume(
+            f"report-referee-{index + 1}",
+            "referee",
+            cast(str, dispute["anonymous_label"]),
+        )
+        if incomplete(group, "report-referee"):
+            return
+    if (
+        position != len(groups)
+        or manifest["state"] != "completed"
+        or manifest["terminal_status"] != "completed"
+    ):
+        raise EvaluationIntegrityError("completed transition conflicts with manifest state")
+
+
+def _replayed_report_disputes(
+    envelope: JsonObject, sealed: JsonObject, data_by_path: dict[str, bytes]
+) -> list[JsonObject]:
+    disputes: list[JsonObject] = []
+    for label in _labels(envelope):
+        disputes.extend(
+            material_disputes(
+                sealed,
+                _data_json(data_by_path, f"grader-1-report-{label}.json"),
+                _data_json(data_by_path, f"grader-2-report-{label}.json"),
+            )
+        )
+    return disputes
+
+
+def _verify_derived_artifacts(
+    manifest: JsonObject,
+    envelope: JsonObject,
+    result: JsonObject | None,
+    data_by_path: dict[str, bytes],
+) -> None:
+    completed = _completed_call_ids(manifest)
+    readiness: JsonObject | None = None
+    if _READINESS_PATH in data_by_path:
+        readiness = _data_json(data_by_path, _READINESS_PATH)
+        if "admission" in completed:
+            admission_call = next(
+                call
+                for call in cast(list[JsonObject], manifest["judge_calls"])
+                if call["call_id"] == "admission" and call["state"] == "completed"
+            )
+            response_path = cast(str, admission_call["response_artifact_path"])
+            response = _validate_response(_data_json(data_by_path, response_path))
+            if readiness != adjudicate_admission(envelope, response["payload"]):
+                raise EvaluationIntegrityError("admission readiness replay mismatch")
+
+    if manifest["legal_ledger_hash"] is not None:
+        if "ledger-repair" in completed:
+            ledger = _data_json(data_by_path, _REPAIRED_LEDGER_PATH)
+            audit = _data_json(data_by_path, _REMAINING_AUDIT_PATH)
+            referee = (
+                _data_json(data_by_path, _LEDGER_REFEREE_PATH)
+                if "ledger-referee" in completed
+                else None
+            )
+        else:
+            ledger = _data_json(data_by_path, _PROPOSED_LEDGER_PATH)
+            audit = _data_json(data_by_path, _LEDGER_AUDIT_PATH)
+            referee = None
+        replayed = seal_ledger(envelope, ledger, audit, referee)
+        sealed = _data_json(data_by_path, _SEALED_LEDGER_PATH)
+        if replayed != sealed:
+            raise EvaluationIntegrityError("sealed ledger replay mismatch")
+        for label in _labels(envelope):
+            expected_checks = _derive_deterministic_checks(
+                _candidate_for_label(envelope, label), label
+            )
+            if expected_checks != _data_json(data_by_path, f"deterministic-checks-{label}.json"):
+                raise EvaluationIntegrityError("deterministic check replay mismatch")
+    else:
+        sealed = None
+
+    labels = _labels(envelope)
+    all_grades = all(
+        f"grade-{label}-{number}" in completed for label in labels for number in (1, 2)
+    )
+    if all_grades:
+        if sealed is None:
+            raise EvaluationIntegrityError("grades exist without a sealed ledger")
+        disputes = _replayed_report_disputes(envelope, sealed, data_by_path)
+        recorded = _data_json(data_by_path, _REPORT_DISPUTES_PATH)
+        _require_artifact_schema(recorded, location=_REPORT_DISPUTES_PATH)
+        if recorded != {"schema_version": "1.3", "disputes": disputes}:
+            raise EvaluationIntegrityError("report dispute replay mismatch")
+
+    if manifest["state"] == "completed":
+        if sealed is None or readiness is None or result is None:
+            raise EvaluationIntegrityError("completed run lacks replay inputs")
+        disputes = cast(
+            list[JsonObject], _data_json(data_by_path, _REPORT_DISPUTES_PATH)["disputes"]
+        )
+        reports: list[JsonObject] = []
+        reports_by_label: dict[str, JsonObject] = {}
+        score_inputs_by_label: dict[str, JsonObject] = {}
+        resolved_by_label: dict[str, JsonObject] = {}
+        source_record = cast(JsonObject, build_admission_packet(envelope)["payload"])
+        for label in labels:
+            for number in (1, 2):
+                grade_path = f"grader-{number}-report-{label}.json"
+                _require_candidate_grade_schema(
+                    _data_json(data_by_path, grade_path), location=grade_path
+                )
+            decisions = [
+                _data_json(data_by_path, _referee_path(index, dispute))
+                for index, dispute in enumerate(disputes)
+                if dispute["anonymous_label"] == label
+            ]
+            resolved = resolve_grades(
+                sealed,
+                _data_json(data_by_path, f"grader-1-report-{label}.json"),
+                _data_json(data_by_path, f"grader-2-report-{label}.json"),
+                decisions,
+            )
+            resolved_artifact: JsonObject = {"schema_version": "1.3", **resolved}
+            resolved_path = f"resolved-grade-{label}.json"
+            stored_resolved = _data_json(data_by_path, resolved_path)
+            _require_resolved_grade_schemas(stored_resolved, location=resolved_path)
+            if resolved_artifact != stored_resolved:
+                raise EvaluationIntegrityError("resolved grade replay mismatch")
+            checks = _data_json(data_by_path, f"deterministic-checks-{label}.json")
+            expected_inputs: JsonObject = {
+                "schema_version": SCORE_INPUT_SCHEMA_VERSION,
+                "anonymous_label": label,
+                "sealed_ledger": sealed,
+                "resolved_grade": resolved_artifact,
+                "deterministic_checks": checks,
+                "rubric": cast(JsonObject, _copy_json(RUBRIC_V1)),
+                "source_record": cast(JsonObject, _copy_json(source_record)),
+            }
+            inputs_path = f"report-score-inputs-{label}.json"
+            stored_inputs = _data_json(data_by_path, inputs_path)
+            _require_score_input_schemas(stored_inputs, location=inputs_path)
+            if stored_inputs.get("source_record") != source_record:
+                raise EvaluationIntegrityError(
+                    EVALUATION_SCORE_INPUT_SOURCE_RECORD_MISMATCH
+                )
+            if expected_inputs != stored_inputs:
+                raise EvaluationIntegrityError("score input replay mismatch")
+            report = score_report(
+                sealed,
+                resolved,
+                checks,
+                source_record=source_record,
+            )
+            report_path = f"report-evaluation-{label}.json"
+            stored_report = _data_json(data_by_path, report_path)
+            _require_artifact_schema(stored_report, location=report_path)
+            if report != stored_report:
+                raise EvaluationIntegrityError("report score replay mismatch")
+            reports.append(report)
+            reports_by_label[label] = report
+            score_inputs_by_label[label] = stored_inputs
+            resolved_by_label[label] = resolved
+        comparison: JsonObject | None = None
+        candidates = cast(list[JsonObject], cast(JsonObject, envelope["case"])["candidates"])
+        if len(candidates) == 2:
+            labels_by_id = {
+                cast(str, item["candidate_id"]): cast(str, item["anonymous_label"])
+                for item in cast(list[JsonObject], envelope["assignments"])
+            }
+            candidate_id = cast(
+                str,
+                next(item["candidate_id"] for item in candidates if item["role"] == "candidate"),
+            )
+            comparator_id = cast(
+                str,
+                next(item["candidate_id"] for item in candidates if item["role"] == "comparator"),
+            )
+            comparison = compare_reports(
+                reports_by_label[labels_by_id[candidate_id]],
+                reports_by_label[labels_by_id[comparator_id]],
+                candidate_inputs=score_inputs_by_label[labels_by_id[candidate_id]],
+                comparator_inputs=score_inputs_by_label[labels_by_id[comparator_id]],
+            )
+        requirement_matrix = _derive_requirement_matrix(sealed, resolved_by_label)
+        judge_isolation = _aggregate_judge_isolation(
+            cast(list[JsonObject], manifest["judge_calls"])
+        )
+        if result != _evaluation_result(
+            readiness,
+            reports,
+            requirement_matrix,
+            comparison,
+            judge_isolation,
+        ):
+            raise EvaluationIntegrityError("terminal result score replay mismatch")
+    elif manifest["terminal_status"] is not None:
+        if result is None:
+            raise EvaluationIntegrityError("terminal run lacks a result")
+        authoritative = (
+            _data_json(data_by_path, _TERMINAL_READINESS_PATH)
+            if _TERMINAL_READINESS_PATH in data_by_path
+            else readiness
+        )
+        if authoritative is None:
+            raise EvaluationIntegrityError("terminal run lacks readiness evidence")
+        disposition = "CASE_INVALID" if manifest["state"] == "case-invalid" else "INCONCLUSIVE"
+        if result != _terminal_result(
+            envelope,
+            authoritative,
+            disposition,
+            _aggregate_judge_isolation(cast(list[JsonObject], manifest["judge_calls"])),
+        ):
+            raise EvaluationIntegrityError("terminal result readiness replay mismatch")
+
+
+def _verify_in_storage_unchecked(
+    storage: _PosixRunStorage,
+) -> tuple[JsonObject, JsonObject, JsonObject | None]:
+    before = storage.scan_inventory()
+    manifest = _parse_manifest(storage.read_artifact(_MANIFEST_PATH))
+    artifacts = cast(list[JsonObject], manifest["artifacts"])
+    paths = [cast(str, item["artifact_path"]) for item in artifacts]
+    if paths != sorted(paths) or len(paths) != len(set(paths)) or _MANIFEST_PATH in paths:
+        raise EvaluationIntegrityError("manifest artifact paths are invalid")
+    expected_files = set(paths) | {_MANIFEST_PATH}
+    actual_files = {path for path in before if not path.endswith("/")}
+    expected_dirs = {f"{Path(path).parent.as_posix()}/" for path in expected_files if "/" in path}
+    expected_dirs.discard("./")
+    actual_dirs = {path for path in before if path.endswith("/")}
+    if actual_files != expected_files or actual_dirs != expected_dirs:
+        raise EvaluationIntegrityError("run inventory does not match the manifest")
+    data_by_path: dict[str, bytes] = {}
+    for record in artifacts:
+        path = cast(str, record["artifact_path"])
+        data = storage.read_artifact(path)
+        if record.get("artifact_hash") != _sha256(data):
+            raise EvaluationIntegrityError(f"artifact hash mismatch: {path}")
+        if path.endswith(".json"):
+            parse_canonical_json_bytes(data, location=path)
+        data_by_path[path] = data
+    envelope = _object(
+        parse_canonical_json_bytes(data_by_path[_CASE_ENVELOPE_PATH], location=_CASE_ENVELOPE_PATH),
+        location=_CASE_ENVELOPE_PATH,
+    )
+    case = validate_case(envelope.get("case"))
+    if envelope.get("case_fingerprint") != _model_fingerprint(case):
+        raise EvaluationIntegrityError("case envelope fingerprint mismatch")
+    if manifest["case_fingerprint"] != envelope["case_fingerprint"] or manifest[
+        "case_envelope_hash"
+    ] != _sha256(data_by_path[_CASE_ENVELOPE_PATH]):
+        raise EvaluationIntegrityError("manifest case binding mismatch")
+    rubric = _object(
+        parse_canonical_json_bytes(data_by_path[_RUBRIC_PATH], location=_RUBRIC_PATH),
+        location=_RUBRIC_PATH,
+    )
+    if rubric != RUBRIC_V1 or manifest["rubric_fingerprint"] != _model_fingerprint(rubric):
+        raise EvaluationIntegrityError("manifest rubric binding mismatch")
+    if set(paths) != _protocol_inventory(manifest, envelope, data_by_path):
+        raise EvaluationIntegrityError("protocol artifact inventory mismatch")
+    _verify_transition_sequence(manifest, envelope, data_by_path)
+    calls = cast(list[JsonObject], manifest["judge_calls"])
+    pending = [call for call in calls if call.get("state") == "pending"]
+    if len(pending) not in {0, 1}:
+        raise EvaluationIntegrityError("run must contain at most one pending call")
+    seen_attempts: set[tuple[object, object]] = set()
+    ledger_requests: list[JsonObject] = []
+    for call in calls:
+        identity = (call.get("call_id"), call.get("attempt"))
+        if identity in seen_attempts:
+            raise EvaluationIntegrityError("judge call identity is duplicated")
+        seen_attempts.add(identity)
+        request_path = call.get("request_artifact_path")
+        if type(request_path) is not str or request_path not in data_by_path:
+            raise EvaluationIntegrityError("judge request artifact is absent")
+        request = _object(
+            parse_canonical_json_bytes(data_by_path[request_path], location=request_path),
+            location=request_path,
+        )
+        if request.get("operation") in {
+            "build_ledger",
+            "audit_ledger",
+            "repair_ledger",
+        }:
+            ledger_requests.append(request)
+        if request.get("request_fingerprint") != _model_fingerprint(
+            request, exclude={"request_fingerprint"}
+        ):
+            raise EvaluationIntegrityError("judge request fingerprint mismatch")
+        if request.get("request_fingerprint") != call.get(
+            "request_fingerprint"
+        ) or _prompt_fingerprint(request) != call.get("prompt_fingerprint"):
+            raise EvaluationIntegrityError("judge call request binding mismatch")
+        _verify_request_noninterference(request, case)
+        if request != _expected_request(request, call, envelope, manifest, data_by_path):
+            raise EvaluationIntegrityError("judge request differs from exact protocol packet")
+        response_path = call.get("response_artifact_path")
+        if call.get("state") == "pending":
+            if response_path is not None or call.get("response_fingerprint") is not None:
+                raise EvaluationIntegrityError("pending call carries response provenance")
+        else:
+            if type(response_path) is not str or response_path not in data_by_path:
+                raise EvaluationIntegrityError("completed call response is absent")
+            if call.get("response_fingerprint") != _sha256(data_by_path[response_path]):
+                raise EvaluationIntegrityError("judge response fingerprint mismatch")
+            response = _validate_response(_data_json(data_by_path, response_path))
+            if call.get("operation") == "grade_report" and call.get("state") == "completed":
+                _require_candidate_grade_schema(response["payload"], location=response_path)
+            if (
+                response["operation"] != call.get("operation")
+                or response["request_fingerprint"] != call.get("request_fingerprint")
+                or response["provider_name"] != call.get("provider_name")
+                or response["model_name"] != call.get("model_name")
+                or response["judge_isolation"] != call.get("judge_isolation")
+            ):
+                raise EvaluationIntegrityError("judge response provenance binding mismatch")
+            if call.get("state") == "completed":
+                _verify_completed_response_artifact(call, response, envelope, data_by_path)
+    _verify_ledger_contract_mode_consistency(ledger_requests)
+    if manifest["terminal_status"] is not None and pending:
+        raise EvaluationIntegrityError("terminal run retains a pending call")
+    result: JsonObject | None = None
+    if _RESULT_PATH in data_by_path:
+        result = _object(
+            parse_canonical_json_bytes(data_by_path[_RESULT_PATH], location=_RESULT_PATH),
+            location=_RESULT_PATH,
+        )
+        result = _validate_evaluation_result(result)
+        if result.get("result_fingerprint") != _model_fingerprint(
+            result, exclude={"result_fingerprint"}
+        ):
+            raise EvaluationIntegrityError("evaluation result self-fingerprint mismatch")
+        if manifest["result_hash"] != _sha256(data_by_path[_RESULT_PATH]):
+            raise EvaluationIntegrityError("manifest result binding mismatch")
+        if data_by_path.get(_REPORT_PATH) != render_evaluation_report(result).encode("utf-8"):
+            raise EvaluationIntegrityError("evaluation report replay mismatch")
+    elif manifest["terminal_status"] is not None:
+        raise EvaluationIntegrityError("terminal run lacks an evaluation result")
+    if _SEALED_LEDGER_PATH in data_by_path:
+        if manifest["legal_ledger_hash"] != _sha256(data_by_path[_SEALED_LEDGER_PATH]):
+            raise EvaluationIntegrityError("manifest sealed-ledger binding mismatch")
+    elif manifest["legal_ledger_hash"] is not None:
+        raise EvaluationIntegrityError("manifest declares an absent sealed ledger")
+    _verify_derived_artifacts(manifest, envelope, result, data_by_path)
+    after = storage.scan_inventory()
+    if before != after:
+        raise EvaluationIntegrityError("run inventory changed during verification")
+    storage.assert_root_identity()
+    return manifest, envelope, result
+
+
+def _verify_in_storage(
+    storage: _PosixRunStorage,
+) -> tuple[JsonObject, JsonObject, JsonObject | None]:
+    try:
+        return _verify_in_storage_unchecked(storage)
+    except EvaluationIntegrityError:
+        raise
+    except (
+        PortableEvaluationInputError,
+        EvaluationInconclusiveError,
+        IndexError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise EvaluationIntegrityError("evaluation artifact semantic validation failed") from error
+
+
+def _all_keys(value: object) -> set[str]:
+    keys: set[str] = set()
+    if type(value) is list:
+        for item in cast(list[object], value):
+            keys.update(_all_keys(item))
+    elif type(value) is dict:
+        for key, item in cast(dict[object, object], value).items():
+            if type(key) is str:
+                keys.add(key)
+            keys.update(_all_keys(item))
+    return keys
+
+
+def _verify_request_noninterference(request: JsonObject, case: JsonObject) -> None:
+    operation = request.get("operation")
+    keys = _all_keys(request)
+    forbidden_keys = {"candidate_id", "assignments", "answer_key"}
+    safe_metadata = _object(request.get("safe_metadata"), location="request safe_metadata")
+    source_only = operation in {
+        "admit_case",
+        "build_ledger",
+        "audit_ledger",
+        "repair_ledger",
+    } or (operation == "referee" and safe_metadata.get("referee_scope") == "ledger")
+    if source_only and forbidden_keys & keys:
+        raise EvaluationIntegrityError("source-only request violates noninterference")
+    if operation == "grade_report":
+        payload = _object(request.get("payload"), location="grade request payload")
+        if set(payload) != {
+            "anonymous_report",
+            "sealed_ledger",
+            "source_record",
+            "source_spans",
+            "deterministic_checks",
+            "rubric",
+            "finding_code_contract",
+        }:
+            raise EvaluationIntegrityError("grade request has an invalid evidence shape")
+        if payload["finding_code_contract"] != _finding_code_contract():
+            raise EvaluationIntegrityError("grade request finding-code contract mismatch")
+        anonymous = _object(payload.get("anonymous_report"), location="anonymous report")
+        if set(anonymous) != {"anonymous_label", "report_hash", "report_text"}:
+            raise EvaluationIntegrityError("grade request has an invalid anonymous report shape")
+        report_texts = [
+            cast(str, item["report_text"]) for item in cast(list[JsonObject], case["candidates"])
+        ]
+        if (
+            sum(anonymous["report_text"] == text for text in report_texts) != 1
+            or forbidden_keys & keys
+        ):
+            raise EvaluationIntegrityError("grade request violates report noninterference")
+    if operation == "referee" and safe_metadata.get("referee_scope") == "report":
+        payload = _object(request.get("payload"), location="referee payload")
+        if set(payload) != {
+            "dispute",
+            "anonymous_passages",
+            "relevant_context",
+            "source_spans",
+            "source_record",
+            "alternative_meanings",
+        }:
+            raise EvaluationIntegrityError("report referee request exceeds one dispute")
+        if "anonymous_label" in keys or set(safe_metadata) != {
+            "record_scope",
+            "referee_scope",
+            "grade_dispute_fingerprint",
+            "legal_ledger_hash",
+        }:
+            raise EvaluationIntegrityError("report referee request exposes report provenance")
+
+
+def verify_evaluation_run(run_dir: Path) -> EvaluationVerification:
+    try:
+        with _open_run_storage(run_dir) as storage:
+            manifest, _, _ = _verify_in_storage(storage)
+            return EvaluationVerification(True, (), cast(str, manifest["manifest_fingerprint"]))
+    except EvaluationIntegrityError as error:
+        message = str(error)
+        if EVALUATION_STORAGE_PLATFORM_UNSUPPORTED in message:
+            code = EVALUATION_STORAGE_PLATFORM_UNSUPPORTED
+        elif EVALUATION_SCORE_INPUT_SCHEMA_UNSUPPORTED in message:
+            code = EVALUATION_SCORE_INPUT_SCHEMA_UNSUPPORTED
+        elif EVALUATION_SCORE_INPUT_SOURCE_RECORD_MISMATCH in message:
+            code = EVALUATION_SCORE_INPUT_SOURCE_RECORD_MISMATCH
+        elif EVALUATION_ARTIFACT_SCHEMA_UNSUPPORTED in message:
+            code = EVALUATION_ARTIFACT_SCHEMA_UNSUPPORTED
+        else:
+            code = "EVALUATION_INTEGRITY_INVALID"
+        return EvaluationVerification(False, (code,), None)
+
+
+@dataclass(frozen=True)
+class _QualificationPreflightContext:
+    manifest: JsonObject
+    case: JsonObject
+    request: JsonObject
+    judgment: JsonObject
+    readiness: JsonObject
+    response: JsonObject | None = None
+    response_bytes: bytes | None = None
+
+
+def _assert_qualification_response_depth(value: object) -> None:
+    """Reject response cycles and nesting beyond the full runtime's limit."""
+    pending: list[tuple[object, int, bool]] = [(value, 1, False)]
+    active: set[int] = set()
+    while pending:
+        current, depth, exiting = pending.pop()
+        if depth > _QUALIFICATION_RESPONSE_MAX_DEPTH:
+            raise PortableEvaluationInputError(
+                "qualification response exceeds the nesting-depth limit"
+            )
+        if not isinstance(current, (dict, list)):
+            continue
+        identity = id(current)
+        if exiting:
+            active.remove(identity)
+            continue
+        if identity in active:
+            raise PortableEvaluationInputError(
+                "qualification response contains a container cycle"
+            )
+        active.add(identity)
+        pending.append((current, depth, True))
+        children = current.values() if isinstance(current, dict) else current
+        pending.extend((item, depth + 1, False) for item in children)
+
+
+def _validate_qualification_response(value: object) -> tuple[JsonObject, bytes]:
+    response = _shape(
+        value,
+        required={
+            "schema_version",
+            "operation",
+            "request_fingerprint",
+            "provider_name",
+            "model_name",
+            "judge_isolation",
+            "payload",
+        },
+        optional={"response_id", "usage"},
+        location="qualification response",
+    )
+    if response["schema_version"] != "1.0":
+        raise PortableEvaluationInputError("qualification response schema is unsupported")
+    _enum(response["operation"], JUDGE_OPERATIONS, location="qualification response.operation")
+    _hash(
+        response["request_fingerprint"],
+        location="qualification response.request_fingerprint",
+    )
+    for field in ("provider_name", "model_name"):
+        _string(
+            response[field],
+            location=f"qualification response.{field}",
+            nonblank=True,
+        )
+    _enum(
+        response["judge_isolation"],
+        JUDGE_ISOLATIONS,
+        location="qualification response.judge_isolation",
+    )
+    _object(response["payload"], location="qualification response.payload")
+    if "response_id" in response:
+        _optional_string(
+            response["response_id"],
+            location="qualification response.response_id",
+            nonblank=True,
+        )
+    if "usage" in response:
+        usage = _object(response["usage"], location="qualification response.usage")
+        if any(type(key) is not str or type(amount) is not int for key, amount in usage.items()):
+            raise PortableEvaluationInputError(
+                "qualification response usage must contain strict integers"
+            )
+    response_bytes = canonical_json_bytes(response)
+    snapshot = json.loads(response_bytes)
+    return cast(JsonObject, snapshot), response_bytes
+
+
+def _load_qualification_response_bytes(
+    data: bytes,
+    *,
+    location: str,
+) -> tuple[JsonObject, bytes]:
+    try:
+        value = json.loads(data.decode("utf-8"))
+        _assert_qualification_response_depth(value)
+        response, response_bytes = _validate_qualification_response(value)
+    except (
+        PortableEvaluationInputError,
+        RecursionError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
+        raise EvaluationIntegrityError(
+            f"{location} is not a valid JudgeResponse"
+        ) from error
+    if response_bytes != data:
+        raise EvaluationIntegrityError(f"{location} changed during strict validation")
+    return response, response_bytes
+
+
+def _qualification_source_issues(case: JsonObject) -> list[str]:
+    """Return only candidate-independent deterministic qualification issues."""
+    issues: list[str] = []
+    sources = cast(list[JsonObject], case["sources"])
+    sources_by_id = {cast(str, source["source_id"]): source for source in sources}
+    if case["mode"] == "current-law" and not any(
+        source["source_role"] != "commentary_analysis"
+        and any(
+            source[field] is not None
+            for field in ("version", "effective_date", "supersession")
+        )
+        for source in sources
+    ):
+        issues.append("CURRENTNESS_EVIDENCE_INSUFFICIENT")
+    for source in sources:
+        if source["source_role"] == "official_primary" and (
+            not cast(str, source["normalized_text"]).strip()
+            or source["completeness"] == "snippet"
+        ):
+            issues.append("OPERATIVE_TEXT_MISSING")
+    for authority in cast(list[JsonObject], case["requested_authorities"]):
+        for source_id in cast(list[str], authority["source_ids"]):
+            source = sources_by_id[source_id]
+            if (
+                source["jurisdiction"] != authority["jurisdiction"]
+                or source["authority_type"] != authority["authority_type"]
+            ):
+                issues.append("AUTHORITY_MISMATCH")
+    return list(dict.fromkeys(issues))
+
+
+def _qualification_call(
+    request_fingerprint: str,
+    *,
+    judgment_fingerprint: str | None = None,
+) -> JsonObject:
+    return {
+        "operation": "admit_case",
+        "request_fingerprint": request_fingerprint,
+        "request_artifact_path": _QUALIFICATION_REQUEST_PATH,
+        "judgment_fingerprint": judgment_fingerprint,
+        "response_artifact_path": (
+            None if judgment_fingerprint is None else _QUALIFICATION_RESPONSE_PATH
+        ),
+        "state": "pending" if judgment_fingerprint is None else "completed",
+    }
+
+
+def _qualification_manifest(
+    *,
+    nonce_fingerprint: str,
+    case_fingerprint: str,
+    source_record_fingerprint: str,
+    call: JsonObject,
+    artifacts: list[JsonObject],
+    status: str,
+    receipt_fingerprint: str | None,
+) -> JsonObject:
+    snapshots = sorted(
+        cast(list[JsonObject], _copy_json(artifacts)),
+        key=lambda item: cast(str, item["artifact_path"]),
+    )
+    payload: JsonObject = {
+        "schema_version": "1.0",
+        "nonce_fingerprint": nonce_fingerprint,
+        "case_fingerprint": case_fingerprint,
+        "source_record_fingerprint": source_record_fingerprint,
+        "call": cast(JsonObject, _copy_json(call)),
+        "artifacts": snapshots,
+        "status": status,
+        "receipt_fingerprint": receipt_fingerprint,
+        "root_hash": "0" * 64,
+    }
+    payload["root_hash"] = _model_fingerprint(payload, exclude={"root_hash"})
+    return payload
+
+
+def _qualification_state(manifest: JsonObject) -> JsonObject:
+    call = cast(JsonObject, manifest["call"])
+    return {
+        "schema_version": "1.0",
+        "case_fingerprint": manifest["case_fingerprint"],
+        "source_record_fingerprint": manifest["source_record_fingerprint"],
+        "request_fingerprint": call["request_fingerprint"],
+        "status": manifest["status"],
+        "receipt_fingerprint": manifest["receipt_fingerprint"],
+        "root_hash": manifest["root_hash"],
+    }
+
+
+def _qualification_receipt(
+    *,
+    case_fingerprint: str,
+    source_record_fingerprint: str,
+    request_fingerprint: str,
+    judgment_fingerprint: str,
+    readiness: JsonObject,
+) -> JsonObject:
+    readiness = _validate_qualification_readiness(
+        cast(JsonObject, _copy_json(readiness))
+    )
+    payload: JsonObject = {
+        "schema_version": "1.0",
+        "case_fingerprint": case_fingerprint,
+        "source_record_fingerprint": source_record_fingerprint,
+        "request_fingerprint": request_fingerprint,
+        "judgment_fingerprint": judgment_fingerprint,
+        "readiness": readiness,
+        "receipt_fingerprint": "0" * 64,
+    }
+    payload["receipt_fingerprint"] = _model_fingerprint(
+        payload,
+        exclude={"receipt_fingerprint"},
+    )
+    return payload
+
+
+def _validate_qualification_call(value: object) -> JsonObject:
+    call = _shape(
+        value,
+        required={
+            "operation",
+            "request_fingerprint",
+            "request_artifact_path",
+            "judgment_fingerprint",
+            "response_artifact_path",
+            "state",
+        },
+        location="qualification manifest.call",
+    )
+    if (
+        call["operation"] != "admit_case"
+        or call["request_artifact_path"] != _QUALIFICATION_REQUEST_PATH
+        or call["state"] not in {"pending", "completed"}
+    ):
+        raise EvaluationIntegrityError("qualification call is invalid")
+    _hash(call["request_fingerprint"], location="qualification call.request_fingerprint")
+    completed = call["state"] == "completed"
+    if completed:
+        _hash(call["judgment_fingerprint"], location="qualification call.judgment_fingerprint")
+        if call["response_artifact_path"] != _QUALIFICATION_RESPONSE_PATH:
+            raise EvaluationIntegrityError("qualification completed call is unbound")
+    elif call["judgment_fingerprint"] is not None or call["response_artifact_path"] is not None:
+        raise EvaluationIntegrityError("qualification pending call carries response provenance")
+    return call
+
+
+def _validate_qualification_manifest(value: object) -> JsonObject:
+    manifest = _shape(
+        value,
+        required={
+            "schema_version",
+            "nonce_fingerprint",
+            "case_fingerprint",
+            "source_record_fingerprint",
+            "call",
+            "artifacts",
+            "status",
+            "receipt_fingerprint",
+            "root_hash",
+        },
+        location="qualification manifest",
+    )
+    if manifest["schema_version"] != "1.0":
+        raise EvaluationIntegrityError("qualification manifest schema is unsupported")
+    for field in (
+        "nonce_fingerprint",
+        "case_fingerprint",
+        "source_record_fingerprint",
+        "root_hash",
+    ):
+        _hash(manifest[field], location=f"qualification manifest.{field}")
+    call = _validate_qualification_call(manifest["call"])
+    artifacts: list[JsonObject] = []
+    for index, item in enumerate(
+        _array(manifest["artifacts"], location="qualification manifest.artifacts")
+    ):
+        artifact = _shape(
+            item,
+            required={"artifact_path", "artifact_hash"},
+            location=f"qualification manifest.artifacts[{index}]",
+        )
+        _validate_relative_path(
+            _string(
+                artifact["artifact_path"],
+                location=f"qualification manifest.artifacts[{index}].artifact_path",
+            )
+        )
+        _hash(
+            artifact["artifact_hash"],
+            location=f"qualification manifest.artifacts[{index}].artifact_hash",
+        )
+        artifacts.append(artifact)
+    paths = [cast(str, artifact["artifact_path"]) for artifact in artifacts]
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise EvaluationIntegrityError("qualification artifacts are not uniquely path-sorted")
+    status = manifest["status"]
+    if status not in {"awaiting-judgment", "qualified", "case-invalid"}:
+        raise EvaluationIntegrityError("qualification manifest status is invalid")
+    terminal = status in {"qualified", "case-invalid"}
+    expected_paths = {_QUALIFICATION_CASE_PATH, _QUALIFICATION_REQUEST_PATH}
+    if terminal:
+        expected_paths.update({_QUALIFICATION_RESPONSE_PATH, _QUALIFICATION_RECEIPT_PATH})
+    if set(paths) != expected_paths:
+        raise EvaluationIntegrityError("qualification artifact inventory is invalid")
+    if terminal != (call["state"] == "completed"):
+        raise EvaluationIntegrityError("qualification call and status disagree")
+    if terminal:
+        _hash(
+            manifest["receipt_fingerprint"],
+            location="qualification manifest.receipt_fingerprint",
+        )
+    elif manifest["receipt_fingerprint"] is not None:
+        raise EvaluationIntegrityError("pending qualification binds a receipt")
+    if manifest["root_hash"] != _model_fingerprint(manifest, exclude={"root_hash"}):
+        raise EvaluationIntegrityError("qualification manifest root mismatch")
+    manifest["call"] = call
+    manifest["artifacts"] = artifacts
+    return manifest
+
+
+def _validate_qualification_readiness(value: object) -> JsonObject:
+    readiness = _shape(
+        value,
+        required={
+            "status",
+            "case_fingerprint",
+            "judgment_fingerprint",
+            "issue_codes",
+            "rationale",
+        },
+        location="qualification readiness",
+    )
+    if readiness["status"] not in {"ADMITTED", "CASE_INVALID"}:
+        raise EvaluationIntegrityError("qualification readiness status is invalid")
+    _hash(readiness["case_fingerprint"], location="qualification readiness.case_fingerprint")
+    _hash(
+        readiness["judgment_fingerprint"],
+        location="qualification readiness.judgment_fingerprint",
+    )
+    _string_list(
+        readiness["issue_codes"],
+        location="qualification readiness.issue_codes",
+        identifiers=True,
+        unique=True,
+    )
+    _string(readiness["rationale"], location="qualification readiness.rationale", nonblank=True)
+    return readiness
+
+
+def _validate_qualification_receipt(value: object) -> JsonObject:
+    receipt = _shape(
+        value,
+        required={
+            "schema_version",
+            "case_fingerprint",
+            "source_record_fingerprint",
+            "request_fingerprint",
+            "judgment_fingerprint",
+            "readiness",
+            "receipt_fingerprint",
+        },
+        location="qualification receipt",
+    )
+    if receipt["schema_version"] != "1.0":
+        raise EvaluationIntegrityError("qualification receipt schema is unsupported")
+    for field in (
+        "case_fingerprint",
+        "source_record_fingerprint",
+        "request_fingerprint",
+        "judgment_fingerprint",
+        "receipt_fingerprint",
+    ):
+        _hash(receipt[field], location=f"qualification receipt.{field}")
+    readiness = _validate_qualification_readiness(receipt["readiness"])
+    if (
+        readiness["case_fingerprint"] != receipt["case_fingerprint"]
+        or readiness["judgment_fingerprint"] != receipt["judgment_fingerprint"]
+    ):
+        raise EvaluationIntegrityError("qualification receipt readiness is unbound")
+    if receipt["receipt_fingerprint"] != _model_fingerprint(
+        receipt,
+        exclude={"receipt_fingerprint"},
+    ):
+        raise EvaluationIntegrityError("qualification receipt fingerprint mismatch")
+    receipt["readiness"] = readiness
+    return receipt
+
+
+def _read_qualification_json(storage: _PosixRunStorage, path: str) -> JsonObject:
+    return _object(
+        parse_canonical_json_bytes(storage.read_artifact(path), location=path),
+        location=path,
+    )
+
+
+def _verify_qualification_in_storage(
+    storage: _PosixRunStorage,
+) -> tuple[JsonObject, JsonObject, JsonObject, JsonObject | None]:
+    try:
+        manifest = _validate_qualification_manifest(
+            _read_qualification_json(storage, _QUALIFICATION_MANIFEST_PATH)
+        )
+        artifacts = cast(list[JsonObject], manifest["artifacts"])
+        expected_files = {
+            cast(str, artifact["artifact_path"]) for artifact in artifacts
+        } | {_QUALIFICATION_MANIFEST_PATH}
+        if set(storage.scan_inventory()) != expected_files:
+            raise EvaluationIntegrityError(
+                "qualification artifact inventory is not allowlisted"
+            )
+        data: dict[str, bytes] = {}
+        for artifact in artifacts:
+            path = cast(str, artifact["artifact_path"])
+            artifact_bytes = storage.read_artifact(path)
+            if _sha256(artifact_bytes) != artifact["artifact_hash"]:
+                raise EvaluationIntegrityError("qualification artifact hash mismatch")
+            data[path] = artifact_bytes
+
+        case = validate_qualification_case(
+            parse_canonical_json_bytes(
+                data[_QUALIFICATION_CASE_PATH],
+                location=_QUALIFICATION_CASE_PATH,
+            )
+        )
+        if canonical_json_bytes(case) != data[_QUALIFICATION_CASE_PATH]:
+            raise EvaluationIntegrityError("qualification case is not canonical")
+        if _model_fingerprint(case) != manifest["case_fingerprint"]:
+            raise EvaluationIntegrityError("qualification case fingerprint mismatch")
+        expected_request = _qualification_request(case)
+        request = _object(
+            parse_canonical_json_bytes(
+                data[_QUALIFICATION_REQUEST_PATH],
+                location=_QUALIFICATION_REQUEST_PATH,
+            ),
+            location=_QUALIFICATION_REQUEST_PATH,
+        )
+        if request != expected_request or canonical_json_bytes(request) != data[
+            _QUALIFICATION_REQUEST_PATH
+        ]:
+            raise EvaluationIntegrityError("qualification admission request does not replay")
+        source_record_fingerprint = cast(
+            str,
+            cast(JsonObject, request["payload"])["source_record_fingerprint"],
+        )
+        if source_record_fingerprint != manifest["source_record_fingerprint"]:
+            raise EvaluationIntegrityError("qualification source fingerprint mismatch")
+        call = cast(JsonObject, manifest["call"])
+        if call["request_fingerprint"] != request["request_fingerprint"]:
+            raise EvaluationIntegrityError("qualification call request is unbound")
+
+        receipt: JsonObject | None = None
+        if manifest["status"] == "awaiting-judgment":
+            expected_manifest = _qualification_manifest(
+                nonce_fingerprint=cast(str, manifest["nonce_fingerprint"]),
+                case_fingerprint=cast(str, manifest["case_fingerprint"]),
+                source_record_fingerprint=cast(
+                    str,
+                    manifest["source_record_fingerprint"],
+                ),
+                call=call,
+                artifacts=artifacts,
+                status="awaiting-judgment",
+                receipt_fingerprint=None,
+            )
+        else:
+            if case["schema_version"] == "1.1":
+                response, _ = _load_qualification_response_bytes(
+                    data[_QUALIFICATION_RESPONSE_PATH],
+                    location=_QUALIFICATION_RESPONSE_PATH,
+                )
+                if (
+                    response["operation"] != "admit_case"
+                    or response["request_fingerprint"] != request["request_fingerprint"]
+                ):
+                    raise EvaluationIntegrityError(
+                        "qualification response does not bind its request"
+                    )
+                judgment = _validate_admission_judgment(response["payload"])
+                if judgment["request_fingerprint"] != request["request_fingerprint"]:
+                    raise EvaluationIntegrityError(
+                        "qualification judgment does not bind its request"
+                    )
+            else:
+                judgment = _validate_admission_judgment(
+                    parse_canonical_json_bytes(
+                        data[_QUALIFICATION_RESPONSE_PATH],
+                        location=_QUALIFICATION_RESPONSE_PATH,
+                    )
+                )
+                if canonical_json_bytes(judgment) != data[_QUALIFICATION_RESPONSE_PATH]:
+                    raise EvaluationIntegrityError("qualification judgment is not canonical")
+            judgment_fingerprint = _model_fingerprint(judgment)
+            if call["judgment_fingerprint"] != judgment_fingerprint:
+                raise EvaluationIntegrityError("qualification judgment is unbound")
+            readiness = adjudicate_source_record(
+                case_fingerprint=cast(str, manifest["case_fingerprint"]),
+                source_ids={
+                    cast(str, source["source_id"])
+                    for source in cast(list[JsonObject], case["sources"])
+                },
+                deterministic_issues=_qualification_source_issues(case),
+                request=request,
+                judgment=judgment,
+            )
+            expected_status = (
+                "qualified" if readiness["status"] == "ADMITTED" else "case-invalid"
+            )
+            if manifest["status"] != expected_status:
+                raise EvaluationIntegrityError("qualification terminal status does not replay")
+            receipt = _validate_qualification_receipt(
+                parse_canonical_json_bytes(
+                    data[_QUALIFICATION_RECEIPT_PATH],
+                    location=_QUALIFICATION_RECEIPT_PATH,
+                )
+            )
+            expected_receipt = _qualification_receipt(
+                case_fingerprint=cast(str, manifest["case_fingerprint"]),
+                source_record_fingerprint=source_record_fingerprint,
+                request_fingerprint=cast(str, request["request_fingerprint"]),
+                judgment_fingerprint=judgment_fingerprint,
+                readiness=readiness,
+            )
+            if (
+                receipt != expected_receipt
+                or canonical_json_bytes(receipt) != data[_QUALIFICATION_RECEIPT_PATH]
+                or manifest["receipt_fingerprint"] != receipt["receipt_fingerprint"]
+            ):
+                raise EvaluationIntegrityError("qualification receipt does not replay")
+            expected_manifest = _qualification_manifest(
+                nonce_fingerprint=cast(str, manifest["nonce_fingerprint"]),
+                case_fingerprint=cast(str, manifest["case_fingerprint"]),
+                source_record_fingerprint=source_record_fingerprint,
+                call=call,
+                artifacts=artifacts,
+                status=expected_status,
+                receipt_fingerprint=cast(str, receipt["receipt_fingerprint"]),
+            )
+        if manifest != expected_manifest:
+            raise EvaluationIntegrityError("qualification root does not replay")
+        storage.assert_root_identity()
+        return manifest, case, request, receipt
+    except EvaluationIntegrityError:
+        raise
+    except (
+        KeyError,
+        PortableEvaluationInputError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise EvaluationIntegrityError("qualification capsule replay failed") from error
+
+
+def initialize_case_qualification(
+    case: object,
+    output_dir: Path,
+    *,
+    nonce_hex: str,
+) -> JsonObject:
+    if not _HASH_RE.fullmatch(nonce_hex):
+        raise PortableEvaluationInputError(
+            "nonce_hex must be exactly 64 lowercase hexadecimal characters"
+        )
+    case_snapshot = validate_qualification_case(case)
+    case_bytes = canonical_json_bytes(case_snapshot)
+    request = _qualification_request(case_snapshot)
+    request_bytes = canonical_json_bytes(request)
+    case_fingerprint = _model_fingerprint(case_snapshot)
+    source_record_fingerprint = cast(
+        str,
+        cast(JsonObject, request["payload"])["source_record_fingerprint"],
+    )
+    call = _qualification_call(cast(str, request["request_fingerprint"]))
+    artifacts = [
+        _artifact_record(_QUALIFICATION_CASE_PATH, case_bytes),
+        _artifact_record(_QUALIFICATION_REQUEST_PATH, request_bytes),
+    ]
+    manifest = _qualification_manifest(
+        nonce_fingerprint=_sha256(nonce_hex.encode("ascii")),
+        case_fingerprint=case_fingerprint,
+        source_record_fingerprint=source_record_fingerprint,
+        call=call,
+        artifacts=artifacts,
+        status="awaiting-judgment",
+        receipt_fingerprint=None,
+    )
+    with _open_run_storage(output_dir, initialize=True) as storage:
+        storage.atomic_write(_QUALIFICATION_CASE_PATH, case_bytes, mutable=False)
+        storage.atomic_write(_QUALIFICATION_REQUEST_PATH, request_bytes, mutable=False)
+        storage.atomic_write(
+            _QUALIFICATION_MANIFEST_PATH,
+            canonical_json_bytes(manifest),
+            mutable=False,
+        )
+        storage.assert_root_identity()
+    return _qualification_state(manifest)
+
+
+def resume_case_qualification(run_dir: Path) -> JsonObject:
+    with _open_run_storage(run_dir) as storage:
+        manifest, _, _, _ = _verify_qualification_in_storage(storage)
+        return _qualification_state(manifest)
+
+
+def next_qualification_request(run_dir: Path) -> JsonObject | None:
+    with _open_run_storage(run_dir) as storage:
+        manifest, _, request, _ = _verify_qualification_in_storage(storage)
+        return request if manifest["status"] == "awaiting-judgment" else None
+
+
+def _qualification_preflight_in_storage(
+    storage: _PosixRunStorage,
+    judgment_value: object,
+) -> tuple[JsonObject, _QualificationPreflightContext | None]:
+    manifest, case, request, _ = _verify_qualification_in_storage(storage)
+    if manifest["status"] != "awaiting-judgment":
+        return _preflight_result(None, code="EVALUATION_NO_PENDING_REQUEST"), None
+    response: JsonObject | None = None
+    response_bytes: bytes | None = None
+    if case["schema_version"] == "1.1":
+        try:
+            _assert_qualification_response_depth(judgment_value)
+            response, response_bytes = _validate_qualification_response(judgment_value)
+        except (
+            KeyError,
+            PortableEvaluationInputError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ):
+            return _preflight_result(
+                request,
+                code="EVALUATION_RESPONSE_SCHEMA_INVALID",
+            ), None
+        if (
+            response["operation"] != "admit_case"
+            or response["request_fingerprint"] != request["request_fingerprint"]
+        ):
+            return _preflight_result(
+                request,
+                code="EVALUATION_RESPONSE_REQUEST_MISMATCH",
+            ), None
+        try:
+            judgment = _validate_admission_judgment(response["payload"])
+        except (KeyError, PortableEvaluationInputError, TypeError, ValueError):
+            return _preflight_result(
+                request,
+                code="EVALUATION_RESPONSE_SCHEMA_INVALID",
+            ), None
+    else:
+        try:
+            judgment = _validate_admission_judgment(judgment_value)
+        except (KeyError, PortableEvaluationInputError, TypeError, ValueError):
+            return _preflight_result(
+                request,
+                code="EVALUATION_RESPONSE_SCHEMA_INVALID",
+            ), None
+    if judgment["request_fingerprint"] != request["request_fingerprint"]:
+        return _preflight_result(
+            request,
+            code="EVALUATION_RESPONSE_REQUEST_MISMATCH",
+        ), None
+    try:
+        readiness = adjudicate_source_record(
+            case_fingerprint=cast(str, manifest["case_fingerprint"]),
+            source_ids={
+                cast(str, source["source_id"])
+                for source in cast(list[JsonObject], case["sources"])
+            },
+            deterministic_issues=_qualification_source_issues(case),
+            request=request,
+            judgment=judgment,
+        )
+    except (KeyError, PortableEvaluationInputError, TypeError, ValueError) as error:
+        code, related_ids = _safe_preflight_issue(error)
+        return _preflight_result(request, code=code, related_ids=related_ids), None
+    return _preflight_result(request), _QualificationPreflightContext(
+        manifest,
+        case,
+        request,
+        judgment,
+        readiness,
+        response,
+        response_bytes,
+    )
+
+
+def preflight_case_qualification(run_dir: Path, judgment_value: object) -> JsonObject:
+    with _open_run_storage(run_dir) as storage:
+        result, _ = _qualification_preflight_in_storage(storage, judgment_value)
+        storage.assert_root_identity()
+        return result
+
+
+def _commit_case_qualification(
+    storage: _PosixRunStorage,
+    context: _QualificationPreflightContext,
+) -> JsonObject:
+    judgment = cast(JsonObject, _copy_json(context.judgment))
+    judgment_bytes = canonical_json_bytes(judgment)
+    judgment_fingerprint = _model_fingerprint(judgment)
+    if context.case["schema_version"] == "1.1":
+        if context.response is None or context.response_bytes is None:
+            raise EvaluationIntegrityError("schema 1.1 qualification response is absent")
+        validated_response, response_bytes = _load_qualification_response_bytes(
+            context.response_bytes,
+            location=_QUALIFICATION_RESPONSE_PATH,
+        )
+        if validated_response != context.response:
+            raise EvaluationIntegrityError(
+                "qualification response bytes changed after preflight"
+            )
+    else:
+        if context.response is not None or context.response_bytes is not None:
+            raise EvaluationIntegrityError("schema 1.0 qualification response is enveloped")
+        response_bytes = judgment_bytes
+    receipt = _qualification_receipt(
+        case_fingerprint=cast(str, context.manifest["case_fingerprint"]),
+        source_record_fingerprint=cast(
+            str,
+            context.manifest["source_record_fingerprint"],
+        ),
+        request_fingerprint=cast(str, context.request["request_fingerprint"]),
+        judgment_fingerprint=judgment_fingerprint,
+        readiness=context.readiness,
+    )
+    receipt_bytes = canonical_json_bytes(receipt)
+    artifacts = [
+        *cast(list[JsonObject], context.manifest["artifacts"]),
+        _artifact_record(_QUALIFICATION_RESPONSE_PATH, response_bytes),
+        _artifact_record(_QUALIFICATION_RECEIPT_PATH, receipt_bytes),
+    ]
+    status = (
+        "qualified" if context.readiness["status"] == "ADMITTED" else "case-invalid"
+    )
+    terminal_manifest = _qualification_manifest(
+        nonce_fingerprint=cast(str, context.manifest["nonce_fingerprint"]),
+        case_fingerprint=cast(str, context.manifest["case_fingerprint"]),
+        source_record_fingerprint=cast(
+            str,
+            context.manifest["source_record_fingerprint"],
+        ),
+        call=_qualification_call(
+            cast(str, context.request["request_fingerprint"]),
+            judgment_fingerprint=judgment_fingerprint,
+        ),
+        artifacts=artifacts,
+        status=status,
+        receipt_fingerprint=cast(str, receipt["receipt_fingerprint"]),
+    )
+    storage.atomic_write(_QUALIFICATION_RESPONSE_PATH, response_bytes, mutable=False)
+    storage.atomic_write(_QUALIFICATION_RECEIPT_PATH, receipt_bytes, mutable=False)
+    storage.atomic_write(
+        _QUALIFICATION_MANIFEST_PATH,
+        canonical_json_bytes(terminal_manifest),
+        mutable=True,
+    )
+    storage.assert_root_identity()
+    return receipt
+
+
+def guarded_submit_case_qualification(
+    run_dir: Path,
+    judgment_value: object,
+) -> JsonObject:
+    with _open_run_storage(run_dir) as storage:
+        preflight, context = _qualification_preflight_in_storage(storage, judgment_value)
+        if context is None:
+            storage.assert_root_identity()
+            return {
+                "schema_version": "1.0",
+                "accepted": False,
+                "preflight": preflight,
+                "receipt": None,
+            }
+        receipt = _commit_case_qualification(storage, context)
+        return {
+            "schema_version": "1.0",
+            "accepted": True,
+            "preflight": preflight,
+            "receipt": receipt,
+        }
+
+
+def submit_case_qualification(run_dir: Path, judgment_value: object) -> JsonObject:
+    with _open_run_storage(run_dir) as storage:
+        preflight, context = _qualification_preflight_in_storage(storage, judgment_value)
+        if context is None:
+            if preflight["operation"] is None:
+                raise EvaluationIntegrityError("no pending qualification judgment")
+            raise PortableEvaluationInputError(
+                cast(str, cast(list[JsonObject], preflight["issues"])[0]["message"])
+            )
+        return _commit_case_qualification(storage, context)
+
+
+def verify_case_qualification(run_dir: Path) -> JsonObject:
+    try:
+        with _open_run_storage(run_dir) as storage:
+            manifest, _, _, _ = _verify_qualification_in_storage(storage)
+            return {
+                "valid": True,
+                "issues": [],
+                "root_hash": manifest["root_hash"],
+            }
+    except EvaluationIntegrityError:
+        return {
+            "valid": False,
+            "issues": ["QUALIFICATION_INTEGRITY_INVALID"],
+            "root_hash": None,
+        }
+
+
+def resume_evaluation(run_dir: Path) -> JsonObject:
+    with _open_run_storage(run_dir) as storage:
+        manifest, _, _ = _verify_in_storage(storage)
+        return _state_from_manifest(manifest)
+
+
+def next_judge_request(run_dir: Path) -> JsonObject | None:
+    with _open_run_storage(run_dir) as storage:
+        manifest, _, _ = _verify_in_storage(storage)
+        if manifest["terminal_status"] is not None:
+            return None
+        pending = [
+            call
+            for call in cast(list[JsonObject], manifest["judge_calls"])
+            if call["state"] == "pending"
+        ]
+        if len(pending) != 1:
+            raise EvaluationIntegrityError("run does not contain exactly one pending request")
+        request_path = cast(str, pending[0]["request_artifact_path"])
+        return _read_json(storage, request_path)
+
+
+def _validate_response(value: object) -> JsonObject:
+    result = _with_defaults(
+        _shape(
+            value,
+            required={
+                "operation",
+                "request_fingerprint",
+                "provider_name",
+                "model_name",
+                "judge_isolation",
+                "payload",
+            },
+            optional={"schema_version", "response_id", "usage"},
+            location="judge response",
+        ),
+        {"schema_version": "1.0", "response_id": None, "usage": {}},
+    )
+    if result["schema_version"] != "1.0":
+        raise PortableEvaluationInputError("judge response schema version is unsupported")
+    _enum(result["operation"], JUDGE_OPERATIONS, location="judge response.operation")
+    _hash(result["request_fingerprint"], location="judge response.request_fingerprint")
+    _string(result["provider_name"], location="judge response.provider_name", nonblank=True)
+    _string(result["model_name"], location="judge response.model_name", nonblank=True)
+    _enum(result["judge_isolation"], JUDGE_ISOLATIONS, location="judge response.judge_isolation")
+    _object(result["payload"], location="judge response.payload")
+    _optional_string(result["response_id"], location="judge response.response_id", nonblank=True)
+    usage = _object(result["usage"], location="judge response.usage")
+    for key, item in usage.items():
+        _string(key, location="judge response.usage key")
+        _strict_int(item, location=f"judge response.usage.{key}")
+    return result
+
+
+def _completed_call(pending: JsonObject, response: JsonObject, response_hash: str) -> JsonObject:
+    result = cast(JsonObject, _copy_json(pending))
+    result.update(
+        {
+            "response_fingerprint": response_hash,
+            "provider_name": response["provider_name"],
+            "model_name": response["model_name"],
+            "judge_isolation": response["judge_isolation"],
+            "response_artifact_path": (
+                f"judge-responses/{pending['call_id']}-attempt-{pending['attempt']}.json"
+            ),
+            "state": "completed",
+            "terminal_status": "completed",
+        }
+    )
+    return result
+
+
+def _failed_call(
+    pending: JsonObject, response: JsonObject, response_hash: str, *, terminal: bool
+) -> JsonObject:
+    result = _completed_call(pending, response, response_hash)
+    result.update(
+        {
+            "diagnostics_artifact_path": (
+                f"judge-diagnostics/{pending['call_id']}-attempt-{pending['attempt']}.json"
+            ),
+            "state": "failed",
+            "terminal_status": "inconclusive" if terminal else "failed",
+        }
+    )
+    return result
+
+
+def _replace_call(calls: list[JsonObject], replacement: JsonObject) -> list[JsonObject]:
+    matched = False
+    result: list[JsonObject] = []
+    for call in calls:
+        if (call["call_id"], call["attempt"]) == (replacement["call_id"], replacement["attempt"]):
+            result.append(replacement)
+            matched = True
+        else:
+            result.append(call)
+    if not matched:
+        raise EvaluationIntegrityError("current judge call is absent")
+    return result
+
+
+def _labels(envelope: JsonObject) -> list[str]:
+    return [
+        cast(str, item["anonymous_label"])
+        for item in cast(list[JsonObject], envelope["assignments"])
+    ]
+
+
+def _sealed_files(
+    envelope: JsonObject, sealed: JsonObject
+) -> tuple[dict[str, bytes], JsonObject, str]:
+    sealed_bytes = canonical_json_bytes(sealed)
+    legal_hash = _sha256(sealed_bytes)
+    files = {_SEALED_LEDGER_PATH: sealed_bytes}
+    labels = _labels(envelope)
+    checks_by_label: dict[str, JsonObject] = {}
+    for label in labels:
+        checks = _derive_deterministic_checks(_candidate_for_label(envelope, label), label)
+        checks_by_label[label] = checks
+        files[f"deterministic-checks-{label}.json"] = canonical_json_bytes(checks)
+    first = labels[0]
+    request = _grade_request(envelope, sealed, checks_by_label[first], first, legal_hash)
+    return files, request, legal_hash
+
+
+def _grade_path(pending: JsonObject) -> str:
+    parts = cast(str, pending["call_id"]).split("-")
+    if len(parts) != 3:
+        raise EvaluationIntegrityError("grade call ID is malformed")
+    return f"grader-{parts[2]}-report-{parts[1]}.json"
+
+
+@dataclass(frozen=True)
+class _Transition:
+    files: dict[str, bytes]
+    request: JsonObject | None
+    call_id: str | None
+    label: str | None
+    state: str
+    terminal_status: str | None = None
+    legal_ledger_hash: str | None = None
+    result_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class _PreflightSubmissionContext:
+    """One verified portable pending call and its fixed accepted transition."""
+
+    manifest: JsonObject
+    envelope: JsonObject
+    pending: JsonObject
+    request: JsonObject
+    transition: _Transition
+
+
+def _load_readiness(storage: _PosixRunStorage) -> JsonObject | None:
+    data = storage.read_optional_artifact(_READINESS_PATH)
+    return (
+        None
+        if data is None
+        else _object(
+            parse_canonical_json_bytes(data, location=_READINESS_PATH), location=_READINESS_PATH
+        )
+    )
+
+
+def _aggregate_judge_isolation(
+    calls: Sequence[JsonObject], current_response: JsonObject | None = None
+) -> str:
+    isolations = [
+        cast(str, call["judge_isolation"])
+        for call in calls
+        if call.get("state") != "pending" and call.get("judge_isolation") is not None
+    ]
+    if current_response is not None:
+        isolations.append(cast(str, current_response["judge_isolation"]))
+    return (
+        "sequential_same_context"
+        if "sequential_same_context" in isolations
+        else "fresh_context"
+    )
+
+
+def _terminal_result(
+    envelope: JsonObject,
+    readiness: JsonObject,
+    disposition: str,
+    judge_isolation: str,
+) -> JsonObject:
+    comparison: JsonObject | None = (
+        {
+            "disposition": disposition,
+            "winner_label": None,
+            "score_difference": None,
+            "rationale_codes": [],
+        }
+        if len(cast(list[JsonObject], cast(JsonObject, envelope["case"])["candidates"])) == 2
+        else None
+    )
+    requirement_matrix: JsonObject = {
+        "available": False,
+        "unavailable_reason": disposition,
+        "rows": [],
+    }
+    return _evaluation_result(
+        readiness, [], requirement_matrix, comparison, judge_isolation
+    )
+
+
+def _inconclusive_readiness(
+    envelope: JsonObject,
+    *,
+    fingerprint: str,
+    issue_code: str,
+    rationale: str,
+    existing: JsonObject | None,
+) -> JsonObject:
+    issue_codes = [] if existing is None else list(cast(list[str], existing["issue_codes"]))
+    if issue_code not in issue_codes:
+        issue_codes.append(issue_code)
+    return {
+        "status": "INCONCLUSIVE",
+        "case_fingerprint": envelope["case_fingerprint"],
+        "judgment_fingerprint": fingerprint
+        if existing is None
+        else existing["judgment_fingerprint"],
+        "issue_codes": issue_codes,
+        "rationale": rationale,
+    }
+
+
+def _load_grades(
+    storage: _PosixRunStorage, label: str, extra: dict[str, bytes] | None = None
+) -> tuple[JsonObject, JsonObject]:
+    result: list[JsonObject] = []
+    for number in (1, 2):
+        path = f"grader-{number}-report-{label}.json"
+        data = extra[path] if extra is not None and path in extra else storage.read_artifact(path)
+        result.append(_object(parse_canonical_json_bytes(data, location=path), location=path))
+    return result[0], result[1]
+
+
+def _all_disputes(
+    storage: _PosixRunStorage,
+    envelope: JsonObject,
+    sealed: JsonObject,
+    extra: dict[str, bytes] | None = None,
+) -> list[JsonObject]:
+    disputes: list[JsonObject] = []
+    for label in _labels(envelope):
+        first, second = _load_grades(storage, label, extra)
+        disputes.extend(material_disputes(sealed, first, second))
+    return disputes
+
+
+def _validate_report_referee_decision_evidence(
+    envelope: JsonObject,
+    sealed: JsonObject,
+    disputes: Sequence[JsonObject],
+    decision: JsonObject,
+    label: str,
+    first: JsonObject,
+    second: JsonObject,
+) -> None:
+    relevant = [dispute for dispute in disputes if dispute["anonymous_label"] == label]
+    decisions: list[JsonObject] = []
+    for dispute in relevant:
+        if dispute["dispute_id"] == decision["dispute_id"]:
+            decisions.append(decision)
+        else:
+            decisions.append(
+                validate_referee_decision(
+                    {
+                        "dispute_id": dispute["dispute_id"],
+                        "selected_grade_resolution": "accept_grader_1",
+                        "grade_dispute_fingerprint": _model_fingerprint(dispute),
+                        "rationale": "Deterministic validation placeholder decision.",
+                    }
+                )
+            )
+    resolved = resolve_grades(sealed, first, second, decisions)
+    _validate_grade_evidence(envelope, cast(JsonObject, resolved["grade"]), label)
+
+
+def _referee_path(index: int, dispute: JsonObject) -> str:
+    fingerprint = _model_fingerprint(dispute)[:12]
+    return f"referee-report-{dispute['anonymous_label']}-{index + 1}-{fingerprint}.json"
+
+
+def _aggregate(
+    storage: _PosixRunStorage,
+    envelope: JsonObject,
+    sealed: JsonObject,
+    readiness: JsonObject,
+    judge_isolation: str,
+    *,
+    extra: dict[str, bytes] | None = None,
+) -> _Transition:
+    files: dict[str, bytes] = {}
+    disputes = _all_disputes(storage, envelope, sealed, extra)
+    reports: list[JsonObject] = []
+    reports_by_label: dict[str, JsonObject] = {}
+    score_inputs_by_label: dict[str, JsonObject] = {}
+    resolved_by_label: dict[str, JsonObject] = {}
+    source_record = cast(JsonObject, build_admission_packet(envelope)["payload"])
+    for label in _labels(envelope):
+        first, second = _load_grades(storage, label, extra)
+        decisions: list[JsonObject] = []
+        for index, dispute in enumerate(disputes):
+            if dispute["anonymous_label"] != label:
+                continue
+            path = _referee_path(index, dispute)
+            data = (
+                extra[path]
+                if extra is not None and path in extra
+                else storage.read_optional_artifact(path)
+            )
+            if data is not None:
+                decisions.append(
+                    _object(parse_canonical_json_bytes(data, location=path), location=path)
+                )
+        resolved = resolve_grades(sealed, first, second, decisions)
+        resolved_artifact: JsonObject = {"schema_version": "1.3", **resolved}
+        files[f"resolved-grade-{label}.json"] = canonical_json_bytes(resolved_artifact)
+        checks_path = f"deterministic-checks-{label}.json"
+        checks_data = (
+            extra[checks_path]
+            if extra is not None and checks_path in extra
+            else storage.read_artifact(checks_path)
+        )
+        checks = _object(
+            parse_canonical_json_bytes(checks_data, location=checks_path), location=checks_path
+        )
+        score_inputs: JsonObject = {
+            "schema_version": SCORE_INPUT_SCHEMA_VERSION,
+            "anonymous_label": label,
+            "sealed_ledger": sealed,
+            "resolved_grade": resolved_artifact,
+            "deterministic_checks": checks,
+            "rubric": cast(JsonObject, _copy_json(RUBRIC_V1)),
+            "source_record": cast(JsonObject, _copy_json(source_record)),
+        }
+        files[f"report-score-inputs-{label}.json"] = canonical_json_bytes(score_inputs)
+        report = score_report(
+            sealed,
+            resolved,
+            checks,
+            source_record=source_record,
+        )
+        files[f"report-evaluation-{label}.json"] = canonical_json_bytes(report)
+        reports.append(report)
+        reports_by_label[label] = report
+        score_inputs_by_label[label] = score_inputs
+        resolved_by_label[label] = resolved
+    comparison: JsonObject | None = None
+    candidates = cast(list[JsonObject], cast(JsonObject, envelope["case"])["candidates"])
+    if len(candidates) == 2:
+        labels_by_id: dict[str, str] = {
+            cast(str, item["candidate_id"]): cast(str, item["anonymous_label"])
+            for item in cast(list[JsonObject], envelope["assignments"])
+        }
+        candidate_id = cast(
+            str,
+            next(item["candidate_id"] for item in candidates if item["role"] == "candidate"),
+        )
+        comparator_id = cast(
+            str,
+            next(item["candidate_id"] for item in candidates if item["role"] == "comparator"),
+        )
+        comparison = compare_reports(
+            reports_by_label[labels_by_id[candidate_id]],
+            reports_by_label[labels_by_id[comparator_id]],
+            candidate_inputs=score_inputs_by_label[labels_by_id[candidate_id]],
+            comparator_inputs=score_inputs_by_label[labels_by_id[comparator_id]],
+        )
+    requirement_matrix = _derive_requirement_matrix(sealed, resolved_by_label)
+    result = _evaluation_result(
+        readiness, reports, requirement_matrix, comparison, judge_isolation
+    )
+    result_bytes = canonical_json_bytes(result)
+    files[_RESULT_PATH] = result_bytes
+    files[_REPORT_PATH] = render_evaluation_report(result).encode("utf-8")
+    return _Transition(
+        files, None, None, None, "completed", "completed", result_hash=_sha256(result_bytes)
+    )
+
+
+def _after_all_grades(
+    storage: _PosixRunStorage,
+    envelope: JsonObject,
+    sealed: JsonObject,
+    readiness: JsonObject,
+    grade_files: dict[str, bytes],
+    legal_hash: str,
+    judge_isolation: str,
+) -> _Transition:
+    disputes = _all_disputes(storage, envelope, sealed, grade_files)
+    grade_files[_REPORT_DISPUTES_PATH] = canonical_json_bytes(
+        {"schema_version": "1.3", "disputes": disputes}
+    )
+    if not disputes:
+        aggregate = _aggregate(
+            storage,
+            envelope,
+            sealed,
+            readiness,
+            judge_isolation,
+            extra=grade_files,
+        )
+        return _Transition(
+            {**grade_files, **aggregate.files},
+            None,
+            None,
+            None,
+            aggregate.state,
+            aggregate.terminal_status,
+            legal_hash,
+            aggregate.result_hash,
+        )
+    request = _report_referee_request(envelope, sealed, disputes[0], legal_hash)
+    return _Transition(
+        grade_files,
+        request,
+        "report-referee-1",
+        cast(str, disputes[0]["anonymous_label"]),
+        "report-referee",
+        legal_ledger_hash=legal_hash,
+    )
+
+
+def _accepted_transition(
+    storage: _PosixRunStorage,
+    manifest: JsonObject,
+    envelope: JsonObject,
+    pending: JsonObject,
+    request: JsonObject,
+    response: JsonObject,
+) -> _Transition:
+    operation = cast(str, request["operation"])
+    payload = response["payload"]
+    judge_isolation = _aggregate_judge_isolation(
+        cast(list[JsonObject], manifest["judge_calls"]), response
+    )
+    if operation == "admit_case":
+        readiness = adjudicate_admission(envelope, payload)
+        files = {_READINESS_PATH: canonical_json_bytes(readiness)}
+        if readiness["status"] == "CASE_INVALID":
+            result = _terminal_result(
+                envelope, readiness, "CASE_INVALID", judge_isolation
+            )
+            result_bytes = canonical_json_bytes(result)
+            files.update(
+                {
+                    _RESULT_PATH: result_bytes,
+                    _REPORT_PATH: render_evaluation_report(result).encode("utf-8"),
+                }
+            )
+            return _Transition(
+                files,
+                None,
+                None,
+                None,
+                "case-invalid",
+                "case-invalid",
+                result_hash=_sha256(result_bytes),
+            )
+        return _Transition(
+            files, _build_ledger_request(envelope), "ledger-build", None, "ledger-build"
+        )
+    loaded_readiness = _load_readiness(storage)
+    if loaded_readiness is None or loaded_readiness["status"] != "ADMITTED":
+        raise EvaluationIntegrityError("post-admission operation lacks admitted readiness")
+    readiness = loaded_readiness
+    if operation == "build_ledger":
+        ledger, issues = validate_ledger(payload, envelope=envelope)
+        if issues:
+            raise PortableEvaluationInputError("invalid proposed ledger: " + ", ".join(issues))
+        return _Transition(
+            {_PROPOSED_LEDGER_PATH: canonical_json_bytes(ledger)},
+            _audit_ledger_request(envelope, ledger),
+            "ledger-audit",
+            None,
+            "ledger-audit",
+        )
+    proposed = _read_json(storage, _PROPOSED_LEDGER_PATH)
+    if operation == "audit_ledger":
+        audit = validate_ledger_audit_findings(
+            payload, envelope=envelope, proposed_ledger=proposed
+        )
+        if audit["request_fingerprint"] != request["request_fingerprint"]:
+            raise PortableEvaluationInputError("ledger audit does not bind the request")
+        files = {_LEDGER_AUDIT_PATH: canonical_json_bytes(audit)}
+        if audit["disputes"]:
+            return _Transition(
+                files,
+                _repair_ledger_request(envelope, proposed, audit),
+                "ledger-repair",
+                None,
+                "ledger-repair",
+            )
+        sealed = seal_ledger(envelope, proposed, audit, None)
+        sealed_files, grade_request, legal_hash = _sealed_files(envelope, sealed)
+        first = _labels(envelope)[0]
+        return _Transition(
+            {**files, **sealed_files},
+            grade_request,
+            f"grade-{first}-1",
+            first,
+            "grade-a",
+            legal_ledger_hash=legal_hash,
+        )
+    if operation == "repair_ledger":
+        repair = _shape(
+            payload, required={"repaired_ledger", "remaining_audit"}, location="ledger repair"
+        )
+        repaired, issues = validate_ledger(repair["repaired_ledger"], envelope=envelope)
+        remaining = validate_ledger_audit(repair["remaining_audit"])
+        if issues or remaining["request_fingerprint"] != request["request_fingerprint"]:
+            raise PortableEvaluationInputError("invalid repaired ledger or audit binding")
+        files = {
+            _REPAIRED_LEDGER_PATH: canonical_json_bytes(repaired),
+            _REMAINING_AUDIT_PATH: canonical_json_bytes(remaining),
+        }
+        material = [
+            item
+            for item in cast(list[JsonObject], remaining["disputes"])
+            if item["materiality"] in {"material", "critical"}
+        ]
+        if len(material) > 1:
+            inconclusive = _inconclusive_readiness(
+                envelope,
+                fingerprint=_model_fingerprint(remaining),
+                issue_code="MULTIPLE_LEDGER_DISPUTES_UNRESOLVED",
+                rationale="More than one material ledger dispute remained after repair.",
+                existing=readiness,
+            )
+            result = _terminal_result(
+                envelope, inconclusive, "INCONCLUSIVE", judge_isolation
+            )
+            result_bytes = canonical_json_bytes(result)
+            files.update(
+                {
+                    _TERMINAL_READINESS_PATH: canonical_json_bytes(inconclusive),
+                    _RESULT_PATH: result_bytes,
+                    _REPORT_PATH: render_evaluation_report(result).encode("utf-8"),
+                }
+            )
+            return _Transition(
+                files,
+                None,
+                None,
+                None,
+                "inconclusive",
+                "inconclusive",
+                result_hash=_sha256(result_bytes),
+            )
+        if material:
+            return _Transition(
+                files,
+                _ledger_referee_request(envelope, repaired, material[0]),
+                "ledger-referee",
+                None,
+                "ledger-referee",
+            )
+        sealed = seal_ledger(envelope, repaired, remaining, None)
+        sealed_files, grade_request, legal_hash = _sealed_files(envelope, sealed)
+        first = _labels(envelope)[0]
+        return _Transition(
+            {**files, **sealed_files},
+            grade_request,
+            f"grade-{first}-1",
+            first,
+            "grade-a",
+            legal_ledger_hash=legal_hash,
+        )
+    if (
+        operation == "referee"
+        and cast(JsonObject, request["safe_metadata"]).get("referee_scope") == "ledger"
+    ):
+        repaired = _read_json(storage, _REPAIRED_LEDGER_PATH)
+        remaining = _read_json(storage, _REMAINING_AUDIT_PATH)
+        decision = validate_referee_decision(payload)
+        sealed = seal_ledger(envelope, repaired, remaining, decision)
+        sealed_files, grade_request, legal_hash = _sealed_files(envelope, sealed)
+        first = _labels(envelope)[0]
+        return _Transition(
+            {_LEDGER_REFEREE_PATH: canonical_json_bytes(decision), **sealed_files},
+            grade_request,
+            f"grade-{first}-1",
+            first,
+            "grade-a",
+            legal_ledger_hash=legal_hash,
+        )
+    sealed = _read_json(storage, _SEALED_LEDGER_PATH)
+    manifest_ledger_hash = manifest["legal_ledger_hash"]
+    if type(manifest_ledger_hash) is not str:
+        raise EvaluationIntegrityError("grading lacks a sealed-ledger hash")
+    legal_hash = manifest_ledger_hash
+    if operation == "grade_report":
+        if (
+            type(payload) is not dict
+            or cast(JsonObject, payload).get("schema_version")
+            != EVALUATION_ARTIFACT_SCHEMA_VERSION
+        ):
+            raise PortableEvaluationInputError("grade response schema version is unsupported")
+        grade, issues = validate_grade(sealed, payload)
+        if (
+            grade["request_fingerprint"] != request["request_fingerprint"]
+            or grade["anonymous_label"] != pending["anonymous_label"]
+            or issues
+        ):
+            raise PortableEvaluationInputError(
+                "invalid candidate grade: "
+                + ", ".join(_grade_issue_diagnostics(sealed, grade, issues))
+            )
+        _validate_grade_evidence(
+            envelope,
+            grade,
+            cast(str, pending["anonymous_label"]),
+        )
+        grade_files = {_grade_path(pending): canonical_json_bytes(grade)}
+        label = cast(str, pending["anonymous_label"])
+        number = int(cast(str, pending["call_id"]).rsplit("-", 1)[1])
+        if number == 1:
+            checks = _read_json(storage, f"deterministic-checks-{label}.json")
+            return _Transition(
+                grade_files,
+                _grade_request(envelope, sealed, checks, label, legal_hash),
+                f"grade-{label}-2",
+                label,
+                "grade-a" if label == "A" else "grade-b",
+                legal_ledger_hash=legal_hash,
+            )
+        labels = _labels(envelope)
+        current = labels.index(label)
+        if current + 1 < len(labels):
+            next_label = labels[current + 1]
+            checks = _read_json(storage, f"deterministic-checks-{next_label}.json")
+            return _Transition(
+                grade_files,
+                _grade_request(envelope, sealed, checks, next_label, legal_hash),
+                f"grade-{next_label}-1",
+                next_label,
+                "grade-b",
+                legal_ledger_hash=legal_hash,
+            )
+        return _after_all_grades(
+            storage,
+            envelope,
+            sealed,
+            readiness,
+            grade_files,
+            legal_hash,
+            judge_isolation,
+        )
+    if (
+        operation == "referee"
+        and cast(JsonObject, request["safe_metadata"]).get("referee_scope") == "report"
+    ):
+        decision = validate_referee_decision(payload)
+        dispute_artifact = _read_json(storage, _REPORT_DISPUTES_PATH)
+        disputes = cast(list[JsonObject], dispute_artifact["disputes"])
+        completed = [
+            call
+            for call in cast(list[JsonObject], manifest["judge_calls"])
+            if call["operation"] == "referee"
+            and call["state"] == "completed"
+            and call["anonymous_label"] is not None
+        ]
+        index = len(completed)
+        dispute = disputes[index]
+        if decision["dispute_id"] != dispute["dispute_id"] or decision[
+            "grade_dispute_fingerprint"
+        ] != _model_fingerprint(dispute):
+            raise PortableEvaluationInputError("report referee decision is not request-bound")
+        dispute_label = cast(str, dispute["anonymous_label"])
+        first_grade, second_grade = _load_grades(storage, dispute_label)
+        _validate_report_referee_decision_evidence(
+            envelope,
+            sealed,
+            disputes,
+            decision,
+            dispute_label,
+            first_grade,
+            second_grade,
+        )
+        path = _referee_path(index, dispute)
+        files = {path: canonical_json_bytes(decision)}
+        if index + 1 < len(disputes):
+            next_dispute = disputes[index + 1]
+            return _Transition(
+                files,
+                _report_referee_request(envelope, sealed, next_dispute, legal_hash),
+                f"report-referee-{index + 2}",
+                cast(str, next_dispute["anonymous_label"]),
+                "report-referee",
+                legal_ledger_hash=legal_hash,
+            )
+        aggregate = _aggregate(
+            storage,
+            envelope,
+            sealed,
+            readiness,
+            judge_isolation,
+            extra=files,
+        )
+        return _Transition(
+            {**files, **aggregate.files},
+            None,
+            None,
+            None,
+            aggregate.state,
+            aggregate.terminal_status,
+            legal_hash,
+            aggregate.result_hash,
+        )
+    raise PortableEvaluationInputError("unsupported judge operation for current state")
+
+
+def _preflight_result(
+    request: JsonObject | None,
+    *,
+    code: str | None = None,
+    related_ids: Sequence[str] = (),
+) -> JsonObject:
+    messages = {
+        "EVALUATION_NO_PENDING_REQUEST": "The evaluation run has no pending request.",
+        "EVALUATION_RESPONSE_REQUEST_MISMATCH": (
+            "The response does not bind the pending request."
+        ),
+        "EVALUATION_RESPONSE_SCHEMA_INVALID": (
+            "The response does not satisfy the canonical response schema."
+        ),
+        "EVALUATION_RESPONSE_SEMANTIC_INVALID": (
+            "The response does not satisfy the pending operation contract."
+        ),
+        "EVALUATION_RESPONSE_INCOMPLETE": (
+            "The response is incomplete for the pending operation."
+        ),
+        "EVALUATION_AUDIT_INCOMPLETE": "The ledger audit is incomplete.",
+        "EVALUATION_AUDIT_RATIONALE_INSUFFICIENT": (
+            "The ledger audit rationale is insufficient."
+        ),
+        "EVALUATION_AUDIT_ACTION_INVALID": "The ledger audit action is invalid.",
+        "EVALUATION_AUDIT_TARGET_UNKNOWN": "The ledger audit target is unknown.",
+        "EVALUATION_SOURCE_BINDING_INVALID": "The source binding is invalid.",
+        "EVALUATION_PROPOSED_ENTRY_INVALID": "The audit proposed entry is invalid.",
+    }
+    if code is not None and code not in messages:
+        raise EvaluationIntegrityError("preflight issue code is unsupported")
+    issues = (
+        []
+        if code is None
+        else [
+            {
+                "code": code,
+                "message": messages[code],
+                "related_ids": sorted(set(related_ids)),
+            }
+        ]
+    )
+    return {
+        "schema_version": "1.0",
+        "ok": code is None,
+        "operation": None if request is None else request["operation"],
+        "request_fingerprint": (
+            None if request is None else request["request_fingerprint"]
+        ),
+        "issues": issues,
+        "diagnostic_fingerprint": (
+            None
+            if code is None or request is None
+            else _sha256(
+                canonical_json_bytes(
+                    {
+                        "issues": issues,
+                        "operation": request["operation"],
+                        "request_fingerprint": request["request_fingerprint"],
+                    }
+                )
+            )
+        ),
+    }
+
+
+def _safe_preflight_issue(error: Exception) -> tuple[str, tuple[str, ...]]:
+    if isinstance(error, PortableResponseContractError):
+        return error.code, error.related_ids
+    return "EVALUATION_RESPONSE_SEMANTIC_INVALID", ()
+
+
+def _preflight_in_storage(
+    storage: _PosixRunStorage,
+    response: JsonObject,
+) -> tuple[JsonObject, _PreflightSubmissionContext | None]:
+    """Validate once and retain the portable transition that guarded submit may commit."""
+    manifest, envelope, _ = _verify_in_storage(storage)
+    pending_calls = [
+        call
+        for call in cast(list[JsonObject], manifest["judge_calls"])
+        if call["state"] == "pending"
+    ]
+    if not pending_calls and manifest["terminal_status"] is not None:
+        return _preflight_result(None, code="EVALUATION_NO_PENDING_REQUEST"), None
+    if len(pending_calls) != 1:
+        raise EvaluationIntegrityError("preflight requires exactly one pending call")
+    pending = pending_calls[0]
+    request = _read_json(storage, cast(str, pending["request_artifact_path"]))
+    if (
+        response["operation"] != request["operation"]
+        or response["request_fingerprint"] != request["request_fingerprint"]
+    ):
+        return _preflight_result(request, code="EVALUATION_RESPONSE_REQUEST_MISMATCH"), None
+    try:
+        transition = _accepted_transition(storage, manifest, envelope, pending, request, response)
+    except EvaluationIntegrityError:
+        raise
+    except (
+        PortableEvaluationInputError,
+        EvaluationInconclusiveError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        code, related_ids = _safe_preflight_issue(error)
+        return _preflight_result(request, code=code, related_ids=related_ids), None
+    return _preflight_result(request), _PreflightSubmissionContext(
+        manifest,
+        envelope,
+        pending,
+        request,
+        transition,
+    )
+
+
+def preflight_judge_response(run_dir: Path, response_value: object) -> JsonObject:
+    """Validate one pending response with the submit transition without writing run bytes."""
+    response = _validate_response(response_value)
+    with _open_run_storage(run_dir) as storage:
+        result, _ = _preflight_in_storage(storage, response)
+        storage.assert_root_identity()
+        return result
+
+
+def _commit_validated_response(
+    storage: _PosixRunStorage,
+    context: _PreflightSubmissionContext,
+    response: JsonObject,
+    response_bytes: bytes,
+) -> JsonObject:
+    """Commit the one accepted transition calculated by portable preflight."""
+    response_hash = _sha256(response_bytes)
+    response_path = (
+        f"judge-responses/{context.pending['call_id']}-attempt-{context.pending['attempt']}.json"
+    )
+    files: dict[str, bytes] = {response_path: response_bytes}
+    calls = _replace_call(
+        cast(list[JsonObject], _copy_json(context.manifest["judge_calls"])),
+        _completed_call(context.pending, response, response_hash),
+    )
+    files.update(context.transition.files)
+    if context.transition.request is not None:
+        if context.transition.call_id is None:
+            raise EvaluationIntegrityError("next request lacks a call ID")
+        next_call = _pending_call(
+            context.transition.call_id,
+            context.transition.request,
+            anonymous_label=context.transition.label,
+        )
+        files[cast(str, next_call["request_artifact_path"])] = canonical_json_bytes(
+            context.transition.request
+        )
+        calls.append(next_call)
+    return _commit(
+        storage,
+        context.manifest,
+        files=files,
+        judge_calls=calls,
+        state=context.transition.state,
+        terminal_status=context.transition.terminal_status,
+        legal_ledger_hash=context.transition.legal_ledger_hash,
+        result_hash=context.transition.result_hash,
+    )
+
+
+def guarded_submit_judge_response(run_dir: Path, response_value: object) -> JsonObject:
+    """Commit a portable response only when one in-storage preflight accepts it."""
+    response = _validate_response(response_value)
+    response_bytes = canonical_json_bytes(response)
+    with _open_run_storage(run_dir) as storage:
+        preflight, context = _preflight_in_storage(storage, response)
+        if not preflight["ok"]:
+            storage.assert_root_identity()
+            return {
+                "schema_version": "1.0",
+                "accepted": False,
+                "preflight": preflight,
+                "state": None,
+            }
+        if context is None:
+            raise EvaluationIntegrityError("successful preflight lacks a submission context")
+        state = _commit_validated_response(storage, context, response, response_bytes)
+        storage.assert_root_identity()
+        return {
+            "schema_version": "1.0",
+            "accepted": True,
+            "preflight": preflight,
+            "state": state,
+        }
+
+
+def submit_judge_response(run_dir: Path, response_value: object) -> JsonObject:
+    response = _validate_response(response_value)
+    response_bytes = canonical_json_bytes(response)
+    with _open_run_storage(run_dir) as storage:
+        manifest, envelope, _ = _verify_in_storage(storage)
+        pending_calls = [
+            call
+            for call in cast(list[JsonObject], manifest["judge_calls"])
+            if call["state"] == "pending"
+        ]
+        if len(pending_calls) != 1:
+            raise PortableEvaluationInputError("response submission requires one pending call")
+        pending = pending_calls[0]
+        request = _read_json(storage, cast(str, pending["request_artifact_path"]))
+        if (
+            response["operation"] != request["operation"]
+            or response["request_fingerprint"] != request["request_fingerprint"]
+        ):
+            raise PortableEvaluationInputError("response does not bind the pending request")
+        response_hash = _sha256(response_bytes)
+        response_path = f"judge-responses/{pending['call_id']}-attempt-{pending['attempt']}.json"
+        files: dict[str, bytes] = {response_path: response_bytes}
+        calls = cast(list[JsonObject], _copy_json(manifest["judge_calls"]))
+        try:
+            transition = _accepted_transition(
+                storage, manifest, envelope, pending, request, response
+            )
+        except EvaluationIntegrityError:
+            raise
+        except (
+            PortableEvaluationInputError,
+            EvaluationInconclusiveError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            diagnostics_payload: JsonObject = {
+                "schema_version": "1.0",
+                "call_id": pending["call_id"],
+                "attempt": pending["attempt"],
+                "operation": pending["operation"],
+                "response_fingerprint": response_hash,
+                "issues": [
+                    {
+                        "code": "JUDGE_RESPONSE_INVALID",
+                        "message": str(error) or type(error).__name__,
+                    }
+                ],
+            }
+            diagnostics = canonical_json_bytes(diagnostics_payload)
+            diagnostics_path = (
+                f"judge-diagnostics/{pending['call_id']}-attempt-{pending['attempt']}.json"
+            )
+            files[diagnostics_path] = diagnostics
+            terminal = cast(int, pending["attempt"]) >= 2
+            failed = _failed_call(pending, response, response_hash, terminal=terminal)
+            calls = _replace_call(calls, failed)
+            if terminal:
+                existing = _load_readiness(storage)
+                readiness = _inconclusive_readiness(
+                    envelope,
+                    fingerprint=response_hash,
+                    issue_code="JUDGE_RESPONSE_INVALID",
+                    rationale="The judge returned invalid structured output twice.",
+                    existing=existing,
+                )
+                result = _terminal_result(
+                    envelope,
+                    readiness,
+                    "INCONCLUSIVE",
+                    _aggregate_judge_isolation(calls),
+                )
+                result_bytes = canonical_json_bytes(result)
+                files.update(
+                    {
+                        _READINESS_PATH
+                        if existing is None
+                        else _TERMINAL_READINESS_PATH: canonical_json_bytes(readiness),
+                        _RESULT_PATH: result_bytes,
+                        _REPORT_PATH: render_evaluation_report(result).encode("utf-8"),
+                    }
+                )
+                return _commit(
+                    storage,
+                    manifest,
+                    files=files,
+                    judge_calls=calls,
+                    state="inconclusive",
+                    terminal_status="inconclusive",
+                    legal_ledger_hash=cast(str | None, manifest["legal_ledger_hash"]),
+                    result_hash=_sha256(result_bytes),
+                )
+            retry = _pending_call(
+                cast(str, pending["call_id"]),
+                request,
+                attempt=2,
+                retry_count=1,
+                anonymous_label=cast(str | None, pending["anonymous_label"]),
+            )
+            files[cast(str, retry["request_artifact_path"])] = canonical_json_bytes(request)
+            calls.append(retry)
+            return _commit(
+                storage,
+                manifest,
+                files=files,
+                judge_calls=calls,
+                state=cast(str, manifest["state"]),
+                legal_ledger_hash=cast(str | None, manifest["legal_ledger_hash"]),
+                retry_count=cast(int, manifest["retry_count"]) + 1,
+            )
+        completed = _completed_call(pending, response, response_hash)
+        calls = _replace_call(calls, completed)
+        files.update(transition.files)
+        if transition.request is not None:
+            if transition.call_id is None:
+                raise EvaluationIntegrityError("next request lacks a call ID")
+            next_call = _pending_call(
+                transition.call_id, transition.request, anonymous_label=transition.label
+            )
+            files[cast(str, next_call["request_artifact_path"])] = canonical_json_bytes(
+                transition.request
+            )
+            calls.append(next_call)
+        state = _commit(
+            storage,
+            manifest,
+            files=files,
+            judge_calls=calls,
+            state=transition.state,
+            terminal_status=transition.terminal_status,
+            legal_ledger_hash=transition.legal_ledger_hash,
+            result_hash=transition.result_hash,
+        )
+        storage.assert_root_identity()
+        return state
+
+
+def load_verified_evaluation_run(run_dir: Path) -> tuple[JsonObject, JsonObject]:
+    with _open_run_storage(run_dir) as storage:
+        manifest, _, result = _verify_in_storage(storage)
+        if result is None:
+            raise EvaluationIntegrityError("terminal evaluation has no result artifact")
+        return manifest, result

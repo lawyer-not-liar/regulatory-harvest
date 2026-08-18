@@ -5,8 +5,8 @@ from datetime import datetime
 from pydantic import Field, field_validator, model_validator
 
 from .base import StrictModel
-from .enums import FetchStatus, SourceQuality
-from .request import _non_blank
+from .enums import FetchStatus, SourceQuality, SourceRole
+from .request import _non_blank, _optional_non_blank, _public_http_url
 
 
 class SourceFailure(StrictModel):
@@ -27,6 +27,7 @@ class SourceRecord(StrictModel):
     media_type: str
     normalized_text: str = ""
     normalization_warnings: list[str] = Field(default_factory=list)
+    canonical_url: str | None = None
     title: str | None = None
     publisher: str | None = None
     jurisdiction: str | None = None
@@ -34,8 +35,10 @@ class SourceRecord(StrictModel):
     citation: str | None = None
     effective_date: str | None = None
     supersession: str | None = None
+    language: str | None = None
     license_assertion: str = "unknown"
     source_quality: SourceQuality = SourceQuality.UNKNOWN
+    source_role: SourceRole | None = None
     fetch_status: FetchStatus = FetchStatus.SUCCEEDED
     error: SourceFailure | None = None
     external_ids: dict[str, str] = Field(default_factory=dict)
@@ -43,6 +46,8 @@ class SourceRecord(StrictModel):
     _validate_text = field_validator(
         "source_id", "origin", "display_name", "media_type", "license_assertion"
     )(_non_blank)
+    _validate_canonical_url = field_validator("canonical_url")(_public_http_url)
+    _validate_language = field_validator("language")(_optional_non_blank)
 
     @model_validator(mode="after")
     def validate_fetch_result(self) -> "SourceRecord":
@@ -68,4 +73,3 @@ class CitationSpan(StrictModel):
         if self.end_char <= self.start_char:
             raise ValueError("end_char must be greater than start_char")
         return self
-

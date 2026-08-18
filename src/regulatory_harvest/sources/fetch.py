@@ -68,6 +68,8 @@ class DefaultSourceFetcher:
                 display_name = source_input.title or Path(location).name
 
             normalized = normalize_content(data, media_type)
+            if not normalized.text.strip():
+                raise NormalizationError("source contained no extractable text")
             content_hash = sha256_digest(normalized.text.encode("utf-8"))
             source_id = self._source_id(final_origin, content_hash)
             return SourceRecord(
@@ -79,14 +81,24 @@ class DefaultSourceFetcher:
                 media_type=normalized.media_type,
                 normalized_text=normalized.text,
                 normalization_warnings=list(normalized.warnings),
+                canonical_url=source_input.canonical_url,
                 title=source_input.title,
+                publisher=source_input.publisher,
                 jurisdiction=source_input.jurisdiction,
                 authority_type=source_input.authority_type,
                 citation=source_input.citation,
+                effective_date=source_input.effective_date,
+                supersession=source_input.supersession,
+                language=source_input.language,
                 license_assertion=source_input.license_assertion,
                 source_quality=classify_source_quality(
-                    source_input.source_quality, normalized.text
+                    source_input.source_quality,
+                    normalized.text,
+                    origin=final_origin,
+                    canonical_url=source_input.canonical_url,
+                    authority_type=source_input.authority_type,
                 ),
+                source_role=source_input.source_role,
             )
         except Exception as error:
             return self._failed_record(source_input, error)
@@ -189,12 +201,18 @@ class DefaultSourceFetcher:
             content_hash=None,
             media_type="application/octet-stream",
             normalized_text="",
+            canonical_url=source_input.canonical_url,
             title=source_input.title,
+            publisher=source_input.publisher,
             jurisdiction=source_input.jurisdiction,
             authority_type=source_input.authority_type,
             citation=source_input.citation,
+            effective_date=source_input.effective_date,
+            supersession=source_input.supersession,
+            language=source_input.language,
             license_assertion=source_input.license_assertion,
             source_quality=SourceQuality.UNUSABLE,
+            source_role=source_input.source_role,
             fetch_status=FetchStatus.FAILED,
             error=SourceFailure(
                 category=category,

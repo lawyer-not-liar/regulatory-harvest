@@ -1,14 +1,32 @@
 from datetime import UTC, datetime
 
+import pytest
+from pydantic import ValidationError
+
 from regulatory_harvest.analysis import (
     AnalysisDraft,
     DraftClaim,
     DraftFinding,
+    DraftGap,
     DraftIssue,
     ProposedCitation,
     build_analysis,
 )
-from regulatory_harvest.models import ClaimKind, Severity, SourceRecord, SupportStatus
+from regulatory_harvest.models import (
+    AttorneyBrief,
+    BriefBlock,
+    BriefBlockKind,
+    BriefBlockPurpose,
+    BriefSection,
+    BriefSectionRole,
+    BriefStructureProfile,
+    ClaimKind,
+    IssueCategory,
+    PresentationRole,
+    Severity,
+    SourceRecord,
+    SupportStatus,
+)
 from regulatory_harvest.storage import sha256_digest
 
 TEXT = "A controller must document risks. A processor must document risks."
@@ -35,6 +53,7 @@ def _draft(proposed: ProposedCitation) -> AnalysisDraft:
                 title="Documentation",
                 description="Whether documentation is required.",
                 jurisdictions=["US"],
+                category="requirements",
             )
         ],
         findings=[
@@ -80,6 +99,45 @@ def test_build_resolves_model_quote_in_trusted_core() -> None:
     assert claim.citation_ids == [citation.citation_id]
     assert claim.support_status is SupportStatus.SUPPORTED
     assert result.review_items == []
+
+
+def test_build_preserves_issue_category_for_predictable_reporting() -> None:
+    """Discarding the category would collapse the attorney briefing back into a flat list."""
+    result = build_analysis(
+        _draft(
+            ProposedCitation(
+                source_id="src_rule",
+                quote="A controller must document risks.",
+            )
+        ),
+        [_source()],
+    )
+
+    assert result.issues[0].category.value == "requirements"
+
+
+def test_build_preserves_issue_and_gap_presentation_roles() -> None:
+    """Losing roles would collapse findings back into parent-category buckets."""
+    draft = _draft(
+        ProposedCitation(
+            source_id="src_rule",
+            quote="A controller must document risks.",
+        )
+    )
+    draft.issues[0].presentation_role = PresentationRole.REQUIREMENT
+    draft.gaps = [
+        DraftGap(
+            code="SCOPE_ACTIVITY_UNKNOWN",
+            message="Covered activities were not established.",
+            category=IssueCategory.SCOPE,
+            presentation_role=PresentationRole.COVERED_ACTIVITIES,
+        )
+    ]
+
+    result = build_analysis(draft, [_source()])
+
+    assert result.issues[0].presentation_role is PresentationRole.REQUIREMENT
+    assert result.gaps[0].presentation_role is PresentationRole.COVERED_ACTIVITIES
 
 
 def test_build_rejects_ambiguous_quote_without_occurrence() -> None:
@@ -130,3 +188,154 @@ def test_build_preserves_uncited_analysis_claim() -> None:
     assert claim.kind is ClaimKind.ANALYSIS
     assert claim.citation_ids == []
     assert result.review_items == []
+
+
+def test_build_converts_agent_research_gap_to_stable_bundle_gap() -> None:
+    """Leaving search and currentness gaps outside the bundle would break the audit trail."""
+    draft = _draft(ProposedCitation(source_id="src_rule", quote="must document risks"))
+    draft.gaps = [
+        DraftGap(
+            code="AUTHORITY_CURRENTNESS_UNVERIFIED",
+            message="The official historical register was unavailable.",
+            category=IssueCategory.STATUS,
+            jurisdiction="US",
+            source_ids=["src_rule"],
+        )
+    ]
+
+    first = build_analysis(draft, [_source()])
+    repeated = build_analysis(draft, [_source()])
+
+    assert first.gaps == repeated.gaps
+    assert first.gaps[0].gap_id.startswith("gap_")
+    assert first.gaps[0].code == "AUTHORITY_CURRENTNESS_UNVERIFIED"
+    assert first.gaps[0].category is IssueCategory.STATUS
+    assert first.gaps[0].source_ids == ["src_rule"]
+
+
+def test_build_adds_plain_language_gaps_for_uncovered_dimensions() -> None:
+    """Omitted dimensions must become explicit gaps instead of empty report sections."""
+    result = build_analysis(
+        _draft(
+            ProposedCitation(
+                source_id="src_rule",
+                quote="A controller must document risks.",
+            )
+        ),
+        [_source()],
+    )
+
+    gaps_by_category = {gap.category: gap for gap in result.gaps}
+    assert set(gaps_by_category) == {
+        IssueCategory.STATUS,
+        IssueCategory.SCOPE,
+        IssueCategory.ENFORCEMENT,
+        IssueCategory.DEADLINES,
+        IssueCategory.IMPLEMENTATION,
+    }
+    assert gaps_by_category[IssueCategory.STATUS].code == "COVERAGE_STATUS_NOT_ESTABLISHED"
+    assert gaps_by_category[IssueCategory.STATUS].message == (
+        "The retained source set did not establish legal status."
+    )
+
+
+def test_build_does_not_duplicate_an_explicit_dimension_gap() -> None:
+    """A researched negative result should not be obscured by a generic duplicate."""
+    draft = _draft(
+        ProposedCitation(
+            source_id="src_rule",
+            quote="A controller must document risks.",
+        )
+    )
+    draft.gaps = [
+        DraftGap(
+            code="SCOPE_THRESHOLD_NOT_ESTABLISHED",
+            message="The supplied excerpt does not state the coverage threshold.",
+            category=IssueCategory.SCOPE,
+            jurisdiction="US",
+            source_ids=["src_rule"],
+        )
+    ]
+
+    result = build_analysis(draft, [_source()])
+
+    scope_gaps = [gap for gap in result.gaps if gap.category is IssueCategory.SCOPE]
+    assert len(scope_gaps) == 1
+    assert scope_gaps[0].code == "SCOPE_THRESHOLD_NOT_ESTABLISHED"
+
+
+def test_build_preserves_adaptive_attorney_brief() -> None:
+    """Discarding the authored brief would force the fixed renderer to invent structure."""
+    draft = _draft(
+        ProposedCitation(
+            source_id="src_rule",
+            quote="A controller must document risks.",
+        )
+    )
+    draft.brief = AttorneyBrief(
+        structure_profile=BriefStructureProfile.REGULATORY_WALK_V1,
+        executive_summary=[
+            BriefBlock(
+                kind=BriefBlockKind.PARAGRAPH,
+                purpose=BriefBlockPurpose.LEGAL_ANALYSIS,
+                text="Controllers must document risks.",
+                finding_ids=["finding-1"],
+            )
+        ],
+        sections=[
+            BriefSection(
+                section_id="documentation",
+                title="Documentation Requirements",
+                role=BriefSectionRole.KEY_REQUIREMENTS,
+                blocks=[
+                    BriefBlock(
+                        kind=BriefBlockKind.PARAGRAPH,
+                        purpose=BriefBlockPurpose.APPLICATION,
+                        text="Maintain a written record.",
+                        finding_ids=["finding-1"],
+                    )
+                ],
+            )
+        ],
+    )
+
+    result = build_analysis(draft, [_source()])
+
+    assert result.brief == draft.brief
+
+
+def test_analysis_draft_rejects_an_authored_brief_without_structure_profile() -> None:
+    """New host-authored briefs must opt into the enforceable report contract."""
+    brief = AttorneyBrief(
+        executive_summary=[
+            BriefBlock(
+                kind=BriefBlockKind.PARAGRAPH,
+                purpose=BriefBlockPurpose.LEGAL_ANALYSIS,
+                text="Controllers must document risks.",
+                finding_ids=["finding-1"],
+            )
+        ],
+        sections=[
+            BriefSection(
+                section_id="documentation",
+                title="Documentation Requirements",
+                blocks=[
+                    BriefBlock(
+                        kind=BriefBlockKind.PARAGRAPH,
+                        purpose=BriefBlockPurpose.APPLICATION,
+                        text="Maintain a written record.",
+                        finding_ids=["finding-1"],
+                    )
+                ],
+            )
+        ],
+    )
+
+    with pytest.raises(ValidationError, match="structure_profile"):
+        AnalysisDraft.model_validate(
+            {
+                "issues": [],
+                "findings": [],
+                "brief": brief.model_dump(mode="json"),
+            }
+        )

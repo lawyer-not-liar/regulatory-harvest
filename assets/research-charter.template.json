@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0",
+  "matter_id": "__REPLACE__",
+  "matter_title": "__REPLACE__",
+  "question": "__REPLACE__",
+  "jurisdictions": [
+    "__REPLACE__"
+  ],
+  "as_of": "__REPLACE__",
+  "source_mode": "provided-only",
+  "context": "__REPLACE__",
+  "excluded_topics": [],
+  "output_instructions": "Produce a concise attorney briefing with material caveats.",
+  "sources": [
+    {
+      "location": "__REPLACE__",
+      "canonical_url": null,
+      "title": "__REPLACE__",
+      "publisher": "__REPLACE__",
+      "jurisdiction": "__REPLACE__",
+      "authority_type": "__REPLACE__",
+      "citation": "__REPLACE__",
+      "effective_date": "__REPLACE__",
+      "supersession": "__REPLACE__",
+      "language": "en",
+      "source_quality": "unknown",
+      "source_role": null,
+      "license_assertion": "unknown"
+    }
+  ]
+}

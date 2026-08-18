@@ -25,7 +25,7 @@ These controls reduce SSRF and resource-exhaustion risk but do not eliminate it.
 
 Local source paths are explicitly supplied by the user. Relative paths are resolved against the request file directory. Symlinks and `..` components can reach files outside that directory, so do not run untrusted request files with access to sensitive files.
 
-Downloads are byte-limited, but compressed or malformed PDFs can still consume disproportionate CPU or memory in a parser. Process high-risk files in an isolated, resource-limited environment and keep `pypdf` current.
+Downloads are byte-limited, but compressed or malformed PDFs can still consume disproportionate CPU or memory in a parser. The dependency-free skill runtime refuses direct PDF normalization; use a verified UTF-8 extraction and record that limitation. When using the full package's PDF path, process high-risk files in an isolated, resource-limited environment and keep `pypdf` current.
 
 ### Artifact storage
 

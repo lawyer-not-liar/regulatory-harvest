@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit tracked release files for clean-room and provenance hazards."""
+"""Audit release candidates and built archives for clean-room hazards."""
 
 from __future__ import annotations
 
@@ -9,8 +9,11 @@ import ipaddress
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import unicodedata
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Final
@@ -65,6 +68,8 @@ GENERATED_DIRECTORIES: Final = frozenset({"run", "runs", "output", "outputs"})
 GENERATED_FILENAMES: Final = frozenset(
     {
         "bundle.json",
+        "coverage-review.json",
+        "audit.md",
         "evaluation.json",
         "manifest.json",
         "receipt.json",
@@ -72,6 +77,44 @@ GENERATED_FILENAMES: Final = frozenset(
         "result.json",
     }
 )
+PRIVATE_EVALUATION_FIELDS: Final = frozenset(
+    {
+        "harvest_label",
+        "legacy_label",
+        "private_record_hash",
+        "private_record_id",
+        "private_round",
+        "report_system_mapping",
+        "sealed_answer",
+        "source_case_id",
+    }
+)
+JSON_CREDENTIAL_FIELDS: Final = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "client_secret",
+        "password",
+        "secret",
+        "token",
+    }
+)
+JSON_CREDENTIAL_COMPACT_FIELDS: Final = frozenset(
+    field.replace("_", "") for field in JSON_CREDENTIAL_FIELDS
+)
+WINDOWS_RESERVED_NAMES: Final = frozenset(
+    {
+        "aux",
+        "con",
+        "nul",
+        "prn",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+    }
+)
+MAX_PRIVATE_MARKER_FILE_BYTES: Final = 1024 * 1024
+MAX_ARCHIVE_ENTRY_BYTES: Final = 32 * 1024 * 1024
+MAX_ARCHIVE_TOTAL_BYTES: Final = 256 * 1024 * 1024
 
 # These files deliberately exercise or document one exact blocked sentinel. Each
 # exception includes the precise matched value; another match in the same file fails.
@@ -145,29 +188,49 @@ class AuditError(RuntimeError):
     """The repository could not be audited reliably."""
 
 
+class DuplicateJSONKeyError(ValueError):
+    """A JSON object repeated a member name."""
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateJSONKeyError
+        value[key] = item
+    return value
+
+
+def _load_unique_json(text: str) -> object:
+    return json.loads(text, object_pairs_hook=_unique_json_object)
+
+
 def _tracked_paths(repo: Path) -> list[str]:
     result = subprocess.run(
-        ["git", "-C", str(repo), "ls-files", "-z"],
+        [
+            "git",
+            "-C",
+            str(repo),
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
         check=False,
         capture_output=True,
     )
     if result.returncode != 0:
-        raise AuditError("git could not enumerate tracked files")
-    return sorted(
-        path.decode("utf-8") for path in result.stdout.split(b"\0") if path
-    )
+        raise AuditError("git could not enumerate candidate files")
+    return sorted(path.decode("utf-8") for path in result.stdout.split(b"\0") if path)
 
 
 def _read_text(repo: Path, relative_path: str) -> str | None:
     target = repo / relative_path
     try:
-        data = (
-            os.readlink(target).encode("utf-8")
-            if target.is_symlink()
-            else target.read_bytes()
-        )
+        data = os.readlink(target).encode("utf-8") if target.is_symlink() else target.read_bytes()
     except (OSError, UnicodeEncodeError) as error:
-        raise AuditError(f"tracked file could not be read: {relative_path}") from error
+        raise AuditError(f"release candidate file could not be read: {relative_path}") from error
     if b"\0" in data:
         return None
     try:
@@ -200,7 +263,7 @@ def _scan_secrets(path: str, text: str) -> list[Finding]:
                 "SECRET_PATTERN",
                 path,
                 _line_number(text, match.start()),
-                "Tracked text matches a credential or private-key pattern.",
+                "Release content matches a credential or private-key pattern.",
                 match.group(0).strip(),
             )
             if finding is not None:
@@ -229,7 +292,7 @@ def _scan_private_urls(path: str, text: str) -> list[Finding]:
             "PRIVATE_NETWORK_URL",
             path,
             _line_number(text, match.start()),
-            "Tracked text contains a URL for a private or non-global host.",
+            "Release content contains a URL for a private or non-global host.",
             matched_url,
         )
         if finding is not None:
@@ -245,7 +308,7 @@ def _scan_home_paths(path: str, text: str) -> list[Finding]:
                 "ABSOLUTE_HOME_PATH",
                 path,
                 _line_number(text, match.start()),
-                "Tracked text contains an absolute user-home path.",
+                "Release content contains an absolute user-home path.",
                 match.group(0),
             )
             if finding is not None:
@@ -264,7 +327,7 @@ def _scan_legacy_identifiers(path: str, text: str) -> list[Finding]:
             "LEGACY_INTERNAL_IDENTIFIER",
             path,
             _line_number(text, match.start()),
-            "Tracked text contains a prohibited legacy or internal project identifier.",
+            "Release content contains a prohibited legacy or internal project identifier.",
             identifier,
         )
         if finding is not None:
@@ -276,8 +339,8 @@ def _scan_workflow_export(path: str, text: str) -> list[Finding]:
     if not path.lower().endswith(".json"):
         return []
     try:
-        payload = json.loads(text)
-    except (json.JSONDecodeError, RecursionError):
+        payload = _load_unique_json(text)
+    except (json.JSONDecodeError, DuplicateJSONKeyError, RecursionError):
         return []
     is_export = (
         isinstance(payload, dict)
@@ -291,9 +354,215 @@ def _scan_workflow_export(path: str, text: str) -> list[Finding]:
         "N8N_WORKFLOW_EXPORT",
         path,
         1,
-        "Tracked JSON has the structural fingerprint of an n8n workflow export.",
+        "Release JSON has the structural fingerprint of an n8n workflow export.",
     )
     return [] if finding is None else [finding]
+
+
+def _private_json_fields(value: object) -> set[str]:
+    fields: set[str] = set()
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            fields.update(str(key) for key in current if key in PRIVATE_EVALUATION_FIELDS)
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return fields
+
+
+def _scan_private_evaluation_fields(path: str, text: str) -> list[Finding]:
+    if not path.lower().endswith(".json"):
+        return []
+    try:
+        payload = _load_unique_json(text)
+    except (json.JSONDecodeError, DuplicateJSONKeyError, RecursionError):
+        return []
+    findings: list[Finding] = []
+    for field in sorted(_private_json_fields(payload)):
+        offset = text.find(json.dumps(field))
+        findings.append(
+            Finding(
+                code="PRIVATE_EVALUATION_MARKER",
+                path=path,
+                line=_line_number(text, max(offset, 0)),
+                message=(
+                    "Release content contains a structural field reserved for private "
+                    "evaluation records or report-to-system mappings."
+                ),
+            )
+        )
+    return findings
+
+
+def _normalized_json_key(key: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(key).casefold()).strip("_")
+
+
+def _json_value_is_present(value: object) -> bool:
+    return value is not None and value != "" and value != [] and value != {}
+
+
+def _scan_decoded_json(
+    path: str,
+    text: str,
+    markers: tuple[str, ...],
+) -> list[Finding]:
+    if not path.lower().endswith(".json"):
+        return []
+    try:
+        payload = _load_unique_json(text)
+    except (json.JSONDecodeError, DuplicateJSONKeyError, RecursionError):
+        return []
+
+    findings: list[Finding] = []
+    pending = [payload]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for key, value in current.items():
+                normalized_key = _normalized_json_key(key)
+                if (
+                    (
+                        normalized_key in JSON_CREDENTIAL_FIELDS
+                        or normalized_key.replace("_", "")
+                        in JSON_CREDENTIAL_COMPACT_FIELDS
+                    )
+                    and _json_value_is_present(value)
+                ):
+                    encoded_key = json.dumps(str(key), ensure_ascii=False)
+                    offset = text.find(encoded_key)
+                    finding = _finding(
+                        "SECRET_PATTERN",
+                        path,
+                        _line_number(text, max(offset, 0)),
+                        "Release JSON contains a populated credential field.",
+                    )
+                    if finding is not None:
+                        findings.append(finding)
+                encoded_key = json.dumps(str(key), ensure_ascii=False)
+                key_line = _line_number(text, max(text.find(encoded_key), 0))
+                for finding in _scan_external_private_markers(path, str(key), markers):
+                    findings.append(
+                        Finding(
+                            code=finding.code,
+                            path=finding.path,
+                            line=key_line,
+                            message=finding.message,
+                        )
+                    )
+                pending.append(value)
+        elif isinstance(current, list):
+            pending.extend(current)
+        elif isinstance(current, str):
+            encoded_value = json.dumps(current, ensure_ascii=False)
+            offset = text.find(encoded_value)
+            source_line = _line_number(text, max(offset, 0))
+            for scanner in (
+                _scan_secrets,
+                _scan_private_urls,
+                _scan_home_paths,
+                _scan_legacy_identifiers,
+            ):
+                for finding in scanner(path, current):
+                    findings.append(
+                        Finding(
+                            code=finding.code,
+                            path=finding.path,
+                            line=source_line,
+                            message=finding.message,
+                        )
+                    )
+            for finding in _scan_external_private_markers(path, current, markers):
+                findings.append(
+                    Finding(
+                        code=finding.code,
+                        path=finding.path,
+                        line=source_line,
+                        message=finding.message,
+                    )
+                )
+    return findings
+
+
+def _scan_external_private_markers(
+    path: str,
+    text: str,
+    markers: tuple[str, ...],
+) -> list[Finding]:
+    findings: list[Finding] = []
+    for marker in markers:
+        offset = text.find(marker)
+        if offset < 0:
+            continue
+        findings.append(
+            Finding(
+                code="PRIVATE_EVALUATION_MARKER",
+                path=path,
+                line=_line_number(text, offset),
+                message="Release content matches a locally supplied private-evaluation marker.",
+            )
+        )
+    return findings
+
+
+def _scan_duplicate_json_keys(path: str, text: str) -> list[Finding]:
+    if not path.lower().endswith(".json"):
+        return []
+    try:
+        _load_unique_json(text)
+    except DuplicateJSONKeyError:
+        return [
+            Finding(
+                code="DUPLICATE_JSON_KEY",
+                path=path,
+                line=1,
+                message="Release JSON repeats an object member name.",
+            )
+        ]
+    except (json.JSONDecodeError, RecursionError):
+        return []
+    return []
+
+
+def _load_private_markers(path: Path | None, *, repo: Path) -> tuple[str, ...]:
+    if path is None:
+        return ()
+    expanded = path.expanduser()
+    if expanded.is_symlink():
+        raise AuditError("private marker file must be a regular file outside the repository")
+    try:
+        resolved = expanded.resolve(strict=True)
+        if resolved.is_relative_to(repo) or not resolved.is_file():
+            raise AuditError("private marker file must be a regular file outside the repository")
+        data = resolved.read_bytes()
+    except OSError as error:
+        raise AuditError("private marker file is unavailable") from error
+    if len(data) > MAX_PRIVATE_MARKER_FILE_BYTES or b"\0" in data:
+        raise AuditError("private marker file is invalid")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise AuditError("private marker file is invalid") from error
+    markers = tuple(sorted({line for line in text.splitlines() if line}))
+    if not markers or any(len(marker) < 4 or marker != marker.strip() for marker in markers):
+        raise AuditError("private marker file is invalid")
+    return markers
+
+
+def _scan_text(path: str, text: str, markers: tuple[str, ...]) -> list[Finding]:
+    findings: list[Finding] = []
+    findings.extend(_scan_secrets(path, text))
+    findings.extend(_scan_private_urls(path, text))
+    findings.extend(_scan_home_paths(path, text))
+    findings.extend(_scan_legacy_identifiers(path, text))
+    findings.extend(_scan_duplicate_json_keys(path, text))
+    findings.extend(_scan_workflow_export(path, text))
+    findings.extend(_scan_private_evaluation_fields(path, text))
+    findings.extend(_scan_decoded_json(path, text, markers))
+    findings.extend(_scan_external_private_markers(path, text, markers))
+    return findings
 
 
 def _fixture_is_licensed(path: PurePosixPath, tracked: set[str]) -> bool:
@@ -323,7 +592,7 @@ def _scan_path(path: str, tracked: set[str]) -> list[Finding]:
             "UNLICENSED_FIXTURE",
             path,
             1,
-            "Tracked fixture has no license manifest in its fixture tree.",
+            "Release fixture has no license manifest in its fixture tree.",
         )
         if finding is not None:
             findings.append(finding)
@@ -335,14 +604,14 @@ def _scan_path(path: str, tracked: set[str]) -> list[Finding]:
             "GENERATED_EXPORT",
             path,
             1,
-            "Tracked run output appears to be a prohibited generated export.",
+            "Release run output appears to be a prohibited generated export.",
         )
         if finding is not None:
             findings.append(finding)
     return findings
 
 
-def audit_repository(repo: Path) -> list[Finding]:
+def audit_repository(repo: Path, *, markers: tuple[str, ...] = ()) -> list[Finding]:
     repo = repo.resolve()
     paths = _tracked_paths(repo)
     tracked = set(paths)
@@ -352,11 +621,83 @@ def audit_repository(repo: Path) -> list[Finding]:
         text = _read_text(repo, path)
         if text is None:
             continue
-        findings.extend(_scan_secrets(path, text))
-        findings.extend(_scan_private_urls(path, text))
-        findings.extend(_scan_home_paths(path, text))
-        findings.extend(_scan_legacy_identifiers(path, text))
-        findings.extend(_scan_workflow_export(path, text))
+        findings.extend(_scan_text(path, text, markers))
+    return sorted(set(findings))
+
+
+def audit_archive(path: Path, *, markers: tuple[str, ...] = ()) -> list[Finding]:
+    expanded = path.expanduser()
+    if expanded.is_symlink():
+        raise AuditError("release archive must be a regular ZIP file")
+    try:
+        resolved = expanded.resolve(strict=True)
+    except OSError as error:
+        raise AuditError("release archive is unavailable") from error
+    if not resolved.is_file():
+        raise AuditError("release archive must be a regular ZIP file")
+    findings: list[Finding] = []
+    try:
+        with zipfile.ZipFile(resolved) as archive:
+            infos = archive.infolist()
+            names = [info.filename for info in infos]
+            if len(names) != len(set(names)):
+                raise AuditError("release archive contains duplicate paths")
+            normalized_names: set[str] = set()
+            total_size = 0
+            for info in infos:
+                name = info.filename
+                path_text = name[:-1] if name.endswith("/") else name
+                segments = path_text.split("/")
+                unsafe_segment = any(
+                    not segment
+                    or segment in {".", ".."}
+                    or segment.endswith((".", " "))
+                    or any(
+                        unicodedata.category(character) in {"Cc", "Cf"}
+                        for character in segment
+                    )
+                    or ":" in segment
+                    or segment.split(".", 1)[0]
+                    .translate(str.maketrans("¹²³", "123"))
+                    .casefold()
+                    in WINDOWS_RESERVED_NAMES
+                    for segment in segments
+                )
+                drive_qualified = bool(re.match(r"(?i)^[a-z]:", path_text))
+                if (
+                    not path_text
+                    or name.startswith("/")
+                    or "\\" in name
+                    or drive_qualified
+                    or unsafe_segment
+                    or PurePosixPath(name).as_posix() != name
+                    or ((info.external_attr >> 16) & 0o170000) == stat.S_IFLNK
+                ):
+                    raise AuditError("release archive contains an unsafe path")
+                normalized_name = "/".join(
+                    unicodedata.normalize("NFC", segment).casefold() for segment in segments
+                )
+                if normalized_name in normalized_names:
+                    raise AuditError("release archive contains an unsafe path")
+                normalized_names.add(normalized_name)
+                if info.file_size > MAX_ARCHIVE_ENTRY_BYTES:
+                    raise AuditError("release archive contains an oversized entry")
+                total_size += info.file_size
+                if total_size > MAX_ARCHIVE_TOTAL_BYTES:
+                    raise AuditError("release archive exceeds the expanded-size limit")
+                data = archive.read(info)
+                if b"\0" in data:
+                    continue
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                display_path = f"archive:{resolved.name}!/{info.filename}"
+                findings.extend(_scan_text(display_path, text, markers))
+    except AuditError:
+        raise
+    except (OSError, zipfile.BadZipFile, RuntimeError) as error:
+        raise AuditError("release archive could not be inspected") from error
     return sorted(set(findings))
 
 
@@ -375,19 +716,26 @@ def _print_human(findings: list[Finding]) -> None:
             print(f"- {finding.code} {finding.path}:{finding.line} — {finding.message}")
     else:
         print("Release audit found no automated issues.")
-    print(
-        "- MANUAL_CONFIRMATION_REQUIRED — "
-        f"{MANUAL_REQUIREMENTS[0]['message']}"
-    )
+    print(f"- MANUAL_CONFIRMATION_REQUIRED — {MANUAL_REQUIREMENTS[0]['message']}")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
+    parser.add_argument("--archive", action="append", default=[], type=Path)
+    parser.add_argument("--private-markers", type=Path)
     parser.add_argument("--json", action="store_true", help="emit one JSON object")
     args = parser.parse_args(argv)
     try:
-        findings = audit_repository(args.repo)
+        try:
+            repo = args.repo.expanduser().resolve(strict=True)
+        except OSError as error:
+            raise AuditError("repository root is unavailable") from error
+        markers = _load_private_markers(args.private_markers, repo=repo)
+        findings = audit_repository(repo, markers=markers)
+        for archive in args.archive:
+            findings.extend(audit_archive(archive, markers=markers))
+        findings = sorted(set(findings))
     except AuditError as error:
         if args.json:
             print(json.dumps({"error": str(error)}, sort_keys=True))

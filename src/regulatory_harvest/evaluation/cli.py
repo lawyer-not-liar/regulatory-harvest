@@ -9,6 +9,7 @@ from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 
+from .attorney_cli import run_attorney_command
 from .runner import (
     ConfigurationValue,
     UpstreamTermsNotAcceptedError,
@@ -29,6 +30,8 @@ def _configuration(args: argparse.Namespace) -> dict[str, ConfigurationValue]:
 
 def run_evaluation_command(args: argparse.Namespace) -> int:
     """Run LegalBench-RAG evaluation with stable CLI exit semantics."""
+    if args.eval_command == "attorney":
+        return run_attorney_command(args)
     try:
         result = run_legalbench_evaluation(
             args.dataset,

@@ -26,6 +26,12 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy src
       - run: uv build
+      - name: Build universal Agent Skill archive
+        if: matrix.python-version == '3.13'
+        run: python scripts/build_skill.py --output dist/regulatory-harvest-skill.zip
+      - name: Audit clean-room release inputs
+        if: matrix.python-version == '3.13'
+        run: uv run python scripts/audit_release.py --archive dist/regulatory-harvest-skill.zip --json
       - name: Verify wheel-only offline and evaluation workflows
         if: matrix.python-version == '3.13'
         shell: bash
