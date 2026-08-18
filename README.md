@@ -8,6 +8,10 @@
 > Generated and may contain errors. Output must be validated by an attorney
 > before the attorney delivers legal advice.
 
+The GitHub prerelease label `v0.1.0-beta.1` packages the unchanged `0.1.0`
+engine used for the bounded private evaluation. The beta suffix describes the
+release channel; it does not relabel or alter the evaluated runtime bytes.
+
 Regulatory Harvest is an installable research skill for attorneys. Ask a legal question in ordinary language, attach your sources or authorize current web research, and receive a cited Markdown briefing plus a machine-verifiable evidence bundle.
 
 The same skill package is designed for Codex and Claude Desktop. It uses the host agent for research and legal analysis, then passes the work through a deterministic Python engine that normalizes sources, resolves exact quotations, validates citations, records gaps, and seals the result.
