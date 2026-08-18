@@ -252,7 +252,14 @@ Initial ledger-audit findings may identify precise defects without supplying a
 complete executable edit. After repair, every unresolved `remaining_audit`
 dispute must be transaction-ready before the ledger can be sealed.
 
-## Development
+## Development and contribution status
+
+Regulatory Harvest is not accepting external contributions, pull requests,
+issues, or feature requests during the experimental beta. The public repository
+is provided for inspection, installation, and evaluation. Security reports must
+use the private process in [SECURITY.md](SECURITY.md).
+
+The commands below are maintainer development checks:
 
 ```bash
 uv sync --frozen
@@ -263,7 +270,10 @@ uv build
 python3 scripts/build_skill.py --output dist/regulatory-harvest-skill.zip
 ```
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md), [CLEAN_ROOM.md](CLEAN_ROOM.md), and [SECURITY.md](SECURITY.md) before contributing. Tests and examples may use only synthetic or clearly redistributable material.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the current closed-contribution
+policy. Maintainers must also follow [CLEAN_ROOM.md](CLEAN_ROOM.md) and
+[SECURITY.md](SECURITY.md). Tests and examples may use only synthetic or clearly
+redistributable material.
 
 ## License
 

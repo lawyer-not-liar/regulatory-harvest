@@ -1,15 +1,23 @@
 # Contributing
 
-Thank you for improving Regulatory Harvest. This project is evidence-sensitive and clean-room by design, so provenance and failure behavior matter as much as happy-path features.
+Regulatory Harvest is not accepting external contributions, pull requests, or
+feature requests during the experimental beta. The repository is public so
+people can inspect, install, and evaluate the software—not as an invitation to
+contribute changes at this stage.
 
-Participation is governed by [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+Unsolicited pull requests may be closed without review. GitHub Issues and
+Projects are disabled. Security vulnerabilities should be reported through the
+private process in [SECURITY.md](SECURITY.md), not through a public issue or
+pull request.
 
-## Before changing code
+The project may open to outside contributions later. This file will be updated
+if that policy changes.
 
-1. Read `CLEAN_ROOM.md` and confirm that every input to the contribution is permitted.
-2. Open or reference a focused issue for changes to the bundle schema, COMBINE semantics, security boundary, provider behavior, or legal-research claims.
-3. Keep core packages independent from optional providers, cite/OpenContracts, LegalBench-RAG, servers, databases, and vector stores.
-4. Use synthetic or clearly redistributable fixtures and record their provenance.
+## Maintainer development notes
+
+Maintainers must read `CLEAN_ROOM.md`, use only synthetic or clearly
+redistributable fixtures, and preserve the project's deterministic validation,
+privacy, and provenance boundaries.
 
 ## Development setup
 
@@ -20,7 +28,7 @@ uv sync --frozen --all-extras --dev
 
 Use test-driven development for behavior changes. The test must fail for the intended reason before production code is added. Prefer real components and temporary directories; mock only an external or slow boundary.
 
-Run before submitting:
+Run before merging:
 
 ```bash
 uv run pytest -q
@@ -44,5 +52,3 @@ Provider adapters must expose safe, stable configuration fingerprints that inclu
 - Add dependency or data notices when applicable.
 - Keep commits focused and preserve provenance-related corrections.
 - Never include keys, private endpoints, client names, matter identifiers, or confidential examples.
-
-By contributing, you represent that you have the right to submit the contribution under the project license.
