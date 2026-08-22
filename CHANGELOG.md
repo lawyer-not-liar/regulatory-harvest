@@ -18,9 +18,11 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 - Made no performance, benchmark, report-quality, legal-correctness,
   completeness, currency, or applicability claim. Attorney validation remains
   required.
-- Changed only this public release wording and its coherence test after the
-  reviewed candidate. Executable and evaluator runtime bytes remain unchanged;
-  packaged README and CHANGELOG bytes give the release ZIP a new archive hash.
+- After the reviewed candidate, hardened POSIX rollback ownership against
+  immediate inode-number reuse and made development-only AST policy inventories
+  stable across Python 3.11 through 3.14. This CI portability work does not
+  loosen evidence binding or policy checks, and it gives the release ZIP a new
+  archive hash.
 
 ## [0.1.0-beta.1] - 2026-08-17
 

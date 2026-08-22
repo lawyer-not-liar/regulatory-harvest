@@ -12,11 +12,13 @@
 
 The GitHub prerelease label `v0.1.0-beta.2` packages project version `0.1.0`.
 The beta suffix describes the release channel. This release-preparation commit
-changes only public release wording and its coherence test; executable and
-evaluator runtime bytes remain those of reviewed candidate
-`bdebfecc1e39812844c77f0a895d563e8f786e80`. The ZIP has a new archive hash
-because README and CHANGELOG are packaged. Protocol 2.2 remains opt-in and
-experimental; Protocol 2.1 remains the new-run default.
+builds on reviewed candidate `bdebfecc1e39812844c77f0a895d563e8f786e80` and
+adds two CI portability corrections: POSIX rollback now confirms complete
+installed-leaf identity and bytes before cleanup, and the development-only AST
+policy inventory canonicalizes empty syntax fields across Python 3.11 through
+3.14. The ZIP therefore has a new archive hash. Neither correction loosens
+evidence binding or policy checks. Protocol 2.2 remains opt-in and experimental;
+Protocol 2.1 remains the new-run default.
 
 Regulatory Harvest is an installable research skill for attorneys. Ask a legal question in ordinary language, attach your sources or authorize current web research, and receive a cited Markdown briefing plus a machine-verifiable evidence bundle.
 

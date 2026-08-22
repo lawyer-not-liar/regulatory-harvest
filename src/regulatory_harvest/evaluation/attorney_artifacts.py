@@ -1462,6 +1462,13 @@ class _PosixRunStorage(_RunStorage):
         self.assert_root_identity()
         with self._artifact_parent(artifact_path, create=False) as (parent, name, _):
             try:
+                current, current_identity = self._read_leaf_with_identity(
+                    parent, name, artifact_path
+                )
+                if current_identity != owned_identity or current != owned_data:
+                    raise EvaluationIntegrityError(
+                        "transaction-owned artifact changed"
+                    )
                 claim_name = self._claim_leaf(
                     parent,
                     name,
@@ -1591,6 +1598,21 @@ class _PosixRunStorage(_RunStorage):
                 if not immutable_collision:
                     os.fsync(parent)
                 self.assert_root_identity()
+                if immutable_visible or mutable_visible:
+                    installed = os.stat(
+                        name, dir_fd=parent, follow_symlinks=False
+                    )
+                    _validate_regular_metadata(installed, artifact_path)
+                    assert descriptor is not None
+                    opened = os.fstat(descriptor)
+                    if (installed.st_dev, installed.st_ino) != (
+                        opened.st_dev,
+                        opened.st_ino,
+                    ):
+                        raise EvaluationIntegrityError(
+                            "installed artifact identity changed"
+                        )
+                    installed_identity = _node_identity(installed)
             except BaseException as error:
                 write_error = error
             finally:
@@ -1730,6 +1752,18 @@ class _PosixRunStorage(_RunStorage):
                 parents.append((current, segment, child))
                 current = child
             try:
+                observed_before_claim, identity_before_claim = (
+                    self._read_leaf_with_identity(
+                        current, relative.name, artifact_path
+                    )
+                )
+                if (
+                    identity_before_claim != expected_identity
+                    or observed_before_claim != expected_data
+                ):
+                    raise EvaluationIntegrityError(
+                        "transaction-owned artifact changed"
+                    )
                 claim_name = self._claim_leaf(
                     current,
                     relative.name,

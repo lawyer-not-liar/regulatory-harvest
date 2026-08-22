@@ -44,6 +44,7 @@ def test_experimental_beta_release_surfaces_are_coherent() -> None:
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs" / "roadmap.md").read_text(encoding="utf-8")
     readme_words = " ".join(readme.split())
+    changelog_words = " ".join(changelog.split())
     roadmap_words = " ".join(roadmap.split())
 
     assert "v0.1.0-beta.2" in readme
@@ -51,8 +52,14 @@ def test_experimental_beta_release_surfaces_are_coherent() -> None:
     assert "Protocol 2.1 remains the new-run default" in readme_words
     assert "before any role response was accepted or grading began" in readme_words
     assert "Private readiness is therefore incomplete" in readme_words
+    assert "adds two CI portability corrections" in readme_words
+    assert "complete installed-leaf identity and bytes before cleanup" in readme_words
+    assert "empty syntax fields across Python 3.11 through 3.14" in readme_words
+    assert "executable and evaluator runtime bytes remain unchanged" not in readme_words.lower()
     assert "## [0.1.0-beta.2] - 2026-08-22" in changelog
     assert "Protocol 2.2 remains opt-in and experimental" in changelog
+    assert "immediate inode-number reuse" in changelog
+    assert "does not loosen evidence binding or policy checks" in changelog_words
     assert "LLM supplies substantive judgments" in roadmap_words
     assert "deterministic code constructs canonical artifacts" in roadmap_words
 

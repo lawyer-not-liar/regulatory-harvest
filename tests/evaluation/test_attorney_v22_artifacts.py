@@ -2004,6 +2004,82 @@ def test_rollback_preserves_replacement_competitor_inode(
     assert target_path.read_bytes() == competitor
 
 
+def test_rollback_preserves_same_byte_competitor_when_inode_numbers_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Model immediate POSIX inode reuse without depending on one filesystem."""
+    run_dir, current, successor, additions = _review_to_audit_transition(tmp_path)
+    target = next(path for path in additions if path.startswith("responses/"))
+    target_path = run_dir / target
+    competitor = additions[target]
+    original_write = shared_artifacts._PosixRunStorage.atomic_write
+    original_read = shared_artifacts._PosixRunStorage._read_leaf_with_identity
+    expected_identity: shared_artifacts._NodeIdentity | None = None
+    competitor_identity: shared_artifacts._NodeIdentity | None = None
+
+    def replace_owned_then_fail(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> bool:
+        nonlocal competitor_identity, expected_identity
+        created = original_write(storage, path, data, mutable=mutable)  # type: ignore[arg-type]
+        if path == target and created and competitor_identity is None:
+            receipt = storage.atomic_write_receipt(path)  # type: ignore[attr-defined]
+            assert receipt is not None and receipt.identity is not None
+            expected_identity = receipt.identity
+            target_path.unlink()
+            target_path.write_bytes(competitor)
+            observed = shared_artifacts._node_identity(target_path.stat())
+            competitor_identity = replace(
+                observed,
+                device=expected_identity.device,
+                inode=expected_identity.inode,
+                changed_ns=max(observed.changed_ns, expected_identity.changed_ns) + 1,
+            )
+        if path == "run-manifest.json":
+            raise OSError("injected manifest failure after competitor replacement")
+        return created
+
+    def read_with_reused_inode_number(
+        storage: object,
+        parent: int,
+        name: str,
+        artifact_path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> tuple[bytes, shared_artifacts._NodeIdentity]:
+        result = original_read(  # type: ignore[misc]
+            storage,
+            parent,
+            name,
+            artifact_path,
+            max_bytes=max_bytes,
+        )
+        if competitor_identity is not None and artifact_path == target:
+            assert result[0] == competitor
+            return result[0], competitor_identity
+        return result
+
+    monkeypatch.setattr(
+        shared_artifacts._PosixRunStorage, "atomic_write", replace_owned_then_fail
+    )
+    monkeypatch.setattr(
+        shared_artifacts._PosixRunStorage,
+        "_read_leaf_with_identity",
+        read_with_reused_inode_number,
+    )
+    with pytest.raises(EvaluationIntegrityError):
+        commit_v22_transition(run_dir, current.manifest_fingerprint, additions, successor)
+
+    assert expected_identity is not None and competitor_identity is not None
+    assert (competitor_identity.device, competitor_identity.inode) == (
+        expected_identity.device,
+        expected_identity.inode,
+    )
+    assert competitor_identity.changed_ns != expected_identity.changed_ns
+    assert competitor_identity != expected_identity
+    assert target_path.read_bytes() == competitor
+
+
 @pytest.mark.skipif(os.name != "posix", reason="root inode replacement is POSIX-specific")
 def test_transition_detects_root_inode_swap_without_mutating_replacement_tree(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

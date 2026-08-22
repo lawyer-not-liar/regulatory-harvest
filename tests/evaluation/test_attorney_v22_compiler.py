@@ -1627,10 +1627,15 @@ def _scan_task3_source_policy(source: str, filename: str) -> _Task3SourcePolicy:
         raise AssertionError("AST node has no syntactic owner")
 
     def stable_dump(node: ast.AST) -> str:
-        # Python 3.12+ adds empty type-parameter fields to definition nodes.
-        return ast.dump(node, annotate_fields=True, include_attributes=False).replace(
-            ", type_params=[]", ""
-        )
+        # Match Python 3.13+'s ``show_empty=False`` on every supported Python.
+        import copy
+
+        stable = copy.deepcopy(node)
+        for item in ast.walk(stable):
+            for name, value in tuple(ast.iter_fields(item)):
+                if isinstance(value, list) and not value:
+                    delattr(item, name)
+        return ast.dump(stable, annotate_fields=True, include_attributes=False)
 
     def structural_digest(node: ast.AST, owner: str, context: str) -> str:
         identity = "|".join((basename, owner, context, paths[node], stable_dump(node)))
@@ -2749,6 +2754,13 @@ def test_task3_development_policy_review_inventories_are_exact() -> None:
     assert sum(observed.definitions.values()) == 59
     assert sum(observed.simple_subscripts.values()) == 9
     assert not observed.prohibited
+
+
+def test_task3_structural_digests_do_not_rewrite_string_literal_contents() -> None:
+    empty = _scan_task3_source_policy('helper("")\n', "synthetic.py")
+    field_syntax = _scan_task3_source_policy('helper("field=[]")\n', "synthetic.py")
+
+    assert empty.calls != field_syntax.calls
 
 
 def test_task3_development_policy_is_test_only_and_has_no_evaluation_state_surface(
