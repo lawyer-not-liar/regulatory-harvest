@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import importlib.util
@@ -13,7 +14,6 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 from regulatory_harvest.evaluation import attorney_generation
 from regulatory_harvest.evaluation.attorney_artifacts import _load_model_bytes
@@ -50,6 +50,12 @@ _CLEAN_EVALUATION_OVERLAY = (
     "src/regulatory_harvest/evaluation/attorney_models.py",
     "src/regulatory_harvest/evaluation/attorney_scoring.py",
     "src/regulatory_harvest/evaluation/attorney_workflow.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_artifacts.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_compiler.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_models.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_requests.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_rubric.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_workflow.py",
     "src/regulatory_harvest/models/enums.py",
 )
 
@@ -76,6 +82,51 @@ def _run(runner: Path, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=10,
     )
+
+
+def _default_request(runner: Path, run: Path) -> dict[str, object]:
+    result = _run(runner, "eval-next", "--run", str(run))
+    assert result.returncode == 0, result.stderr
+    request = json.loads(result.stdout)
+    assert request["operation"] == "source_review"
+    assert request["schema_version"] == "2.1"
+    return request
+
+
+def _v2_case(run: Path) -> dict[str, object]:
+    return json.loads((run / "inputs" / "case.json").read_bytes())
+
+
+def _tree_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _assert_cli_parity(results: list[subprocess.CompletedProcess[str]]) -> None:
+    assert len(results) == 2
+    assert (results[0].returncode, results[0].stdout, results[0].stderr) == (
+        results[1].returncode,
+        results[1].stdout,
+        results[1].stderr,
+    )
+
+
+def _extract_frozen_legacy_run(tmp_path: Path) -> Path:
+    fixture = ROOT / "tests" / "fixtures" / "attorney-eval" / "legacy-ledger-repair-919eb5f.tgz.b64"
+    archive = base64.b64decode(fixture.read_bytes())
+    assert hashlib.sha256(archive).hexdigest() == (
+        "0a13f0fbeb9c6c5841a198a811efcf1f567c91ebfbeade3f9d4214b87ee7729d"
+    )
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+        assert all(
+            not member.name.startswith("/") and ".." not in Path(member.name).parts
+            for member in tar.getmembers()
+        )
+        tar.extractall(tmp_path, filter="data")
+    return tmp_path / "completed-repair"
 
 
 def _response(request: dict[str, object], report_text: str) -> dict[str, object]:
@@ -387,10 +438,8 @@ def test_eval_init_loads_verified_capsule_report_and_provenance_with_runner_pari
         )
         assert result.returncode == 0, result.stderr
 
-    assert (runs[0] / "case-envelope.json").read_bytes() == (
-        runs[1] / "case-envelope.json"
-    ).read_bytes()
-    envelope = json.loads((runs[0] / "case-envelope.json").read_bytes())
+    assert _tree_bytes(runs[0]) == _tree_bytes(runs[1])
+    envelope = _v2_case(runs[0])
     candidate = envelope["case"]["candidates"][0]
     assert envelope["case"]["schema_version"] == "1.1"
     assert candidate["report_text"] == report
@@ -399,6 +448,48 @@ def test_eval_init_loads_verified_capsule_report_and_provenance_with_runner_pari
         (fixture / "capsules" / "candidate-a" / "generation-manifest.json").read_bytes()
     )["manifest_fingerprint"]
     assert candidate["validation_receipt"]["generation_record"]["candidate_id"] == "candidate-a"
+    assert "generation_capsule_path" not in json.dumps(envelope)
+    assert _default_request(FULL_RUNNER, runs[0]) == _default_request(
+        PORTABLE_RUNNER, runs[1]
+    )
+
+
+def test_full_eval_init_preserves_capsule_provenance_under_protocol_21(tmp_path: Path) -> None:
+    """The 2.1 default freezes the same verified capsule content without path leakage."""
+    fixture = tmp_path / "fixture"
+    report = "# Exact report\n\nNotice is due within 10 days.\n"
+    _capsule(
+        tmp_path,
+        fixture,
+        candidate_id="candidate-a",
+        report_text=report,
+        nonce="2" * 64,
+    )
+    case_path = _case(fixture, [_capsule_candidate("candidate-a", "candidate")])
+    run = tmp_path / "full"
+
+    result = _run(
+        FULL_RUNNER,
+        "eval-init",
+        "--case",
+        str(case_path),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "b" * 64,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads((run / "run-manifest.json").read_bytes())["protocol_version"] == "2.1"
+    envelope = json.loads((run / "inputs" / "case.json").read_bytes())
+    candidate = envelope["case"]["candidates"][0]
+    receipt = candidate["validation_receipt"]
+    assert candidate["report_text"] == report
+    assert receipt["kind"] == "capsule"
+    assert receipt["capsule_root"] == json.loads(
+        (fixture / "capsules" / "candidate-a" / "generation-manifest.json").read_bytes()
+    )["manifest_fingerprint"]
+    assert receipt["generation_record"]["candidate_id"] == "candidate-a"
     assert "generation_capsule_path" not in json.dumps(envelope)
 
 
@@ -481,9 +572,11 @@ def test_full_eval_init_runs_from_clean_tracked_snapshot_without_portable_fallba
 
     assert direct.returncode == 0, direct.stderr
     assert result.returncode == 0, result.stderr
-    assert (direct_run / "case-envelope.json").read_bytes() == (
-        run / "case-envelope.json"
-    ).read_bytes()
+    assert _tree_bytes(direct_run) == _tree_bytes(run)
+    assert (
+        json.loads((run / "run-manifest.json").read_bytes())["calls"][0]["operation"]
+        == "source_review"
+    )
 
 
 @pytest.mark.parametrize("runner", RUNNERS)
@@ -533,10 +626,8 @@ def test_eval_init_rejects_legacy_self_attested_filesystem_case(
     assert not run.exists()
 
 
-@pytest.mark.parametrize("runner", RUNNERS)
 @pytest.mark.parametrize("pair", ["external", "mixed"])
-def test_eval_init_suppresses_unproven_two_report_comparison_before_run_creation(
-    runner: Path,
+def test_eval_init_rejects_unproven_two_report_comparison_before_source_review(
     pair: str,
     tmp_path: Path,
 ) -> None:
@@ -557,25 +648,24 @@ def test_eval_init_suppresses_unproven_two_report_comparison_before_run_creation
         )
         second = _capsule_candidate("candidate-b", "comparator")
     case_path = _case(fixture, [first, second])
-    run = tmp_path / "run"
-
-    result = _run(
-        runner,
-        "eval-init",
-        "--case",
-        str(case_path),
-        "--run",
-        str(run),
-        "--seed-hex",
-        "c" * 64,
-    )
-
-    assert result.returncode == 3
-    assert result.stderr == (
-        '{"code": "EVALUATION_SOURCE_PARITY_UNPROVEN", '
-        '"message": "Formal comparison requires two verified generation capsules."}\n'
-    )
-    assert not run.exists()
+    results = []
+    for runner in RUNNERS:
+        run = tmp_path / f"{pair}-{runner.stem}"
+        result = _run(
+            runner,
+            "eval-init",
+            "--case",
+            str(case_path),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "c" * 64,
+        )
+        results.append(result)
+        assert result.returncode == 2
+        assert json.loads(result.stderr)["code"] == "EVALUATION_INPUT_INVALID"
+        assert not run.exists()
+    _assert_cli_parity(results)
 
 
 def test_eval_init_accepts_two_verified_capsules_with_byte_identical_runners(
@@ -615,16 +705,60 @@ def test_eval_init_accepts_two_verified_capsules_with_byte_identical_runners(
         )
         assert result.returncode == 0, result.stderr
 
-    assert (runs[0] / "case-envelope.json").read_bytes() == (
-        runs[1] / "case-envelope.json"
-    ).read_bytes()
-    candidates = json.loads((runs[0] / "case-envelope.json").read_bytes())["case"][
-        "candidates"
-    ]
+    assert _tree_bytes(runs[0]) == _tree_bytes(runs[1])
+    candidates = _v2_case(runs[0])["case"]["candidates"]
     assert {item["validation_receipt"]["kind"] for item in candidates} == {"capsule"}
+    assert _default_request(FULL_RUNNER, runs[0]) == _default_request(
+        PORTABLE_RUNNER, runs[1]
+    )
 
 
-def test_eval_init_rejects_two_valid_capsules_with_different_generation_instructions(
+def test_protocol_22_init_preserves_capsule_provenance_without_public_paths(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / "fixture"
+    capsule = _capsule(
+        tmp_path,
+        fixture,
+        candidate_id="candidate-a",
+        report_text="A covered operator must file notice within 10 days.",
+        nonce="8" * 64,
+    )
+    case_path = _case(
+        fixture,
+        [_capsule_candidate("candidate-a", "candidate")],
+    )
+    run = tmp_path / "v22-run"
+
+    initialized = _run(
+        FULL_RUNNER,
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(case_path),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "9" * 64,
+    )
+
+    assert initialized.returncode == 0, initialized.stderr
+    frozen = json.loads((run / "inputs" / "case.json").read_bytes())
+    candidate = frozen["case"]["candidates"][0]
+    assert candidate["validation_receipt"]["kind"] == "capsule"
+    assert candidate["validation_receipt"]["capsule_root"] == json.loads(
+        (capsule / "generation-manifest.json").read_bytes()
+    )["manifest_fingerprint"]
+    status = _run(FULL_RUNNER, "eval-status", "--run", str(run))
+    verified = _run(FULL_RUNNER, "eval-verify", "--run", str(run))
+    assert status.returncode == verified.returncode == 0
+    public_bytes = initialized.stdout + status.stdout + verified.stdout
+    assert str(tmp_path) not in public_bytes
+    assert str(capsule) not in public_bytes
+
+
+def test_eval_init_rejects_different_generation_instructions_before_source_review(
     tmp_path: Path,
 ) -> None:
     """A formal comparison must bind both reports to the same generation task."""
@@ -659,7 +793,6 @@ def test_eval_init_rejects_two_valid_capsules_with_different_generation_instruct
         ],
     )
     results = []
-
     for runner in RUNNERS:
         run = tmp_path / runner.stem
         result = _run(
@@ -673,11 +806,11 @@ def test_eval_init_rejects_two_valid_capsules_with_different_generation_instruct
             "d" * 64,
         )
         results.append(result)
-        assert result.returncode == 3
-        assert json.loads(result.stderr)["code"] == "EVALUATION_SOURCE_PARITY_UNPROVEN"
+        assert result.returncode == 2
+        assert json.loads(result.stderr)["code"] == "EVALUATION_INPUT_INVALID"
         assert not run.exists()
+    _assert_cli_parity(results)
 
-    assert results[0].stderr == results[1].stderr
 
 
 @pytest.mark.parametrize(
@@ -692,7 +825,7 @@ def test_eval_init_rejects_two_valid_capsules_with_different_generation_instruct
         "question-changed",
     ],
 )
-def test_eval_init_classifies_common_evidence_mismatch_as_unproven_parity(
+def test_eval_init_rejects_common_evidence_mismatch_before_source_review(
     mutation: str,
     tmp_path: Path,
 ) -> None:
@@ -734,7 +867,6 @@ def test_eval_init_classifies_common_evidence_mismatch_as_unproven_parity(
         ),
     )
     results = []
-
     for runner in RUNNERS:
         run = tmp_path / runner.stem
         result = _run(
@@ -748,11 +880,10 @@ def test_eval_init_classifies_common_evidence_mismatch_as_unproven_parity(
             "e" * 64,
         )
         results.append(result)
-        assert result.returncode == 3
-        assert json.loads(result.stderr)["code"] == "EVALUATION_SOURCE_PARITY_UNPROVEN"
+        assert result.returncode == 2
+        assert json.loads(result.stderr)["code"] == "EVALUATION_INPUT_INVALID"
         assert not run.exists()
-
-    assert results[0].stderr == results[1].stderr
+    _assert_cli_parity(results)
 
 
 @pytest.mark.parametrize("mutation", ["candidate-id", "incomplete"])
@@ -774,6 +905,7 @@ def test_eval_init_rejects_malformed_or_incomplete_capsule_as_input(
         candidate["candidate_id"] = "candidate-other"
     case_path = _case(fixture, [candidate])
 
+    results = []
     for runner in RUNNERS:
         run = tmp_path / f"{runner.stem}-run"
         result = _run(
@@ -786,11 +918,13 @@ def test_eval_init_rejects_malformed_or_incomplete_capsule_as_input(
             "--seed-hex",
             "f" * 64,
         )
+        results.append(result)
         assert result.returncode == 2
         assert not run.exists()
+    _assert_cli_parity(results)
 
 
-def test_eval_init_classifies_tampered_capsule_as_integrity_failure(
+def test_eval_init_rejects_tampered_candidate_capsule_before_source_review(
     tmp_path: Path,
 ) -> None:
     fixture = tmp_path / "fixture"
@@ -818,10 +952,10 @@ def test_eval_init_classifies_tampered_capsule_as_integrity_failure(
             "8" * 64,
         )
         results.append(result)
-        assert result.returncode == 5
-        assert json.loads(result.stderr)["code"] == "GENERATION_INTEGRITY_INVALID"
+        assert result.returncode == 2
+        assert json.loads(result.stderr)["code"] == "EVALUATION_INPUT_INVALID"
         assert not run.exists()
-    assert results[0].stderr == results[1].stderr
+    _assert_cli_parity(results)
 
 
 @pytest.mark.parametrize(
@@ -870,6 +1004,7 @@ def test_eval_init_rejects_mixed_schema_xor_and_strict_type_violations(
         candidate["external_report_path"] = 1
     case_path.write_bytes(_canonical(case))
 
+    results = []
     for runner in RUNNERS:
         run = tmp_path / f"{runner.stem}-run"
         result = _run(
@@ -882,64 +1017,26 @@ def test_eval_init_rejects_mixed_schema_xor_and_strict_type_violations(
             "--seed-hex",
             "a" * 64,
         )
+        results.append(result)
         assert result.returncode == 2
         assert not run.exists()
+    _assert_cli_parity(results)
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    ["record-extra", "usage-bool", "report-hash-mismatch", "provenance-extra"],
-)
-def test_schema_11_programmatic_wire_provenance_is_strict_in_full_and_portable(
-    mutation: str,
+def test_frozen_protocol_13_fixture_replays_read_only_with_both_runners(
     tmp_path: Path,
 ) -> None:
-    fixture = tmp_path / "fixture"
-    _capsule(
-        tmp_path,
-        fixture,
-        candidate_id="candidate-a",
-        report_text="Capsule report.",
-        nonce="a" * 64,
-    )
-    case_path = _case(fixture, [_capsule_candidate("candidate-a", "candidate")])
-    run = tmp_path / "initialized"
-    initialized = _run(
-        FULL_RUNNER,
-        "eval-init",
-        "--case",
-        str(case_path),
-        "--run",
-        str(run),
-        "--seed-hex",
-        "b" * 64,
-    )
-    assert initialized.returncode == 0, initialized.stderr
-    payload = json.loads((run / "case-envelope.json").read_bytes())["case"]
-    provenance = payload["candidates"][0]["validation_receipt"]
-    record = provenance["generation_record"]
-    if mutation == "record-extra":
-        record["unexpected"] = True
-    elif mutation == "usage-bool":
-        record["usage"] = {"input_tokens": True}
-    elif mutation == "report-hash-mismatch":
-        record["report_hash"] = "0" * 64
-    else:
-        provenance["unexpected"] = True
+    """Provenance-era runs remain verifiable only as immutable retained fixtures."""
+    run = _extract_frozen_legacy_run(tmp_path)
+    before = _tree_bytes(run)
+    results = [_run(runner, "eval-status", "--run", str(run)) for runner in RUNNERS]
+    verifies = [_run(runner, "eval-verify", "--run", str(run)) for runner in RUNNERS]
 
-    with pytest.raises(ValidationError):
-        AttorneyEvaluationCase.model_validate(payload)
-
-    portable_path = ROOT / "scripts" / "attorney_eval_portable.py"
-    spec = importlib.util.spec_from_file_location(
-        f"strict_attorney_eval_portable_{mutation}", portable_path
-    )
-    assert spec is not None and spec.loader is not None
-    portable = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = portable
-    spec.loader.exec_module(portable)
-    with pytest.raises(portable.PortableEvaluationInputError):
-        portable.validate_case(payload)
+    assert [result.returncode for result in results] == [0, 0]
+    assert [result.returncode for result in verifies] == [0, 0]
+    assert results[0].stdout == results[1].stdout
+    assert verifies[0].stdout == verifies[1].stdout
+    assert _tree_bytes(run) == before
 
 
 def _submit_dynamic_response(
@@ -990,14 +1087,11 @@ def _submit_dynamic_response(
     )
 
 
-def test_one_external_report_reaches_terminal_absolute_matrix_without_comparison(
+def test_one_external_report_initializes_source_review_without_comparison(
     tmp_path: Path,
 ) -> None:
     fixture = tmp_path / "fixture"
     shutil.copytree(ROOT / "tests" / "fixtures" / "attorney-eval", fixture)
-    scripted = json.loads(
-        (fixture / "responses" / "scripted-responses.json").read_bytes()
-    )["responses"]
     runs = [tmp_path / "full", tmp_path / "portable"]
 
     for runner, run in zip(RUNNERS, runs, strict=True):
@@ -1012,28 +1106,13 @@ def test_one_external_report_reaches_terminal_absolute_matrix_without_comparison
             "b" * 64,
         )
         assert initialized.returncode == 0, initialized.stderr
-        submitted = None
-        for index, item in enumerate(scripted, start=1):
-            submitted = _submit_dynamic_response(
-                runner,
-                run,
-                tmp_path / f"{runner.stem}-response-{index}.json",
-                item["payload"],
-            )
-        assert submitted is not None
-        assert submitted.returncode == 0, submitted.stderr
+        assert _default_request(runner, run)["operation"] == "source_review"
 
-    for filename in ("case-envelope.json", "evaluation-result.json", "evaluation-report.md"):
-        assert (runs[0] / filename).read_bytes() == (runs[1] / filename).read_bytes()
-    result = json.loads((runs[0] / "evaluation-result.json").read_bytes())
-    assert json.loads((runs[0] / "run-manifest.json").read_bytes())["terminal_status"] == (
-        "completed"
-    )
-    assert len(result["reports"]) == 1
-    assert result["comparison"] is None
-    assert result["requirement_matrix"]["rows"]
-    assert result["requirement_matrix"]["rows"][0]["report_a"]["anonymous_label"] == "A"
-    assert result["requirement_matrix"]["rows"][0]["report_b"] is None
+    assert _tree_bytes(runs[0]) == _tree_bytes(runs[1])
+    manifest = json.loads((runs[0] / "run-manifest.json").read_bytes())
+    assert manifest["protocol_version"] == "2.1"
+    assert manifest["phase"] == "source_review"
+    assert manifest["terminal_status"] is None
 
 
 def test_legacy_schema_10_retained_run_still_verifies_without_migration(

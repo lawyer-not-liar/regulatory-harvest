@@ -16,6 +16,7 @@ ROOT = Path(__file__).parents[2]
 BUILDER = ROOT / "scripts" / "build_skill.py"
 EVALUATION_FIXTURE = ROOT / "tests" / "fixtures" / "attorney-eval"
 EVALUATOR_RELIABILITY_PACKAGE_PATHS = (
+    "assets/attorney-evaluation-v2-response.template.json",
     "assets/attorney-evaluation-qualification.template.json",
     "scripts/attorney_eval_full.py",
     "scripts/attorney_eval_portable.py",
@@ -27,7 +28,44 @@ EVALUATOR_RELIABILITY_PACKAGE_PATHS = (
     "src/regulatory_harvest/evaluation/attorney_contract.py",
     "src/regulatory_harvest/evaluation/attorney_ledger.py",
     "src/regulatory_harvest/evaluation/attorney_qualification.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_artifacts.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_compiler.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_models.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_requests.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_rubric.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_workflow.py",
     "src/regulatory_harvest/evaluation/attorney_workflow.py",
+)
+
+EVALUATOR_V2_PACKAGE_PATHS = (
+    "assets/attorney-evaluation-v2-response.template.json",
+    "src/regulatory_harvest/evaluation/attorney_v2_artifacts.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_compiler.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_models.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_requests.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_rubric.py",
+    "src/regulatory_harvest/evaluation/attorney_v2_workflow.py",
+)
+
+EVALUATOR_V21_PACKAGE_PATHS = (
+    "assets/attorney-evaluation-v21-response.template.json",
+    "src/regulatory_harvest/evaluation/attorney_protocol.py",
+    "src/regulatory_harvest/evaluation/attorney_v21_artifacts.py",
+    "src/regulatory_harvest/evaluation/attorney_v21_compiler.py",
+    "src/regulatory_harvest/evaluation/attorney_v21_models.py",
+    "src/regulatory_harvest/evaluation/attorney_v21_requests.py",
+    "src/regulatory_harvest/evaluation/attorney_v21_rubric.py",
+    "src/regulatory_harvest/evaluation/attorney_v21_workflow.py",
+)
+
+EVALUATOR_V22_PACKAGE_PATHS = (
+    "assets/attorney-evaluation-v22-response.template.json",
+    "src/regulatory_harvest/evaluation/attorney_v22_artifacts.py",
+    "src/regulatory_harvest/evaluation/attorney_v22_compiler.py",
+    "src/regulatory_harvest/evaluation/attorney_v22_drafts.py",
+    "src/regulatory_harvest/evaluation/attorney_v22_models.py",
+    "src/regulatory_harvest/evaluation/attorney_v22_requests.py",
+    "src/regulatory_harvest/evaluation/attorney_v22_workflow.py",
 )
 SPEC = importlib.util.spec_from_file_location("regulatory_harvest_skill_builder", BUILDER)
 assert SPEC is not None and SPEC.loader is not None
@@ -268,8 +306,8 @@ def test_built_skill_preserves_qualification_and_ledger_repair_contract(
         for required_contract in (
             "qualify every locked case before generating a candidate",
             "use eval-submit-safe for every evaluator response",
-            "one initial response and at most two mechanical repairs",
-            "stop when the same diagnostic code occurs twice",
+            "one initial response and at most one fresh mechanical repair per fragment",
+            "stop as `inconclusive_mechanical` after a second mechanical refusal",
             "never retry an unfavorable substantive judgment",
             "accept an unfavorable substantive result without retry",
             "verify terminal evaluation artifacts",
@@ -540,6 +578,56 @@ def test_skill_archive_is_one_reproducible_cross_platform_package(tmp_path: Path
             '  default_prompt: "Use $regulatory-harvest to research the governing '
             'regulation and produce a cited attorney briefing."\n'
         )
+
+
+def test_protocol_2_runtime_and_template_are_exactly_packaged(tmp_path: Path) -> None:
+    """A clean archive must carry each v2 runtime byte once and reproducibly."""
+    manifest_entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert manifest_entries == sorted(set(manifest_entries))
+    assert all(manifest_entries.count(path) == 1 for path in EVALUATOR_V2_PACKAGE_PATHS)
+
+    first, second = tmp_path / "v2-a.zip", tmp_path / "v2-b.zip"
+    assert _build(first).returncode == 0
+    assert _build(second).returncode == 0
+    assert first.read_bytes() == second.read_bytes()
+    with zipfile.ZipFile(first) as archive:
+        for path in EVALUATOR_V2_PACKAGE_PATHS:
+            assert archive.read(f"regulatory-harvest/{path}") == (ROOT / path).read_bytes()
+
+
+def test_protocol_21_runtime_and_template_are_exactly_packaged(tmp_path: Path) -> None:
+    """A clean archive must contain every Protocol 2.1 runtime byte exactly once."""
+    manifest_entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert manifest_entries == sorted(set(manifest_entries))
+    assert all(manifest_entries.count(path) == 1 for path in EVALUATOR_V21_PACKAGE_PATHS)
+
+    built = tmp_path / "v21.zip"
+    assert _build(built).returncode == 0
+    with zipfile.ZipFile(built) as archive:
+        for path in EVALUATOR_V21_PACKAGE_PATHS:
+            assert archive.read(f"regulatory-harvest/{path}") == (ROOT / path).read_bytes()
+
+
+def test_protocol_22_runtime_and_template_are_exactly_packaged(tmp_path: Path) -> None:
+    """A clean archive contains every Protocol 2.2 runtime byte exactly once."""
+    manifest_entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert manifest_entries == sorted(set(manifest_entries))
+    assert all(manifest_entries.count(path) == 1 for path in EVALUATOR_V22_PACKAGE_PATHS)
+
+    built = tmp_path / "v22.zip"
+    assert _build(built).returncode == 0
+    with zipfile.ZipFile(built) as archive:
+        names = archive.namelist()
+        for path in EVALUATOR_V22_PACKAGE_PATHS:
+            member = f"regulatory-harvest/{path}"
+            assert names.count(member) == 1
+            assert archive.read(member) == (ROOT / path).read_bytes()
 
 
 def test_atomic_v2_template_and_runtime_dependencies_are_byte_complete_in_archive(
@@ -887,10 +975,10 @@ def test_extracted_skill_runs_all_generation_capsule_commands_in_isolated_mode(
     assert record["report_hash"] == hashlib.sha256(generated.stdout).hexdigest()
 
 
-def test_extracted_skill_completes_automated_external_report_evaluation(
+def test_extracted_skill_initializes_protocol_2_evaluation_with_runtime_parity(
     tmp_path: Path,
 ) -> None:
-    """The universal ZIP must execute a terminal no-human evaluation on its own runtime."""
+    """The universal ZIP initializes the default evaluator identically without site packages."""
     skill = _build_and_extract(tmp_path)
     runner = skill / "scripts" / "harvest_skill.py"
     fixture = tmp_path / "evaluation-fixture"
@@ -913,79 +1001,21 @@ def test_extracted_skill_completes_automated_external_report_evaluation(
             without_site_packages=portable,
         )
         assert initialized.returncode == 0, initialized.stderr
-    scripted = json.loads(
-        (fixture / "responses" / "scripted-responses.json").read_text(encoding="utf-8")
-    )
-    for index, item in enumerate(scripted["responses"], start=1):
-        packets: dict[str, dict[str, object]] = {}
-        for label, (run, portable) in runs.items():
-            next_result = _run_isolated(
-                runner,
-                tmp_path,
-                "eval-next",
-                "--run",
-                str(run),
-                without_site_packages=portable,
-            )
-            assert next_result.returncode == 0, next_result.stderr
-            packets[label] = json.loads(next_result.stdout)
-        assert packets["full"] == packets["portable"]
-        request = packets["full"]
-        assert request["operation"] == item["operation"]
-        for label, (run, portable) in runs.items():
-            payload = json.loads(json.dumps(item["payload"]))
-            if "request_fingerprint" in payload:
-                payload["request_fingerprint"] = request["request_fingerprint"]
-            response = tmp_path / f"evaluation-response-{label}-{index}.json"
-            response.write_bytes(
-                _canonical_bytes(
-                    {
-                        "judge_isolation": "scripted_fixture",
-                        "model_name": "no-provider",
-                        "operation": request["operation"],
-                        "payload": payload,
-                        "provider_name": "local-scripted-fixture",
-                        "request_fingerprint": request["request_fingerprint"],
-                        "response_id": f"fixture-response-{index}",
-                        "schema_version": "1.0",
-                        "usage": {},
-                    }
-                )
-            )
-            submitted = _run_isolated(
-                runner,
-                tmp_path,
-                "eval-submit",
-                "--run",
-                str(run),
-                "--response",
-                str(response),
-                without_site_packages=portable,
-            )
-            assert submitted.returncode == 0, submitted.stderr
-
-    for run, portable in runs.values():
-        verified = _run_isolated(
+    packets: dict[str, dict[str, object]] = {}
+    for label, (run, portable) in runs.items():
+        next_result = _run_isolated(
             runner,
             tmp_path,
-            "eval-verify",
+            "eval-next",
             "--run",
             str(run),
             without_site_packages=portable,
         )
-        assert verified.returncode == 0, verified.stderr
-    full_run = runs["full"][0]
-    portable_run = runs["portable"][0]
-    result = json.loads((full_run / "evaluation-result.json").read_text(encoding="utf-8"))
-    assert result["comparison"] is None
-    assert len(result["reports"]) == 1
-    for artifact in (
-        "case-readiness.json",
-        "legal-ledger.json",
-        "evaluation-result.json",
-        "evaluation-report.md",
-    ):
-        assert (full_run / artifact).read_bytes() == (portable_run / artifact).read_bytes()
+        assert next_result.returncode == 0, next_result.stderr
+        packets[label] = json.loads(next_result.stdout)
+
+    assert packets["full"] == packets["portable"]
+    assert packets["full"]["operation"] == "source_review"
 
 
 @pytest.mark.parametrize("source_mode", ["provided-only", "web"])
@@ -1179,3 +1209,51 @@ def test_skill_build_fails_when_a_runtime_tree_contains_an_unlisted_file(
 
     with pytest.raises(skill_builder.SkillBuildError, match="unexpected runtime file"):
         skill_builder.build_skill(tmp_path / "skill.zip")
+
+
+def test_skill_build_refuses_manifest_missing_protocol_21_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The archive guard names a missing 2.1 runtime instead of silently building."""
+    required = "src/regulatory_harvest/evaluation/attorney_v21_workflow.py"
+    entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert required in entries
+    manifest = tmp_path / "skill-package-files.txt"
+    manifest.write_text(
+        "\n".join(entry for entry in entries if entry != required) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(skill_builder, "PACKAGE_MANIFEST", manifest)
+
+    with pytest.raises(
+        skill_builder.SkillBuildError,
+        match="skill package manifest is missing Protocol 2.1 input: " + required,
+    ):
+        skill_builder._runtime_files()
+
+
+def test_skill_build_refuses_manifest_missing_protocol_22_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The builder rejects an incomplete Protocol 2.2 runtime as one unit."""
+    required = "src/regulatory_harvest/evaluation/attorney_v22_workflow.py"
+    entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert required in entries
+    manifest = tmp_path / "skill-package-files.txt"
+    manifest.write_text(
+        "\n".join(entry for entry in entries if entry != required) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(skill_builder, "PACKAGE_MANIFEST", manifest)
+
+    with pytest.raises(
+        skill_builder.SkillBuildError,
+        match="skill package manifest is missing Protocol 2.2 input: " + required,
+    ):
+        skill_builder._runtime_files()

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E501, RUF100
 """Dependency-free substrate for blind attorney-report evaluation.
 
 The module deliberately exposes ordinary ``dict`` wire values.  Every public
@@ -8,6 +9,7 @@ import the Regulatory Harvest package, Pydantic, a model SDK, or a provider.
 
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import html
@@ -17,8 +19,10 @@ import os
 import re
 import stat
 import tempfile
+import threading as _threading
 import unicodedata
 import uuid
+import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -380,6 +384,32 @@ class PortableResponseContractError(PortableEvaluationInputError):
 
 class EvaluationIntegrityError(ValueError):
     """Raised when a run cannot be trusted or safely mutated."""
+
+
+class _AtomicWriteOwnershipError(EvaluationIntegrityError):
+    """A target became visible before its write reported success."""
+
+    def __init__(
+        self,
+        artifact_path: str,
+        error: BaseException,
+        *,
+        created: bool = True,
+        replaced: bool = False,
+        identity: _NodeIdentity | None = None,
+    ) -> None:
+        if created == replaced:
+            raise ValueError("atomic write ownership disposition is invalid")
+        message = (
+            str(error)
+            if isinstance(error, EvaluationIntegrityError)
+            else f"evaluation storage artifact write ({artifact_path}) failed"
+        )
+        super().__init__(message)
+        self.artifact_path = artifact_path
+        self.created = created
+        self.replaced = replaced
+        self.identity = identity
 
 
 class EvaluationInconclusiveError(ValueError):
@@ -1281,6 +1311,13 @@ class _NodeIdentity:
 
 
 @dataclass(frozen=True)
+class _AtomicWriteReceipt:
+    created: bool
+    replaced: bool
+    identity: _NodeIdentity | None
+
+
+@dataclass(frozen=True)
 class _PosixAnchor:
     name: str | None
     descriptor: int
@@ -1358,12 +1395,17 @@ def _write_all(descriptor: int, data: bytes) -> None:
         offset += written
 
 
-def _read_all(descriptor: int) -> bytes:
+def _read_all(descriptor: int, *, max_bytes: int | None = None) -> bytes:
     chunks: list[bytes] = []
+    total = 0
     while True:
-        chunk = os.read(descriptor, 1024 * 1024)
+        amount = 1024 * 1024 if max_bytes is None else min(1024 * 1024, max_bytes - total + 1)
+        chunk = os.read(descriptor, amount)
         if not chunk:
             return b"".join(chunks)
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise EvaluationIntegrityError("artifact exceeds the size limit")
         chunks.append(chunk)
 
 
@@ -1420,6 +1462,7 @@ class _PosixRunStorage:
         self._anchors = anchors
         self._root_descriptor = anchors[-1].descriptor
         self._closed = False
+        self._last_atomic_write: tuple[str, _AtomicWriteReceipt] | None = None
 
     @classmethod
     def open(cls, run_dir: Path, *, initialize: bool) -> _PosixRunStorage:
@@ -1524,7 +1567,9 @@ class _PosixRunStorage:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
 
-    def _read_leaf(self, parent: int, name: str, artifact_path: str) -> bytes:
+    def _read_leaf_with_identity(
+        self, parent: int, name: str, artifact_path: str, *, max_bytes: int | None = None
+    ) -> tuple[bytes, _NodeIdentity]:
         try:
             descriptor = os.open(name, _file_flags(), dir_fd=parent)
         except OSError as error:
@@ -1536,7 +1581,13 @@ class _PosixRunStorage:
         try:
             before = os.fstat(descriptor)
             _validate_regular(before, artifact_path)
-            data = _read_all(descriptor)
+            if max_bytes is not None and before.st_size > max_bytes:
+                raise EvaluationIntegrityError(f"artifact exceeds the size limit: {artifact_path}")
+            data = (
+                _read_all(descriptor)
+                if max_bytes is None
+                else _read_all(descriptor, max_bytes=max_bytes)
+            )
             after = os.fstat(descriptor)
             named = os.stat(name, dir_fd=parent, follow_symlinks=False)
             if _node_identity(before) != _node_identity(after) or (
@@ -1544,47 +1595,131 @@ class _PosixRunStorage:
                 before.st_ino,
             ) != (named.st_dev, named.st_ino):
                 raise EvaluationIntegrityError(f"artifact changed while reading: {artifact_path}")
-            return data
+            return data, _node_identity(after)
         finally:
             os.close(descriptor)
 
-    def read_artifact(self, artifact_path: str) -> bytes:
+    def _read_leaf(
+        self, parent: int, name: str, artifact_path: str, *, max_bytes: int | None = None
+    ) -> bytes:
+        data, _ = self._read_leaf_with_identity(
+            parent, name, artifact_path, max_bytes=max_bytes
+        )
+        return data
+
+    def read_artifact(self, artifact_path: str, *, max_bytes: int | None = None) -> bytes:
         self.failure_stage = f"artifact read ({artifact_path})"
         self.assert_root_identity()
         try:
             with self._artifact_parent(artifact_path, create=False) as (parent, name):
-                data = self._read_leaf(parent, name, artifact_path)
+                data = self._read_leaf(parent, name, artifact_path, max_bytes=max_bytes)
         except FileNotFoundError as error:
             raise EvaluationIntegrityError(f"artifact is missing: {artifact_path}") from error
         self.assert_root_identity()
         return data
 
-    def read_optional_artifact(self, artifact_path: str) -> bytes | None:
+    def read_optional_artifact(
+        self, artifact_path: str, *, max_bytes: int | None = None
+    ) -> bytes | None:
         self.assert_root_identity()
         try:
             with self._artifact_parent(artifact_path, create=False) as (parent, name):
-                data = self._read_leaf(parent, name, artifact_path)
+                data = self._read_leaf(
+                    parent, name, artifact_path, max_bytes=max_bytes
+                )
         except FileNotFoundError:
             data = None
         self.assert_root_identity()
         return data
 
-    def atomic_write(self, artifact_path: str, data: bytes, *, mutable: bool) -> None:
+    def read_optional_artifact_with_identity(
+        self, artifact_path: str, *, max_bytes: int | None = None
+    ) -> tuple[bytes, _NodeIdentity] | None:
+        self.assert_root_identity()
+        try:
+            with self._artifact_parent(artifact_path, create=False) as (parent, name):
+                result = self._read_leaf_with_identity(
+                    parent, name, artifact_path, max_bytes=max_bytes
+                )
+        except FileNotFoundError:
+            result = None
+        self.assert_root_identity()
+        return result
+
+    def atomic_write(self, artifact_path: str, data: bytes, *, mutable: bool) -> bool:
+        return self._atomic_write(artifact_path, data, mutable=mutable)
+
+    def atomic_write_receipt(self, artifact_path: str) -> _AtomicWriteReceipt | None:
+        if self._last_atomic_write is None:
+            return None
+        path, receipt = self._last_atomic_write
+        return receipt if path == artifact_path else None
+
+    def replace_artifact_if_owned(
+        self,
+        artifact_path: str,
+        data: bytes,
+        *,
+        owned_identity: _NodeIdentity,
+        owned_data: bytes,
+    ) -> None:
+        self._atomic_write(
+            artifact_path,
+            data,
+            mutable=True,
+            expected_identity=owned_identity,
+            expected_data=owned_data,
+        )
+
+    def _atomic_write(
+        self,
+        artifact_path: str,
+        data: bytes,
+        *,
+        mutable: bool,
+        expected_identity: _NodeIdentity | None = None,
+        expected_data: bytes | None = None,
+    ) -> bool:
+        if (expected_identity is None) != (expected_data is None):
+            raise ValueError("owned artifact identity and bytes must be supplied together")
+        if expected_identity is not None and not mutable:
+            raise ValueError("owned artifact replacement must be mutable")
+        self._last_atomic_write = None
         self.failure_stage = f"artifact write ({artifact_path})"
         self.assert_root_identity()
         with self._artifact_parent(artifact_path, create=True) as (parent, name):
             try:
-                existing = self._read_leaf(parent, name, artifact_path)
+                existing, existing_identity = self._read_leaf_with_identity(
+                    parent, name, artifact_path
+                )
             except FileNotFoundError:
                 existing = None
+                existing_identity = None
             self.assert_root_identity()
+            if expected_identity is not None and (
+                existing is None
+                or existing_identity is None
+                or not _same_filesystem_object(existing_identity, expected_identity)
+                or existing != expected_data
+            ):
+                raise EvaluationIntegrityError("transaction-owned artifact changed")
             if existing is not None:
                 if existing == data:
-                    return
+                    self._last_atomic_write = (
+                        artifact_path,
+                        _AtomicWriteReceipt(False, False, None),
+                    )
+                    return False
                 if not mutable:
                     raise EvaluationIntegrityError(f"immutable artifact differs: {artifact_path}")
             temporary_name = f".{name}.{uuid.uuid4().hex}.tmp"
             descriptor: int | None = None
+            temporary_exists = False
+            immutable_collision = False
+            immutable_visible = False
+            mutable_visible = False
+            installed_identity: _NodeIdentity | None = None
+            write_error: BaseException | None = None
             try:
                 descriptor = os.open(
                     temporary_name,
@@ -1596,18 +1731,156 @@ class _PosixRunStorage:
                     0o600,
                     dir_fd=parent,
                 )
+                temporary_exists = True
                 os.fchmod(descriptor, 0o600)
                 _write_all(descriptor, data)
                 os.fsync(descriptor)
+                installed_identity = _node_identity(os.fstat(descriptor))
                 self.assert_root_identity()
-                os.replace(temporary_name, name, src_dir_fd=parent, dst_dir_fd=parent)
-                os.fsync(parent)
+                if mutable:
+                    if expected_identity is not None:
+                        current_data, current_identity = self._read_leaf_with_identity(
+                            parent, name, artifact_path
+                        )
+                        if (
+                            not _same_filesystem_object(
+                                current_identity, expected_identity
+                            )
+                            or current_data != expected_data
+                        ):
+                            raise EvaluationIntegrityError(
+                                "transaction-owned artifact changed"
+                            )
+                    os.replace(
+                        temporary_name, name, src_dir_fd=parent, dst_dir_fd=parent
+                    )
+                    temporary_exists = False
+                    mutable_visible = True
+                else:
+                    try:
+                        os.link(
+                            temporary_name, name, src_dir_fd=parent,
+                            dst_dir_fd=parent, follow_symlinks=False,
+                        )
+                    except FileExistsError:
+                        immutable_collision = True
+                    else:
+                        immutable_visible = True
+                        os.unlink(temporary_name, dir_fd=parent)
+                        temporary_exists = False
+                if not immutable_collision:
+                    os.fsync(parent)
                 self.assert_root_identity()
+            except BaseException as error:
+                write_error = error
             finally:
                 if descriptor is not None:
-                    os.close(descriptor)
-                with suppress(FileNotFoundError):
-                    os.unlink(temporary_name, dir_fd=parent)
+                    try:
+                        os.close(descriptor)
+                    except BaseException as error:
+                        write_error = error
+                if temporary_exists:
+                    try:
+                        os.unlink(temporary_name, dir_fd=parent)
+                    except FileNotFoundError:
+                        pass
+                    except BaseException as error:
+                        write_error = error
+            if write_error is not None:
+                if immutable_visible:
+                    assert installed_identity is not None
+                    self._last_atomic_write = (
+                        artifact_path,
+                        _AtomicWriteReceipt(True, False, installed_identity),
+                    )
+                    raise _AtomicWriteOwnershipError(
+                        artifact_path, write_error, identity=installed_identity
+                    ) from write_error
+                if mutable_visible:
+                    assert installed_identity is not None
+                    receipt = _AtomicWriteReceipt(
+                        existing is None,
+                        existing is not None,
+                        installed_identity,
+                    )
+                    self._last_atomic_write = (artifact_path, receipt)
+                    raise _AtomicWriteOwnershipError(
+                        artifact_path,
+                        write_error,
+                        created=receipt.created,
+                        replaced=receipt.replaced,
+                        identity=installed_identity,
+                    ) from write_error
+                raise write_error
+            if immutable_collision:
+                competing = self._read_leaf(parent, name, artifact_path)
+                if competing == data:
+                    self._last_atomic_write = (
+                        artifact_path,
+                        _AtomicWriteReceipt(False, False, None),
+                    )
+                    return False
+                raise EvaluationIntegrityError(f"immutable artifact differs: {artifact_path}")
+        assert installed_identity is not None
+        self._last_atomic_write = (
+            artifact_path,
+            _AtomicWriteReceipt(
+                created=existing is None,
+                replaced=mutable and existing is not None,
+                identity=installed_identity,
+            ),
+        )
+        return True
+
+    def remove_artifact(
+        self,
+        artifact_path: str,
+        *,
+        expected_identity: _NodeIdentity | None = None,
+        expected_data: bytes | None = None,
+    ) -> None:
+        """Remove one verified leaf and prune only newly empty parent directories."""
+        if (expected_identity is None) != (expected_data is None):
+            raise ValueError("owned artifact identity and bytes must be supplied together")
+        self.failure_stage = f"artifact remove ({artifact_path})"
+        self.assert_root_identity()
+        relative = _validate_relative_path(artifact_path)
+        parents: list[tuple[int, str, int]] = []
+        current = self._root_descriptor
+        try:
+            for segment in relative.parts[:-1]:
+                child = _open_directory(current, segment)
+                parents.append((current, segment, child))
+                current = child
+            observed, observed_identity = self._read_leaf_with_identity(
+                current, relative.name, artifact_path
+            )
+            if expected_identity is not None and (
+                not _same_filesystem_object(observed_identity, expected_identity)
+                or observed != expected_data
+            ):
+                raise EvaluationIntegrityError("transaction-owned artifact changed")
+            named = os.stat(relative.name, dir_fd=current, follow_symlinks=False)
+            if expected_identity is not None and not _same_filesystem_object(
+                named, expected_identity
+            ):
+                raise EvaluationIntegrityError("transaction-owned artifact changed")
+            os.unlink(relative.name, dir_fd=current)
+            os.fsync(current)
+            for parent, name, child in reversed(parents):
+                try:
+                    os.rmdir(name, dir_fd=parent)
+                    os.fsync(parent)
+                except OSError as error:
+                    if error.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                        raise
+                finally:
+                    os.close(child)
+            parents.clear()
+        finally:
+            for _, _, child in reversed(parents):
+                os.close(child)
+        self.assert_root_identity()
 
     def _scan_directory(self, descriptor: int, prefix: PurePosixPath) -> dict[str, _NodeIdentity]:
         inventory: dict[str, _NodeIdentity] = {}
@@ -9050,3 +9323,6007 @@ def load_verified_evaluation_run(run_dir: Path) -> tuple[JsonObject, JsonObject]
         if result is None:
             raise EvaluationIntegrityError("terminal evaluation has no result artifact")
         return manifest, result
+
+
+# Protocol 2.0 portable mirror -------------------------------------------------
+#
+# This section intentionally uses only canonical ordinary JSON and the existing
+# descriptor-anchored storage.  It is kept separate from the retained 1.3
+# ledger implementation above: a new run is 2.0, while an existing sealed 1.3
+# run remains readable through the aliases captured below.
+
+_initialize_evaluation_v1 = initialize_evaluation
+_verify_evaluation_run_v1 = verify_evaluation_run
+_resume_evaluation_v1 = resume_evaluation
+_next_judge_request_v1 = next_judge_request
+_preflight_judge_response_v1 = preflight_judge_response
+_guarded_submit_judge_response_v1 = guarded_submit_judge_response
+_submit_judge_response_v1 = submit_judge_response
+
+_V2_PROTOCOL = "2.0"
+_V2_MANIFEST_PATH = "run-manifest.json"
+_V2_CASE_PATH = "inputs/case.json"
+_V2_BUILD_PATH = "inputs/build.json"
+_V2_RUBRIC_PATH = "rubric.json"
+_V2_SOURCE_REVIEW_SCHEMA: JsonObject = {
+    "$defs": {
+        "ImportanceV2": {
+            "enum": ["critical", "material", "supporting"],
+            "title": "ImportanceV2",
+            "type": "string",
+        },
+        "RequirementKindV2": {
+            "enum": [
+                "obligation",
+                "prohibition",
+                "permission",
+                "exception",
+                "definition",
+                "deadline",
+                "enforcement",
+                "gap",
+            ],
+            "title": "RequirementKindV2",
+            "type": "string",
+        },
+        "SemanticDependency": {
+            "additionalProperties": False,
+            "properties": {
+                "relationship": {
+                    "enum": ["depends_on", "exception_to", "defines", "enforced_by"],
+                    "title": "Relationship",
+                    "type": "string",
+                },
+                "target_statement": {"title": "Target Statement", "type": "string"},
+            },
+            "required": ["relationship", "target_statement"],
+            "title": "SemanticDependency",
+            "type": "object",
+        },
+        "SemanticPassage": {
+            "additionalProperties": False,
+            "properties": {
+                "quote": {"title": "Quote", "type": "string"},
+                "source_id": {"title": "Source Id", "type": "string"},
+            },
+            "required": ["source_id", "quote"],
+            "title": "SemanticPassage",
+            "type": "object",
+        },
+        "SemanticProposal": {
+            "additionalProperties": False,
+            "properties": {
+                "confidence": {
+                    "enum": ["clear", "ambiguous", "unresolved"],
+                    "title": "Confidence",
+                    "type": "string",
+                },
+                "dependency": {
+                    "anyOf": [{"$ref": "#/$defs/SemanticDependency"}, {"type": "null"}],
+                    "default": None,
+                },
+                "importance": {"$ref": "#/$defs/ImportanceV2"},
+                "kind": {"$ref": "#/$defs/RequirementKindV2"},
+                "passages": {
+                    "items": {"$ref": "#/$defs/SemanticPassage"},
+                    "maxItems": 128,
+                    "minItems": 1,
+                    "title": "Passages",
+                    "type": "array",
+                },
+                "rationale": {"title": "Rationale", "type": "string"},
+                "statement": {"title": "Statement", "type": "string"},
+            },
+            "required": ["statement", "kind", "importance", "passages", "confidence", "rationale"],
+            "title": "SemanticProposal",
+            "type": "object",
+        },
+    },
+    "additionalProperties": False,
+    "properties": {
+        "proposals": {
+            "items": {"$ref": "#/$defs/SemanticProposal"},
+            "maxItems": 128,
+            "title": "Proposals",
+            "type": "array",
+        },
+        "schema_version": {
+            "const": "2.0",
+            "default": "2.0",
+            "title": "Schema Version",
+            "type": "string",
+        },
+    },
+    "required": ["proposals"],
+    "title": "SourceReviewV2",
+    "type": "object",
+}
+_V2_SOURCE_AUDIT_SCHEMA_PACKED = (
+    "c-qBQ!EW0y4E>cr>oHrqV27=@VcQ|tVO?AFQgnu5GbuM)QYE=)5cJ<i$(AG8TGO0%vuKKZe0-$6V<#1?"
+    "4Ljel&uxYFixeejakFq1UXcZ*;Pr);3baKa&o!?N%$bTzJ63l03cFR{&LG-`o!>IqpfMDJ%^8YPY7M0="
+    "jO7*@5H_*GBUV6B5~GHiI|$|;6}{li3O6m<ExVgDi?*g@tj9dNcDc#yAuwY#iVb_7vp$wX;ffO5A8UfP"
+    "V<#HufxS8P6r5f`!-d7t)hZ3I>FO>76Kzdr%1NHQtt~ru7K#l|s^)@+-~rON$ecl>xG{XwF^5EjfA|-i"
+    "&evUQ_|vlUe!uugM-<_>C*vZ79@28H`PN;xTyMY@s;{r``C>v8x0Z;cJHIY&&)$Bz+kJRG$>2Xg%O1?N"
+    "&o~Q=&MqnAGa=FN(4vOQDI`%&L`}+V)b5c^2Y7Pzo4V`@T{cQ;%gLkDaS&svNzNs8)=^27qJK24a_+9Q"
+    "C`%F})56QH1gGNfD5^A(T-CS<-6y{9afRUodOs5IRD$YX5QQjkIPj`Q;Rpe-mbwh%vf(O5IYp6y8kF=E"
+    "6bLtB+arfN8N#T{$_F$>T1#PND5q;<S3p&)wkh;vvL~o}weELCG+w=~uA)6Mx<3-xXpKx_N4PR<Wh6G9"
+    "&f^GuXr+a?pr785VZq3jxGS)Vy|27+wyX};y}v&1lV&OnHM~@2*ojAf71sSykH@eEu7_nVTPKoMXfU#V"
+    "B-rU@Uk@LJ2{%=$=R<ovYUpb=I}QsVvz(LdK+b<?_%d$O@%(SgU-PbKiR>;1V@`Ux$$S0C#UFW3PeN(3"
+    "=*zgxd!RX~1|3ecO4*P9U3swwqwmbL1*89u9P6gMC*;K=Xw&~8P-a7nvc<bI7KyGu5B2(cvzz|jA+CpV"
+    "V#@sJ`yz5*$-mbYbTR"
+)
+
+
+def _v2_embedded_schema(packed: str, expected_hash: str) -> JsonObject:
+    """Frozen full-runtime schema; regenerate with the Task8 provenance command."""
+    data = zlib.decompress(base64.b85decode(packed.encode("ascii")))
+    if _sha256(data) != expected_hash:
+        raise EvaluationIntegrityError("EVALUATOR_V2_SCHEMA_PROVENANCE")
+    return _object(
+        parse_canonical_json_bytes(data, location="v2 response schema"),
+        location="v2 response schema",
+    )
+
+
+# Generated from SourceAuditV2.model_json_schema() at Task8 base 35e3a4f.
+_V2_SOURCE_AUDIT_SCHEMA = _v2_embedded_schema(
+    _V2_SOURCE_AUDIT_SCHEMA_PACKED,
+    "144e36e2539cb01645c3f5bb274b0c717e0d2371cb67513cdd7efefece3106a0",
+)
+_V2_GRADE_SCHEMA_PACKED = (
+    "c-pO0+iu%14E+^D%cHY)!7yxjOVO<eFrZzA^`%G+#%3}NvgAqfu)yfQkMdQ%6)Vs;NhZ%B4-Z|iMS@4e"
+    ")&<+9nbH<yjQ1;dN13N={lH?)EssI4kfmTz^YUo&%!PA#V*8L;ZUwS+AA_FHnR_)>ySS&2?eKTbHKr)-"
+    "jfSLVf+QgdB|+S2l_8-bRdfVlFl3qcRIr4bOqnv;uQ5eSbQw?_2yu?8yHvJ5<x~;X#id{DwTCrPt4g^s"
+    "H4n)1?U9IzQCRyTb0OFh!IPel3(MB-rDMBo;0Rhn)h;^hCScb-P86fj2^(c#44f({xW%+QjDl16yRAOH"
+    "TYc;**p(Q;U4zlmfYxxXSlaPKJaO0=SQ<HLz#ey>zbzjwm!I~<`=<r-VcVo&n~aO^a1%GG0Y}&y>9|o}"
+    "to<ZuW2BZ?9e!bKT|Yl$ZBtA(#yA%#`C`lQ*3<5`&`3sLZ!XHcx#$`G6(-wD>&@#wgzW)^e&I7J&ge5z"
+    "l9*l~7)T}0sme_x;DEy4(+y!?`4w!M*x+j!J0Z{k3<@qWBEelXud|L<HEM8Oq54Ee!a|)9q#f*l^FJ()"
+    "`{F}?2U@f*Uh3qqJM*8MZ~L1(FxQ01pWE(k4R0#w@q(N9C#DenLEZe>VkHfA$yRSKnI~3#Z@|BodBJ_1"
+    "H_=(%St)|XOV4&UW4`$gy@X)XQ4G5rti{lcGjpDt&1_qqgG;S<NdGWtCVxZ!0Gy?hUj"
+)
+_V2_GRADE_SCHEMA = _v2_embedded_schema(
+    _V2_GRADE_SCHEMA_PACKED,
+    "cb3fc381a29d0e513ba9aa59c8ec1abfc9ce94a698b1b7f69e899ebc93973c9c",
+)
+_V2_SOURCE_REFEREE_SCHEMA = _v2_embedded_schema(
+    "c-ozkO-}+b5QhH>sT@~9;z2!g;f9cKAxLU>7Hjs4=@ca!{=2i?4=OAYy|vSM=bd>vh3JP68Sz|*IV3VAt)|i#xq&hy!%&mXQW;M%%K=FPr$#b15Qy9h6=G{MavIVU^Fh40Kp<$Jmsdlm(~UR;!ekZ|taa#T&t0%L3C|TQLD*W2z>1|O4{Fm@a4d5&Lt89+`v66yedRQR2oPWlN*f+<G5X`UVJ$4rklLi|OezIAtr2z_J^|Uhj!4UOvoc^)1e3)(9>wdr>7t8Ps7-FE!IeuQKz0?c<K^)7X;nNN`ogPJWp{Gq5h^Nf08Nm%LmwgHteb&bguy96mL>9QQf1$d9{H-%=6W=qHl<rzi75A_9A(Ay$9Bxx;I;qu00c+u-Y~v{zX})r`D`WF?;jukJH!j#=P*xKpbMZ;@BAt29bmI@iW7-bMt4I8C6YEi-dh4r*IU%OtDxH!E>WC;$@v|+D1HN)UU^m",
+    "ba9848d415bb1375e33db89854ac6d2fe7c6ef9155e8213bb5e3e18acc27d963",
+)
+_V2_RUBRIC: JsonObject = {
+    "version": "attorney-eval-v2",
+    "importance_weights": {"critical": 3, "material": 2, "supporting": 1},
+    "critical_recall_floor": 1.0,
+    "weighted_coverage_floor": 0.9,
+    "material_unsupported_assertions_allowed": 0,
+}
+_V2_SOURCE_REVIEW_INSTRUCTIONS = (
+    "Review the supplied frozen source record. Identify the legal requirements, "
+    "exceptions, dependencies, ambiguities, and evidence that are material to the "
+    "evaluation. Return only the required semantic proposals."
+)
+_V2_SOURCE_AUDIT_INSTRUCTIONS = (
+    "Audit the supplied semantic proposals against the frozen source record. "
+    "Return only material concerns with source-grounded corrections where required."
+)
+_V2_SOURCE_REFEREE_INSTRUCTIONS = (
+    "Resolve each supplied material dispute using the frozen source record. "
+    "Return the required source-grounded decisions and rationales."
+)
+_V2_GRADE_INSTRUCTIONS = (
+    "Assess exactly one anonymous report against the supplied sealed baseline and "
+    "rubric. Evaluate every supplied requirement and identify any material unsupported "
+    "assertion or baseline defect. Return only the required grading judgment."
+)
+_V2_INNER_PAYLOAD_INSTRUCTIONS = (
+    " Return only the inner payload as one canonical JSON object conforming exactly "
+    "to json_schema. Do not author the outer response envelope; the controller supplies "
+    "operation, request_fingerprint, provider_name, model_name, judge_isolation, and the "
+    "outer schema_version."
+)
+
+
+def _v2_snapshot(value: object, *, location: str) -> JsonObject:
+    """Copy bounded, ordinary JSON before any v2 operation observes it."""
+    pending: list[tuple[object, int, bool]] = [(value, 1, False)]
+    active: set[int] = set()
+    while pending:
+        current, depth, exiting = pending.pop()
+        if depth > 64:
+            raise PortableEvaluationInputError(f"{location} exceeds the nesting-depth limit")
+        if current is None or type(current) in {str, bool, int}:
+            continue
+        if type(current) is float:
+            if not math.isfinite(current):
+                raise PortableEvaluationInputError(f"{location} contains a non-finite number")
+            continue
+        if type(current) not in {dict, list}:
+            raise PortableEvaluationInputError(f"{location} contains a non-JSON value")
+        identity = id(current)
+        if exiting:
+            active.remove(identity)
+            continue
+        if identity in active:
+            raise PortableEvaluationInputError(f"{location} contains a container cycle")
+        active.add(identity)
+        pending.append((current, depth, True))
+        if type(current) is dict:
+            if any(type(key) is not str for key in cast(dict[object, object], current)):
+                raise PortableEvaluationInputError(f"{location} contains a non-string object key")
+            pending.extend(
+                (child, depth + 1, False) for child in cast(dict[str, object], current).values()
+            )
+        else:
+            pending.extend((child, depth + 1, False) for child in cast(list[object], current))
+    try:
+        encoded = canonical_json_bytes(value)
+        if len(encoded) > 16 * 1024 * 1024:
+            raise PortableEvaluationInputError(f"{location} exceeds the size limit")
+        copied = parse_canonical_json_bytes(encoded, location=location)
+    except (EvaluationIntegrityError, RecursionError) as error:
+        raise PortableEvaluationInputError(f"{location} is not canonical JSON") from error
+    if type(copied) is not dict:
+        raise PortableEvaluationInputError(f"{location} must be an object")
+    return copied
+
+
+def _v2_list(value: object, *, location: str) -> list[object]:
+    if type(value) is not list:
+        raise PortableEvaluationInputError(f"{location} must be an array")
+    return value
+
+
+def _v2_nonblank(value: object, *, location: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise PortableEvaluationInputError(f"{location} must be nonblank")
+    return value
+
+
+def _v2_source_record(envelope: JsonObject) -> JsonObject:
+    case = _object(envelope.get("case"), location="v2 case envelope")
+    keys = (
+        "schema_version",
+        "mode",
+        "question",
+        "jurisdiction",
+        "as_of",
+        "requested_authorities",
+        "sources",
+    )
+    return {key: cast(JsonValue, _copy_json(case[key])) for key in keys}
+
+
+def _v2_request_fingerprint(request: JsonObject) -> str:
+    payload = cast(JsonObject, _copy_json(request))
+    payload.pop("request_fingerprint")
+    return _sha256(canonical_json_bytes(payload))
+
+
+def _v2_source_review_request(envelope: JsonObject) -> JsonObject:
+    source_record = _v2_source_record(envelope)
+    request: JsonObject = {
+        "schema_version": _V2_PROTOCOL,
+        "operation": "source_review",
+        "request_fingerprint": "0" * 64,
+        "system_instructions": (
+            _V2_SOURCE_REVIEW_INSTRUCTIONS + _V2_INNER_PAYLOAD_INSTRUCTIONS
+        ),
+        "json_schema": _V2_SOURCE_REVIEW_SCHEMA,
+        "payload": {"source_record": source_record},
+        "safe_metadata": {
+            "record_scope": "source-only",
+            "source_record_fingerprint": _sha256(canonical_json_bytes(source_record)),
+        },
+    }
+    request["request_fingerprint"] = _v2_request_fingerprint(request)
+    return request
+
+
+def _v2_source_audit_request(envelope: JsonObject, review: JsonObject) -> JsonObject:
+    indexed = [
+        {"proposal_ref": f"P{index:04d}", "proposal": proposal}
+        for index, proposal in enumerate(cast(list[object], review["proposals"]), start=1)
+    ]
+    source_record = _v2_source_record(envelope)
+    request: JsonObject = {
+        "schema_version": _V2_PROTOCOL,
+        "operation": "source_audit",
+        "request_fingerprint": "0" * 64,
+        "system_instructions": (
+            _V2_SOURCE_AUDIT_INSTRUCTIONS + _V2_INNER_PAYLOAD_INSTRUCTIONS
+        ),
+        "json_schema": _V2_SOURCE_AUDIT_SCHEMA,
+        "payload": {"source_record": source_record, "indexed_proposals": indexed},
+        "safe_metadata": {
+            "record_scope": "source-only",
+            "source_record_fingerprint": _sha256(canonical_json_bytes(source_record)),
+        },
+    }
+    request["request_fingerprint"] = _v2_request_fingerprint(request)
+    return request
+
+
+def _v2_grade_request(envelope: JsonObject, baseline: JsonObject, label: str) -> JsonObject:
+    assignment = next(
+        item
+        for item in cast(list[JsonObject], envelope["assignments"])
+        if item["anonymous_label"] == label
+    )
+    candidate = next(
+        item
+        for item in cast(list[JsonObject], _object(envelope["case"], location="case")["candidates"])
+        if item["candidate_id"] == assignment["candidate_id"]
+    )
+    report = {
+        "anonymous_label": label,
+        "report_hash": candidate["report_hash"],
+        "report_text": candidate["report_text"],
+    }
+    request: JsonObject = {
+        "schema_version": _V2_PROTOCOL,
+        "operation": "grade_report",
+        "request_fingerprint": "0" * 64,
+        "system_instructions": _V2_GRADE_INSTRUCTIONS + _V2_INNER_PAYLOAD_INSTRUCTIONS,
+        "json_schema": _V2_GRADE_SCHEMA,
+        "payload": {"anonymous_report": report, **baseline, "rubric": _V2_RUBRIC},
+        "safe_metadata": {
+            "record_scope": "one-anonymous-report",
+            "anonymous_label": label,
+            "baseline_fingerprint": baseline["baseline_fingerprint"],
+            "rubric_fingerprint": _sha256(canonical_json_bytes(_V2_RUBRIC)),
+        },
+    }
+    request["request_fingerprint"] = _v2_request_fingerprint(request)
+    return request
+
+
+def _v2_proposal(value: object, *, location: str) -> JsonObject:
+    """Validate the strict semantic-proposal wire shape without retaining caller data."""
+    proposal = _object(value, location=location)
+    expected = {
+        "statement",
+        "kind",
+        "importance",
+        "passages",
+        "dependency",
+        "confidence",
+        "rationale",
+    }
+    if set(proposal) != expected:
+        raise PortableEvaluationInputError(f"{location} has an unexpected shape")
+    if (
+        proposal["kind"]
+        not in {
+            "obligation",
+            "prohibition",
+            "permission",
+            "exception",
+            "definition",
+            "deadline",
+            "enforcement",
+            "gap",
+        }
+        or proposal["importance"] not in {"critical", "material", "supporting"}
+        or proposal["confidence"] not in {"clear", "ambiguous", "unresolved"}
+    ):
+        raise PortableEvaluationInputError(f"{location} has an invalid enum")
+    _v2_nonblank(proposal["statement"], location=f"{location} statement")
+    _v2_nonblank(proposal["rationale"], location=f"{location} rationale")
+    passages = _v2_list(proposal["passages"], location=f"{location} passages")
+    if not passages or len(passages) > 128:
+        raise PortableEvaluationInputError(f"{location} passages are invalid")
+    seen: set[tuple[str, str]] = set()
+    for raw in passages:
+        passage = _object(raw, location=f"{location} passage")
+        if set(passage) != {"source_id", "quote"}:
+            raise PortableEvaluationInputError(f"{location} passage has an unexpected shape")
+        source_id = _v2_nonblank(passage["source_id"], location=f"{location} source")
+        quote = passage["quote"]
+        if type(quote) is not str or not quote.strip():
+            raise PortableEvaluationInputError(f"{location} quote must be nonblank")
+        if (source_id, quote) in seen:
+            raise PortableEvaluationInputError(f"{location} passages must be unique")
+        seen.add((source_id, quote))
+    dependency = proposal["dependency"]
+    if dependency is not None:
+        edge = _object(dependency, location=f"{location} dependency")
+        if set(edge) != {"relationship", "target_statement"} or edge["relationship"] not in {
+            "depends_on",
+            "exception_to",
+            "defines",
+            "enforced_by",
+        }:
+            raise PortableEvaluationInputError(f"{location} dependency has an unexpected shape")
+        _v2_nonblank(edge["target_statement"], location=f"{location} dependency target")
+    return proposal
+
+
+def _v2_disputes(review: JsonObject, audit: JsonObject) -> list[JsonObject]:
+    by_ref = {
+        f"P{index:04d}": proposal
+        for index, proposal in enumerate(cast(list[JsonObject], review["proposals"]), 1)
+    }
+    disputes: list[JsonObject] = []
+    for index, concern in enumerate(cast(list[JsonObject], audit["concerns"]), 1):
+        target = cast(str | None, concern["target_proposal_ref"])
+        disputes.append(
+            {
+                "dispute_id": f"D{index:04d}",
+                "target_proposal_ref": target,
+                "reviewer_proposal": None if target is None else by_ref[target],
+                "audit_concern": concern,
+            }
+        )
+    return disputes
+
+
+def _v2_source_referee_request(envelope: JsonObject, disputes: list[JsonObject]) -> JsonObject:
+    source_record = _v2_source_record(envelope)
+    request: JsonObject = {
+        "schema_version": _V2_PROTOCOL,
+        "operation": "source_referee",
+        "request_fingerprint": "0" * 64,
+        "system_instructions": (
+            _V2_SOURCE_REFEREE_INSTRUCTIONS + _V2_INNER_PAYLOAD_INSTRUCTIONS
+        ),
+        "json_schema": _V2_SOURCE_REFEREE_SCHEMA,
+        "payload": {"source_record": source_record, "material_disputes": disputes},
+        "safe_metadata": {
+            "record_scope": "source-only",
+            "source_record_fingerprint": _sha256(canonical_json_bytes(source_record)),
+        },
+    }
+    request["request_fingerprint"] = _v2_request_fingerprint(request)
+    return request
+
+
+def _v2_compile_baseline(
+    envelope: JsonObject,
+    review: JsonObject,
+    audit: JsonObject | None = None,
+    referee: JsonObject | None = None,
+) -> JsonObject:
+    """Mirror the full compiler's source-only evidence resolution and sealing."""
+    audit = {"schema_version": _V2_PROTOCOL, "concerns": []} if audit is None else audit
+    disputes = _v2_disputes(review, audit)
+    if bool(disputes) != bool(referee):
+        raise PortableEvaluationInputError("referee presence does not match material disputes")
+    source_texts = {
+        cast(str, source["source_id"]): cast(str, source["normalized_text"])
+        for source in cast(list[JsonObject], _object(envelope["case"], location="case")["sources"])
+    }
+    accepted = list(cast(list[JsonObject], review["proposals"]))
+    unresolved: list[str] = []
+    if referee is not None:
+        concerns = cast(list[JsonObject], audit["concerns"])
+        by_decision = {
+            cast(str, item["dispute_id"]): item
+            for item in cast(list[JsonObject], referee["decisions"])
+        }
+        replacements: dict[str, JsonObject] = {}
+        omissions: list[JsonObject] = []
+        for dispute, concern in zip(disputes, concerns, strict=True):
+            decision = by_decision[cast(str, dispute["dispute_id"])]
+            chosen = decision["decision"]
+            target = cast(str | None, concern["target_proposal_ref"])
+            correction = concern["correction"]
+            if chosen == "unresolved" or (
+                chosen == "accept_auditor"
+                and concern["concern_type"] == "ambiguity"
+                and correction is None
+            ):
+                unresolved.append(cast(str, dispute["dispute_id"]))
+            elif chosen == "accept_auditor" and correction is not None:
+                corrected = _object(correction, location="audit correction")
+                if target is None:
+                    omissions.append(corrected)
+                elif target in replacements:
+                    raise PortableEvaluationInputError("conflicting audit corrections")
+                else:
+                    replacements[target] = corrected
+        accepted = [
+            replacements.get(f"P{index:04d}", proposal)
+            for index, proposal in enumerate(accepted, 1)
+        ] + omissions
+    resolved: list[tuple[JsonObject, list[JsonObject], JsonObject]] = []
+    for proposal in accepted:
+        passages: list[JsonObject] = []
+        for raw in cast(list[JsonObject], proposal["passages"]):
+            passage = raw
+            source_id = cast(str, passage["source_id"])
+            quote = cast(str, passage["quote"])
+            text = source_texts.get(source_id)
+            if text is None or text.count(quote) != 1:
+                raise PortableEvaluationInputError("semantic passage is absent or ambiguous")
+            start = text.index(quote)
+            passages.append(
+                {
+                    "source_id": source_id,
+                    "quote": quote,
+                    "start_char": start,
+                    "end_char": start + len(quote),
+                }
+            )
+        passages.sort(
+            key=lambda item: (
+                item["source_id"],
+                item["start_char"],
+                item["end_char"],
+                item["quote"],
+            )
+        )
+        canonical = {
+            "statement": proposal["statement"],
+            "kind": proposal["kind"],
+            "importance": proposal["importance"],
+            "passages": passages,
+            "dependency": proposal["dependency"],
+            "confidence": proposal["confidence"],
+            "rationale": proposal["rationale"],
+        }
+        resolved.append((proposal, passages, canonical))
+    if len({canonical_json_bytes(item[2]) for item in resolved}) != len(resolved):
+        raise PortableEvaluationInputError("duplicate accepted proposal")
+    resolved.sort(
+        key=lambda item: (
+            item[1][0]["source_id"],
+            item[1][0]["start_char"],
+            item[1][0]["end_char"],
+            item[0]["kind"],
+            unicodedata.normalize(
+                "NFC", " ".join(cast(str, item[0]["statement"]).split())
+            ),
+            _sha256(canonical_json_bytes(item[2])),
+        )
+    )
+    requirements: list[JsonObject] = []
+    for index, (proposal, passages, _) in enumerate(resolved, 1):
+        requirements.append(
+            {
+                "requirement_id": f"REQ-{index:04d}",
+                "canonical_order": index - 1,
+                "statement": proposal["statement"],
+                "kind": proposal["kind"],
+                "importance": proposal["importance"],
+                "passages": passages,
+                "dependency": proposal["dependency"],
+                "confidence": proposal["confidence"],
+                "rationale": proposal["rationale"],
+            }
+        )
+    by_statement: dict[str, list[JsonObject]] = {}
+    for requirement in requirements:
+        by_statement.setdefault(
+            unicodedata.normalize("NFC", " ".join(cast(str, requirement["statement"]).split())), []
+        ).append(requirement)
+    relationships: list[JsonObject] = []
+    for requirement in requirements:
+        dependency = requirement["dependency"]
+        if dependency is None:
+            continue
+        targets = by_statement.get(
+            unicodedata.normalize(
+                "NFC", " ".join(cast(str, cast(JsonObject, dependency)["target_statement"]).split())
+            ),
+            [],
+        )
+        if len(targets) != 1 or targets[0]["requirement_id"] == requirement["requirement_id"]:
+            raise PortableEvaluationInputError("dependency target is unresolved")
+        relationships.append(
+            {
+                "relationship_id": f"REL-{len(relationships) + 1:04d}",
+                "relationship": cast(JsonObject, dependency)["relationship"],
+                "source_requirement_id": requirement["requirement_id"],
+                "target_requirement_id": targets[0]["requirement_id"],
+            }
+        )
+    payload: JsonObject = {
+        "schema_version": _V2_PROTOCOL,
+        "case_fingerprint": envelope["case_fingerprint"],
+        "requirements": requirements,
+        "relationships": relationships,
+        "unresolved_dispute_ids": unresolved,
+    }
+    payload["baseline_fingerprint"] = _sha256(canonical_json_bytes(payload))
+    return payload
+
+
+def _v2_manifest(
+    *,
+    case_fingerprint: str,
+    case_hash: str,
+    build_hash: str,
+    rubric_hash: str,
+    calls: list[JsonObject],
+    files: Mapping[str, bytes],
+    phase: str = "source_review",
+    baseline_fingerprint: str | None = None,
+    result_hash: str | None = None,
+    terminal_status: str | None = None,
+) -> JsonObject:
+    artifacts = [
+        {"artifact_path": path, "artifact_hash": _sha256(data)}
+        for path, data in sorted(files.items())
+    ]
+    manifest: JsonObject = {
+        "protocol_version": _V2_PROTOCOL,
+        "case_fingerprint": case_fingerprint,
+        "case_envelope_hash": case_hash,
+        "build_fingerprint": build_hash,
+        "rubric_fingerprint": rubric_hash,
+        "compiler_version": "semantic-compiler-v2",
+        "phase": phase,
+        "calls": _copy_json(calls),
+        "baseline_fingerprint": baseline_fingerprint,
+        "result_hash": result_hash,
+        "terminal_status": terminal_status,
+        "artifacts": artifacts,
+        "manifest_fingerprint": "0" * 64,
+    }
+    provisional = cast(JsonObject, _copy_json(manifest))
+    provisional.pop("manifest_fingerprint")
+    manifest["manifest_fingerprint"] = _sha256(canonical_json_bytes(provisional))
+    return manifest
+
+
+def _v2_state(manifest: JsonObject) -> JsonObject:
+    pending = [
+        call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"
+    ]
+    return {
+        "schema_version": _V2_PROTOCOL,
+        "case_fingerprint": manifest["case_fingerprint"],
+        "phase": manifest["phase"],
+        "current_call_id": None if not pending else pending[0]["call_id"],
+        "terminal_status": manifest["terminal_status"],
+        "manifest_fingerprint": manifest["manifest_fingerprint"],
+    }
+
+
+def _v2_parse_manifest(data: bytes) -> JsonObject:
+    manifest = _object(
+        parse_canonical_json_bytes(data, location=_V2_MANIFEST_PATH), location=_V2_MANIFEST_PATH
+    )
+    required = {
+        "protocol_version",
+        "case_fingerprint",
+        "case_envelope_hash",
+        "build_fingerprint",
+        "rubric_fingerprint",
+        "compiler_version",
+        "phase",
+        "calls",
+        "baseline_fingerprint",
+        "result_hash",
+        "terminal_status",
+        "artifacts",
+        "manifest_fingerprint",
+    }
+    if set(manifest) != required or manifest["protocol_version"] != _V2_PROTOCOL:
+        raise EvaluationIntegrityError("EVALUATOR_V2_MANIFEST")
+    fingerprint = manifest["manifest_fingerprint"]
+    if type(fingerprint) is not str:
+        raise EvaluationIntegrityError("EVALUATOR_V2_MANIFEST")
+    candidate = cast(JsonObject, _copy_json(manifest))
+    candidate.pop("manifest_fingerprint")
+    if fingerprint != _sha256(canonical_json_bytes(candidate)):
+        raise EvaluationIntegrityError("EVALUATOR_V2_MANIFEST_FINGERPRINT")
+    return manifest
+
+
+def _v2_verified(run_dir: Path) -> tuple[JsonObject, dict[str, bytes]]:
+    with _open_run_storage(run_dir) as storage:
+        manifest = _v2_parse_manifest(storage.read_artifact(_V2_MANIFEST_PATH))
+        artifacts = _v2_list(manifest["artifacts"], location="v2 manifest artifacts")
+        files: dict[str, bytes] = {}
+        for record in artifacts:
+            item = _object(record, location="v2 artifact")
+            path = _string(item.get("artifact_path"), location="v2 artifact path", nonblank=True)
+            data = storage.read_artifact(path)
+            if item.get("artifact_hash") != _sha256(data):
+                raise EvaluationIntegrityError("EVALUATOR_V2_ARTIFACT_HASH")
+            files[path] = data
+        inventory = set(storage.scan_inventory())
+        directories = {
+            f"{PurePosixPath(path).parent.as_posix()}/"
+            for path in files
+            if PurePosixPath(path).parent.as_posix() != "."
+        }
+        expected = set(files) | directories | {_V2_MANIFEST_PATH}
+        if inventory != expected:
+            raise EvaluationIntegrityError("EVALUATOR_V2_INVENTORY")
+        storage.assert_root_identity()
+    return manifest, files
+
+
+def _portable_v2_source_review(value: object) -> JsonObject:
+    payload = _v2_snapshot(value, location="source review")
+    if set(payload) != {"schema_version", "proposals"} or payload["schema_version"] != _V2_PROTOCOL:
+        raise PortableEvaluationInputError("source review has an unexpected shape")
+    proposals = _v2_list(payload["proposals"], location="source review proposals")
+    if len(proposals) > 128:
+        raise PortableEvaluationInputError("source review has too many proposals")
+    for proposal in proposals:
+        item = _object(proposal, location="source proposal")
+        if set(item) != {
+            "statement",
+            "kind",
+            "importance",
+            "passages",
+            "dependency",
+            "confidence",
+            "rationale",
+        }:
+            raise PortableEvaluationInputError("source proposal has an unexpected shape")
+        if (
+            item["kind"]
+            not in {
+                "obligation",
+                "prohibition",
+                "permission",
+                "exception",
+                "definition",
+                "deadline",
+                "enforcement",
+                "gap",
+            }
+            or item["importance"] not in {"critical", "material", "supporting"}
+            or item["confidence"] not in {"clear", "ambiguous", "unresolved"}
+        ):
+            raise PortableEvaluationInputError("source proposal has an invalid enum")
+        _v2_nonblank(item["statement"], location="source proposal statement")
+        _v2_nonblank(item["rationale"], location="source proposal rationale")
+        passages = _v2_list(item["passages"], location="source proposal passages")
+        if not passages or len(passages) > 128:
+            raise PortableEvaluationInputError("source proposal passages are invalid")
+        seen: set[tuple[str, str]] = set()
+        for passage in passages:
+            entry = _object(passage, location="source passage")
+            if set(entry) != {"source_id", "quote"}:
+                raise PortableEvaluationInputError("source passage has an unexpected shape")
+            source_id = _string(entry["source_id"], location="source id", nonblank=True)
+            quote = entry["quote"]
+            if type(quote) is not str or not quote.strip():
+                raise PortableEvaluationInputError("source quote must be nonblank")
+            identity = (source_id, quote)
+            if identity in seen:
+                raise PortableEvaluationInputError("source proposal passages must be unique")
+            seen.add(identity)
+    return payload
+
+
+def _portable_v2_source_audit(value: object) -> JsonObject:
+    payload = _v2_snapshot(value, location="source audit")
+    if set(payload) != {"schema_version", "concerns"} or payload["schema_version"] != _V2_PROTOCOL:
+        raise PortableEvaluationInputError("source audit has an unexpected shape")
+    concerns = _v2_list(payload["concerns"], location="source audit concerns")
+    if len(concerns) > 128:
+        raise PortableEvaluationInputError("source audit has too many concerns")
+    for raw in concerns:
+        concern = _object(raw, location="source audit concern")
+        if set(concern) != {
+            "target_proposal_ref",
+            "concern_type",
+            "passages",
+            "explanation",
+            "correction",
+        }:
+            raise PortableEvaluationInputError("source audit concern has an unexpected shape")
+        target, kind, correction = (
+            concern["target_proposal_ref"],
+            concern["concern_type"],
+            concern["correction"],
+        )
+        if target is not None and (
+            type(target) is not str or re.fullmatch(r"P[0-9]{4}", target) is None
+        ):
+            raise PortableEvaluationInputError("source audit target is invalid")
+        if kind not in {
+            "omission",
+            "incorrect_statement",
+            "incorrect_evidence",
+            "incorrect_relationship",
+            "ambiguity",
+        }:
+            raise PortableEvaluationInputError("source audit concern type is invalid")
+        if (
+            (kind == "omission" and (target is not None or correction is None))
+            or (
+                kind in {"incorrect_statement", "incorrect_evidence", "incorrect_relationship"}
+                and (target is None or correction is None)
+            )
+            or (kind == "ambiguity" and target is None)
+        ):
+            raise PortableEvaluationInputError(
+                "source audit concern target and correction are invalid"
+            )
+        _string(concern["explanation"], location="source audit explanation", nonblank=True)
+        _v2_proposal(
+            correction, location="source audit correction"
+        ) if correction is not None else None
+        _v2_proposal(
+            {
+                "statement": "x",
+                "kind": "gap",
+                "importance": "supporting",
+                "passages": concern["passages"],
+                "dependency": None,
+                "confidence": "clear",
+                "rationale": "x",
+            },
+            location="source audit passages",
+        )
+    return payload
+
+
+def _portable_v2_source_referee(value: object) -> JsonObject:
+    payload = _v2_snapshot(value, location="source referee")
+    if set(payload) != {"schema_version", "decisions"} or payload["schema_version"] != _V2_PROTOCOL:
+        raise PortableEvaluationInputError("source referee has an unexpected shape")
+    decisions = _v2_list(payload["decisions"], location="source referee decisions")
+    if len(decisions) > 128:
+        raise PortableEvaluationInputError("source referee has too many decisions")
+    seen: set[str] = set()
+    for raw in decisions:
+        decision = _object(raw, location="source referee decision")
+        if set(decision) != {"dispute_id", "decision", "passages", "rationale"}:
+            raise PortableEvaluationInputError("source referee decision has an unexpected shape")
+        dispute_id = _string(
+            decision["dispute_id"], location="source referee dispute", nonblank=True
+        )
+        if (
+            re.fullmatch(r"D[0-9]{4}", dispute_id) is None
+            or dispute_id in seen
+            or decision["decision"] not in {"accept_reviewer", "accept_auditor", "unresolved"}
+        ):
+            raise PortableEvaluationInputError("source referee decision is invalid")
+        seen.add(dispute_id)
+        _string(decision["rationale"], location="source referee rationale", nonblank=True)
+        _v2_proposal(
+            {
+                "statement": "x",
+                "kind": "gap",
+                "importance": "supporting",
+                "passages": decision["passages"],
+                "dependency": None,
+                "confidence": "clear",
+                "rationale": "x",
+            },
+            location="source referee passages",
+        )
+    return payload
+
+
+def _portable_v2_grade(value: object) -> JsonObject:
+    payload = _v2_snapshot(value, location="grade")
+    required = {
+        "schema_version",
+        "anonymous_label",
+        "baseline_fingerprint",
+        "requirement_grades",
+        "unsupported_assertions",
+        "baseline_defect",
+    }
+    if (
+        set(payload) != required
+        or payload["schema_version"] != _V2_PROTOCOL
+        or payload["anonymous_label"] not in {"A", "B"}
+        or type(payload["baseline_fingerprint"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", payload["baseline_fingerprint"]) is None
+    ):
+        raise PortableEvaluationInputError("grade has an unexpected shape")
+    grades = _v2_list(payload["requirement_grades"], location="grade requirements")
+    assertions = _v2_list(payload["unsupported_assertions"], location="grade assertions")
+    if (
+        len(grades) > 128
+        or len(assertions) > 128
+        or (
+            payload["baseline_defect"] is not None
+            and (
+                type(payload["baseline_defect"]) is not str
+                or not payload["baseline_defect"].strip()
+            )
+        )
+    ):
+        raise PortableEvaluationInputError("grade is invalid")
+    seen: set[str] = set()
+    for raw in grades:
+        grade = _object(raw, location="requirement grade")
+        if set(grade) != {
+            "requirement_id",
+            "disposition",
+            "report_passages",
+            "rationale",
+            "omission",
+        }:
+            raise PortableEvaluationInputError("requirement grade has an unexpected shape")
+        requirement_id = _string(
+            grade["requirement_id"], location="requirement grade id", nonblank=True
+        )
+        if (
+            re.fullmatch(r"REQ-[0-9]{4}", requirement_id) is None
+            or requirement_id in seen
+            or grade["disposition"] not in {"met", "partially_met", "not_met", "uncertain"}
+        ):
+            raise PortableEvaluationInputError("requirement grade is invalid")
+        seen.add(requirement_id)
+        _string(grade["rationale"], location="requirement grade rationale", nonblank=True)
+        passages = _v2_list(grade["report_passages"], location="requirement grade passages")
+        if len(passages) > 128 or any(
+            type(passage) is not str or not passage.strip() for passage in passages
+        ):
+            raise PortableEvaluationInputError("requirement grade passages are invalid")
+        if grade["omission"] is not None and (
+            type(grade["omission"]) is not str or not grade["omission"].strip()
+        ):
+            raise PortableEvaluationInputError("requirement grade omission is invalid")
+    for raw in assertions:
+        assertion = _object(raw, location="unsupported assertion")
+        if set(assertion) != {"report_passage", "importance", "rationale"} or assertion[
+            "importance"
+        ] not in {"critical", "material", "supporting"}:
+            raise PortableEvaluationInputError("unsupported assertion has an unexpected shape")
+        _string(
+            assertion["report_passage"], location="unsupported assertion passage", nonblank=True
+        )
+        _string(assertion["rationale"], location="unsupported assertion rationale", nonblank=True)
+    return payload
+
+
+def _v2_initialize_evaluation(
+    case: object,
+    output_dir: Path,
+    *,
+    seed_hex: str,
+    generation_capsule_paths: Mapping[str, Path] | None = None,
+    generation_substrate: Any | None = None,
+) -> JsonObject:
+    case_snapshot = _verify_generation_capsules_for_initialization(
+        case,
+        generation_capsule_paths=generation_capsule_paths,
+        generation_substrate=generation_substrate,
+    )
+    if case_snapshot.get("schema_version") != "1.1":
+        raise PortableEvaluationInputError("case schema 1.1 is required for new evaluation runs")
+    envelope = freeze_case(case_snapshot, seed_hex=seed_hex)
+    request = _v2_source_review_request(envelope)
+    case_bytes = canonical_json_bytes(envelope)
+    build_bytes = canonical_json_bytes(
+        {"protocol_version": _V2_PROTOCOL, "compiler_version": "semantic-compiler-v2"}
+    )
+    rubric_bytes = canonical_json_bytes(_V2_RUBRIC)
+    request_path = "requests/source-review.json"
+    request_bytes = canonical_json_bytes(request)
+    files = {
+        _V2_CASE_PATH: case_bytes,
+        _V2_BUILD_PATH: build_bytes,
+        _V2_RUBRIC_PATH: rubric_bytes,
+        request_path: request_bytes,
+    }
+    call: JsonObject = {
+        "call_id": "source-review",
+        "operation": "source_review",
+        "anonymous_label": None,
+        "state": "pending",
+        "request_artifact_path": request_path,
+        "request_fingerprint": request["request_fingerprint"],
+        "response_artifact_path": None,
+        "response_fingerprint": None,
+        "provider_name": None,
+        "model_name": None,
+        "judge_isolation": None,
+    }
+    manifest = _v2_manifest(
+        case_fingerprint=cast(str, envelope["case_fingerprint"]),
+        case_hash=_sha256(case_bytes),
+        build_hash=_sha256(build_bytes),
+        rubric_hash=_sha256(rubric_bytes),
+        calls=[call],
+        files=files,
+    )
+    with _open_run_storage(output_dir, initialize=True) as storage:
+        for path, data in sorted(files.items()):
+            storage.atomic_write(path, data, mutable=False)
+        storage.atomic_write(_V2_MANIFEST_PATH, canonical_json_bytes(manifest), mutable=False)
+        storage.assert_root_identity()
+    return _v2_state(manifest)
+
+
+def _v2_protocol(run_dir: Path) -> str | None:
+    try:
+        with _open_run_storage(run_dir) as storage:
+            data = storage.read_optional_artifact(
+                _V2_MANIFEST_PATH, max_bytes=16 * 1024 * 1024
+            )
+            storage.assert_root_identity()
+    except EvaluationIntegrityError:
+        return None
+    if data is None:
+        return None
+    try:
+        raw = _object(
+            parse_canonical_json_bytes(data, location=_V2_MANIFEST_PATH), location=_V2_MANIFEST_PATH
+        )
+    except EvaluationIntegrityError:
+        return None
+    version = raw.get("protocol_version")
+    if version == _V2_PROTOCOL:
+        return _V2_PROTOCOL
+    if raw.get("schema_version") == "1.3":
+        return "1.3"
+    return "unknown" if "protocol_version" in raw else None
+
+
+def initialize_evaluation(  # type: ignore[no-redef]
+    case: object,
+    output_dir: Path,
+    *,
+    seed_hex: str,
+    generation_capsule_paths: Mapping[str, Path] | None = None,
+    generation_substrate: Any | None = None,
+) -> JsonObject:
+    """Create only a protocol-2.0 portable evaluation run."""
+    return _v2_initialize_evaluation(
+        case,
+        output_dir,
+        seed_hex=seed_hex,
+        generation_capsule_paths=generation_capsule_paths,
+        generation_substrate=generation_substrate,
+    )
+
+
+def resume_evaluation(run_dir: Path) -> JsonObject:  # type: ignore[no-redef]
+    protocol = _v2_protocol(run_dir)
+    if protocol == _V2_PROTOCOL:
+        manifest, _ = _v2_verified(run_dir)
+        return _v2_state(manifest)
+    if protocol in {"1.3", None}:
+        return _resume_evaluation_v1(run_dir)
+    raise EvaluationIntegrityError("EVALUATOR_V2_PROTOCOL_UNSUPPORTED")
+
+
+def next_judge_request(run_dir: Path) -> JsonObject | None:  # type: ignore[no-redef]
+    protocol = _v2_protocol(run_dir)
+    if protocol == _V2_PROTOCOL:
+        manifest, files = _v2_verified(run_dir)
+        if manifest["terminal_status"] is not None:
+            return None
+        pending = [
+            call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"
+        ]
+        if len(pending) != 1:
+            raise EvaluationIntegrityError("EVALUATOR_V2_PENDING_CALL")
+        return _object(
+            parse_canonical_json_bytes(
+                files[cast(str, pending[0]["request_artifact_path"])], location="v2 request"
+            ),
+            location="v2 request",
+        )
+    if protocol == "1.3":
+        raise PortableEvaluationInputError("Protocol 1.3 evaluation runs are read-only.")
+    raise EvaluationIntegrityError("EVALUATOR_V2_PROTOCOL_UNSUPPORTED")
+
+
+def _v2_response(value: object, request: JsonObject) -> JsonObject:
+    response = _v2_snapshot(value, location="evaluator response")
+    required = {
+        "schema_version",
+        "operation",
+        "request_fingerprint",
+        "provider_name",
+        "model_name",
+        "judge_isolation",
+        "payload",
+    }
+    if set(response) != required or response["schema_version"] != _V2_PROTOCOL:
+        raise PortableEvaluationInputError("evaluator response has an unexpected shape")
+    if (
+        response["operation"] != request["operation"]
+        or response["request_fingerprint"] != request["request_fingerprint"]
+    ):
+        raise PortableEvaluationInputError("evaluator response does not bind the pending request")
+    if response["judge_isolation"] not in {"fresh_context", "scripted_fixture"}:
+        raise PortableEvaluationInputError("evaluator response has an invalid isolation label")
+    _string(response["provider_name"], location="evaluator provider", nonblank=True)
+    _string(response["model_name"], location="evaluator model", nonblank=True)
+    if response["operation"] == "source_review":
+        _portable_v2_source_review(response["payload"])
+    elif response["operation"] == "source_audit":
+        audit = _portable_v2_source_audit(response["payload"])
+        indexed = _v2_list(
+            _object(request["payload"], location="audit request")["indexed_proposals"],
+            location="indexed proposals",
+        )
+        known = {
+            cast(str, _object(item, location="indexed proposal")["proposal_ref"])
+            for item in indexed
+        }
+        concerns = cast(list[JsonObject], audit["concerns"])
+        if any(
+            concern["target_proposal_ref"] is not None
+            and _string(
+                concern["target_proposal_ref"], location="audit target", nonblank=True
+            ) not in known
+            for concern in concerns
+        ):
+            raise PortableEvaluationInputError("source audit target is not engine-issued")
+    elif response["operation"] == "source_referee":
+        referee = _portable_v2_source_referee(response["payload"])
+        disputes = _v2_list(
+            _object(request["payload"], location="referee request")["material_disputes"],
+            location="material disputes",
+        )
+        expected = {
+            cast(str, _object(item, location="material dispute")["dispute_id"]) for item in disputes
+        }
+        actual = {
+            cast(str, _object(item, location="referee decision")["dispute_id"])
+            for item in cast(list[JsonObject], referee["decisions"])
+        }
+        if actual != expected:
+            raise PortableEvaluationInputError("source referee must cover every engine dispute")
+    elif response["operation"] == "grade_report":
+        grade = _portable_v2_grade(response["payload"])
+        grade_payload = _object(request["payload"], location="grade request")
+        baseline = {
+            key: grade_payload[key]
+            for key in (
+                "schema_version",
+                "case_fingerprint",
+                "requirements",
+                "relationships",
+                "unresolved_dispute_ids",
+                "baseline_fingerprint",
+            )
+        }
+        report = _object(grade_payload["anonymous_report"], location="anonymous report")
+        expected = {
+            cast(str, _object(item, location="baseline requirement")["requirement_id"])
+            for item in cast(list[JsonObject], baseline["requirements"])
+        }
+        actual = {
+            cast(str, _object(item, location="requirement grade")["requirement_id"])
+            for item in cast(list[JsonObject], grade["requirement_grades"])
+        }
+        if (
+            grade["anonymous_label"] != report["anonymous_label"]
+            or grade["baseline_fingerprint"] != baseline["baseline_fingerprint"]
+            or actual != expected
+        ):
+            raise PortableEvaluationInputError("grade does not bind the pending baseline and label")
+        _v2_validate_grade_evidence(grade, cast(str, report["report_text"]))
+    else:
+        raise PortableEvaluationInputError("evaluator response has an unsupported operation")
+    return response
+
+
+def _v2_commit_source_review(run_dir: Path, response: JsonObject) -> JsonObject:
+    manifest, files = _v2_verified(run_dir)
+    pending = [
+        call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"
+    ]
+    if len(pending) != 1 or pending[0]["operation"] != "source_review":
+        raise PortableEvaluationInputError("source review is not pending")
+    call = cast(JsonObject, _copy_json(pending[0]))
+    reviewed = _portable_v2_source_review(response["payload"])
+    envelope = _object(
+        parse_canonical_json_bytes(files[_V2_CASE_PATH], location=_V2_CASE_PATH),
+        location=_V2_CASE_PATH,
+    )
+    audit_request = _v2_source_audit_request(envelope, reviewed)
+    response_path = "responses/source-review.json"
+    audit_path = "requests/source-audit.json"
+    response_bytes = canonical_json_bytes(response)
+    call.update(
+        {
+            "state": "accepted",
+            "response_artifact_path": response_path,
+            "response_fingerprint": _sha256(response_bytes),
+            "provider_name": response["provider_name"],
+            "model_name": response["model_name"],
+            "judge_isolation": response["judge_isolation"],
+        }
+    )
+    next_call: JsonObject = {
+        "call_id": "source-audit",
+        "operation": "source_audit",
+        "anonymous_label": None,
+        "state": "pending",
+        "request_artifact_path": audit_path,
+        "request_fingerprint": audit_request["request_fingerprint"],
+        "response_artifact_path": None,
+        "response_fingerprint": None,
+        "provider_name": None,
+        "model_name": None,
+        "judge_isolation": None,
+    }
+    updated = dict(files)
+    updated[response_path] = response_bytes
+    updated[audit_path] = canonical_json_bytes(audit_request)
+    successor = _v2_manifest(
+        case_fingerprint=cast(str, manifest["case_fingerprint"]),
+        case_hash=cast(str, manifest["case_envelope_hash"]),
+        build_hash=cast(str, manifest["build_fingerprint"]),
+        rubric_hash=cast(str, manifest["rubric_fingerprint"]),
+        calls=[call, next_call],
+        files=updated,
+        phase="source_audit",
+    )
+    with _open_run_storage(run_dir) as storage:
+        storage.atomic_write(response_path, response_bytes, mutable=False)
+        storage.atomic_write(audit_path, updated[audit_path], mutable=False)
+        storage.atomic_write(_V2_MANIFEST_PATH, canonical_json_bytes(successor), mutable=True)
+        storage.assert_root_identity()
+    return _v2_state(successor)
+
+
+def _v2_commit_source_audit(run_dir: Path, response: JsonObject) -> JsonObject:
+    manifest, files = _v2_verified(run_dir)
+    pending = [
+        call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"
+    ]
+    if len(pending) != 1 or pending[0]["operation"] != "source_audit":
+        raise PortableEvaluationInputError("source audit is not pending")
+    audit = _portable_v2_source_audit(response["payload"])
+    if audit["concerns"]:
+        raise PortableEvaluationInputError("material source disputes require referee support")
+    envelope = _object(
+        parse_canonical_json_bytes(files[_V2_CASE_PATH], location=_V2_CASE_PATH),
+        location=_V2_CASE_PATH,
+    )
+    review_response = _object(
+        parse_canonical_json_bytes(files["responses/source-review.json"], location="source review"),
+        location="source review",
+    )
+    baseline = _v2_compile_baseline(
+        envelope, _object(review_response["payload"], location="source review")
+    )
+    grade_request = _v2_grade_request(envelope, baseline, "A")
+    call = cast(JsonObject, _copy_json(pending[0]))
+    response_path, request_path = "responses/source-audit.json", "requests/grade-A-1.json"
+    response_bytes = canonical_json_bytes(response)
+    call.update(
+        {
+            "state": "accepted",
+            "response_artifact_path": response_path,
+            "response_fingerprint": _sha256(response_bytes),
+            "provider_name": response["provider_name"],
+            "model_name": response["model_name"],
+            "judge_isolation": response["judge_isolation"],
+        }
+    )
+    next_call: JsonObject = {
+        "call_id": "grade-A-1",
+        "operation": "grade_report",
+        "anonymous_label": "A",
+        "state": "pending",
+        "request_artifact_path": request_path,
+        "request_fingerprint": grade_request["request_fingerprint"],
+        "response_artifact_path": None,
+        "response_fingerprint": None,
+        "provider_name": None,
+        "model_name": None,
+        "judge_isolation": None,
+    }
+    updated = dict(files)
+    updated.update(
+        {
+            response_path: response_bytes,
+            "baseline.json": canonical_json_bytes(baseline),
+            request_path: canonical_json_bytes(grade_request),
+        }
+    )
+    successor = _v2_manifest(
+        case_fingerprint=cast(str, manifest["case_fingerprint"]),
+        case_hash=cast(str, manifest["case_envelope_hash"]),
+        build_hash=cast(str, manifest["build_fingerprint"]),
+        rubric_hash=cast(str, manifest["rubric_fingerprint"]),
+        calls=[*cast(list[JsonObject], manifest["calls"])[:-1], call, next_call],
+        files=updated,
+        phase="grade_report",
+        baseline_fingerprint=cast(str, baseline["baseline_fingerprint"]),
+    )
+    with _open_run_storage(run_dir) as storage:
+        for path in (response_path, "baseline.json", request_path):
+            storage.atomic_write(path, updated[path], mutable=False)
+        storage.atomic_write(_V2_MANIFEST_PATH, canonical_json_bytes(successor), mutable=True)
+    return _v2_state(successor)
+
+
+def _v2_validate_grade_evidence(grade: JsonObject, report_text: str) -> None:
+    """Resolve report evidence exactly once, matching the full rubric boundary."""
+    assertion_ids: set[tuple[int, int, str]] = set()
+    for raw in cast(list[JsonObject], grade["requirement_grades"]):
+        seen: set[tuple[int, int, str]] = set()
+        for quote in cast(list[str], raw["report_passages"]):
+            if report_text.count(quote) != 1:
+                raise PortableEvaluationInputError("grade report passage is absent or ambiguous")
+            identity = (report_text.index(quote), report_text.index(quote) + len(quote), quote)
+            if identity in seen:
+                raise PortableEvaluationInputError("grade report passage is duplicate")
+            seen.add(identity)
+    for raw in cast(list[JsonObject], grade["unsupported_assertions"]):
+        quote = cast(str, raw["report_passage"])
+        if report_text.count(quote) != 1:
+            raise PortableEvaluationInputError(
+                "unsupported assertion passage is absent or ambiguous"
+            )
+        identity = (
+            report_text.index(quote),
+            report_text.index(quote) + len(quote),
+            cast(str, raw["importance"]),
+        )
+        if identity in assertion_ids:
+            raise PortableEvaluationInputError("unsupported assertion is duplicate")
+        assertion_ids.add(identity)
+
+
+def _v2_report_result(
+    baseline: JsonObject, first: JsonObject, second: JsonObject, report_text: str
+) -> JsonObject:
+    """Reconcile two valid observations and apply the fixed public rubric once."""
+    label = cast(str, first["anonymous_label"])
+    reason_codes: list[str] = []
+    disposition = "PASS"
+    requirements = cast(list[JsonObject], baseline["requirements"])
+    if cast(list[object], baseline["unresolved_dispute_ids"]):
+        disposition, reason_codes = "INCONCLUSIVE", ["BASELINE_DISPUTE_UNRESOLVED"]
+    elif first["baseline_defect"] is not None or second["baseline_defect"] is not None:
+        disposition, reason_codes = "INCONCLUSIVE", ["BASELINE_DEFECT_REPORTED"]
+    elif any(
+        item["disposition"] == "uncertain"
+        for item in [
+            *cast(list[JsonObject], first["requirement_grades"]),
+            *cast(list[JsonObject], second["requirement_grades"]),
+        ]
+    ):
+        disposition, reason_codes = "INCONCLUSIVE", ["GRADE_UNCERTAIN"]
+    else:
+        one = {
+            cast(str, item["requirement_id"]): item
+            for item in cast(list[JsonObject], first["requirement_grades"])
+        }
+        two = {
+            cast(str, item["requirement_id"]): item
+            for item in cast(list[JsonObject], second["requirement_grades"])
+        }
+
+        def unsupported_identities(grade: JsonObject) -> set[tuple[int, int, object]]:
+            return {
+                (
+                    report_text.index(cast(str, item["report_passage"])),
+                    report_text.index(cast(str, item["report_passage"]))
+                    + len(cast(str, item["report_passage"])),
+                    item["importance"],
+                )
+                for item in cast(list[JsonObject], grade["unsupported_assertions"])
+            }
+
+        if {key: item["disposition"] for key, item in one.items()} != {
+            key: item["disposition"] for key, item in two.items()
+        } or unsupported_identities(first) != unsupported_identities(second):
+            disposition, reason_codes = "INCONCLUSIVE", ["GRADER_DISAGREEMENT"]
+    reconciliations: list[JsonObject] = []
+    assertions: list[JsonObject] = []
+    critical_recall = weighted_coverage = 0.0
+    if disposition == "PASS":
+        by_requirement = {
+            cast(str, item["requirement_id"]): item
+            for item in cast(list[JsonObject], first["requirement_grades"])
+        }
+        reconciliations = [
+            {
+                "requirement_id": requirement["requirement_id"],
+                "disposition": by_requirement[cast(str, requirement["requirement_id"])][
+                    "disposition"
+                ],
+                "report_passages": by_requirement[cast(str, requirement["requirement_id"])][
+                    "report_passages"
+                ],
+                "rationale": by_requirement[cast(str, requirement["requirement_id"])]["rationale"],
+                "graders_agree": True,
+            }
+            for requirement in requirements
+        ]
+        assertions = cast(list[JsonObject], first["unsupported_assertions"])
+        credits = {"met": 1.0, "partially_met": 0.5, "not_met": 0.0, "uncertain": 0.0}
+        weights = {"critical": 3, "material": 2, "supporting": 1}
+        critical = [
+            credits[
+                cast(str, by_requirement[cast(str, requirement["requirement_id"])]["disposition"])
+            ]
+            for requirement in requirements
+            if requirement["importance"] == "critical"
+        ]
+        total = sum(weights[cast(str, requirement["importance"])] for requirement in requirements)
+        credited = sum(
+            weights[cast(str, requirement["importance"])]
+            * credits[
+                cast(str, by_requirement[cast(str, requirement["requirement_id"])]["disposition"])
+            ]
+            for requirement in requirements
+        )
+        critical_recall = sum(critical) / len(critical) if critical else 1.0
+        weighted_coverage = credited / total if total else 1.0
+        if critical_recall < 1.0:
+            reason_codes.append("CRITICAL_RECALL_BELOW_FLOOR")
+        if weighted_coverage < 0.9:
+            reason_codes.append("WEIGHTED_COVERAGE_BELOW_FLOOR")
+        if any(item["importance"] in {"critical", "material"} for item in assertions):
+            reason_codes.append("MATERIAL_UNSUPPORTED_ASSERTION")
+        if reason_codes:
+            disposition = "FAIL"
+    reconciliation: JsonObject = {
+        "anonymous_label": label,
+        "disposition": disposition,
+        "reason_codes": reason_codes,
+        "grader_responses": [first, second],
+        "requirement_reconciliations": reconciliations,
+        "unsupported_assertions": assertions,
+    }
+    report: JsonObject = {
+        "anonymous_label": label,
+        "absolute_disposition": disposition,
+        "reconciliation": reconciliation,
+        "critical_recall": critical_recall,
+        "weighted_coverage": weighted_coverage,
+        "reason_codes": reason_codes,
+    }
+    report["result_fingerprint"] = _sha256(canonical_json_bytes(report))
+    return report
+
+
+def _v2_comparison(first: JsonObject, second: JsonObject) -> JsonObject:
+    if "INCONCLUSIVE" in {first["absolute_disposition"], second["absolute_disposition"]}:
+        return {
+            "disposition": "inconclusive",
+            "winner_label": None,
+            "rationale": "At least one report is inconclusive.",
+        }
+    if first["absolute_disposition"] == "PASS" and second["absolute_disposition"] == "FAIL":
+        return {
+            "disposition": "candidate_win",
+            "winner_label": "A",
+            "rationale": "Only the candidate report passed the rubric.",
+        }
+    if first["absolute_disposition"] == "FAIL" and second["absolute_disposition"] == "PASS":
+        return {
+            "disposition": "comparator_win",
+            "winner_label": "B",
+            "rationale": "Only the comparator report passed the rubric.",
+        }
+    if first["absolute_disposition"] == "FAIL":
+        return {
+            "disposition": "neither",
+            "winner_label": None,
+            "rationale": "Neither report passed the rubric.",
+        }
+    return {
+        "disposition": "tie",
+        "winner_label": None,
+        "rationale": "Both reports passed the rubric.",
+    }
+
+
+def _v2_commit_grade(run_dir: Path, response: JsonObject) -> JsonObject:
+    manifest, files = _v2_verified(run_dir)
+    pending = [
+        call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"
+    ]
+    if len(pending) != 1 or pending[0]["operation"] != "grade_report":
+        raise PortableEvaluationInputError("grade is not pending")
+    call = cast(JsonObject, _copy_json(pending[0]))
+    label = cast(str, call["anonymous_label"])
+    baseline = _object(
+        parse_canonical_json_bytes(files["baseline.json"], location="baseline"), location="baseline"
+    )
+    response_bytes = canonical_json_bytes(response)
+    response_path = f"responses/{call['call_id']}.json"
+    call.update(
+        {
+            "state": "accepted",
+            "response_artifact_path": response_path,
+            "response_fingerprint": _sha256(response_bytes),
+            "provider_name": response["provider_name"],
+            "model_name": response["model_name"],
+            "judge_isolation": response["judge_isolation"],
+        }
+    )
+    calls = [
+        *(
+            [
+                item
+                for item in cast(list[JsonObject], manifest["calls"])
+                if item["state"] == "accepted"
+            ]
+        ),
+        call,
+    ]
+    updated = dict(files)
+    updated[response_path] = response_bytes
+    envelope = _object(
+        parse_canonical_json_bytes(files[_V2_CASE_PATH], location=_V2_CASE_PATH),
+        location=_V2_CASE_PATH,
+    )
+    prior = [
+        item
+        for item in calls
+        if item["operation"] == "grade_report" and item["anonymous_label"] == label
+    ]
+    if len(prior) == 1:
+        request = _v2_grade_request(envelope, baseline, label)
+        request_path = f"requests/grade-{label}-2.json"
+        next_call: JsonObject = {
+            "call_id": f"grade-{label}-2",
+            "operation": "grade_report",
+            "anonymous_label": label,
+            "state": "pending",
+            "request_artifact_path": request_path,
+            "request_fingerprint": request["request_fingerprint"],
+            "response_artifact_path": None,
+            "response_fingerprint": None,
+            "provider_name": None,
+            "model_name": None,
+            "judge_isolation": None,
+        }
+        calls.append(next_call)
+        updated[request_path] = canonical_json_bytes(request)
+        phase, terminal, result_hash = "grade_report", None, None
+    else:
+        response_by_call = {
+            cast(str, item["call_id"]): _object(
+                parse_canonical_json_bytes(
+                    updated[cast(str, item["response_artifact_path"])], location="grade response"
+                ),
+                location="grade response",
+            )
+            for item in prior
+        }
+        report_text = cast(
+            str,
+            _object(
+                _object(
+                    _v2_grade_request(envelope, baseline, label)["payload"],
+                    location="grade payload",
+                )["anonymous_report"],
+                location="report",
+            )["report_text"],
+        )
+        result_for_report = _v2_report_result(
+            baseline,
+            _object(response_by_call[f"grade-{label}-1"]["payload"], location="grade payload"),
+            _object(response_by_call[f"grade-{label}-2"]["payload"], location="grade payload"),
+            report_text,
+        )
+        report_path = f"report-results/{label}.json"
+        updated[report_path] = canonical_json_bytes(result_for_report)
+        labels = [
+            item["anonymous_label"] for item in cast(list[JsonObject], envelope["assignments"])
+        ]
+        if label == "A" and labels == ["A", "B"]:
+            request = _v2_grade_request(envelope, baseline, "B")
+            request_path = "requests/grade-B-1.json"
+            next_call = {
+                "call_id": "grade-B-1",
+                "operation": "grade_report",
+                "anonymous_label": "B",
+                "state": "pending",
+                "request_artifact_path": request_path,
+                "request_fingerprint": request["request_fingerprint"],
+                "response_artifact_path": None,
+                "response_fingerprint": None,
+                "provider_name": None,
+                "model_name": None,
+                "judge_isolation": None,
+            }
+            calls.append(next_call)
+            updated[request_path] = canonical_json_bytes(request)
+            phase, terminal, result_hash = "grade_report", None, None
+        else:
+            reports = [result_for_report]
+            if label == "B":
+                reports.insert(
+                    0,
+                    _object(
+                        parse_canonical_json_bytes(
+                            updated["report-results/A.json"], location="report A"
+                        ),
+                        location="report A",
+                    ),
+                )
+            result: JsonObject = {
+                "schema_version": _V2_PROTOCOL,
+                "rubric": _V2_RUBRIC,
+                "baseline": baseline,
+                "reports": reports,
+                "comparison": None if len(reports) == 1 else _v2_comparison(reports[0], reports[1]),
+            }
+            result["result_fingerprint"] = _sha256(canonical_json_bytes(result))
+            updated["result.json"] = canonical_json_bytes(result)
+            phase, terminal, result_hash = "completed", "completed", result["result_fingerprint"]
+    successor = _v2_manifest(
+        case_fingerprint=cast(str, manifest["case_fingerprint"]),
+        case_hash=cast(str, manifest["case_envelope_hash"]),
+        build_hash=cast(str, manifest["build_fingerprint"]),
+        rubric_hash=cast(str, manifest["rubric_fingerprint"]),
+        calls=calls,
+        files=updated,
+        phase=phase,
+        baseline_fingerprint=cast(str, baseline["baseline_fingerprint"]),
+        result_hash=cast(str | None, result_hash),
+        terminal_status=terminal,
+    )
+    with _open_run_storage(run_dir) as storage:
+        for path, data in sorted(updated.items()):
+            if path not in files:
+                storage.atomic_write(path, data, mutable=False)
+        storage.atomic_write(_V2_MANIFEST_PATH, canonical_json_bytes(successor), mutable=True)
+        storage.assert_root_identity()
+    return _v2_state(successor)
+
+
+def _v2_accept_call(call: JsonObject, response: JsonObject) -> tuple[JsonObject, str, bytes]:
+    accepted = cast(JsonObject, _copy_json(call))
+    response_path = f"responses/{call['call_id']}.json"
+    data = canonical_json_bytes(response)
+    accepted.update(
+        {
+            "state": "accepted",
+            "response_artifact_path": response_path,
+            "response_fingerprint": _sha256(data),
+            "provider_name": response["provider_name"],
+            "model_name": response["model_name"],
+            "judge_isolation": response["judge_isolation"],
+        }
+    )
+    return accepted, response_path, data
+
+
+def _v2_commit_source_audit_full(run_dir: Path, response: JsonObject) -> JsonObject:
+    manifest, files = _v2_verified(run_dir)
+    pending = [
+        call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"
+    ]
+    if len(pending) != 1 or pending[0]["operation"] != "source_audit":
+        raise PortableEvaluationInputError("source audit is not pending")
+    envelope = _object(
+        parse_canonical_json_bytes(files[_V2_CASE_PATH], location=_V2_CASE_PATH),
+        location=_V2_CASE_PATH,
+    )
+    review_response = _object(
+        parse_canonical_json_bytes(files["responses/source-review.json"], location="source review"),
+        location="source review",
+    )
+    review = _object(review_response["payload"], location="source review")
+    audit = _portable_v2_source_audit(response["payload"])
+    call, response_path, response_bytes = _v2_accept_call(pending[0], response)
+    calls = [
+        *(
+            [
+                item
+                for item in cast(list[JsonObject], manifest["calls"])
+                if item["state"] == "accepted"
+            ]
+        ),
+        call,
+    ]
+    updated = dict(files)
+    updated[response_path] = response_bytes
+    disputes = _v2_disputes(review, audit)
+    if disputes:
+        request = _v2_source_referee_request(envelope, disputes)
+        request_path = "requests/source-referee.json"
+        next_call: JsonObject = {
+            "call_id": "source-referee",
+            "operation": "source_referee",
+            "anonymous_label": None,
+            "state": "pending",
+            "request_artifact_path": request_path,
+            "request_fingerprint": request["request_fingerprint"],
+            "response_artifact_path": None,
+            "response_fingerprint": None,
+            "provider_name": None,
+            "model_name": None,
+            "judge_isolation": None,
+        }
+        calls.append(next_call)
+        updated[request_path] = canonical_json_bytes(request)
+        phase, baseline_fingerprint = "source_referee", None
+    else:
+        baseline = _v2_compile_baseline(envelope, review, audit)
+        request = _v2_grade_request(envelope, baseline, "A")
+        request_path = "requests/grade-A-1.json"
+        next_call = {
+            "call_id": "grade-A-1",
+            "operation": "grade_report",
+            "anonymous_label": "A",
+            "state": "pending",
+            "request_artifact_path": request_path,
+            "request_fingerprint": request["request_fingerprint"],
+            "response_artifact_path": None,
+            "response_fingerprint": None,
+            "provider_name": None,
+            "model_name": None,
+            "judge_isolation": None,
+        }
+        calls.append(next_call)
+        updated.update(
+            {
+                "baseline.json": canonical_json_bytes(baseline),
+                request_path: canonical_json_bytes(request),
+            }
+        )
+        phase, baseline_fingerprint = "grade_report", baseline["baseline_fingerprint"]
+    successor = _v2_manifest(
+        case_fingerprint=cast(str, manifest["case_fingerprint"]),
+        case_hash=cast(str, manifest["case_envelope_hash"]),
+        build_hash=cast(str, manifest["build_fingerprint"]),
+        rubric_hash=cast(str, manifest["rubric_fingerprint"]),
+        calls=calls,
+        files=updated,
+        phase=phase,
+        baseline_fingerprint=cast(str | None, baseline_fingerprint),
+    )
+    with _open_run_storage(run_dir) as storage:
+        for path, data in sorted(updated.items()):
+            if path not in files:
+                storage.atomic_write(path, data, mutable=False)
+        storage.atomic_write(_V2_MANIFEST_PATH, canonical_json_bytes(successor), mutable=True)
+        storage.assert_root_identity()
+    return _v2_state(successor)
+
+
+def _v2_commit_source_referee(run_dir: Path, response: JsonObject) -> JsonObject:
+    manifest, files = _v2_verified(run_dir)
+    pending = [
+        call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"
+    ]
+    if len(pending) != 1 or pending[0]["operation"] != "source_referee":
+        raise PortableEvaluationInputError("source referee is not pending")
+    envelope = _object(
+        parse_canonical_json_bytes(files[_V2_CASE_PATH], location=_V2_CASE_PATH),
+        location=_V2_CASE_PATH,
+    )
+    review = _object(
+        _object(
+            parse_canonical_json_bytes(
+                files["responses/source-review.json"], location="source review"
+            ),
+            location="source review",
+        )["payload"],
+        location="source review",
+    )
+    audit = _object(
+        _object(
+            parse_canonical_json_bytes(
+                files["responses/source-audit.json"], location="source audit"
+            ),
+            location="source audit",
+        )["payload"],
+        location="source audit",
+    )
+    baseline = _v2_compile_baseline(
+        envelope, review, audit, _portable_v2_source_referee(response["payload"])
+    )
+    request = _v2_grade_request(envelope, baseline, "A")
+    call, response_path, response_bytes = _v2_accept_call(pending[0], response)
+    next_call: JsonObject = {
+        "call_id": "grade-A-1",
+        "operation": "grade_report",
+        "anonymous_label": "A",
+        "state": "pending",
+        "request_artifact_path": "requests/grade-A-1.json",
+        "request_fingerprint": request["request_fingerprint"],
+        "response_artifact_path": None,
+        "response_fingerprint": None,
+        "provider_name": None,
+        "model_name": None,
+        "judge_isolation": None,
+    }
+    calls = [
+        *(
+            [
+                item
+                for item in cast(list[JsonObject], manifest["calls"])
+                if item["state"] == "accepted"
+            ]
+        ),
+        call,
+        next_call,
+    ]
+    updated = dict(files)
+    updated.update(
+        {
+            response_path: response_bytes,
+            "baseline.json": canonical_json_bytes(baseline),
+            "requests/grade-A-1.json": canonical_json_bytes(request),
+        }
+    )
+    successor = _v2_manifest(
+        case_fingerprint=cast(str, manifest["case_fingerprint"]),
+        case_hash=cast(str, manifest["case_envelope_hash"]),
+        build_hash=cast(str, manifest["build_fingerprint"]),
+        rubric_hash=cast(str, manifest["rubric_fingerprint"]),
+        calls=calls,
+        files=updated,
+        phase="grade_report",
+        baseline_fingerprint=cast(str, baseline["baseline_fingerprint"]),
+    )
+    with _open_run_storage(run_dir) as storage:
+        for path, data in sorted(updated.items()):
+            if path not in files:
+                storage.atomic_write(path, data, mutable=False)
+        storage.atomic_write(_V2_MANIFEST_PATH, canonical_json_bytes(successor), mutable=True)
+        storage.assert_root_identity()
+    return _v2_state(successor)
+
+
+def preflight_judge_response(  # type: ignore[no-redef]
+    run_dir: Path, response_value: object
+) -> JsonObject:
+    protocol = _v2_protocol(run_dir)
+    if protocol == _V2_PROTOCOL:
+        try:
+            request = next_judge_request(run_dir)
+            if request is None:
+                raise PortableEvaluationInputError("no pending evaluator request")
+            _v2_response(response_value, request)
+        except (EvaluationIntegrityError, PortableEvaluationInputError, TypeError, ValueError):
+            return {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]}
+        return {"valid": True, "diagnostics": []}
+    if protocol == "1.3":
+        raise PortableEvaluationInputError("Protocol 1.3 evaluation runs are read-only.")
+    raise EvaluationIntegrityError("EVALUATOR_V2_PROTOCOL_UNSUPPORTED")
+
+
+def guarded_submit_judge_response(  # type: ignore[no-redef]
+    run_dir: Path, response_value: object
+) -> JsonObject:
+    protocol = _v2_protocol(run_dir)
+    if protocol == _V2_PROTOCOL:
+        preflight = preflight_judge_response(run_dir, response_value)
+        if not preflight["valid"]:
+            return {"accepted": False, "preflight": preflight}
+        try:
+            response = _v2_response(response_value, cast(JsonObject, next_judge_request(run_dir)))
+            if response["operation"] == "source_review":
+                state = _v2_commit_source_review(run_dir, response)
+            elif response["operation"] == "source_audit":
+                state = _v2_commit_source_audit_full(run_dir, response)
+            elif response["operation"] == "source_referee":
+                state = _v2_commit_source_referee(run_dir, response)
+            elif response["operation"] == "grade_report":
+                state = _v2_commit_grade(run_dir, response)
+            else:
+                raise PortableEvaluationInputError(
+                    "evaluator response has an unsupported operation"
+                )
+        except (
+            EvaluationIntegrityError,
+            PortableEvaluationInputError,
+            TypeError,
+            ValueError,
+            KeyError,
+        ):
+            return {
+                "accepted": False,
+                "preflight": {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]},
+            }
+        return {"accepted": True, "preflight": preflight, "state": state}
+    if protocol == "1.3":
+        raise PortableEvaluationInputError("Protocol 1.3 evaluation runs are read-only.")
+    return _guarded_submit_judge_response_v1(run_dir, response_value)
+
+
+def submit_judge_response(run_dir: Path, response_value: object) -> JsonObject:  # type: ignore[no-redef]
+    protocol = _v2_protocol(run_dir)
+    if protocol == _V2_PROTOCOL:
+        preflight = preflight_judge_response(run_dir, response_value)
+        if not preflight["valid"]:
+            raise PortableEvaluationInputError("MECHANICAL_RESPONSE_INVALID")
+        guarded = guarded_submit_judge_response(run_dir, response_value)
+        if not guarded["accepted"]:
+            raise PortableEvaluationInputError("MECHANICAL_RESPONSE_INVALID")
+        return cast(JsonObject, guarded["state"])
+    if protocol == "1.3":
+        raise PortableEvaluationInputError("Protocol 1.3 evaluation runs are read-only.")
+    return _submit_judge_response_v1(run_dir, response_value)
+
+
+def verify_evaluation_run(run_dir: Path) -> EvaluationVerification:  # type: ignore[no-redef]
+    protocol = _v2_protocol(run_dir)
+    if protocol == _V2_PROTOCOL:
+        try:
+            manifest, _ = _v2_verified(run_dir)
+        except EvaluationIntegrityError:
+            return EvaluationVerification(False, ("EVALUATION_INTEGRITY_INVALID",), None)
+        return EvaluationVerification(True, (), cast(str, manifest["manifest_fingerprint"]))
+    if protocol in {"1.3", None}:
+        return _verify_evaluation_run_v1(run_dir)
+    return EvaluationVerification(False, ("EVALUATION_PROTOCOL_UNSUPPORTED",), None)
+
+
+def stop_evaluation_v2_inconclusive(run_dir: Path, reason: str) -> JsonObject:
+    if reason != "MECHANICAL_RESPONSE_INVALID":
+        raise PortableEvaluationInputError("unsupported inconclusive reason")
+    manifest, files = _v2_verified(run_dir)
+    if manifest["terminal_status"] is not None:
+        raise PortableEvaluationInputError("evaluation run is already terminal")
+    calls = [
+        call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "accepted"
+    ]
+    updated = dict(files)
+    updated["terminal-reason.json"] = canonical_json_bytes({"reason": reason})
+    successor = _v2_manifest(
+        case_fingerprint=cast(str, manifest["case_fingerprint"]),
+        case_hash=cast(str, manifest["case_envelope_hash"]),
+        build_hash=cast(str, manifest["build_fingerprint"]),
+        rubric_hash=cast(str, manifest["rubric_fingerprint"]),
+        calls=calls,
+        files=updated,
+        phase="inconclusive",
+        baseline_fingerprint=cast(str | None, manifest["baseline_fingerprint"]),
+        result_hash=None,
+        terminal_status="inconclusive",
+    )
+    with _open_run_storage(run_dir) as storage:
+        storage.atomic_write("terminal-reason.json", updated["terminal-reason.json"], mutable=False)
+        storage.atomic_write(_V2_MANIFEST_PATH, canonical_json_bytes(successor), mutable=True)
+        storage.assert_root_identity()
+    return _v2_state(successor)
+
+
+# Protocol 2.1 portable mirror
+_V21_PROTOCOL = "2.1"
+_V21_BUILD = {"protocol_version": "2.1", "compiler_version": "semantic-compiler-v2.1"}
+_V21_RUBRIC: JsonObject = {
+    "version": "attorney-eval-v2.1",
+    "importance_weights": {"critical": 3, "material": 2, "supporting": 1},
+    "critical_recall_floor": 1.0,
+    "weighted_coverage_floor": 0.9,
+    "material_unsupported_assertions_allowed": 0,
+}
+_V21_SOURCE_REVIEW_INSTRUCTIONS = _V2_SOURCE_REVIEW_INSTRUCTIONS
+_V21_SOURCE_AUDIT_INSTRUCTIONS = _V2_SOURCE_AUDIT_INSTRUCTIONS
+_V21_INNER_PAYLOAD_INSTRUCTIONS = _V2_INNER_PAYLOAD_INSTRUCTIONS
+
+
+def _v21_semantic_schema(source: JsonObject, *, title: str, description: str) -> JsonObject:
+    schema = cast(JsonObject, _copy_json(source))
+    version = _object(schema["properties"], location="v2.1 schema")["schema_version"]
+    version_object = _object(version, location="v2.1 version schema")
+    version_object["const"] = _V21_PROTOCOL
+    version_object["default"] = _V21_PROTOCOL
+    schema["title"] = title
+    schema["description"] = description
+    return schema
+
+
+_V21_SOURCE_REVIEW_SCHEMA = _v21_semantic_schema(
+    _V2_SOURCE_REVIEW_SCHEMA,
+    title="SourceReviewV21",
+    description="Protocol-2.1 wrapper with the unchanged source-review semantics.",
+)
+_V21_SOURCE_AUDIT_SCHEMA = _v21_semantic_schema(
+    _V2_SOURCE_AUDIT_SCHEMA,
+    title="SourceAuditV21",
+    description="Protocol-2.1 wrapper with the unchanged source-audit semantics.",
+)
+_V21_ORDINARY_GRADE_INSTRUCTIONS = (
+    "Grade only the supplied canonical requirement subset against the supplied report and "
+    "source context. Resolve every report passage exactly and return only the bounded grade fragment."
+)
+_V21_SOURCE_REFEREE_INSTRUCTIONS = (
+    "Resolve the one supplied material dispute using only its controller-resolved evidence. "
+    "Return the required source-grounded decision and rationale."
+)
+_V21_CONTESTED_GRADE_INSTRUCTIONS = (
+    "Grade both supplied alternatives for exactly one contested requirement against the "
+    "supplied report and source context. Return only the isolated contested grade fragment."
+)
+_V21_REFEREE_SCHEMA: JsonObject = {
+    "$defs": {
+        "RefereeUnresolvedReasonV21": {
+            "enum": [
+                "SOURCE_AMBIGUITY", "SOURCE_CONFLICT", "SOURCE_GAP",
+                "BOTH_POSITIONS_UNSUPPORTED",
+            ],
+            "title": "RefereeUnresolvedReasonV21", "type": "string",
+        }
+    },
+    "additionalProperties": False,
+    "properties": {
+        "schema_version": {
+            "const": "2.1", "default": "2.1", "title": "Schema Version", "type": "string",
+        },
+        "decision": {
+            "enum": ["accept_reviewer", "accept_auditor", "unresolved"],
+            "title": "Decision", "type": "string",
+        },
+        "unresolved_reason": {
+            "anyOf": [
+                {"$ref": "#/$defs/RefereeUnresolvedReasonV21"}, {"type": "null"}
+            ],
+            "default": None,
+        },
+        "evidence_refs": {
+            "items": {"pattern": "^EVID-[0-9]{4}$", "type": "string"},
+            "maxItems": 128, "minItems": 1, "title": "Evidence Refs", "type": "array",
+        },
+        "rationale": {"title": "Rationale", "type": "string"},
+    },
+    "required": ["decision", "evidence_refs", "rationale"],
+    "title": "RefereeDecisionV21", "type": "object",
+}
+_V21_CONTESTED_GRADE_SCHEMA: JsonObject = {
+    "$defs": {
+        "AmbiguityDispositionV21": {
+            "enum": ["acknowledged", "overstated", "omitted", "uncertain"],
+            "title": "AmbiguityDispositionV21", "type": "string",
+        },
+        "ContestedAlternativeGradeV21": {
+            "additionalProperties": False,
+            "properties": {
+                "disposition": {"$ref": "#/$defs/ContestedDispositionV21"},
+                "report_passages": {
+                    "items": {"type": "string"}, "maxItems": 128,
+                    "title": "Report Passages", "type": "array",
+                },
+                "rationale": {"title": "Rationale", "type": "string"},
+            },
+            "required": ["disposition", "report_passages", "rationale"],
+            "title": "ContestedAlternativeGradeV21", "type": "object",
+        },
+        "ContestedDispositionV21": {
+            "enum": ["met", "partially_met", "not_met", "uncertain"],
+            "title": "ContestedDispositionV21", "type": "string",
+        },
+    },
+    "additionalProperties": False,
+    "properties": {
+        "schema_version": {
+            "const": "2.1", "default": "2.1", "title": "Schema Version", "type": "string",
+        },
+        "anonymous_label": {"enum": ["A", "B"], "title": "Anonymous Label", "type": "string"},
+        "grader_lane": {"enum": [1, 2], "title": "Grader Lane", "type": "integer"},
+        "contested_requirement_id": {"title": "Contested Requirement Id", "type": "string"},
+        "baseline_fingerprint": {"pattern": "^[0-9a-f]{64}$", "title": "Baseline Fingerprint", "type": "string"},
+        "report_fingerprint": {"pattern": "^[0-9a-f]{64}$", "title": "Report Fingerprint", "type": "string"},
+        "reviewer_alternative_grade": {"$ref": "#/$defs/ContestedAlternativeGradeV21"},
+        "auditor_alternative_grade": {"$ref": "#/$defs/ContestedAlternativeGradeV21"},
+        "ambiguity_disposition": {"$ref": "#/$defs/AmbiguityDispositionV21"},
+        "rationale": {"title": "Rationale", "type": "string"},
+    },
+    "required": [
+        "anonymous_label", "grader_lane", "contested_requirement_id",
+        "baseline_fingerprint", "report_fingerprint", "reviewer_alternative_grade",
+        "auditor_alternative_grade", "ambiguity_disposition", "rationale",
+    ],
+    "title": "ContestedGradeFragmentV21", "type": "object",
+}
+_V21_ORDINARY_GRADE_SCHEMA: JsonObject = {
+    "$defs": {"RequirementGradeV2": cast(JsonObject, _copy_json(_V2_GRADE_SCHEMA["$defs"]))["RequirementGradeV2"]},
+    "additionalProperties": False,
+    "properties": {
+        "schema_version": {"const": "2.1", "default": "2.1", "title": "Schema Version", "type": "string"},
+        "anonymous_label": {"enum": ["A", "B"], "title": "Anonymous Label", "type": "string"},
+        "grader_lane": {"enum": [1, 2], "title": "Grader Lane", "type": "integer"},
+        "batch_ref": {"pattern": "^GB-[AB]-[12]-[0-9]{4}$", "title": "Batch Ref", "type": "string"},
+        "baseline_fingerprint": {"pattern": "^[0-9a-f]{64}$", "title": "Baseline Fingerprint", "type": "string"},
+        "report_fingerprint": {"pattern": "^[0-9a-f]{64}$", "title": "Report Fingerprint", "type": "string"},
+        "requirement_grades": {"items": {"$ref": "#/$defs/RequirementGradeV2"}, "maxItems": 5, "minItems": 1, "title": "Requirement Grades", "type": "array"},
+        "rationale": {"title": "Rationale", "type": "string"},
+    },
+    "required": ["anonymous_label", "grader_lane", "batch_ref", "baseline_fingerprint", "report_fingerprint", "requirement_grades", "rationale"],
+    "title": "OrdinaryGradeFragmentV21",
+    "type": "object",
+}
+
+
+def _v21_request_fingerprint(request: JsonObject) -> str:
+    payload = cast(JsonObject, _copy_json(request))
+    payload.pop("request_fingerprint")
+    return _sha256(canonical_json_bytes(payload))
+
+
+def _v21_source_review_request(envelope: JsonObject) -> JsonObject:
+    source_record = _v2_source_record(envelope)
+    request: JsonObject = {
+        "schema_version": _V21_PROTOCOL,
+        "operation": "source_review",
+        "request_fingerprint": "0" * 64,
+        "system_instructions": (
+            _V21_SOURCE_REVIEW_INSTRUCTIONS + _V21_INNER_PAYLOAD_INSTRUCTIONS
+        ),
+        "json_schema": _V21_SOURCE_REVIEW_SCHEMA,
+        "payload": {"source_record": source_record},
+        "safe_metadata": {
+            "record_scope": "source-only",
+            "source_record_fingerprint": _sha256(canonical_json_bytes(source_record)),
+        },
+    }
+    request["request_fingerprint"] = _v21_request_fingerprint(request)
+    return request
+
+
+def _v21_source_audit_request(envelope: JsonObject, review: JsonObject) -> JsonObject:
+    indexed = [
+        {"proposal_ref": f"P{index:04d}", "proposal": proposal}
+        for index, proposal in enumerate(cast(list[object], review["proposals"]), start=1)
+    ]
+    source_record = _v2_source_record(envelope)
+    request: JsonObject = {
+        "schema_version": _V21_PROTOCOL,
+        "operation": "source_audit",
+        "request_fingerprint": "0" * 64,
+        "system_instructions": (
+            _V21_SOURCE_AUDIT_INSTRUCTIONS + _V21_INNER_PAYLOAD_INSTRUCTIONS
+        ),
+        "json_schema": _V21_SOURCE_AUDIT_SCHEMA,
+        "payload": {"source_record": source_record, "indexed_proposals": indexed},
+        "safe_metadata": {
+            "record_scope": "source-only",
+            "source_record_fingerprint": _sha256(canonical_json_bytes(source_record)),
+        },
+    }
+    request["request_fingerprint"] = _v21_request_fingerprint(request)
+    return request
+
+
+def _v21_compile_common_baseline(envelope: JsonObject, review: JsonObject) -> JsonObject:
+    legacy = _v2_compile_baseline(envelope, review)
+    payload: JsonObject = {
+        "schema_version": "2.1",
+        "case_fingerprint": legacy["case_fingerprint"],
+        "requirements": legacy["requirements"],
+        "relationships": legacy["relationships"],
+        "contested_requirements": [],
+    }
+    payload["baseline_fingerprint"] = _sha256(canonical_json_bytes(payload))
+    return payload
+
+
+def _v21_resolved_requirement(
+    envelope: JsonObject, proposal: JsonObject, requirement_id: str, order: int
+) -> JsonObject:
+    source_texts = {
+        cast(str, item["source_id"]): cast(str, item["normalized_text"])
+        for item in cast(
+            list[JsonObject], _object(envelope["case"], location="case")["sources"]
+        )
+    }
+    passages: list[JsonObject] = []
+    for item in cast(list[JsonObject], proposal["passages"]):
+        source_id = cast(str, item["source_id"])
+        quote = cast(str, item["quote"])
+        text = source_texts.get(source_id)
+        if text is None or text.count(quote) != 1:
+            raise PortableEvaluationInputError("semantic passage is absent or ambiguous")
+        start = text.index(quote)
+        passages.append(
+            {
+                "source_id": source_id, "start_char": start,
+                "end_char": start + len(quote), "quote": quote,
+            }
+        )
+    passages.sort(
+        key=lambda item: (
+            item["source_id"], item["start_char"], item["end_char"], item["quote"]
+        )
+    )
+    return {
+        "requirement_id": requirement_id, "canonical_order": order,
+        "statement": proposal["statement"], "kind": proposal["kind"],
+        "importance": proposal["importance"], "passages": passages,
+        "dependency": proposal["dependency"], "confidence": proposal["confidence"],
+        "rationale": proposal["rationale"],
+    }
+
+
+def _v21_disputes(
+    envelope: JsonObject, review: JsonObject, audit: JsonObject
+) -> list[JsonObject]:
+    material = _v2_disputes(review, audit)
+    resolved: list[tuple[JsonObject, list[JsonObject]]] = []
+    for dispute in material:
+        raw_passages: list[JsonObject] = []
+        reviewer = dispute["reviewer_proposal"]
+        concern = _object(dispute["audit_concern"], location="audit concern")
+        proposals = [reviewer, concern.get("correction")]
+        for proposal in proposals:
+            if proposal is not None:
+                raw_passages.extend(cast(list[JsonObject], cast(JsonObject, proposal)["passages"]))
+        raw_passages.extend(cast(list[JsonObject], concern["passages"]))
+        unique: dict[tuple[str, int, int, str], JsonObject] = {}
+        for passage in raw_passages:
+            resolved_requirement = _v21_resolved_requirement(
+                envelope,
+                {
+                    "statement": "evidence", "kind": "gap", "importance": "supporting",
+                    "passages": [passage], "dependency": None, "confidence": "clear",
+                    "rationale": "evidence",
+                },
+                "REQ-0001", 0,
+            )
+            resolved_passage = cast(
+                list[JsonObject], resolved_requirement["passages"]
+            )[0]
+            checked = resolved_passage
+            key = (
+                cast(str, checked["source_id"]), cast(int, checked["start_char"]),
+                cast(int, checked["end_char"]), cast(str, checked["quote"]),
+            )
+            unique[key] = checked
+        passages = [unique[key] for key in sorted(unique)]
+        resolved.append((dispute, passages))
+    evidence_order = sorted(
+        (
+            cast(str, passage["source_id"]), cast(int, passage["start_char"]),
+            cast(int, passage["end_char"]), cast(str, passage["quote"]),
+            cast(str, dispute["dispute_id"]),
+        )
+        for dispute, passages in resolved for passage in passages
+    )
+    references = {
+        (dispute_id, source_id, start, end, quote): f"EVID-{index:04d}"
+        for index, (source_id, start, end, quote, dispute_id) in enumerate(
+            evidence_order, start=1
+        )
+    }
+    result: list[JsonObject] = []
+    for dispute, passages in resolved:
+        evidence = [
+            {
+                "evidence_ref": references[
+                    (
+                        cast(str, dispute["dispute_id"]), cast(str, item["source_id"]),
+                        cast(int, item["start_char"]), cast(int, item["end_char"]),
+                        cast(str, item["quote"]),
+                    )
+                ],
+                "passage": item,
+            }
+            for item in passages
+        ]
+        body: JsonObject = {
+            "schema_version": "2.1", "case_fingerprint": envelope["case_fingerprint"],
+            "dispute_id": dispute["dispute_id"], "material_dispute": dispute,
+            "evidence": evidence,
+        }
+        result.append(
+            {
+                "case_fingerprint": envelope["case_fingerprint"],
+                "dispute_fingerprint": _sha256(canonical_json_bytes(body)),
+                "dispute_id": dispute["dispute_id"], "material_dispute": dispute,
+                "evidence": evidence,
+            }
+        )
+    return result
+
+
+def _v21_referee_request(envelope: JsonObject, dispute: JsonObject) -> JsonObject:
+    request: JsonObject = {
+        "schema_version": "2.1", "operation": "source_referee_fragment",
+        "request_fingerprint": "0" * 64,
+        "system_instructions": _V21_SOURCE_REFEREE_INSTRUCTIONS + _V21_INNER_PAYLOAD_INSTRUCTIONS,
+        "json_schema": _V21_REFEREE_SCHEMA,
+        "payload": {"material_disputes": [dispute]},
+        "safe_metadata": {
+            "record_scope": "one-source-referee-dispute",
+            "case_fingerprint": envelope["case_fingerprint"],
+            "dispute_id": dispute["dispute_id"],
+            "dispute_fingerprint": dispute["dispute_fingerprint"],
+        },
+    }
+    request["request_fingerprint"] = _v21_request_fingerprint(request)
+    return request
+
+
+def _v21_referee_call(request: JsonObject) -> JsonObject:
+    dispute = cast(JsonObject, cast(list[object], cast(JsonObject, request["payload"])["material_disputes"])[0])
+    dispute_id = cast(str, dispute["dispute_id"])
+    call_id = f"source-referee-{dispute_id}"
+    return _v21_call(
+        call_id, "source_referee_fragment", f"requests/{call_id}.json",
+        request["request_fingerprint"], dispute_id=dispute_id,
+    )
+
+
+def _v21_disputed_baseline(
+    envelope: JsonObject, review: JsonObject, audit: JsonObject,
+    disputes: list[JsonObject], fragments: list[JsonObject],
+) -> JsonObject:
+    material = _v2_disputes(review, audit)
+    decisions = {
+        cast(str, item["dispute_id"]): cast(JsonObject, item["decision"])
+        for item in fragments
+    }
+    proposals = list(cast(list[JsonObject], review["proposals"]))
+    replacements: dict[str, JsonObject] = {}
+    removed: set[str] = set()
+    additions: list[JsonObject] = []
+    contested: list[JsonObject] = []
+    for index, (item, _dispute) in enumerate(zip(material, disputes, strict=True), start=1):
+        decision = decisions[cast(str, item["dispute_id"])]
+        concern = cast(JsonObject, item["audit_concern"])
+        target = cast(str | None, item["target_proposal_ref"])
+        correction = cast(JsonObject | None, concern["correction"])
+        if decision["decision"] == "accept_auditor":
+            if target is not None:
+                removed.add(target)
+                if correction is not None:
+                    replacements[target] = correction
+            elif correction is not None:
+                additions.append(correction)
+        elif decision["decision"] == "unresolved":
+            if target is not None:
+                removed.add(target)
+            reviewer = cast(JsonObject | None, item["reviewer_proposal"])
+            contested.append(
+                {
+                    "contested_requirement_id": f"CONT-{len(contested) + 1:04d}",
+                    "reviewer_alternative": None if reviewer is None else _v21_resolved_requirement(envelope, reviewer, "REQ-0001", 0),
+                    "auditor_alternative": None if correction is None else _v21_resolved_requirement(envelope, correction, "REQ-0002", 1),
+                    "unresolved_reason": decision["unresolved_reason"],
+                    "rationale": decision["rationale"],
+                    "referee_fragment_fingerprint": fragments[index - 1]["response_fingerprint"],
+                }
+            )
+    common = [
+        replacements.get(f"P{index:04d}", proposal)
+        for index, proposal in enumerate(proposals, start=1)
+        if f"P{index:04d}" not in removed or f"P{index:04d}" in replacements
+    ] + additions
+    legacy = _v2_compile_baseline(
+        envelope, {"schema_version": "2.0", "proposals": common}
+    )
+    body: JsonObject = {
+        "schema_version": "2.1", "case_fingerprint": envelope["case_fingerprint"],
+        "requirements": legacy["requirements"], "relationships": legacy["relationships"],
+        "contested_requirements": contested,
+    }
+    body["baseline_fingerprint"] = _sha256(canonical_json_bytes(body))
+    return body
+
+
+def _v21_labels(envelope: JsonObject) -> list[str]:
+    return [cast(str, item["anonymous_label"]) for item in cast(list[JsonObject], envelope["assignments"])]
+
+
+def _v21_batches(baseline: JsonObject, labels: list[str]) -> list[JsonObject]:
+    ids = [cast(str, item["requirement_id"]) for item in cast(list[JsonObject], baseline["requirements"])]
+    return [
+        {"batch_ref": f"GB-{label}-{lane}-{index // 5 + 1:04d}", "requirement_ids": ids[index:index + 5]}
+        for label in labels for lane in (1, 2) for index in range(0, len(ids), 5)
+    ]
+
+
+def _v21_report(envelope: JsonObject, label: str) -> JsonObject:
+    assignment = next(item for item in cast(list[JsonObject], envelope["assignments"]) if item["anonymous_label"] == label)
+    case = _object(envelope["case"], location="case")
+    return next(item for item in cast(list[JsonObject], case["candidates"]) if item["candidate_id"] == assignment["candidate_id"])
+
+
+def _v21_ordinary_request(
+    envelope: JsonObject, baseline: JsonObject, batch: JsonObject
+) -> JsonObject:
+    ref = cast(str, batch["batch_ref"])
+    label, lane = ref[3], int(ref[5])
+    report = _v21_report(envelope, label)
+    requirements = {item["requirement_id"]: item for item in cast(list[JsonObject], baseline["requirements"])}
+    source_context = {
+        cast(str, item["source_id"]): cast(str, item["normalized_text"])
+        for item in cast(list[JsonObject], _object(envelope["case"], location="case")["sources"])
+    }
+    payload: JsonObject = {
+        "anonymous_label": label,
+        "grader_lane": lane,
+        "batch_ref": ref,
+        "baseline_fingerprint": baseline["baseline_fingerprint"],
+        "requirements": [requirements[item] for item in cast(list[str], batch["requirement_ids"])],
+        "report_text": report["report_text"],
+        "report_fingerprint": report["report_hash"],
+        "source_context": source_context,
+        "rubric": _V21_RUBRIC,
+    }
+    request: JsonObject = {
+        "schema_version": "2.1", "operation": "ordinary_grade_fragment",
+        "request_fingerprint": "0" * 64,
+        "system_instructions": _V21_ORDINARY_GRADE_INSTRUCTIONS + _V21_INNER_PAYLOAD_INSTRUCTIONS,
+        "json_schema": _V21_ORDINARY_GRADE_SCHEMA,
+        "payload": payload,
+        "safe_metadata": {"record_scope": "one-ordinary-grade-batch", "baseline_fingerprint": baseline["baseline_fingerprint"], "batch_ref": ref},
+    }
+    request["request_fingerprint"] = _v21_request_fingerprint(request)
+    return request
+
+
+def _v21_contested_request(
+    envelope: JsonObject, baseline: JsonObject, contested: JsonObject,
+    label: str, lane: int,
+) -> JsonObject:
+    report = _v21_report(envelope, label)
+    source_context = {
+        cast(str, item["source_id"]): cast(str, item["normalized_text"])
+        for item in cast(
+            list[JsonObject], _object(envelope["case"], location="case")["sources"]
+        )
+    }
+    payload: JsonObject = {
+        "anonymous_label": label, "grader_lane": lane,
+        "baseline_fingerprint": baseline["baseline_fingerprint"],
+        "contested_requirement": contested, "report_text": report["report_text"],
+        "report_fingerprint": report["report_hash"], "source_context": source_context,
+        "rubric": _V21_RUBRIC,
+    }
+    request: JsonObject = {
+        "schema_version": "2.1", "operation": "contested_grade_fragment",
+        "request_fingerprint": "0" * 64,
+        "system_instructions": _V21_CONTESTED_GRADE_INSTRUCTIONS + _V21_INNER_PAYLOAD_INSTRUCTIONS,
+        "json_schema": _V21_CONTESTED_GRADE_SCHEMA, "payload": payload,
+        "safe_metadata": {
+            "record_scope": "one-contested-grade-requirement",
+            "baseline_fingerprint": baseline["baseline_fingerprint"],
+            "contested_requirement_id": contested["contested_requirement_id"],
+        },
+    }
+    request["request_fingerprint"] = _v21_request_fingerprint(request)
+    return request
+
+
+def _v21_grade_call(request: JsonObject) -> JsonObject:
+    payload = _object(request["payload"], location="grade payload")
+    label = cast(str, payload["anonymous_label"])
+    lane = cast(int, payload["grader_lane"])
+    if request["operation"] == "ordinary_grade_fragment":
+        ref = cast(str, payload["batch_ref"])
+        call_id = f"grade-{label}-lane{lane}-batch{ref[-4:]}"
+        return _v21_call(
+            call_id, "ordinary_grade_fragment", f"requests/{call_id}.json",
+            request["request_fingerprint"], label=label, lane=lane, batch_ref=ref,
+        )
+    contested = _object(payload["contested_requirement"], location="contested requirement")
+    contested_id = cast(str, contested["contested_requirement_id"])
+    call_id = f"grade-{label}-lane{lane}-contested-{contested_id}"
+    return _v21_call(
+        call_id, "contested_grade_fragment", f"requests/{call_id}.json",
+        request["request_fingerprint"], label=label, lane=lane,
+        contested_id=contested_id,
+    )
+
+
+def _v21_grade_steps(
+    baseline: JsonObject, labels: list[str], batches: list[JsonObject]
+) -> list[tuple[str, str, int, JsonObject]]:
+    steps: list[tuple[str, str, int, JsonObject]] = []
+    contested = cast(list[JsonObject], baseline["contested_requirements"])
+    for label in labels:
+        for lane in (1, 2):
+            steps.extend(
+                ("ordinary_grade_fragment", label, lane, batch)
+                for batch in batches
+                if cast(str, batch["batch_ref"]).startswith(f"GB-{label}-{lane}-")
+            )
+            steps.extend(
+                ("contested_grade_fragment", label, lane, item) for item in contested
+            )
+    return steps
+
+
+def _v21_request_for_step(
+    envelope: JsonObject, baseline: JsonObject,
+    step: tuple[str, str, int, JsonObject],
+) -> JsonObject:
+    operation, label, lane, item = step
+    if operation == "ordinary_grade_fragment":
+        return _v21_ordinary_request(envelope, baseline, item)
+    return _v21_contested_request(envelope, baseline, item, label, lane)
+
+
+def _v21_call(
+    call_id: str,
+    operation: str,
+    request_path: str,
+    request_fingerprint: object,
+    *,
+    label: str | None = None,
+    lane: int | None = None,
+    dispute_id: str | None = None,
+    batch_ref: str | None = None,
+    contested_id: str | None = None,
+) -> JsonObject:
+    return {
+        "call_id": call_id,
+        "operation": operation,
+        "state": "pending",
+        "attempt": 1,
+        "request_artifact_path": request_path,
+        "request_fingerprint": request_fingerprint,
+        "response_artifact_path": None,
+        "response_fingerprint": None,
+        "provider_name": None,
+        "model_name": None,
+        "judge_isolation": None,
+        "anonymous_label": label,
+        "grader_lane": lane,
+        "dispute_id": dispute_id,
+        "batch_ref": batch_ref,
+        "contested_requirement_id": contested_id,
+    }
+
+
+def _v21_manifest(
+    prior: JsonObject | None,
+    *,
+    case_fingerprint: str,
+    case_hash: str,
+    build_hash: str,
+    rubric_hash: str,
+    calls: list[JsonObject],
+    files: Mapping[str, bytes],
+    phase: str,
+    baseline_fingerprint: str | None = None,
+    referee_fingerprint: str | None = None,
+    aggregate_fingerprints: list[str] | None = None,
+    sensitivity_fingerprints: list[str] | None = None,
+    result_hash: str | None = None,
+    terminal_status: str | None = None,
+    disputes: list[JsonObject] | None = None,
+    batches: list[JsonObject] | None = None,
+) -> JsonObject:
+    manifest: JsonObject = {
+        "protocol_version": _V21_PROTOCOL,
+        "case_fingerprint": case_fingerprint,
+        "case_envelope_hash": case_hash,
+        "build_fingerprint": build_hash,
+        "rubric_fingerprint": rubric_hash,
+        "compiler_version": "semantic-compiler-v2.1",
+        "baseline_fingerprint": baseline_fingerprint,
+        "referee_aggregate_fingerprint": referee_fingerprint,
+        "grader_aggregate_fingerprints": aggregate_fingerprints or [],
+        "sensitivity_fingerprints": sensitivity_fingerprints or [],
+        "result_hash": result_hash,
+        "phase": phase,
+        "terminal_status": terminal_status,
+        "calls": _copy_json(calls),
+        "artifacts": [
+            {"artifact_path": path, "artifact_hash": _sha256(data)}
+            for path, data in sorted(files.items())
+        ],
+        "referee_disputes": disputes or [],
+        "ordinary_grade_batches": batches or [],
+        "manifest_fingerprint": "0" * 64,
+    }
+    candidate = cast(JsonObject, _copy_json(manifest))
+    candidate.pop("manifest_fingerprint")
+    manifest["manifest_fingerprint"] = _sha256(canonical_json_bytes(candidate))
+    return manifest
+
+
+def _v21_state(manifest: JsonObject) -> JsonObject:
+    pending = [
+        call for call in cast(list[JsonObject], manifest["calls"])
+        if call["state"] == "pending"
+    ]
+    return {
+        "schema_version": _V21_PROTOCOL,
+        "case_fingerprint": manifest["case_fingerprint"],
+        "phase": manifest["phase"],
+        "current_call_id": None if not pending else pending[0]["call_id"],
+        "terminal_status": manifest["terminal_status"],
+        "manifest_fingerprint": manifest["manifest_fingerprint"],
+    }
+
+
+def _v21_initialize_evaluation(
+    case: object,
+    output_dir: Path,
+    *,
+    seed_hex: str,
+    generation_capsule_paths: Mapping[str, Path] | None = None,
+    generation_substrate: Any | None = None,
+) -> JsonObject:
+    case_snapshot = _verify_generation_capsules_for_initialization(
+        case,
+        generation_capsule_paths=generation_capsule_paths,
+        generation_substrate=generation_substrate,
+    )
+    if case_snapshot.get("schema_version") != "1.1":
+        raise PortableEvaluationInputError("case schema 1.1 is required for new evaluation runs")
+    envelope = freeze_case(case_snapshot, seed_hex=seed_hex)
+    request = _v21_source_review_request(envelope)
+    case_bytes = canonical_json_bytes(envelope)
+    build_bytes = canonical_json_bytes(_V21_BUILD)
+    rubric_bytes = canonical_json_bytes(_V21_RUBRIC)
+    request_path = "requests/source-review.json"
+    files = {
+        _V2_CASE_PATH: case_bytes,
+        _V2_BUILD_PATH: build_bytes,
+        _V2_RUBRIC_PATH: rubric_bytes,
+        request_path: canonical_json_bytes(request),
+    }
+    call = _v21_call(
+        "source-review", "source_review", request_path, request["request_fingerprint"]
+    )
+    manifest = _v21_manifest(
+        None,
+        case_fingerprint=cast(str, envelope["case_fingerprint"]),
+        case_hash=_sha256(case_bytes),
+        build_hash=_sha256(build_bytes),
+        rubric_hash=_sha256(rubric_bytes),
+        calls=[call],
+        files=files,
+        phase="source_review",
+    )
+    _v21_commit_transition(output_dir, None, files, manifest, initialize=True)
+    return _v21_state(manifest)
+
+
+def _v21_verified_storage(
+    storage: _PosixRunStorage,
+) -> tuple[JsonObject, dict[str, bytes]]:
+    initial_inventory = set(storage.scan_inventory())
+    data = storage.read_artifact(_V2_MANIFEST_PATH, max_bytes=16 * 1024 * 1024)
+    manifest = _object(
+        parse_canonical_json_bytes(data, location=_V2_MANIFEST_PATH),
+        location=_V2_MANIFEST_PATH,
+    )
+    if manifest.get("protocol_version") != _V21_PROTOCOL:
+        raise EvaluationIntegrityError("EVALUATOR_V21_MANIFEST")
+    fingerprint = manifest.get("manifest_fingerprint")
+    candidate = cast(JsonObject, _copy_json(manifest))
+    candidate.pop("manifest_fingerprint", None)
+    if fingerprint != _sha256(canonical_json_bytes(candidate)):
+        raise EvaluationIntegrityError("EVALUATOR_V21_MANIFEST_FINGERPRINT")
+    artifacts = _v2_list(manifest.get("artifacts"), location="v2.1 artifacts")
+    files: dict[str, bytes] = {}
+    for raw in artifacts:
+        record = _object(raw, location="v2.1 artifact")
+        path = _string(record.get("artifact_path"), location="artifact path", nonblank=True)
+        if path in files:
+            raise EvaluationIntegrityError("EVALUATOR_V21_INVENTORY")
+        item = storage.read_artifact(path, max_bytes=16 * 1024 * 1024)
+        if record.get("artifact_hash") != _sha256(item):
+            raise EvaluationIntegrityError("EVALUATOR_V21_ARTIFACT_HASH")
+        files[path] = item
+    directories = {
+        f"{PurePosixPath(path).parent.as_posix()}/"
+        for path in files if PurePosixPath(path).parent.as_posix() != "."
+    }
+    if initial_inventory != set(files) | directories | {_V2_MANIFEST_PATH}:
+        raise EvaluationIntegrityError("EVALUATOR_V21_INVENTORY")
+    _v21_verify_semantics(manifest, files)
+    if set(storage.scan_inventory()) != initial_inventory:
+        raise EvaluationIntegrityError("EVALUATOR_V21_INVENTORY_CHANGED")
+    storage.assert_root_identity()
+    return manifest, files
+
+
+def _v21_verified(run_dir: Path) -> tuple[JsonObject, dict[str, bytes]]:
+    with _open_run_storage(run_dir) as storage:
+        return _v21_verified_storage(storage)
+
+
+def _v21_fingerprint_field(value: JsonObject, field: str) -> str:
+    fingerprint = value.get(field)
+    body = cast(JsonObject, _copy_json(value))
+    body.pop(field, None)
+    if type(fingerprint) is not str or fingerprint != _sha256(canonical_json_bytes(body)):
+        raise EvaluationIntegrityError("EVALUATOR_V21_SEMANTIC_FINGERPRINT")
+    return fingerprint
+
+
+def _v21_verify_semantics(manifest: JsonObject, files: dict[str, bytes]) -> None:
+    try:
+        expected_manifest = {
+            "protocol_version", "case_fingerprint", "case_envelope_hash",
+            "build_fingerprint", "rubric_fingerprint", "compiler_version",
+            "baseline_fingerprint", "referee_aggregate_fingerprint",
+            "grader_aggregate_fingerprints", "sensitivity_fingerprints", "result_hash",
+            "phase", "terminal_status", "calls", "artifacts", "referee_disputes",
+            "ordinary_grade_batches", "manifest_fingerprint",
+        }
+        if set(manifest) != expected_manifest:
+            raise EvaluationIntegrityError("EVALUATOR_V21_MANIFEST_SCHEMA")
+        calls = [
+            _object(item, location="v2.1 call")
+            for item in _v2_list(manifest["calls"], location="calls")
+        ]
+        envelope = _object(
+            parse_canonical_json_bytes(files[_V2_CASE_PATH], location=_V2_CASE_PATH),
+            location=_V2_CASE_PATH,
+        )
+        build = _object(
+            parse_canonical_json_bytes(files[_V2_BUILD_PATH], location=_V2_BUILD_PATH),
+            location=_V2_BUILD_PATH,
+        )
+        rubric = _object(
+            parse_canonical_json_bytes(files[_V2_RUBRIC_PATH], location=_V2_RUBRIC_PATH),
+            location=_V2_RUBRIC_PATH,
+        )
+        if (
+            build != _V21_BUILD
+            or rubric != _V21_RUBRIC
+            or envelope.get("case_fingerprint") != manifest["case_fingerprint"]
+            or _sha256(files[_V2_CASE_PATH]) != manifest["case_envelope_hash"]
+            or _sha256(files[_V2_BUILD_PATH]) != manifest["build_fingerprint"]
+            or _sha256(files[_V2_RUBRIC_PATH]) != manifest["rubric_fingerprint"]
+        ):
+            raise EvaluationIntegrityError("EVALUATOR_V21_CASE_BUILD_BINDING")
+
+        reconstructed_files = {
+            _V2_CASE_PATH: files[_V2_CASE_PATH],
+            _V2_BUILD_PATH: files[_V2_BUILD_PATH],
+            _V2_RUBRIC_PATH: files[_V2_RUBRIC_PATH],
+        }
+        reconstructed_calls: list[JsonObject] = []
+        cursor = 0
+        pending_operation: str | None = None
+        missing_request: tuple[JsonObject, JsonObject] | None = None
+
+        def consume(
+            expected_call: JsonObject, expected_request: JsonObject
+        ) -> JsonObject | None:
+            nonlocal cursor, pending_operation, missing_request
+            request_path = cast(str, expected_call["request_artifact_path"])
+            request_bytes = canonical_json_bytes(expected_request)
+            if cursor >= len(calls):
+                missing_request = (expected_call, expected_request)
+                return None
+            actual = calls[cursor]
+            if files.get(request_path) != request_bytes:
+                raise EvaluationIntegrityError("EVALUATOR_V21_CALL_REQUEST_BINDING")
+            reconstructed_files[request_path] = request_bytes
+            if actual.get("state") == "pending":
+                if actual != expected_call or cursor != len(calls) - 1:
+                    raise EvaluationIntegrityError("EVALUATOR_V21_CALL_HISTORY")
+                reconstructed_calls.append(expected_call)
+                pending_operation = cast(str, expected_call["operation"])
+                cursor += 1
+                return None
+            response_path = f"responses/{expected_call['call_id']}.json"
+            response_bytes = files.get(response_path)
+            if response_bytes is None:
+                raise EvaluationIntegrityError("EVALUATOR_V21_CALL_RESPONSE_BINDING")
+            response = _object(
+                parse_canonical_json_bytes(response_bytes, location=response_path),
+                location=response_path,
+            )
+            validated = _v21_response(response, expected_request)
+            expected_accepted, expected_response_bytes = _v21_accept_call(
+                expected_call, validated
+            )
+            if actual != expected_accepted or response_bytes != expected_response_bytes:
+                raise EvaluationIntegrityError("EVALUATOR_V21_CALL_RESPONSE_BINDING")
+            reconstructed_calls.append(expected_accepted)
+            reconstructed_files[response_path] = expected_response_bytes
+            cursor += 1
+            return validated
+
+        review_request = _v21_source_review_request(envelope)
+        review_call = _v21_call(
+            "source-review", "source_review", "requests/source-review.json",
+            review_request["request_fingerprint"],
+        )
+        review_response = consume(review_call, review_request)
+        review = (
+            None
+            if review_response is None
+            else _object(review_response["payload"], location="source review")
+        )
+        audit: JsonObject | None = None
+        disputes: list[JsonObject] = []
+        fragments: list[JsonObject] = []
+        source_complete = False
+        baseline: JsonObject | None = None
+        batches: list[JsonObject] = []
+
+        if review is not None:
+            audit_request = _v21_source_audit_request(envelope, review)
+            audit_call = _v21_call(
+                "source-audit", "source_audit", "requests/source-audit.json",
+                audit_request["request_fingerprint"],
+            )
+            audit_response = consume(audit_call, audit_request)
+            if audit_response is not None:
+                audit = _object(audit_response["payload"], location="source audit")
+                disputes = _v21_disputes(envelope, review, audit)
+                for dispute in disputes:
+                    request = _v21_referee_request(envelope, dispute)
+                    call = _v21_referee_call(request)
+                    response = consume(call, request)
+                    if response is None:
+                        break
+                    fragments.append(
+                        {
+                            "case_fingerprint": dispute["case_fingerprint"],
+                            "dispute_id": dispute["dispute_id"],
+                            "dispute_fingerprint": dispute["dispute_fingerprint"],
+                            "decision": response["payload"],
+                            "response_fingerprint": reconstructed_calls[-1][
+                                "response_fingerprint"
+                            ],
+                        }
+                    )
+                source_complete = len(fragments) == len(disputes)
+
+        referee_fingerprint: str | None = None
+        baseline_fingerprint: str | None = None
+        if source_complete:
+            aggregate_body: JsonObject = {
+                "schema_version": "2.1", "disputes": disputes, "fragments": fragments,
+            }
+            aggregate: JsonObject = {
+                "fragments": fragments,
+                "aggregate_fingerprint": _sha256(canonical_json_bytes(aggregate_body)),
+            }
+            baseline = (
+                _v21_compile_common_baseline(envelope, cast(JsonObject, review))
+                if not disputes
+                else _v21_disputed_baseline(
+                    envelope, cast(JsonObject, review), cast(JsonObject, audit),
+                    disputes, fragments,
+                )
+            )
+            reconstructed_files["aggregates/referee.json"] = canonical_json_bytes(
+                aggregate
+            )
+            reconstructed_files["baseline.json"] = canonical_json_bytes(baseline)
+            referee_fingerprint = cast(str, aggregate["aggregate_fingerprint"])
+            baseline_fingerprint = cast(str, baseline["baseline_fingerprint"])
+            labels = _v21_labels(envelope)
+            batches = _v21_batches(baseline, labels)
+            steps = _v21_grade_steps(baseline, labels, batches)
+            for step in steps:
+                request = _v21_request_for_step(envelope, baseline, step)
+                response = consume(_v21_grade_call(request), request)
+                if response is None:
+                    break
+
+        if cursor != len(calls):
+            raise EvaluationIntegrityError("EVALUATOR_V21_CALL_HISTORY")
+
+        mechanical = manifest["terminal_status"] == "INCONCLUSIVE_MECHANICAL"
+        if mechanical:
+            if pending_operation is not None or missing_request is None:
+                raise EvaluationIntegrityError("EVALUATOR_V21_CALL_HISTORY")
+            orphan_call, orphan_request = missing_request
+            orphan_path = cast(str, orphan_call["request_artifact_path"])
+            orphan_bytes = canonical_json_bytes(orphan_request)
+            if files.get(orphan_path) != orphan_bytes:
+                raise EvaluationIntegrityError("EVALUATOR_V21_UNBOUND_REQUEST")
+            reconstructed_files[orphan_path] = orphan_bytes
+            reason = canonical_json_bytes({"reason": "MECHANICAL_RESPONSE_INVALID"})
+            if files.get("terminal-reason.json") != reason:
+                raise EvaluationIntegrityError("EVALUATOR_V21_TERMINAL_REASON")
+            reconstructed_files["terminal-reason.json"] = reason
+
+        aggregate_fingerprints: list[str] = []
+        sensitivity_fingerprints: list[str] = []
+        reports: list[JsonObject] = []
+        if baseline is not None:
+            provisional = cast(JsonObject, _copy_json(manifest))
+            provisional["calls"] = reconstructed_calls
+            provisional["ordinary_grade_batches"] = batches
+            grade_files, aggregate_fingerprints, sensitivity_fingerprints, reports = (
+                _v21_grade_artifacts(provisional, reconstructed_files, baseline)
+            )
+            reconstructed_files.update(grade_files)
+
+        accepted_count = sum(call["state"] == "accepted" for call in reconstructed_calls)
+        all_accepted = bool(reconstructed_calls) and accepted_count == len(
+            reconstructed_calls
+        )
+        grade_terminal = (
+            baseline is not None
+            and missing_request is None
+            and pending_operation is None
+            and all_accepted
+        )
+        created_state = (
+            not reconstructed_calls
+            and missing_request is not None
+            and missing_request[0]["operation"] == "source_review"
+            and manifest["phase"] == "created"
+        )
+        baseline_sealed = (
+            baseline is not None
+            and missing_request is not None
+            and missing_request[0]["operation"] in {
+                "ordinary_grade_fragment", "contested_grade_fragment"
+            }
+            and not any(
+                call["operation"] in {
+                    "ordinary_grade_fragment", "contested_grade_fragment"
+                }
+                for call in reconstructed_calls
+            )
+            and manifest["phase"] == "baseline_sealed"
+        )
+        terminal_status: str | None = None
+        result_hash: str | None = None
+        if mechanical:
+            phase = "inconclusive_mechanical"
+            terminal_status = "INCONCLUSIVE_MECHANICAL"
+        elif created_state:
+            phase = "created"
+        elif baseline_sealed:
+            phase = "baseline_sealed"
+        elif pending_operation == "source_review":
+            phase = "source_review"
+        elif pending_operation == "source_audit":
+            phase = "source_audit"
+        elif pending_operation == "source_referee_fragment":
+            phase = "source_referee"
+        elif pending_operation == "ordinary_grade_fragment":
+            phase = "ordinary_grading"
+        elif pending_operation == "contested_grade_fragment":
+            phase = "contested_grading"
+        elif grade_terminal and manifest["phase"] == "aggregate":
+            phase = "aggregate"
+        elif grade_terminal:
+            terminal_status = (
+                "INCONCLUSIVE"
+                if any(
+                    cast(JsonObject, item["sensitivity"])["absolute_disposition"]
+                    == "INCONCLUSIVE"
+                    for item in reports
+                )
+                else "COMPLETED"
+            )
+            phase = "inconclusive" if terminal_status == "INCONCLUSIVE" else "completed"
+            result_body: JsonObject = {
+                "schema_version": "2.1", "rubric": _V21_RUBRIC,
+                "baseline": baseline, "reports": reports,
+                "comparison": _v21_comparison(reports),
+                "terminal_status": terminal_status,
+            }
+            result = {
+                **result_body,
+                "result_fingerprint": _sha256(canonical_json_bytes(result_body)),
+            }
+            reconstructed_files["result.json"] = canonical_json_bytes(result)
+            result_hash = cast(str, result["result_fingerprint"])
+        else:
+            raise EvaluationIntegrityError("EVALUATOR_V21_CALL_HISTORY")
+
+        if files != reconstructed_files:
+            raise EvaluationIntegrityError("EVALUATOR_V21_DERIVED_INVENTORY")
+        expected = _v21_manifest(
+            manifest,
+            case_fingerprint=cast(str, manifest["case_fingerprint"]),
+            case_hash=manifest["case_envelope_hash"],
+            build_hash=manifest["build_fingerprint"],
+            rubric_hash=manifest["rubric_fingerprint"],
+            calls=reconstructed_calls, files=reconstructed_files, phase=phase,
+            baseline_fingerprint=baseline_fingerprint,
+            referee_fingerprint=referee_fingerprint,
+            aggregate_fingerprints=aggregate_fingerprints,
+            sensitivity_fingerprints=sensitivity_fingerprints,
+            result_hash=result_hash, terminal_status=terminal_status,
+            disputes=disputes, batches=batches,
+        )
+        if manifest != expected:
+            raise EvaluationIntegrityError("EVALUATOR_V21_SEMANTIC_REPLAY")
+    except PortableEvaluationInputError as error:
+        raise EvaluationIntegrityError("EVALUATOR_V21_SEMANTIC_REPLAY") from error
+    except (KeyError, TypeError, ValueError, IndexError) as error:
+        raise EvaluationIntegrityError("EVALUATOR_V21_SEMANTIC_REPLAY") from error
+
+
+def _v21_commit_transition(
+    run_dir: Path,
+    expected_manifest_fingerprint: str | None,
+    additions: Mapping[str, bytes],
+    successor: JsonObject,
+    *,
+    initialize: bool = False,
+) -> None:
+    """Commit one replay-valid successor or restore the exact prior tree."""
+    snapshot = {
+        _validate_relative_path(path).as_posix(): bytes(data)
+        for path, data in additions.items()
+    }
+    with _open_run_storage(run_dir, initialize=initialize) as storage:
+        prior_manifest: JsonObject | None = None
+        prior_manifest_bytes: bytes | None = None
+        inherited: dict[str, bytes] = {}
+        if storage.scan_inventory():
+            prior_manifest, inherited = _v21_verified_storage(storage)
+            prior_manifest_bytes = storage.read_artifact(
+                _V2_MANIFEST_PATH, max_bytes=16 * 1024 * 1024
+            )
+            if (
+                expected_manifest_fingerprint is None
+                or prior_manifest["manifest_fingerprint"]
+                != expected_manifest_fingerprint
+            ):
+                raise EvaluationIntegrityError("EVALUATOR_V21_STALE_TRANSITION")
+        elif expected_manifest_fingerprint is not None:
+            raise EvaluationIntegrityError("EVALUATOR_V21_STALE_TRANSITION")
+        if any(path in inherited and inherited[path] != data for path, data in snapshot.items()):
+            raise EvaluationIntegrityError("EVALUATOR_V21_IMMUTABLE_ARTIFACT")
+        all_files = {**inherited, **snapshot}
+        manifest_bytes = canonical_json_bytes(successor)
+        _v21_verify_semantics(successor, all_files)
+        created: list[str] = []
+        manifest_installed = False
+        manifest_identity: _NodeIdentity | None = None
+        try:
+            for path in sorted(snapshot):
+                try:
+                    created_now = storage.atomic_write(
+                        path, snapshot[path], mutable=False
+                    )
+                except _AtomicWriteOwnershipError as error:
+                    if error.created:
+                        created.append(path)
+                    raise
+                if created_now:
+                    created.append(path)
+            if any(
+                storage.read_artifact(path, max_bytes=16 * 1024 * 1024) != data
+                for path, data in snapshot.items()
+            ):
+                raise EvaluationIntegrityError("EVALUATOR_V21_STALE_TRANSITION")
+            if prior_manifest is not None:
+                if any(
+                    storage.read_artifact(path, max_bytes=16 * 1024 * 1024) != data
+                    for path, data in inherited.items()
+                ):
+                    raise EvaluationIntegrityError("EVALUATOR_V21_STALE_TRANSITION")
+                current_bytes = storage.read_artifact(
+                    _V2_MANIFEST_PATH, max_bytes=16 * 1024 * 1024
+                )
+                current = _object(
+                    parse_canonical_json_bytes(current_bytes, location=_V2_MANIFEST_PATH),
+                    location=_V2_MANIFEST_PATH,
+                )
+                candidate = cast(JsonObject, _copy_json(current))
+                fingerprint = candidate.pop("manifest_fingerprint", None)
+                if (
+                    fingerprint != _sha256(canonical_json_bytes(candidate))
+                    or fingerprint != expected_manifest_fingerprint
+                ):
+                    raise EvaluationIntegrityError("EVALUATOR_V21_STALE_TRANSITION")
+            try:
+                manifest_installed = storage.atomic_write(
+                    _V2_MANIFEST_PATH,
+                    manifest_bytes,
+                    mutable=prior_manifest is not None,
+                )
+                receipt = storage.atomic_write_receipt(_V2_MANIFEST_PATH)
+                if manifest_installed:
+                    manifest_identity = receipt.identity if receipt is not None else None
+                    if manifest_identity is None:
+                        raise EvaluationIntegrityError("EVALUATOR_V21_ROLLBACK_FAILED")
+            except _AtomicWriteOwnershipError as error:
+                if error.created or error.replaced:
+                    manifest_installed = True
+                    manifest_identity = error.identity
+                    if manifest_identity is None:
+                        receipt = storage.atomic_write_receipt(_V2_MANIFEST_PATH)
+                        manifest_identity = (
+                            receipt.identity if receipt is not None else None
+                        )
+                raise
+            committed, committed_files = _v21_verified_storage(storage)
+            if committed != successor or committed_files != all_files:
+                raise EvaluationIntegrityError("EVALUATOR_V21_STALE_TRANSITION")
+        except BaseException as error:
+            cleanup_error: BaseException | None = None
+            restored_manifest = False
+            try:
+                observed = storage.read_optional_artifact_with_identity(
+                    _V2_MANIFEST_PATH, max_bytes=16 * 1024 * 1024
+                )
+                if prior_manifest_bytes is None:
+                    if (
+                        manifest_installed
+                        and manifest_identity is not None
+                        and observed is not None
+                        and observed[0] == manifest_bytes
+                        and _same_filesystem_object(observed[1], manifest_identity)
+                    ):
+                        storage.remove_artifact(
+                            _V2_MANIFEST_PATH,
+                            expected_identity=manifest_identity,
+                            expected_data=manifest_bytes,
+                        )
+                        restored_manifest = True
+                    elif manifest_installed:
+                        raise EvaluationIntegrityError("EVALUATOR_V21_ROLLBACK_FAILED")
+                elif (
+                    manifest_installed
+                    and manifest_identity is not None
+                    and observed is not None
+                    and observed[0] == manifest_bytes
+                    and _same_filesystem_object(observed[1], manifest_identity)
+                ):
+                    storage.replace_artifact_if_owned(
+                        _V2_MANIFEST_PATH,
+                        prior_manifest_bytes,
+                        owned_identity=manifest_identity,
+                        owned_data=manifest_bytes,
+                    )
+                    if storage.read_artifact(
+                        _V2_MANIFEST_PATH, max_bytes=16 * 1024 * 1024
+                    ) != prior_manifest_bytes:
+                        raise EvaluationIntegrityError("EVALUATOR_V21_ROLLBACK_FAILED")
+                    restored_manifest = True
+                elif manifest_installed:
+                    raise EvaluationIntegrityError("EVALUATOR_V21_ROLLBACK_FAILED")
+            except BaseException as cleanup:
+                cleanup_error = cleanup
+            for path in reversed(created):
+                try:
+                    storage.remove_artifact(path)
+                except BaseException as cleanup:
+                    cleanup_error = cleanup
+            try:
+                if prior_manifest_bytes is None:
+                    if storage.scan_inventory():
+                        raise EvaluationIntegrityError("EVALUATOR_V21_ROLLBACK_FAILED")
+                elif restored_manifest or storage.read_optional_artifact(
+                    _V2_MANIFEST_PATH, max_bytes=16 * 1024 * 1024
+                ) == prior_manifest_bytes:
+                    restored, restored_files = _v21_verified_storage(storage)
+                    if restored != prior_manifest or restored_files != inherited:
+                        raise EvaluationIntegrityError("EVALUATOR_V21_ROLLBACK_FAILED")
+            except BaseException as cleanup:
+                cleanup_error = cleanup
+            if cleanup_error is not None:
+                raise EvaluationIntegrityError("EVALUATOR_V21_ROLLBACK_FAILED") from cleanup_error
+            raise error
+
+
+def _v21_payload_with_v2_version(payload: object, validator: Any) -> JsonObject:
+    snapshot = _v2_snapshot(payload, location="protocol 2.1 payload")
+    if snapshot.get("schema_version") != _V21_PROTOCOL:
+        raise PortableEvaluationInputError("protocol 2.1 payload version is invalid")
+    translated = cast(JsonObject, _copy_json(snapshot))
+    translated["schema_version"] = _V2_PROTOCOL
+    validator(translated)
+    return snapshot
+
+
+def _v21_response(value: object, request: JsonObject) -> JsonObject:
+    response = _v2_snapshot(value, location="evaluator response")
+    if set(response) != {
+        "schema_version", "operation", "request_fingerprint", "provider_name",
+        "model_name", "judge_isolation", "payload",
+    } or response.get("schema_version") != _V21_PROTOCOL:
+        raise PortableEvaluationInputError("evaluator response has an unexpected shape")
+    if (
+        response.get("operation") != request.get("operation")
+        or response.get("request_fingerprint") != request.get("request_fingerprint")
+        or response.get("judge_isolation") not in {"fresh_context", "scripted_fixture"}
+    ):
+        raise PortableEvaluationInputError("evaluator response does not bind the pending request")
+    _string(response["provider_name"], location="provider", nonblank=True)
+    _string(response["model_name"], location="model", nonblank=True)
+    if response["operation"] == "source_review":
+        _v21_payload_with_v2_version(response["payload"], _portable_v2_source_review)
+    elif response["operation"] == "source_audit":
+        audit = _v21_payload_with_v2_version(response["payload"], _portable_v2_source_audit)
+        known = {
+            cast(str, _object(item, location="indexed proposal")["proposal_ref"])
+            for item in cast(list[object], _object(request["payload"], location="request")["indexed_proposals"])
+        }
+        if any(
+            item.get("target_proposal_ref") is not None
+            and item.get("target_proposal_ref") not in known
+            for item in cast(list[JsonObject], audit["concerns"])
+        ):
+            raise PortableEvaluationInputError("source audit target is not engine-issued")
+    elif response["operation"] == "source_referee_fragment":
+        payload = _v2_snapshot(response["payload"], location="referee decision")
+        if set(payload) != {
+            "schema_version", "decision", "unresolved_reason", "evidence_refs", "rationale"
+        } or payload["schema_version"] != "2.1":
+            raise PortableEvaluationInputError("referee decision has an unexpected shape")
+        decision = payload["decision"]
+        reason = payload["unresolved_reason"]
+        if decision not in {"accept_reviewer", "accept_auditor", "unresolved"}:
+            raise PortableEvaluationInputError("referee decision is invalid")
+        if (decision == "unresolved") != (reason is not None):
+            raise PortableEvaluationInputError("referee unresolved reason is invalid")
+        if reason is not None and reason not in {
+            "SOURCE_AMBIGUITY", "SOURCE_CONFLICT", "SOURCE_GAP",
+            "BOTH_POSITIONS_UNSUPPORTED",
+        }:
+            raise PortableEvaluationInputError("referee unresolved reason is invalid")
+        refs = _v2_list(payload["evidence_refs"], location="referee evidence refs")
+        disputes = cast(
+            list[JsonObject], _object(request["payload"], location="referee request")["material_disputes"]
+        )
+        if len(disputes) != 1:
+            raise PortableEvaluationInputError("referee request is invalid")
+        allowed = {
+            item["evidence_ref"] for item in cast(list[JsonObject], disputes[0]["evidence"])
+        }
+        if not refs or len(refs) != len(set(cast(list[str], refs))) or not set(refs) <= allowed:
+            raise PortableEvaluationInputError("referee evidence binding is invalid")
+        _v2_nonblank(payload["rationale"], location="referee rationale")
+    elif response["operation"] == "ordinary_grade_fragment":
+        payload = _v2_snapshot(response["payload"], location="ordinary grade")
+        expected = {
+            "schema_version", "anonymous_label", "grader_lane", "batch_ref",
+            "baseline_fingerprint", "report_fingerprint", "requirement_grades", "rationale",
+        }
+        request_payload = _object(request["payload"], location="grade request")
+        if (
+            set(payload) != expected or payload["schema_version"] != "2.1"
+            or payload["anonymous_label"] != request_payload["anonymous_label"]
+            or payload["grader_lane"] != request_payload["grader_lane"]
+            or payload["batch_ref"] != request_payload["batch_ref"]
+            or payload["baseline_fingerprint"] != request_payload["baseline_fingerprint"]
+            or payload["report_fingerprint"] != request_payload["report_fingerprint"]
+        ):
+            raise PortableEvaluationInputError("ordinary grade binding is invalid")
+        grades = _v2_list(payload["requirement_grades"], location="requirement grades")
+        expected_ids = [item["requirement_id"] for item in cast(list[JsonObject], request_payload["requirements"])]
+        if [cast(JsonObject, item).get("requirement_id") for item in grades] != expected_ids:
+            raise PortableEvaluationInputError("ordinary grade coverage is invalid")
+        for item in grades:
+            grade = _object(item, location="requirement grade")
+            if set(grade) != {"requirement_id", "disposition", "report_passages", "rationale", "omission"} or grade["disposition"] not in {"met", "partially_met", "not_met", "uncertain"}:
+                raise PortableEvaluationInputError("ordinary grade is invalid")
+            _v2_nonblank(grade["rationale"], location="grade rationale")
+        _v2_nonblank(payload["rationale"], location="fragment rationale")
+        _v2_validate_grade_evidence(
+            {"requirement_grades": grades, "unsupported_assertions": []},
+            cast(str, request_payload["report_text"]),
+        )
+    elif response["operation"] == "contested_grade_fragment":
+        payload = _v2_snapshot(response["payload"], location="contested grade")
+        expected = {
+            "schema_version", "anonymous_label", "grader_lane",
+            "contested_requirement_id", "baseline_fingerprint", "report_fingerprint",
+            "reviewer_alternative_grade", "auditor_alternative_grade",
+            "ambiguity_disposition", "rationale",
+        }
+        request_payload = _object(request["payload"], location="contested request")
+        contested = _object(
+            request_payload["contested_requirement"], location="contested requirement"
+        )
+        if (
+            set(payload) != expected or payload["schema_version"] != "2.1"
+            or payload["anonymous_label"] != request_payload["anonymous_label"]
+            or payload["grader_lane"] != request_payload["grader_lane"]
+            or payload["contested_requirement_id"] != contested["contested_requirement_id"]
+            or payload["baseline_fingerprint"] != request_payload["baseline_fingerprint"]
+            or payload["report_fingerprint"] != request_payload["report_fingerprint"]
+        ):
+            raise PortableEvaluationInputError("contested grade binding is invalid")
+        report_text = cast(str, request_payload["report_text"])
+        for name in ("reviewer_alternative_grade", "auditor_alternative_grade"):
+            grade = _object(payload[name], location=name)
+            if set(grade) != {"disposition", "report_passages", "rationale"} or grade[
+                "disposition"
+            ] not in {"met", "partially_met", "not_met", "uncertain"}:
+                raise PortableEvaluationInputError("contested alternative grade is invalid")
+            passages = _v2_list(grade["report_passages"], location="report passages")
+            for passage in passages:
+                if type(passage) is not str or report_text.count(passage) != 1:
+                    raise PortableEvaluationInputError("contested report passage is invalid")
+            _v2_nonblank(grade["rationale"], location="contested grade rationale")
+        if payload["ambiguity_disposition"] not in {
+            "acknowledged", "overstated", "omitted", "uncertain"
+        }:
+            raise PortableEvaluationInputError("ambiguity disposition is invalid")
+        _v2_nonblank(payload["rationale"], location="contested rationale")
+    else:
+        raise PortableEvaluationInputError("protocol 2.1 operation is not mirrored")
+    return response
+
+
+def _v21_accept_call(call: JsonObject, response: JsonObject) -> tuple[JsonObject, bytes]:
+    accepted = cast(JsonObject, _copy_json(call))
+    response_bytes = canonical_json_bytes(response)
+    accepted.update(
+        {
+            "state": "accepted",
+            "response_artifact_path": f"responses/{call['call_id']}.json",
+            "response_fingerprint": _sha256(response_bytes),
+            "provider_name": response["provider_name"],
+            "model_name": response["model_name"],
+            "judge_isolation": response["judge_isolation"],
+        }
+    )
+    return accepted, response_bytes
+
+
+def _v21_commit_source_review(run_dir: Path, response: JsonObject) -> JsonObject:
+    manifest, files = _v21_verified(run_dir)
+    pending = [call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"]
+    if len(pending) != 1 or pending[0]["operation"] != "source_review":
+        raise PortableEvaluationInputError("source review is not pending")
+    accepted, response_bytes = _v21_accept_call(pending[0], response)
+    envelope = _object(
+        parse_canonical_json_bytes(files[_V2_CASE_PATH], location=_V2_CASE_PATH),
+        location=_V2_CASE_PATH,
+    )
+    review = _object(response["payload"], location="source review")
+    request = _v21_source_audit_request(envelope, review)
+    request_path = "requests/source-audit.json"
+    call = _v21_call("source-audit", "source_audit", request_path, request["request_fingerprint"])
+    updated = dict(files)
+    response_path = cast(str, accepted["response_artifact_path"])
+    updated[response_path] = response_bytes
+    updated[request_path] = canonical_json_bytes(request)
+    successor = _v21_manifest(
+        manifest,
+        case_fingerprint=cast(str, manifest["case_fingerprint"]),
+        case_hash=cast(str, manifest["case_envelope_hash"]),
+        build_hash=cast(str, manifest["build_fingerprint"]),
+        rubric_hash=cast(str, manifest["rubric_fingerprint"]),
+        calls=[accepted, call],
+        files=updated,
+        phase="source_audit",
+    )
+    _v21_commit_transition(
+        run_dir,
+        cast(str, manifest["manifest_fingerprint"]),
+        {response_path: response_bytes, request_path: updated[request_path]},
+        successor,
+    )
+    return _v21_state(successor)
+
+
+def _v21_commit_source_audit(run_dir: Path, response: JsonObject) -> JsonObject:
+    manifest, files = _v21_verified(run_dir)
+    pending = [call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"]
+    if len(pending) != 1 or pending[0]["operation"] != "source_audit":
+        raise PortableEvaluationInputError("source audit is not pending")
+    audit = _object(response["payload"], location="source audit")
+    accepted, response_bytes = _v21_accept_call(pending[0], response)
+    envelope = _object(parse_canonical_json_bytes(files[_V2_CASE_PATH], location=_V2_CASE_PATH), location=_V2_CASE_PATH)
+    review_response = _object(parse_canonical_json_bytes(files["responses/source-review.json"], location="review"), location="review")
+    review = _object(review_response["payload"], location="review payload")
+    disputes = _v21_disputes(envelope, review, audit)
+    if disputes:
+        request = _v21_referee_request(envelope, disputes[0])
+        call = _v21_referee_call(request)
+        response_path = cast(str, accepted["response_artifact_path"])
+        request_path = cast(str, call["request_artifact_path"])
+        updated = dict(files)
+        updated[response_path] = response_bytes
+        updated[request_path] = canonical_json_bytes(request)
+        successor = _v21_manifest(
+            manifest,
+            case_fingerprint=cast(str, manifest["case_fingerprint"]),
+            case_hash=cast(str, manifest["case_envelope_hash"]),
+            build_hash=cast(str, manifest["build_fingerprint"]),
+            rubric_hash=cast(str, manifest["rubric_fingerprint"]),
+            calls=[*cast(list[JsonObject], manifest["calls"])[:-1], accepted, call],
+            files=updated, phase="source_referee", disputes=disputes,
+        )
+        _v21_commit_transition(
+            run_dir,
+            cast(str, manifest["manifest_fingerprint"]),
+            {response_path: response_bytes, request_path: updated[request_path]},
+            successor,
+        )
+        return _v21_state(successor)
+    baseline = _v21_compile_common_baseline(envelope, review)
+    aggregate: JsonObject = {"fragments": []}
+    aggregate["aggregate_fingerprint"] = _sha256(
+        canonical_json_bytes(
+            {"schema_version": "2.1", "disputes": [], "fragments": []}
+        )
+    )
+    labels = _v21_labels(envelope)
+    batches = _v21_batches(baseline, labels)
+    if not batches:
+        raise PortableEvaluationInputError("grade batch inventory is empty")
+    request = _v21_ordinary_request(envelope, baseline, batches[0])
+    call = _v21_grade_call(request)
+    response_path = cast(str, accepted["response_artifact_path"])
+    request_path = cast(str, call["request_artifact_path"])
+    updated = dict(files)
+    updated.update({
+        response_path: response_bytes,
+        "aggregates/referee.json": canonical_json_bytes(aggregate),
+        "baseline.json": canonical_json_bytes(baseline),
+        request_path: canonical_json_bytes(request),
+    })
+    successor = _v21_manifest(
+        manifest,
+        case_fingerprint=cast(str, manifest["case_fingerprint"]), case_hash=cast(str, manifest["case_envelope_hash"]),
+        build_hash=cast(str, manifest["build_fingerprint"]), rubric_hash=cast(str, manifest["rubric_fingerprint"]),
+        calls=[*cast(list[JsonObject], manifest["calls"])[:-1], accepted, call], files=updated,
+        phase="ordinary_grading", baseline_fingerprint=cast(str, baseline["baseline_fingerprint"]),
+        referee_fingerprint=cast(str, aggregate["aggregate_fingerprint"]), batches=batches,
+    )
+    _v21_commit_transition(
+        run_dir,
+        cast(str, manifest["manifest_fingerprint"]),
+        {
+            path: updated[path]
+            for path in (
+                response_path, "aggregates/referee.json", "baseline.json", request_path
+            )
+        },
+        successor,
+    )
+    return _v21_state(successor)
+
+
+def _v21_commit_referee(run_dir: Path, response: JsonObject) -> JsonObject:
+    manifest, files = _v21_verified(run_dir)
+    calls = cast(list[JsonObject], manifest["calls"])
+    pending = [call for call in calls if call["state"] == "pending"]
+    if len(pending) != 1 or pending[0]["operation"] != "source_referee_fragment":
+        raise PortableEvaluationInputError("source referee is not pending")
+    accepted, response_bytes = _v21_accept_call(pending[0], response)
+    next_calls = [*calls[:-1], accepted]
+    updated = dict(files)
+    response_path = cast(str, accepted["response_artifact_path"])
+    updated[response_path] = response_bytes
+    disputes = cast(list[JsonObject], manifest["referee_disputes"])
+    fragments: list[JsonObject] = []
+    for call in next_calls:
+        if call["operation"] != "source_referee_fragment" or call["state"] != "accepted":
+            continue
+        response_item = _object(
+            parse_canonical_json_bytes(
+                updated[cast(str, call["response_artifact_path"])],
+                location="referee response",
+            ),
+            location="referee response",
+        )
+        dispute = next(
+            item for item in disputes if item["dispute_id"] == call["dispute_id"]
+        )
+        fragments.append(
+            {
+                "case_fingerprint": dispute["case_fingerprint"],
+                "dispute_id": dispute["dispute_id"],
+                "dispute_fingerprint": dispute["dispute_fingerprint"],
+                "decision": response_item["payload"],
+                "response_fingerprint": call["response_fingerprint"],
+            }
+        )
+    envelope = _object(
+        parse_canonical_json_bytes(updated[_V2_CASE_PATH], location=_V2_CASE_PATH),
+        location=_V2_CASE_PATH,
+    )
+    if len(fragments) < len(disputes):
+        request = _v21_referee_request(envelope, disputes[len(fragments)])
+        call = _v21_referee_call(request)
+        next_calls.append(call)
+        request_path = cast(str, call["request_artifact_path"])
+        updated[request_path] = canonical_json_bytes(request)
+        successor = _v21_manifest(
+            manifest,
+            case_fingerprint=cast(str, manifest["case_fingerprint"]),
+            case_hash=cast(str, manifest["case_envelope_hash"]),
+            build_hash=cast(str, manifest["build_fingerprint"]),
+            rubric_hash=cast(str, manifest["rubric_fingerprint"]), calls=next_calls,
+            files=updated, phase="source_referee", disputes=disputes,
+        )
+        _v21_commit_transition(
+            run_dir,
+            cast(str, manifest["manifest_fingerprint"]),
+            {response_path: response_bytes, request_path: updated[request_path]},
+            successor,
+        )
+        return _v21_state(successor)
+    aggregate_body: JsonObject = {
+        "schema_version": "2.1", "disputes": disputes, "fragments": fragments,
+    }
+    aggregate: JsonObject = {
+        "fragments": fragments,
+        "aggregate_fingerprint": _sha256(canonical_json_bytes(aggregate_body)),
+    }
+    review_response = _object(
+        parse_canonical_json_bytes(updated["responses/source-review.json"], location="review"),
+        location="review",
+    )
+    audit_response = _object(
+        parse_canonical_json_bytes(updated["responses/source-audit.json"], location="audit"),
+        location="audit",
+    )
+    baseline = _v21_disputed_baseline(
+        envelope, _object(review_response["payload"], location="review payload"),
+        _object(audit_response["payload"], location="audit payload"),
+        disputes, fragments,
+    )
+    labels = _v21_labels(envelope)
+    batches = _v21_batches(baseline, labels)
+    steps = _v21_grade_steps(baseline, labels, batches)
+    if not steps:
+        raise PortableEvaluationInputError("grade fragment inventory is empty")
+    request = _v21_request_for_step(envelope, baseline, steps[0])
+    call = _v21_grade_call(request)
+    next_calls.append(call)
+    request_path = cast(str, call["request_artifact_path"])
+    updated.update(
+        {
+            "aggregates/referee.json": canonical_json_bytes(aggregate),
+            "baseline.json": canonical_json_bytes(baseline),
+            request_path: canonical_json_bytes(request),
+        }
+    )
+    successor = _v21_manifest(
+        manifest,
+        case_fingerprint=cast(str, manifest["case_fingerprint"]),
+        case_hash=cast(str, manifest["case_envelope_hash"]),
+        build_hash=cast(str, manifest["build_fingerprint"]),
+        rubric_hash=cast(str, manifest["rubric_fingerprint"]), calls=next_calls,
+        files=updated,
+        phase=("ordinary_grading" if request["operation"] == "ordinary_grade_fragment" else "contested_grading"),
+        baseline_fingerprint=cast(str, baseline["baseline_fingerprint"]),
+        referee_fingerprint=cast(str, aggregate["aggregate_fingerprint"]),
+        disputes=disputes, batches=batches,
+    )
+    _v21_commit_transition(
+        run_dir,
+        cast(str, manifest["manifest_fingerprint"]),
+        {path: data for path, data in updated.items() if path not in files},
+        successor,
+    )
+    return _v21_state(successor)
+
+
+def _v21_score(baseline: JsonObject, fragment: JsonObject) -> tuple[str, list[str]]:
+    importance = {item["requirement_id"]: item["importance"] for item in cast(list[JsonObject], baseline["requirements"])}
+    grades = cast(list[JsonObject], fragment["requirement_grades"])
+    credit = {"met": 1.0, "partially_met": 0.5, "not_met": 0.0}
+    if any(item["disposition"] == "uncertain" for item in grades):
+        return "INCONCLUSIVE", ["GRADE_UNCERTAIN"]
+    weights = cast(JsonObject, _V21_RUBRIC["importance_weights"])
+    total = sum(cast(int, weights[cast(str, importance[item["requirement_id"]])]) for item in grades)
+    got = sum(cast(int, weights[cast(str, importance[item["requirement_id"]])]) * credit[cast(str, item["disposition"])] for item in grades)
+    critical = [credit[cast(str, item["disposition"])] for item in grades if importance[item["requirement_id"]] == "critical"]
+    reasons = []
+    if critical and sum(critical) / len(critical) < 1.0:
+        reasons.append("CRITICAL_RECALL_BELOW_FLOOR")
+    if total and got / total < 0.9:
+        reasons.append("WEIGHTED_COVERAGE_BELOW_FLOOR")
+    return ("FAIL", reasons) if reasons else ("PASS", [])
+
+
+def _v21_score_grades(
+    baseline: JsonObject, grades: list[JsonObject],
+    extra: tuple[str, str] | None = None,
+) -> tuple[str, list[str]]:
+    observations = [
+        (cast(str, requirement["importance"]), cast(str, grade["disposition"]))
+        for requirement in cast(list[JsonObject], baseline["requirements"])
+        for grade in grades if grade["requirement_id"] == requirement["requirement_id"]
+    ]
+    if extra is not None:
+        observations.append(extra)
+    if any(disposition == "uncertain" for _, disposition in observations):
+        return "INCONCLUSIVE", ["GRADE_UNCERTAIN"]
+    weights = cast(JsonObject, _V21_RUBRIC["importance_weights"])
+    credit = {"met": 1.0, "partially_met": 0.5, "not_met": 0.0}
+    total = sum(cast(int, weights[importance]) for importance, _ in observations)
+    got = sum(
+        cast(int, weights[importance]) * credit[disposition]
+        for importance, disposition in observations
+    )
+    critical = [
+        credit[disposition] for importance, disposition in observations
+        if importance == "critical"
+    ]
+    reasons: list[str] = []
+    if critical and sum(critical) / len(critical) < 1.0:
+        reasons.append("CRITICAL_RECALL_BELOW_FLOOR")
+    if total and got / total < 0.9:
+        reasons.append("WEIGHTED_COVERAGE_BELOW_FLOOR")
+    return ("FAIL", reasons) if reasons else ("PASS", [])
+
+
+def _v21_grade_artifacts(
+    manifest: JsonObject, files: dict[str, bytes], baseline: JsonObject
+) -> tuple[dict[str, bytes], list[str], list[str], list[JsonObject]]:
+    additions: dict[str, bytes] = {}
+    aggregate_hashes: list[str] = []
+    sensitivity_hashes: list[str] = []
+    reports: list[JsonObject] = []
+    labels = sorted({cast(str, call["anonymous_label"]) for call in cast(list[JsonObject], manifest["calls"]) if call["anonymous_label"] is not None})
+    for label in labels:
+        aggregates: list[JsonObject] = []
+        for lane in (1, 2):
+            calls = [call for call in cast(list[JsonObject], manifest["calls"]) if call["operation"] == "ordinary_grade_fragment" and call["anonymous_label"] == label and call["grader_lane"] == lane]
+            contested_calls = [call for call in cast(list[JsonObject], manifest["calls"]) if call["operation"] == "contested_grade_fragment" and call["anonymous_label"] == label and call["grader_lane"] == lane]
+            expected = [batch for batch in cast(list[JsonObject], manifest["ordinary_grade_batches"]) if cast(str, batch["batch_ref"]).startswith(f"GB-{label}-{lane}-")]
+            expected_contested = cast(list[JsonObject], baseline["contested_requirements"])
+            if (
+                len(calls) != len(expected)
+                or len(contested_calls) != len(expected_contested)
+                or any(call["state"] != "accepted" for call in [*calls, *contested_calls])
+            ):
+                continue
+            fragments = [
+                _object(
+                    _object(parse_canonical_json_bytes(files[cast(str, call["response_artifact_path"])], location="grade response"), location="grade response")["payload"],
+                    location="grade payload",
+                )
+                for call in calls
+            ]
+            contested_fragments = [
+                _object(
+                    _object(parse_canonical_json_bytes(files[cast(str, call["response_artifact_path"])], location="grade response"), location="grade response")["payload"],
+                    location="grade payload",
+                )
+                for call in contested_calls
+            ]
+            all_fragments: list[JsonObject] = [*fragments, *contested_fragments]
+            report_hashes = {
+                cast(str, item["report_fingerprint"])
+                for item in all_fragments
+            }
+            if len(report_hashes) != 1:
+                raise PortableEvaluationInputError("grade report binding differs")
+            body: JsonObject = {
+                "anonymous_label": label, "grader_lane": lane,
+                "baseline_fingerprint": baseline["baseline_fingerprint"],
+                "report_fingerprint": next(iter(report_hashes)),
+                "ordinary_fragments": fragments, "contested_fragments": contested_fragments,
+            }
+            aggregate = {**body, "aggregate_fingerprint": _sha256(canonical_json_bytes(body))}
+            additions[f"aggregates/grade-{label}-{lane}.json"] = canonical_json_bytes(aggregate)
+            aggregate_hashes.append(cast(str, aggregate["aggregate_fingerprint"]))
+            aggregates.append(aggregate)
+        if len(aggregates) != 2:
+            continue
+        first_fragments = cast(list[JsonObject], aggregates[0]["ordinary_fragments"])
+        second_fragments = cast(list[JsonObject], aggregates[1]["ordinary_fragments"])
+        first_view: list[object] = [[(g["requirement_id"], g["disposition"], g["report_passages"]) for g in cast(list[JsonObject], f["requirement_grades"])] for f in first_fragments]
+        second_view: list[object] = [[(g["requirement_id"], g["disposition"], g["report_passages"]) for g in cast(list[JsonObject], f["requirement_grades"])] for f in second_fragments]
+        first_contested = cast(list[JsonObject], aggregates[0]["contested_fragments"])
+        second_contested = cast(list[JsonObject], aggregates[1]["contested_fragments"])
+        first_view.extend(
+            [[
+                item["contested_requirement_id"],
+                cast(JsonObject, item["reviewer_alternative_grade"])["disposition"],
+                cast(JsonObject, item["auditor_alternative_grade"])["disposition"],
+                item["ambiguity_disposition"],
+            ] for item in first_contested]
+        )
+        second_view.extend(
+            [[
+                item["contested_requirement_id"],
+                cast(JsonObject, item["reviewer_alternative_grade"])["disposition"],
+                cast(JsonObject, item["auditor_alternative_grade"])["disposition"],
+                item["ambiguity_disposition"],
+            ] for item in second_contested]
+        )
+        ordinary_grades = [
+            grade for fragment in first_fragments
+            for grade in cast(list[JsonObject], fragment["requirement_grades"])
+        ]
+        disposition, reasons = _v21_score_grades(baseline, ordinary_grades)
+        if first_view != second_view:
+            disposition, reasons = "INCONCLUSIVE", ["GRADER_DISAGREEMENT"]
+        reconciliation_body: JsonObject = {
+            "anonymous_label": label, "absolute_disposition": disposition,
+            "reason_codes": reasons, "grader_aggregates": aggregates,
+        }
+        reconciliation = {**reconciliation_body, "reconciliation_fingerprint": _sha256(canonical_json_bytes(reconciliation_body))}
+        changing: list[str] = []
+        insufficient = False
+        contested_by_id = {
+            item["contested_requirement_id"]: item
+            for item in cast(list[JsonObject], baseline["contested_requirements"])
+        }
+        for grade in first_contested:
+            contested = contested_by_id[grade["contested_requirement_id"]]
+            reviewer_grade = cast(JsonObject, grade["reviewer_alternative_grade"])
+            auditor_grade = cast(JsonObject, grade["auditor_alternative_grade"])
+            if reviewer_grade["disposition"] == auditor_grade["disposition"] == "uncertain":
+                insufficient = True
+                continue
+            reviewer = cast(JsonObject | None, contested["reviewer_alternative"])
+            auditor = cast(JsonObject | None, contested["auditor_alternative"])
+            reviewer_result = _v21_score_grades(
+                baseline, ordinary_grades,
+                (("supporting" if reviewer is None else cast(str, reviewer["importance"])), cast(str, reviewer_grade["disposition"])),
+            )[0]
+            auditor_result = _v21_score_grades(
+                baseline, ordinary_grades,
+                (("supporting" if auditor is None else cast(str, auditor["importance"])), cast(str, auditor_grade["disposition"])),
+            )[0]
+            if reviewer_result != auditor_result:
+                changing.append(cast(str, grade["contested_requirement_id"]))
+        sensitivity_disposition, sensitivity_reasons = disposition, reasons
+        if changing:
+            sensitivity_disposition = "INCONCLUSIVE"
+            sensitivity_reasons = ["OUTCOME_SENSITIVE_BASELINE_DISPUTE"]
+        elif insufficient:
+            sensitivity_disposition = "INCONCLUSIVE"
+            sensitivity_reasons = ["BASELINE_EVIDENCE_INSUFFICIENT"]
+        sensitivity_body: JsonObject = {
+            "anonymous_label": label, "baseline_fingerprint": baseline["baseline_fingerprint"],
+            "reconciliation_fingerprint": reconciliation["reconciliation_fingerprint"],
+            "absolute_disposition": sensitivity_disposition,
+            "reason_codes": sensitivity_reasons,
+            "outcome_determinative_contested_ids": changing,
+        }
+        sensitivity = {**sensitivity_body, "sensitivity_fingerprint": _sha256(canonical_json_bytes(sensitivity_body))}
+        additions[f"sensitivities/{label}.json"] = canonical_json_bytes(sensitivity)
+        sensitivity_hashes.append(cast(str, sensitivity["sensitivity_fingerprint"]))
+        report_body: JsonObject = {"anonymous_label": label, "reconciliation": reconciliation, "sensitivity": sensitivity}
+        reports.append({**report_body, "result_fingerprint": _sha256(canonical_json_bytes(report_body))})
+    return additions, aggregate_hashes, sensitivity_hashes, reports
+
+
+def _v21_comparison(reports: list[JsonObject]) -> JsonObject | None:
+    if len(reports) == 1:
+        return None
+    dispositions = [cast(JsonObject, item["sensitivity"])["absolute_disposition"] for item in reports]
+    if "INCONCLUSIVE" in dispositions:
+        return {"disposition": "inconclusive", "winner_label": None, "rationale": "At least one report is inconclusive."}
+    if dispositions == ["PASS", "FAIL"]:
+        return {"disposition": "candidate_win", "winner_label": "A", "rationale": "Only the candidate report passed the rubric."}
+    if dispositions == ["FAIL", "PASS"]:
+        return {"disposition": "comparator_win", "winner_label": "B", "rationale": "Only the comparator report passed the rubric."}
+    if dispositions[0] == "FAIL":
+        return {"disposition": "neither", "winner_label": None, "rationale": "Neither report passed the rubric."}
+    return {"disposition": "tie", "winner_label": None, "rationale": "Both reports passed the rubric."}
+
+
+def _v21_commit_grade(run_dir: Path, response: JsonObject) -> JsonObject:
+    manifest, files = _v21_verified(run_dir)
+    calls = cast(list[JsonObject], manifest["calls"])
+    pending = [call for call in calls if call["state"] == "pending"]
+    if len(pending) != 1 or pending[0]["operation"] not in {
+        "ordinary_grade_fragment", "contested_grade_fragment"
+    }:
+        raise PortableEvaluationInputError("ordinary grade is not pending")
+    accepted, response_bytes = _v21_accept_call(pending[0], response)
+    next_calls = [*calls[:-1], accepted]
+    updated = dict(files)
+    response_path = cast(str, accepted["response_artifact_path"])
+    updated[response_path] = response_bytes
+    envelope = _object(parse_canonical_json_bytes(files[_V2_CASE_PATH], location=_V2_CASE_PATH), location=_V2_CASE_PATH)
+    baseline = _object(parse_canonical_json_bytes(files["baseline.json"], location="baseline.json"), location="baseline.json")
+    batches = cast(list[JsonObject], manifest["ordinary_grade_batches"])
+    steps = _v21_grade_steps(baseline, _v21_labels(envelope), batches)
+    accepted_count = sum(
+        call["state"] == "accepted" and call["operation"] in {
+            "ordinary_grade_fragment", "contested_grade_fragment"
+        }
+        for call in next_calls
+    )
+    terminal = accepted_count == len(steps)
+    if not terminal:
+        request = _v21_request_for_step(envelope, baseline, steps[accepted_count])
+        call = _v21_grade_call(request)
+        next_calls.append(call)
+        updated[cast(str, call["request_artifact_path"])] = canonical_json_bytes(request)
+    provisional = cast(JsonObject, _copy_json(manifest))
+    provisional["calls"] = next_calls
+    grade_files, aggregate_hashes, sensitivity_hashes, reports = _v21_grade_artifacts(provisional, updated, baseline)
+    updated.update(grade_files)
+    result_hash = None
+    terminal_status = None
+    phase = "ordinary_grading"
+    if not terminal and next_calls[-1]["operation"] == "contested_grade_fragment":
+        phase = "contested_grading"
+    if terminal:
+        terminal_status = "INCONCLUSIVE" if any(cast(JsonObject, item["sensitivity"])["absolute_disposition"] == "INCONCLUSIVE" for item in reports) else "COMPLETED"
+        phase = "inconclusive" if terminal_status == "INCONCLUSIVE" else "completed"
+        result_body: JsonObject = {"schema_version": "2.1", "rubric": _V21_RUBRIC, "baseline": baseline, "reports": reports, "comparison": _v21_comparison(reports), "terminal_status": terminal_status}
+        result = {**result_body, "result_fingerprint": _sha256(canonical_json_bytes(result_body))}
+        updated["result.json"] = canonical_json_bytes(result)
+        result_hash = cast(str, result["result_fingerprint"])
+    successor = _v21_manifest(
+        manifest, case_fingerprint=cast(str, manifest["case_fingerprint"]), case_hash=cast(str, manifest["case_envelope_hash"]),
+        build_hash=cast(str, manifest["build_fingerprint"]), rubric_hash=cast(str, manifest["rubric_fingerprint"]),
+        calls=next_calls, files=updated, phase=phase,
+        baseline_fingerprint=cast(str, baseline["baseline_fingerprint"]), referee_fingerprint=cast(str, manifest["referee_aggregate_fingerprint"]),
+        aggregate_fingerprints=aggregate_hashes, sensitivity_fingerprints=sensitivity_hashes,
+        result_hash=result_hash, terminal_status=terminal_status,
+        disputes=cast(list[JsonObject], manifest["referee_disputes"]), batches=batches,
+    )
+    _v21_commit_transition(
+        run_dir,
+        cast(str, manifest["manifest_fingerprint"]),
+        {path: data for path, data in updated.items() if path not in files},
+        successor,
+    )
+    return _v21_state(successor)
+
+
+# Retain the complete 2.0 implementation behind explicit replay-only aliases.
+_v20_resume_evaluation = resume_evaluation
+_v20_next_judge_request = next_judge_request
+_v20_verify_evaluation_run = verify_evaluation_run
+
+
+def _v2_protocol(run_dir: Path) -> str | None:  # type: ignore[no-redef]
+    try:
+        with _open_run_storage(run_dir) as storage:
+            data = storage.read_optional_artifact(
+                _V2_MANIFEST_PATH, max_bytes=16 * 1024 * 1024
+            )
+            storage.assert_root_identity()
+    except EvaluationIntegrityError:
+        return None
+    if data is None:
+        return None
+    try:
+        raw = _object(
+            parse_canonical_json_bytes(data, location=_V2_MANIFEST_PATH),
+            location=_V2_MANIFEST_PATH,
+        )
+    except EvaluationIntegrityError:
+        return None
+    version = raw.get("protocol_version")
+    if version in {_V2_PROTOCOL, _V21_PROTOCOL}:
+        return version
+    if raw.get("schema_version") == "1.3":
+        return "1.3"
+    return "unknown" if "protocol_version" in raw else None
+
+
+def initialize_evaluation(  # type: ignore[no-redef]
+    case: object,
+    output_dir: Path,
+    *,
+    seed_hex: str,
+    generation_capsule_paths: Mapping[str, Path] | None = None,
+    generation_substrate: Any | None = None,
+) -> JsonObject:
+    return _v21_initialize_evaluation(
+        case,
+        output_dir,
+        seed_hex=seed_hex,
+        generation_capsule_paths=generation_capsule_paths,
+        generation_substrate=generation_substrate,
+    )
+
+
+def resume_evaluation(run_dir: Path) -> JsonObject:  # type: ignore[no-redef]
+    protocol = _v2_protocol(run_dir)
+    if protocol == _V21_PROTOCOL:
+        manifest, _ = _v21_verified(run_dir)
+        return _v21_state(manifest)
+    if protocol == _V2_PROTOCOL:
+        manifest, _ = _v2_verified(run_dir)
+        return _v2_state(manifest)
+    if protocol == "1.3":
+        return _resume_evaluation_v1(run_dir)
+    raise EvaluationIntegrityError("EVALUATOR_PROTOCOL_UNSUPPORTED")
+
+
+# Protocol 2.2 portable mirror
+_V22_PROTOCOL = "2.2"
+_V22_MAX_JSON_BYTES = 16 * 1024 * 1024
+_V22_COMPILER_VERSION = "semantic-compiler-v2.2"
+_V22_COMPILER_CONTRACT_FINGERPRINT = (
+    "46d582434e37f9b396c73a8c523c3b0666bb11ec8880c9fc2369bcc1fc854306"
+)
+_V22_STORAGE_CONCURRENCY_CONTRACT = (
+    "cooperative-exclusive-directory-namespace-per-operation-v1"
+)
+_V22_BUILD: JsonObject = {
+    "compiler_contract_fingerprint": _V22_COMPILER_CONTRACT_FINGERPRINT,
+    "compiler_version": _V22_COMPILER_VERSION,
+    "protocol_version": _V22_PROTOCOL,
+}
+_V22_RUBRIC: JsonObject = {
+    "version": "attorney-eval-v2.2",
+    "importance_weights": {"critical": 3, "material": 2, "supporting": 1},
+    "critical_recall_floor": 1.0,
+    "weighted_coverage_floor": 0.9,
+    "material_unsupported_assertions_allowed": 0,
+}
+_V22_INNER = (
+    " Return only the inner payload as one canonical JSON object conforming exactly to "
+    "json_schema. Do not author the outer response envelope; the controller supplies "
+    "operation, request_fingerprint, provider_name, model_name, judge_isolation, and the "
+    "outer schema_version."
+)
+_V22_INSTRUCTIONS = {
+    "source_review_fragment": "Review the supplied frozen source record and accepted inventory. Identify only new source-grounded semantic proposals.",
+    "source_audit_fragment": "Audit the supplied source record and controller-indexed proposal inventory. Identify only new source-grounded concerns.",
+    "source_referee_fragment": "Resolve one supplied material dispute using only controller-resolved source evidence.",
+    "ordinary_grade_fragment": "Grade only the supplied canonical requirement subset against the supplied report and source context.",
+    "contested_grade_fragment": "Grade both supplied alternatives for exactly one contested requirement against the supplied report and source context.",
+}
+_V22_DRAFT_SCHEMAS: dict[str, JsonObject] = {
+    'source_review_fragment': _v2_embedded_schema('c-oy+O>f&U4E-yC)}w)91$ybVy#zZnON(8G!jLW6<*Khra@Qcpe;*|$wqm;*x|=AI?~#wByk{2z8qaR_>;V+l0qYI-p0^OMxDXi7Xf8L-Sa1P>TpKPu6wGE<d-mFykYWM`NeA{lT@)<rY&3mvs9Sa@m^YoPp+u2;KcvgmTFfIT#KCKa4k+Sh7G4}lpNbJ?Qo{gds$WotNMGK81ua0=yF165@Z;+0lchS4Ji7X4w9y9LshF8az`it^c;USU8@<Y4$Rv?bQ#gIljiCZWS?%)7w>jv7YJs~JLTQ{p$}!R^)Tko!*AeA0d9Ch`UIPy504=zgm~O&)PLid!q}r0WQ9R?h{7-3XqZ^DYkPBN&;Ew3Hs<7=$7iH|U18?LT)sdxnJH{_)D25tRT6%Zi5d5B9IG_Xja+!AFa;ersu|MJIPD*xoN<HPB4D2S}5IibtT;S8>9Ti`vW+)!OVLJNGM(3DVmi~G~SV;c`waAf8C9zHIV@bzntng%kQ|LXOkK$<#aWJ@$G?wF3D$s$fmfJk7Z;^N*A=__R>Kq18=`ay<x{-${!~44TzAoYvAB}8`Hz(kMlsm_FG1&2bl+NCo?QpsD-UO086_&p@!{tBUo6Pg27XtG(*)i8TpT05Ce2r%NF<T;{|HQ)BBi>(oFlU{1VGw?RTTmX}5Pp}nQC7nFTfa@8R=1~5LvUpb?XI4QYBQcGZZ22<Tj=3Gmh2BNELi3', '566effc520f36e8b28efaab111d19ff0f209e68568d0a0b8836c04b469428faa'),
+    'source_audit_fragment': _v2_embedded_schema('c-qZYO>f&U4E-yC)?<L81$OCeXm<#9Xx0|H41=NAw98eNR7oxp1o`iy<S)r~+jXbiBw8XLA0H_n*;xUlWmiXb4>gw#^DVcQSKv*&DA1vjTx^ZfU>pJ+ExE9;W;!w**>j^@xZ}_XTCnfIux9R{{nk2zvSOz-v#K#UWLU(f?}Kr*Ddsomih<__4bY9B(e-r~^w)ZHGs$6argpy}cRqafrJ<y*mCV7&8^cTY<MQ%@$>#0ttaW~5Ae-7_Q#D#kE+{U_Tp2?#GwZm68l+3C@PY-9m&9m5a1X&gqNWeL-eJ|CJH#n=$X5?O_5!_~FOR|}B@eeHK|8WD1GHeD&O^b^GoPfgTnrSP*2mtPY=mGZ3Q9+LBOJT(7IF@IEx6>p_a4*N$h-hax77&LA#o8F6Fk$((Y2cIH|^=qv_aWzE=Df4z2hM$H-;blWyehgF4J9>nKA`ZX;V(fDb~Jp7lQ+o4k|G3voWH02%%Ozp{v_2)Ks~NY9dxrTBA}gOLa-pH=sd!Jstj0(TVaRMHj)b%|c;epM&<NGN)Le17(X}mWrCP$aaZT?@~F>bkWr)Dos+5l-{1zd8H;aPnu{FB&K(PwIy<Ao$}#fQFgr^5t|F(X6SL%cp4jNz$)=Vd87?r4zps$VKL<JcDpa+`Zo=awN}RQDR@K4=b;!i4L5^fX&dbidted#&FEnP{u9a~nV>s?RX<3G$4A^@zXLOl*FlQC4sqD<LXa#+Rd%Dd;yQ-)%?JKZW|iTsl#=)JZZIyrp~IUJzoF4X^UfO@oqTGEz_?7&Xv$;tjX>izn)S!5i75OB8ixC+m*uL~0@8nqFb`MP{g)xmPAO_9**<?^TE1Do<+(bo;^e`d7jAjH`*V{FVzSyFodDo<zWxAWKvW9', 'a30365d1413adf1eda94143e41b921cba15e3f52ac4a0efd9b8b284b630cfa04'),
+    'source_referee_fragment': _v2_embedded_schema('c-n1|%TB{E5Ji8bnsqj<#3sAGD3PF!@<2ieMJAq9Mu`&~r%+Y-cg9T<SHR9bnz?i5&KbB6(#TrzGSqd0+DL4{FL>Fa2h9ySgTP$2RBGR-x(fVP;CYUX$uu4%exU|$B)lWt+Ja7LZ0quf0^U3@(v%23Y(_Ccr^b@jXsHg+dq83WRgPJ$g(PQ}>C#|zc~nx#%1)n8tx_30&~)mp_;)Z=-g&n4`kA}Q+pGGFjp~yQ*P5TKisnNmXa|ms(FFhT?6#yZcsr!T)rl1plgle+X|&#E%coVaOM~Qvq^@Yq_V<s$I&oyT4C%9C$wL;hI7kAvkF#_ir(wvVWV^Y<`OC+7B&sV*=&3?r!MoCcZ;4AGo&3(C!EbN(#?MY_x)fOz?m~YLavRajRkH{S)QB6+3-i2KxTNa$56lhpKOl$IMg', 'ef15eaa6fa7cb11ed8c34ed497c01f0420d47f5d0cef62b88aa8da790749a0bb'),
+    'ordinary_grade_fragment': _v2_embedded_schema('c-oy)%WA_g5d4*}&Cw7V=*8zi=qVwGUP>|Bcx_bla91+anEZPsKV;|C(%z)iXl8dtYGIjEVIgfHJJ4q>m=tNZWz1>ASh$z<Ivir23nz?5xo1-mJ3;<Zfzna})vVM)E^K9NhYnlPwSx2&6gluv^f;8V$@;xEZdld&=s8emcuT+uCkay6%(#5DsY1~@7P^E}0!9gI2OZSSuJA(b6)aYCEhU^hy&oBC=^zc2No_aMd1}UfTngMH;1G*9nqjI8yR1TMvFxo7j#Rg}0xSG_?hl_P{X@sF*pCcR1evkvHDW}W;avD$0=*Jis9^KsoGd~Yy8#*rg?3aD!)fBoLrAyyle0vx=bU>ri|+n&id~rZ4?4Q8i9fur|0FX_Rfbm1!&x%<hXW6*?klYBH-4F$w|&^$@qOEiUFP_M>E(Fiwx@lN-27tbH{Z}%Is', '4972008ae8aa6d9a589a3680df797eecce21d43d8caf19b7a01f0fbd907ae364'),
+    'contested_grade_fragment': _v2_embedded_schema('c-pN}!A`?44E+@pcC0k96WVQJ65=*-;DS))Ep8QPli;`;)wF*nNm;wCT_q4VJF)$q-}7EfBxX*`_u|25M#m@@1tV!-wZ%sQi7&HR_y;K!E2E)Uk+Ddu(D!9fI81~+dD;u9oHZ_1hjc=iiMhC)MyzQIwCu_P#vu^|4FZNXRvZHH+&(6PYa5;%lhS$YKx>Fo3(i5_pex2Q2EF1EzMh)TyV-rx0mK<MtK*Co28f^*hY0goDMBgcuV>r!37jtR)?tjQ+X9;PJ8n2oy(W@h3w2cn9woBxwBTijqNvj**M@(hN^iU+p!6V*i@7~%J%?X74&_?qmEt<R@cu{^HXqvT3Y57QF%f2q<QTX~O2thyNO^IbeX~4MzGp8~p0A-4I*HRfXgqd=Lw@}661NI>_#f~W2RAZ#Z0Y2RD_1TwZ8=3EOM;9CkMkREkAIc', '0f2fd52fe2b6e96686b777c79573b23812c79864ca9fcaa8a081a02bf2cb9d8c'),
+}
+_V22_SUBMISSION_LOCKS = tuple(_threading.RLock() for _ in range(64))
+_V22_OPERATIONS = tuple(_V22_INSTRUCTIONS)
+_V22_ENUMS = {
+    "kind": {"obligation", "prohibition", "permission", "exception", "definition", "deadline", "enforcement", "gap"},
+    "importance": {"critical", "material", "supporting"},
+    "confidence": {"clear", "ambiguous", "unresolved"},
+    "decision": {"accept_reviewer", "accept_auditor", "unresolved"},
+    "disposition": {"met", "partially_met", "not_met", "uncertain"},
+    "ambiguity_disposition": {"acknowledged", "overstated", "omitted", "uncertain"},
+}
+
+
+class _V22Clarification(ValueError):
+    def __init__(self, *codes: str) -> None:
+        super().__init__("draft needs clarification")
+        self.codes = tuple(sorted(set(codes)))
+
+
+def _v22_draft_object(value: object, *, location: str) -> JsonObject:
+    """Translate only untrusted draft shape failures into clarification."""
+    try:
+        return _object(value, location=location)
+    except PortableEvaluationInputError as error:
+        raise _V22Clarification("DRAFT_INVALID") from error
+
+
+def _v22_draft_list(value: object, *, location: str) -> list[object]:
+    """Translate only untrusted draft array failures into clarification."""
+    try:
+        return _v2_list(value, location=location)
+    except PortableEvaluationInputError as error:
+        raise _V22Clarification("DRAFT_INVALID") from error
+
+
+def _v22_nonblank(value: object) -> str:
+    if type(value) is not str or not value.strip():
+        raise _V22Clarification("DRAFT_INVALID")
+    return value
+
+
+def _v22_required_nonblank(value: JsonObject, key: str) -> str:
+    if key not in value:
+        raise _V22Clarification("SUBSTANCE_MISSING")
+    return _v22_nonblank(value[key])
+
+
+def _v22_provenance_nonblank(value: object) -> str:
+    if type(value) is not str or not value.strip():
+        raise EvaluationIntegrityError("EVALUATOR_V22_PROVENANCE")
+    return value
+
+
+def _v22_response_nonblank(value: object) -> str:
+    if type(value) is not str or not value.strip():
+        raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+    return value
+
+
+def _v22_response_member(value: object, allowed: set[str]) -> str:
+    if type(value) is not str or value not in allowed:
+        raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+    return value
+
+
+def _v22_response_proposal(value: object, *, location: str) -> JsonObject:
+    proposal = _object(value, location=location)
+    for key, allowed in (
+        ("kind", _V22_ENUMS["kind"]),
+        ("importance", _V22_ENUMS["importance"]),
+        ("confidence", _V22_ENUMS["confidence"]),
+    ):
+        if key in proposal:
+            _v22_response_member(proposal[key], allowed)
+    dependency = proposal.get("dependency")
+    if type(dependency) is dict:
+        edge = cast(JsonObject, dependency)
+        if "relationship" in edge:
+            _v22_response_member(
+                edge["relationship"],
+                {"depends_on", "exception_to", "defines", "enforced_by"},
+            )
+    return _v2_proposal(proposal, location=location)
+
+
+def _v22_bounded_json_object(value: object) -> JsonObject:
+    def pairs(items: list[tuple[str, object]]) -> JsonObject:
+        result: JsonObject = {}
+        for key, item in items:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = item
+        return result
+
+    if isinstance(value, bytes):
+        if len(value) > 262_144:
+            raise _V22Clarification("DRAFT_TOO_LARGE")
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise _V22Clarification("DRAFT_INVALID") from error
+    if isinstance(value, str):
+        if len(value.encode("utf-8")) > 262_144:
+            raise _V22Clarification("DRAFT_TOO_LARGE")
+        try:
+            value = json.loads(value, object_pairs_hook=pairs)
+        except (json.JSONDecodeError, ValueError) as error:
+            raise _V22Clarification("DRAFT_INVALID") from error
+    try:
+        encoded = canonical_json_bytes(value)
+    except (TypeError, ValueError, RecursionError) as error:
+        raise _V22Clarification("DRAFT_INVALID") from error
+    if len(encoded) > 262_144:
+        raise _V22Clarification("DRAFT_TOO_LARGE")
+    decoded = json.loads(encoded, object_pairs_hook=pairs)
+    if type(decoded) is not dict:
+        raise _V22Clarification("DRAFT_INVALID")
+    return cast(JsonObject, decoded)
+
+
+def _v22_trim_aliases(value: object, *, quoted: bool = False) -> object:
+    if isinstance(value, dict):
+        result: JsonObject = {}
+        for key, item in value.items():
+            if key in _V22_ENUMS and isinstance(item, str):
+                folded = item.casefold()
+                result[key] = folded if folded in _V22_ENUMS[key] else item
+            else:
+                result[key] = _v22_trim_aliases(
+                    item, quoted=key in {"quote", "report_passages"}
+                )
+        return result
+    if isinstance(value, list):
+        return [_v22_trim_aliases(item, quoted=quoted) for item in value]
+    return value.strip() if isinstance(value, str) and not quoted else value
+
+
+def _v22_passage(value: object) -> JsonObject:
+    item = _v22_draft_object(value, location="draft passage")
+    if not {"source_id", "quote"} <= set(item):
+        raise _V22Clarification("SUBSTANCE_MISSING")
+    if set(item) != {"source_id", "quote"}:
+        raise _V22Clarification("DRAFT_INVALID")
+    return {
+        "source_id": _v22_required_nonblank(item, "source_id"),
+        "quote": _v22_required_nonblank(item, "quote"),
+    }
+
+
+def _v22_proposal_draft(value: object) -> JsonObject:
+    item = _v22_draft_object(value, location="draft proposal")
+    required = {"statement", "kind", "importance", "passages", "confidence", "rationale"}
+    if not required <= set(item):
+        raise _V22Clarification("SUBSTANCE_MISSING")
+    if set(item) - (required | {"dependency"}):
+        raise _V22Clarification("DRAFT_INVALID")
+    if item["kind"] not in _V22_ENUMS["kind"] or item["importance"] not in _V22_ENUMS["importance"] or item["confidence"] not in _V22_ENUMS["confidence"]:
+        raise _V22Clarification("DRAFT_INVALID")
+    passages = _v22_draft_list(item["passages"], location="draft passages")
+    if not 1 <= len(passages) <= 5:
+        raise _V22Clarification("ITEM_LIMIT_EXCEEDED" if len(passages) > 5 else "DRAFT_INVALID")
+    checked_passages = [_v22_passage(raw) for raw in passages]
+    if len({canonical_json_bytes(raw) for raw in checked_passages}) != len(checked_passages):
+        raise _V22Clarification("DRAFT_INVALID")
+    dependency = item.get("dependency")
+    if dependency is not None:
+        edge = _v22_draft_object(dependency, location="draft dependency")
+        if not {"relationship", "target_ordinal"} <= set(edge):
+            raise _V22Clarification("SUBSTANCE_MISSING")
+        if set(edge) != {"relationship", "target_ordinal"} or edge["relationship"] not in {"depends_on", "exception_to", "defines", "enforced_by"} or type(edge["target_ordinal"]) is not int or edge["target_ordinal"] < 1:
+            raise _V22Clarification("DRAFT_INVALID")
+    return {
+        "statement": _v22_required_nonblank(item, "statement"),
+        "kind": item["kind"], "importance": item["importance"],
+        "passages": checked_passages, "dependency": _copy_json(dependency),
+        "confidence": item["confidence"],
+        "rationale": _v22_required_nonblank(item, "rationale"),
+    }
+
+
+def _v22_resolve_quote(source_id: str, quote: str, sources: dict[str, str]) -> tuple[str, bool]:
+    text = sources.get(source_id)
+    if text is None:
+        raise _V22Clarification("REFERENCE_UNKNOWN")
+    exact = [match.start() for match in re.finditer(re.escape(quote), text)]
+    if len(exact) == 1:
+        return quote, False
+    if len(exact) > 1:
+        raise _V22Clarification("EVIDENCE_AMBIGUOUS")
+    pattern = r"\s+".join(re.escape(piece) for piece in re.compile(r"\s+").split(quote))
+    matches = [match.group(1) for match in re.finditer(f"(?=({pattern}))", text)]
+    if len(matches) == 1:
+        return matches[0], True
+    if len(matches) > 1:
+        raise _V22Clarification("EVIDENCE_AMBIGUOUS")
+    raise _V22Clarification("EVIDENCE_NOT_FOUND")
+
+
+def _v22_request_sources(request: JsonObject) -> dict[str, str]:
+    payload = _object(request.get("payload"), location="request payload")
+    record = _object(payload.get("source_record"), location="source record")
+    sources = _v2_list(record.get("sources"), location="source record sources")
+    result: dict[str, str] = {}
+    for raw in sources:
+        source = _object(raw, location="source")
+        source_id = source.get("source_id")
+        text = source.get("normalized_text")
+        if type(source_id) is not str or type(text) is not str or source_id in result:
+            raise EvaluationIntegrityError("EVALUATOR_V22_REQUEST_CONTEXT")
+        result[source_id] = text
+    return result
+
+
+def _v22_resolved_proposal(
+    proposal: JsonObject, sources: dict[str, str], inventory: list[tuple[str, str]]
+) -> tuple[JsonObject, bool, bool]:
+    passages: list[JsonObject] = []
+    seen: set[tuple[str, str]] = set()
+    normalized = duplicate = False
+    for raw in cast(list[JsonObject], proposal["passages"]):
+        quote, changed = _v22_resolve_quote(cast(str, raw["source_id"]), cast(str, raw["quote"]), sources)
+        key = (cast(str, raw["source_id"]), quote)
+        normalized = normalized or changed
+        if key in seen:
+            duplicate = True
+            continue
+        seen.add(key)
+        passages.append({"source_id": key[0], "quote": key[1]})
+    result = cast(JsonObject, _copy_json(proposal))
+    result["passages"] = passages
+    dependency = cast(JsonObject | None, proposal["dependency"])
+    if dependency is not None:
+        ordinal = cast(int, dependency["target_ordinal"])
+        if ordinal > len(inventory):
+            raise _V22Clarification("REFERENCE_UNKNOWN")
+        result["dependency"] = {
+            "relationship": dependency["relationship"],
+            "target_statement": inventory[ordinal - 1][1],
+        }
+    return result, normalized, duplicate
+
+
+def _v22_compile_draft(
+    request: JsonObject, draft: object, provenance: Mapping[str, object]
+) -> tuple[JsonObject | None, tuple[str, ...]]:
+    try:
+        raw = cast(JsonObject, _v22_trim_aliases(_v22_bounded_json_object(draft)))
+        operation = request.get("operation")
+        payload = _object(request.get("payload"), location="request payload")
+        sources = _v22_request_sources(request) if operation in {"source_review_fragment", "source_audit_fragment"} else {}
+        codes: list[str] = []
+        strict: JsonObject
+        if operation == "source_review_fragment":
+            if not {"proposals", "review_complete"} <= set(raw):
+                raise _V22Clarification("SUBSTANCE_MISSING")
+            if set(raw) != {"proposals", "review_complete"} or type(raw["review_complete"]) is not bool:
+                raise _V22Clarification("DRAFT_INVALID")
+            values = _v22_draft_list(raw["proposals"], location="draft proposals")
+            if len(values) > 5:
+                raise _V22Clarification("ITEM_LIMIT_EXCEEDED")
+            if not raw["review_complete"] and not values:
+                raise _V22Clarification("DRAFT_INVALID")
+            accepted = _v2_list(
+                payload.get("accepted_proposals", []), location="accepted proposals"
+            )
+            inventory = []
+            for index, item in enumerate(accepted, 1):
+                proposal = _object(item, location="accepted proposal")
+                semantic = _object(proposal.get("proposal"), location="accepted proposal") if "proposal" in proposal else proposal
+                inventory.append((f"P{index:04d}", cast(str, semantic["statement"])))
+            compiled: list[JsonObject] = []
+            seen: dict[str, bytes] = {}
+            normalized = duplicate = False
+            for item in values:
+                proposal, changed, removed = _v22_resolved_proposal(_v22_proposal_draft(item), sources, inventory)
+                identity = cast(str, proposal["statement"])
+                encoded = canonical_json_bytes(proposal)
+                if identity in seen and seen[identity] != encoded:
+                    raise _V22Clarification("CONFLICTING_ITEMS")
+                if identity in seen:
+                    duplicate = True
+                else:
+                    seen[identity] = encoded
+                    compiled.append(proposal)
+                normalized = normalized or changed
+                duplicate = duplicate or removed
+            if normalized:
+                codes.append("DRAFT_NORMALIZED_EVIDENCE_WHITESPACE")
+            if duplicate:
+                codes.append("DRAFT_NORMALIZED_DUPLICATES")
+            strict = {"schema_version": "2.2", "proposals": compiled, "review_complete": raw["review_complete"]}
+        elif operation == "source_audit_fragment":
+            strict, codes = _v22_compile_audit_draft(raw, payload, sources)
+        elif operation == "source_referee_fragment":
+            strict, codes = _v22_compile_referee_draft(raw, payload)
+        elif operation == "ordinary_grade_fragment":
+            strict, codes = _v22_compile_ordinary_draft(raw, payload)
+        elif operation == "contested_grade_fragment":
+            strict, codes = _v22_compile_contested_draft(raw, payload)
+        else:
+            raise EvaluationIntegrityError("EVALUATOR_V22_REQUEST_OPERATION")
+        provider = _v22_provenance_nonblank(provenance.get("provider_name"))
+        model = _v22_provenance_nonblank(provenance.get("model_name"))
+        isolation = provenance.get("judge_isolation")
+        if isolation not in {"fresh_context", "scripted_fixture"}:
+            raise EvaluationIntegrityError("EVALUATOR_V22_PROVENANCE")
+        response: JsonObject = {
+            "schema_version": "2.2", "operation": operation,
+            "request_fingerprint": request["request_fingerprint"],
+            "provider_name": provider, "model_name": model,
+            "judge_isolation": isolation, "payload": strict,
+        }
+        return response, tuple(sorted(set(codes)))
+    except _V22Clarification as error:
+        return None, error.codes
+
+
+def _compile_evaluator_draft_v22_for_test(
+    request_bytes: bytes, draft_bytes: bytes, provenance: Mapping[str, object]
+) -> bytes | tuple[str, ...]:
+    try:
+        request = _object(
+            parse_canonical_json_bytes(request_bytes, location="evaluator request"),
+            location="evaluator request",
+        )
+        if (
+            set(request)
+            != {
+                "schema_version", "operation", "request_fingerprint",
+                "system_instructions", "json_schema", "payload", "safe_metadata",
+            }
+            or request.get("schema_version") != "2.2"
+            or request.get("operation") not in _V22_OPERATIONS
+            or type(request.get("request_fingerprint")) is not str
+            or not re.fullmatch(r"[0-9a-f]{64}", cast(str, request["request_fingerprint"]))
+            or type(request.get("payload")) is not dict
+        ):
+            raise ValueError
+    except (EvaluationIntegrityError, PortableEvaluationInputError, TypeError, ValueError):
+        return ("COMPILER_INVARIANT",)
+    response, codes = _v22_compile_draft(request, draft_bytes, provenance)
+    return codes if response is None else canonical_json_bytes(response)
+
+
+def _v22_compile_audit_draft(
+    raw: JsonObject, payload: JsonObject, sources: dict[str, str]
+) -> tuple[JsonObject, list[str]]:
+    if not {"concerns", "audit_complete"} <= set(raw):
+        raise _V22Clarification("SUBSTANCE_MISSING")
+    if set(raw) != {"concerns", "audit_complete"} or type(raw["audit_complete"]) is not bool:
+        raise _V22Clarification("DRAFT_INVALID")
+    values = _v22_draft_list(raw["concerns"], location="draft concerns")
+    if len(values) > 5:
+        raise _V22Clarification("ITEM_LIMIT_EXCEEDED")
+    if not raw["audit_complete"] and not values:
+        raise _V22Clarification("DRAFT_INVALID")
+    indexed = cast(list[JsonObject], _v2_list(payload.get("indexed_proposals"), location="indexed proposals"))
+    refs = [cast(str, _object(item, location="indexed proposal")["proposal_ref"]) for item in indexed]
+    dependency_inventory = [
+        (cast(str, item["proposal_ref"]), cast(str, _object(item["proposal"], location="proposal")["statement"]))
+        for item in indexed
+    ]
+    compiled: list[JsonObject] = []
+    seen: dict[tuple[object, ...], bytes] = {}
+    evidence_normalized = duplicate = False
+    for value in values:
+        item = _v22_draft_object(value, location="draft concern")
+        required = {"concern_type", "passages", "explanation"}
+        if not required <= set(item):
+            raise _V22Clarification("SUBSTANCE_MISSING")
+        if set(item) - (required | {"target_proposal_ordinal", "correction"}):
+            raise _V22Clarification("DRAFT_INVALID")
+        concern_type = item["concern_type"]
+        if concern_type not in {"omission", "incorrect_statement", "incorrect_evidence", "incorrect_relationship", "ambiguity"}:
+            raise _V22Clarification("DRAFT_INVALID")
+        ordinal = item.get("target_proposal_ordinal")
+        if ordinal is not None and (type(ordinal) is not int or ordinal < 1):
+            raise _V22Clarification("DRAFT_INVALID")
+        target = None
+        if ordinal is not None:
+            if ordinal > len(refs):
+                raise _V22Clarification("REFERENCE_UNKNOWN")
+            target = refs[ordinal - 1]
+        correction_raw = item.get("correction")
+        if concern_type == "omission":
+            if target is not None or correction_raw is None:
+                raise _V22Clarification("SUBSTANCE_MISSING")
+        elif concern_type == "ambiguity":
+            if target is None or correction_raw is not None:
+                raise _V22Clarification("SUBSTANCE_MISSING")
+        elif target is None or correction_raw is None:
+            raise _V22Clarification("SUBSTANCE_MISSING")
+        passages_raw = _v22_draft_list(item["passages"], location="concern passages")
+        if not 1 <= len(passages_raw) <= 5:
+            raise _V22Clarification("ITEM_LIMIT_EXCEEDED" if len(passages_raw) > 5 else "DRAFT_INVALID")
+        passages: list[JsonObject] = []
+        passage_seen: set[tuple[str, str]] = set()
+        for passage_value in passages_raw:
+            passage = _v22_passage(passage_value)
+            quote, changed = _v22_resolve_quote(cast(str, passage["source_id"]), cast(str, passage["quote"]), sources)
+            key = (cast(str, passage["source_id"]), quote)
+            evidence_normalized = evidence_normalized or changed
+            if key in passage_seen:
+                duplicate = True
+            else:
+                passage_seen.add(key)
+                passages.append({"source_id": key[0], "quote": key[1]})
+        correction = None
+        if correction_raw is not None:
+            correction, changed, removed = _v22_resolved_proposal(
+                _v22_proposal_draft(correction_raw), sources, dependency_inventory
+            )
+            evidence_normalized = evidence_normalized or changed
+            duplicate = duplicate or removed
+        concern: JsonObject = {
+            "target_proposal_ref": target, "concern_type": concern_type,
+            "passages": passages,
+            "explanation": _v22_required_nonblank(item, "explanation"),
+            "correction": correction,
+        }
+        identity = (
+            target, concern_type,
+            tuple((passage["source_id"], passage["quote"]) for passage in passages),
+            None if correction is None else correction["statement"],
+        )
+        encoded = canonical_json_bytes(concern)
+        if identity in seen and seen[identity] != encoded:
+            raise _V22Clarification("CONFLICTING_ITEMS")
+        if identity in seen:
+            duplicate = True
+        else:
+            seen[identity] = encoded
+            compiled.append(concern)
+    codes = []
+    if evidence_normalized:
+        codes.append("DRAFT_NORMALIZED_EVIDENCE_WHITESPACE")
+    if duplicate:
+        codes.append("DRAFT_NORMALIZED_DUPLICATES")
+    return {"schema_version": "2.2", "concerns": compiled, "audit_complete": raw["audit_complete"]}, codes
+
+
+def _v22_compile_referee_draft(raw: JsonObject, payload: JsonObject) -> tuple[JsonObject, list[str]]:
+    required = {"decision", "evidence_ordinals", "rationale"}
+    if not required <= set(raw):
+        raise _V22Clarification("SUBSTANCE_MISSING")
+    if set(raw) - (required | {"unresolved_reason"}):
+        raise _V22Clarification("DRAFT_INVALID")
+    decision = raw["decision"]
+    reason = raw.get("unresolved_reason")
+    if decision not in _V22_ENUMS["decision"] or (decision == "unresolved") != (reason is not None):
+        raise _V22Clarification("DRAFT_INVALID")
+    if reason is not None and reason not in {"SOURCE_AMBIGUITY", "SOURCE_CONFLICT", "SOURCE_GAP", "BOTH_POSITIONS_UNSUPPORTED"}:
+        raise _V22Clarification("DRAFT_INVALID")
+    disputes = _v2_list(payload.get("material_disputes"), location="material disputes")
+    if len(disputes) != 1:
+        raise EvaluationIntegrityError("EVALUATOR_V22_REQUEST_CONTEXT")
+    evidence = cast(list[JsonObject], _v2_list(_object(disputes[0], location="dispute").get("evidence"), location="evidence"))
+    ordinals = _v22_draft_list(raw["evidence_ordinals"], location="evidence ordinals")
+    if not 1 <= len(ordinals) <= 5:
+        raise _V22Clarification("ITEM_LIMIT_EXCEEDED" if len(ordinals) > 5 else "DRAFT_INVALID")
+    refs: list[str] = []
+    duplicate = False
+    for ordinal in ordinals:
+        if type(ordinal) is not int or ordinal < 1:
+            raise _V22Clarification("DRAFT_INVALID")
+        if ordinal > len(evidence):
+            raise _V22Clarification("REFERENCE_UNKNOWN")
+        ref = cast(str, evidence[ordinal - 1]["evidence_ref"])
+        if ref in refs:
+            duplicate = True
+        else:
+            refs.append(ref)
+    return {
+        "schema_version": "2.2", "decision": decision,
+        "unresolved_reason": reason, "evidence_refs": refs,
+        "rationale": _v22_required_nonblank(raw, "rationale"),
+    }, (["DRAFT_NORMALIZED_DUPLICATES"] if duplicate else [])
+
+
+def _v22_report_passages(values: object, report: str) -> tuple[list[str], bool]:
+    items = _v22_draft_list(values, location="report passages")
+    if len(items) > 5:
+        raise _V22Clarification("ITEM_LIMIT_EXCEEDED")
+    result: list[str] = []
+    duplicate = False
+    for value in items:
+        if type(value) is not str:
+            raise _V22Clarification("DRAFT_INVALID")
+        occurrences = [match.start() for match in re.finditer(re.escape(value), report)]
+        if not occurrences:
+            raise _V22Clarification("EVIDENCE_NOT_FOUND")
+        if len(occurrences) > 1:
+            raise _V22Clarification("EVIDENCE_AMBIGUOUS")
+        if value in result:
+            duplicate = True
+        else:
+            result.append(value)
+    return result, duplicate
+
+
+def _v22_compile_ordinary_draft(raw: JsonObject, payload: JsonObject) -> tuple[JsonObject, list[str]]:
+    if set(raw) != {"requirement_grades", "rationale"}:
+        if not {"requirement_grades", "rationale"} <= set(raw):
+            raise _V22Clarification("SUBSTANCE_MISSING")
+        raise _V22Clarification("DRAFT_INVALID")
+    requirements = cast(list[JsonObject], _v2_list(payload.get("requirements"), location="requirements"))
+    identifiers = [cast(str, item["requirement_id"]) for item in requirements]
+    values = _v22_draft_list(raw["requirement_grades"], location="requirement grades")
+    if not 1 <= len(values) <= 5:
+        raise _V22Clarification("ITEM_LIMIT_EXCEEDED" if len(values) > 5 else "DRAFT_INVALID")
+    report = _v22_nonblank(payload.get("report_text"))
+    by_ordinal: dict[int, JsonObject] = {}
+    duplicate = False
+    for value in values:
+        item = _v22_draft_object(value, location="grade")
+        required = {"requirement_ordinal", "disposition", "report_passages", "rationale"}
+        if not required <= set(item):
+            raise _V22Clarification("SUBSTANCE_MISSING")
+        if set(item) - (required | {"omission"}):
+            raise _V22Clarification("DRAFT_INVALID")
+        ordinal = item["requirement_ordinal"]
+        if type(ordinal) is not int or ordinal < 1:
+            raise _V22Clarification("DRAFT_INVALID")
+        if ordinal > len(identifiers):
+            raise _V22Clarification("REFERENCE_UNKNOWN")
+        disposition = item["disposition"]
+        if disposition not in _V22_ENUMS["disposition"]:
+            raise _V22Clarification("DRAFT_INVALID")
+        passages, removed = _v22_report_passages(item["report_passages"], report)
+        omission = item.get("omission")
+        if omission is not None:
+            _v22_nonblank(omission)
+        grade: JsonObject = {
+            "requirement_id": identifiers[ordinal - 1],
+            "disposition": disposition, "report_passages": passages,
+            "rationale": _v22_required_nonblank(item, "rationale"),
+            "omission": omission,
+        }
+        if ordinal in by_ordinal:
+            if canonical_json_bytes(by_ordinal[ordinal]) != canonical_json_bytes(grade):
+                raise _V22Clarification("CONFLICTING_ITEMS")
+            duplicate = True
+        else:
+            by_ordinal[ordinal] = grade
+        duplicate = duplicate or removed
+    if sorted(by_ordinal) != list(range(1, len(identifiers) + 1)):
+        raise _V22Clarification("REFERENCE_UNKNOWN")
+    return {
+        "schema_version": "2.2", "anonymous_label": payload["anonymous_label"],
+        "grader_lane": payload["grader_lane"], "batch_ref": payload["batch_ref"],
+        "baseline_fingerprint": payload["baseline_fingerprint"],
+        "report_fingerprint": payload["report_fingerprint"],
+        "requirement_grades": [by_ordinal[index] for index in sorted(by_ordinal)],
+        "rationale": _v22_required_nonblank(raw, "rationale"),
+    }, (["DRAFT_NORMALIZED_DUPLICATES"] if duplicate else [])
+
+
+def _v22_alternative(value: object, report: str) -> tuple[JsonObject, bool]:
+    item = _v22_draft_object(value, location="alternative grade")
+    required = {"disposition", "report_passages", "rationale"}
+    if not required <= set(item):
+        raise _V22Clarification("SUBSTANCE_MISSING")
+    if set(item) != required or item.get("disposition") not in _V22_ENUMS["disposition"]:
+        raise _V22Clarification("DRAFT_INVALID")
+    passages, duplicate = _v22_report_passages(item["report_passages"], report)
+    return {
+        "disposition": item["disposition"], "report_passages": passages,
+        "rationale": _v22_required_nonblank(item, "rationale"),
+    }, duplicate
+
+
+def _v22_compile_contested_draft(raw: JsonObject, payload: JsonObject) -> tuple[JsonObject, list[str]]:
+    required = {"reviewer_alternative_grade", "auditor_alternative_grade", "ambiguity_disposition", "rationale"}
+    if not required <= set(raw):
+        raise _V22Clarification("SUBSTANCE_MISSING")
+    if set(raw) != required or raw["ambiguity_disposition"] not in _V22_ENUMS["ambiguity_disposition"]:
+        raise _V22Clarification("DRAFT_INVALID")
+    report = _v22_nonblank(payload.get("report_text"))
+    reviewer, first = _v22_alternative(raw["reviewer_alternative_grade"], report)
+    auditor, second = _v22_alternative(raw["auditor_alternative_grade"], report)
+    contested = _object(payload.get("contested_requirement"), location="contested requirement")
+    return {
+        "schema_version": "2.2", "anonymous_label": payload["anonymous_label"],
+        "grader_lane": payload["grader_lane"],
+        "contested_requirement_id": contested["contested_requirement_id"],
+        "baseline_fingerprint": payload["baseline_fingerprint"],
+        "report_fingerprint": payload["report_fingerprint"],
+        "reviewer_alternative_grade": reviewer, "auditor_alternative_grade": auditor,
+        "ambiguity_disposition": raw["ambiguity_disposition"],
+        "rationale": _v22_required_nonblank(raw, "rationale"),
+    }, (["DRAFT_NORMALIZED_DUPLICATES"] if first or second else [])
+
+
+def _v22_request_fingerprint(request: JsonObject) -> str:
+    body = cast(JsonObject, _copy_json(request))
+    body.pop("request_fingerprint", None)
+    return _sha256(canonical_json_bytes(body))
+
+
+def _v22_new_request(operation: str, payload: JsonObject, metadata: dict[str, str]) -> JsonObject:
+    request: JsonObject = {
+        "schema_version": "2.2", "operation": operation,
+        "request_fingerprint": "0" * 64,
+        "system_instructions": _V22_INSTRUCTIONS[operation] + _V22_INNER,
+        "json_schema": _copy_json(_V22_DRAFT_SCHEMAS[operation]),
+        "payload": _copy_json(payload),
+        "safe_metadata": {
+            **metadata,
+            "compiler_contract_fingerprint": _V22_COMPILER_CONTRACT_FINGERPRINT,
+        },
+    }
+    request["request_fingerprint"] = _v22_request_fingerprint(request)
+    return request
+
+
+def _v22_validate_request(value: object) -> JsonObject:
+    request = _object(value, location="evaluator request")
+    if set(request) != {"schema_version", "operation", "request_fingerprint", "system_instructions", "json_schema", "payload", "safe_metadata"} or request.get("schema_version") != "2.2" or request.get("operation") not in _V22_OPERATIONS or request.get("request_fingerprint") != _v22_request_fingerprint(request):
+        raise PortableEvaluationInputError("evaluator request is invalid")
+    expected = _V22_DRAFT_SCHEMAS.get(cast(str, request["operation"]))
+    if expected is None or request["json_schema"] != expected:
+        raise PortableEvaluationInputError("evaluator request schema is invalid")
+    return cast(JsonObject, _copy_json(request))
+
+
+def _v22_source_context(envelope: JsonObject) -> dict[str, str]:
+    case = _object(envelope["case"], location="case")
+    return {
+        cast(str, item["source_id"]): cast(str, item["normalized_text"])
+        for item in cast(list[JsonObject], case["sources"])
+    }
+
+
+def _v22_source_metadata(envelope: JsonObject, record: JsonObject) -> dict[str, str]:
+    return {
+        "record_scope": "source-only",
+        "case_fingerprint": cast(str, envelope["case_fingerprint"]),
+        "source_record_fingerprint": _sha256(canonical_json_bytes(record)),
+    }
+
+
+def _v22_review_request(
+    envelope: JsonObject, fragments: list[JsonObject]
+) -> JsonObject:
+    record = build_source_record(_object(envelope["case"], location="case"))
+    accepted = [
+        proposal
+        for fragment in fragments
+        for proposal in cast(list[JsonObject], _object(fragment["payload"], location="review payload")["proposals"])
+    ]
+    return _v22_new_request(
+        "source_review_fragment",
+        {
+            "source_record": record, "accepted_proposals": accepted,
+            "fragment_ordinal": len(fragments) + 1, "max_new_proposals": 5,
+        },
+        _v22_source_metadata(envelope, record),
+    )
+
+
+def _v22_semantic_identity(value: JsonObject, *, proposal: bool) -> object:
+    """Mirror the full reducer's meaning-bearing fragment identity."""
+    separator = " "
+    if proposal:
+        statement = value.get("statement")
+        if type(statement) is not str:
+            raise ValueError("accepted source-review proposal is invalid")
+        return ("proposal", separator.join(statement.split()))
+    passages = value.get("passages")
+    correction = value.get("correction")
+    if type(passages) is not list or any(type(item) is not dict for item in passages):
+        raise ValueError("accepted source-audit concern is invalid")
+    passage_identity = tuple(
+        sorted(
+            (
+                _object(item, location="accepted audit passage").get("source_id"),
+                _object(item, location="accepted audit passage").get("quote"),
+            )
+            for item in passages
+        )
+    )
+    correction_statement = None
+    if correction is not None:
+        correction_value = _object(correction, location="accepted audit correction")
+        raw_statement = correction_value.get("statement")
+        if type(raw_statement) is not str:
+            raise ValueError("accepted source-audit concern is invalid")
+        correction_statement = separator.join(raw_statement.split())
+    return (
+        "concern",
+        value.get("target_proposal_ref"),
+        value.get("concern_type"),
+        passage_identity,
+        correction_statement,
+    )
+
+
+class _V22ExternalResponseSemanticsError(ValueError):
+    """Controlled duplicate/conflict refusal for one external fragment."""
+
+
+def _v22_validate_fragment_semantics(
+    values: list[JsonObject], *, proposal: bool
+) -> None:
+    kind = "source-review proposal" if proposal else "source-audit concern"
+    seen: dict[object, bytes] = {}
+    for value in values:
+        identity = _v22_semantic_identity(value, proposal=proposal)
+        encoded = canonical_json_bytes(value)
+        if identity in seen:
+            if seen[identity] != encoded:
+                raise _V22ExternalResponseSemanticsError(
+                    f"conflicting accepted {kind}"
+                )
+            raise _V22ExternalResponseSemanticsError(
+                f"duplicate accepted {kind}"
+            )
+        seen[identity] = encoded
+
+
+def _v22_review_aggregate(fragments: list[JsonObject]) -> JsonObject:
+    proposals = [
+        proposal
+        for fragment in fragments
+        for proposal in cast(list[JsonObject], _object(fragment["payload"], location="review payload")["proposals"])
+    ]
+    _v22_validate_fragment_semantics(proposals, proposal=True)
+    indexed = [
+        {"proposal_ref": f"P{index:04d}", "proposal": proposal}
+        for index, proposal in enumerate(proposals, 1)
+    ]
+    body: JsonObject = {
+        "schema_version": "2.2", "fragments": fragments, "proposals": indexed,
+    }
+    return {
+        "fragments": _copy_json(fragments), "proposals": indexed,
+        "fragment_fingerprints": [item["response_fingerprint"] for item in fragments],
+        "aggregate_fingerprint": _sha256(canonical_json_bytes(body)),
+    }
+
+
+def _v22_audit_request(
+    envelope: JsonObject, review: JsonObject, fragments: list[JsonObject]
+) -> JsonObject:
+    record = build_source_record(_object(envelope["case"], location="case"))
+    accepted = [
+        concern
+        for fragment in fragments
+        for concern in cast(list[JsonObject], _object(fragment["payload"], location="audit payload")["concerns"])
+    ]
+    return _v22_new_request(
+        "source_audit_fragment",
+        {
+            "source_record": record,
+            "indexed_proposals": _copy_json(review["proposals"]),
+            "accepted_concerns": accepted,
+            "fragment_ordinal": len(fragments) + 1, "max_new_concerns": 5,
+        },
+        _v22_source_metadata(envelope, record),
+    )
+
+
+def _v22_audit_aggregate(review: JsonObject, fragments: list[JsonObject]) -> JsonObject:
+    concerns = [
+        concern
+        for fragment in fragments
+        for concern in cast(list[JsonObject], _object(fragment["payload"], location="audit payload")["concerns"])
+    ]
+    _v22_validate_fragment_semantics(concerns, proposal=False)
+    indexed = [
+        {"concern_ref": f"C{index:04d}", "concern": concern}
+        for index, concern in enumerate(concerns, 1)
+    ]
+    body: JsonObject = {
+        "schema_version": "2.2", "review": review["aggregate_fingerprint"],
+        "fragments": fragments, "concerns": indexed,
+    }
+    return {
+        "fragments": _copy_json(fragments), "concerns": indexed,
+        "fragment_fingerprints": [item["response_fingerprint"] for item in fragments],
+        "aggregate_fingerprint": _sha256(canonical_json_bytes(body)),
+    }
+
+
+def _v22_disputes(
+    envelope: JsonObject, review: JsonObject, audit: JsonObject
+) -> list[JsonObject]:
+    plain_review: JsonObject = {
+        "schema_version": "2.1",
+        "proposals": [item["proposal"] for item in cast(list[JsonObject], review["proposals"])],
+    }
+    plain_audit: JsonObject = {
+        "schema_version": "2.1",
+        "concerns": [item["concern"] for item in cast(list[JsonObject], audit["concerns"])],
+    }
+    disputes = _v21_disputes(envelope, plain_review, plain_audit)
+    for dispute in disputes:
+        body: JsonObject = {
+            "schema_version": "2.2", "case_fingerprint": dispute["case_fingerprint"],
+            "dispute_id": dispute["dispute_id"],
+            "material_dispute": dispute["material_dispute"], "evidence": dispute["evidence"],
+        }
+        dispute["dispute_fingerprint"] = _sha256(canonical_json_bytes(body))
+    return disputes
+
+
+def _v22_referee_request(
+    envelope: JsonObject, disputes: list[JsonObject], index: int
+) -> JsonObject:
+    dispute = disputes[index]
+    return _v22_new_request(
+        "source_referee_fragment", {"material_disputes": [_copy_json(dispute)]},
+        {
+            "record_scope": "one-source-referee-dispute",
+            "case_fingerprint": cast(str, envelope["case_fingerprint"]),
+            "dispute_id": cast(str, dispute["dispute_id"]),
+            "dispute_fingerprint": cast(str, dispute["dispute_fingerprint"]),
+        },
+    )
+
+
+def _v22_referee_aggregate(
+    disputes: list[JsonObject], fragments: list[JsonObject]
+) -> JsonObject:
+    body: JsonObject = {
+        "schema_version": "2.2", "disputes": disputes, "fragments": fragments,
+    }
+    return {
+        "fragments": _copy_json(fragments),
+        "aggregate_fingerprint": _sha256(canonical_json_bytes(body)),
+    }
+
+
+def _v22_baseline(
+    envelope: JsonObject, review: JsonObject, audit: JsonObject,
+    disputes: list[JsonObject], fragments: list[JsonObject],
+) -> JsonObject:
+    plain_review: JsonObject = {
+        "schema_version": "2.1",
+        "proposals": [item["proposal"] for item in cast(list[JsonObject], review["proposals"])],
+    }
+    plain_audit: JsonObject = {
+        "schema_version": "2.1",
+        "concerns": [item["concern"] for item in cast(list[JsonObject], audit["concerns"])],
+    }
+    baseline = _v21_disputed_baseline(envelope, plain_review, plain_audit, disputes, fragments)
+    baseline["schema_version"] = "2.2"
+    baseline.pop("baseline_fingerprint", None)
+    baseline["baseline_fingerprint"] = _sha256(canonical_json_bytes(baseline))
+    return baseline
+
+
+def _v22_labels(envelope: JsonObject) -> list[str]:
+    labels = [cast(str, item["anonymous_label"]) for item in cast(list[JsonObject], envelope["assignments"])]
+    if labels not in (["A"], ["A", "B"]):
+        raise EvaluationIntegrityError("EVALUATOR_V22_CASE_BUILD_BINDING")
+    return labels
+
+
+def _v22_batches(baseline: JsonObject, labels: list[str]) -> list[JsonObject]:
+    ids = [cast(str, item["requirement_id"]) for item in cast(list[JsonObject], baseline["requirements"])]
+    return [
+        {"batch_ref": f"GB-{label}-{lane}-{index // 5 + 1:04d}", "requirement_ids": ids[index:index + 5]}
+        for label in labels for lane in (1, 2) for index in range(0, len(ids), 5)
+    ]
+
+
+def _v22_report(envelope: JsonObject, label: str) -> JsonObject:
+    assignment = next(item for item in cast(list[JsonObject], envelope["assignments"]) if item["anonymous_label"] == label)
+    return next(item for item in cast(list[JsonObject], _object(envelope["case"], location="case")["candidates"]) if item["candidate_id"] == assignment["candidate_id"])
+
+
+def _v22_grade_steps(
+    baseline: JsonObject, batches: list[JsonObject], labels: list[str]
+) -> list[tuple[str, str, int, JsonObject]]:
+    steps: list[tuple[str, str, int, JsonObject]] = []
+    contested = cast(list[JsonObject], baseline["contested_requirements"])
+    for label in labels:
+        for lane in (1, 2):
+            steps.extend(
+                ("ordinary_grade_fragment", label, lane, item)
+                for item in batches
+                if cast(str, item["batch_ref"]).startswith(f"GB-{label}-{lane}-")
+            )
+            steps.extend(("contested_grade_fragment", label, lane, item) for item in contested)
+    return steps
+
+
+def _v22_grade_request(
+    envelope: JsonObject, baseline: JsonObject, step: tuple[str, str, int, JsonObject]
+) -> JsonObject:
+    operation, label, lane, item = step
+    report = _v22_report(envelope, label)
+    report_text = cast(str, report["report_text"])
+    common: JsonObject = {
+        "anonymous_label": label, "grader_lane": lane,
+        "baseline_fingerprint": baseline["baseline_fingerprint"],
+        "report_text": report_text,
+        "report_fingerprint": _sha256(report_text.encode("utf-8")),
+        "source_context": _v22_source_context(envelope), "rubric": _copy_json(_V22_RUBRIC),
+    }
+    if operation == "ordinary_grade_fragment":
+        ids = set(cast(list[str], item["requirement_ids"]))
+        requirements = [raw for raw in cast(list[JsonObject], baseline["requirements"]) if raw["requirement_id"] in ids]
+        common.update({"batch_ref": item["batch_ref"], "requirements": requirements})
+        metadata = {
+            "record_scope": "one-ordinary-grade-batch",
+            "baseline_fingerprint": cast(str, baseline["baseline_fingerprint"]),
+            "batch_ref": cast(str, item["batch_ref"]),
+        }
+    else:
+        common["contested_requirement"] = _copy_json(item)
+        metadata = {
+            "record_scope": "one-contested-grade-requirement",
+            "baseline_fingerprint": cast(str, baseline["baseline_fingerprint"]),
+            "contested_requirement_id": cast(str, item["contested_requirement_id"]),
+        }
+    return _v22_new_request(operation, common, metadata)
+
+
+def _v22_call(
+    call_id: str, request: JsonObject, *, fragment: int | None = None,
+    label: str | None = None, lane: int | None = None,
+    dispute_id: str | None = None, batch_ref: str | None = None,
+    contested_id: str | None = None,
+) -> JsonObject:
+    return {
+        "call_id": call_id, "operation": request["operation"], "state": "pending",
+        "attempt": 1, "request_artifact_path": f"requests/{call_id}.json",
+        "request_fingerprint": request["request_fingerprint"],
+        "response_artifact_path": None, "response_fingerprint": None,
+        "provider_name": None, "model_name": None, "judge_isolation": None,
+        "fragment_ordinal": fragment, "anonymous_label": label,
+        "grader_lane": lane, "dispute_id": dispute_id, "batch_ref": batch_ref,
+        "contested_requirement_id": contested_id,
+    }
+
+
+def _v22_call_for_grade(request: JsonObject, step: tuple[str, str, int, JsonObject]) -> JsonObject:
+    operation, label, lane, item = step
+    if operation == "ordinary_grade_fragment":
+        ref = cast(str, item["batch_ref"])
+        return _v22_call(
+            f"grade-{ref}", request, label=label, lane=lane, batch_ref=ref
+        )
+    contested = cast(str, item["contested_requirement_id"])
+    return _v22_call(
+        f"grade-contested-{label}-{lane}-{contested}", request,
+        label=label, lane=lane, contested_id=contested,
+    )
+
+
+def _v22_accept(call: JsonObject, response: JsonObject) -> JsonObject:
+    data = canonical_json_bytes(response)
+    accepted = cast(JsonObject, _copy_json(call))
+    accepted.update(
+        {
+            "state": "accepted",
+            "response_artifact_path": f"responses/{call['call_id']}.json",
+            "response_fingerprint": _sha256(data),
+            "provider_name": response["provider_name"],
+            "model_name": response["model_name"],
+            "judge_isolation": response["judge_isolation"],
+        }
+    )
+    return accepted
+
+
+def _v22_validate_response(request: JsonObject, value: object) -> JsonObject:
+    response = _object(value, location="evaluator response")
+    expected = {
+        "schema_version", "operation", "request_fingerprint", "provider_name",
+        "model_name", "judge_isolation", "payload",
+    }
+    if (
+        set(response) != expected or response.get("schema_version") != "2.2"
+        or response.get("operation") != request["operation"]
+        or response.get("request_fingerprint") != request["request_fingerprint"]
+        or type(response.get("payload")) is not dict
+    ):
+        raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+    _v22_response_member(
+        response.get("judge_isolation"), {"fresh_context", "scripted_fixture"}
+    )
+    _v22_response_nonblank(response.get("provider_name"))
+    _v22_response_nonblank(response.get("model_name"))
+    payload = _object(response["payload"], location="response payload")
+    operation = request["operation"]
+    if payload.get("schema_version") != "2.2":
+        raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+    if operation == "source_review_fragment":
+        if set(payload) != {"schema_version", "proposals", "review_complete"} or type(payload["review_complete"]) is not bool:
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+        proposals = _v2_list(payload["proposals"], location="proposals")
+        if len(proposals) > 5 or (not payload["review_complete"] and not proposals):
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+        for proposal in proposals:
+            _v22_response_proposal(proposal, location="proposal")
+    elif operation == "source_audit_fragment":
+        if set(payload) != {"schema_version", "concerns", "audit_complete"} or type(payload["audit_complete"]) is not bool:
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+        concerns = _v2_list(payload["concerns"], location="concerns")
+        if len(concerns) > 5 or (not payload["audit_complete"] and not concerns):
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+        known = {
+            cast(str, item["proposal_ref"])
+            for item in cast(list[JsonObject], _object(request["payload"], location="request payload")["indexed_proposals"])
+        }
+        for raw in concerns:
+            item = _object(raw, location="concern")
+            if (
+                set(item)
+                != {
+                    "target_proposal_ref",
+                    "concern_type",
+                    "passages",
+                    "explanation",
+                    "correction",
+                }
+            ):
+                raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+            target_value = item["target_proposal_ref"]
+            if target_value is not None:
+                _v22_response_member(target_value, known)
+            _v22_response_member(
+                item["concern_type"],
+                {
+                    "omission",
+                    "incorrect_statement",
+                    "incorrect_evidence",
+                    "incorrect_relationship",
+                    "ambiguity",
+                },
+            )
+            _v22_response_nonblank(item["explanation"])
+            passages = _v2_list(item["passages"], location="concern passages")
+            if not 1 <= len(passages) <= 5:
+                raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+            seen_passages: set[tuple[str, str]] = set()
+            for passage_value in passages:
+                passage = _object(passage_value, location="concern passage")
+                if set(passage) != {"source_id", "quote"}:
+                    raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+                pair = (
+                    _v22_response_nonblank(passage["source_id"]),
+                    _v22_response_nonblank(passage["quote"]),
+                )
+                if pair in seen_passages:
+                    raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+                seen_passages.add(pair)
+            target = item["target_proposal_ref"]
+            correction = item["correction"]
+            if correction is not None:
+                _v22_response_proposal(correction, location="concern correction")
+            if item["concern_type"] == "omission":
+                valid_relationship = target is None and correction is not None
+            elif item["concern_type"] == "ambiguity":
+                valid_relationship = target is not None and correction is None
+            else:
+                valid_relationship = target is not None and correction is not None
+            if not valid_relationship:
+                raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+    elif operation == "source_referee_fragment":
+        if set(payload) != {"schema_version", "decision", "unresolved_reason", "evidence_refs", "rationale"}:
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+        decision = payload["decision"]
+        reason = payload["unresolved_reason"]
+        _v22_response_member(
+            decision, {"accept_reviewer", "accept_auditor", "unresolved"}
+        )
+        if (decision == "unresolved") != (reason is not None):
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+        if reason is not None:
+            _v22_response_member(
+                reason,
+                {
+                    "SOURCE_AMBIGUITY",
+                    "SOURCE_CONFLICT",
+                    "SOURCE_GAP",
+                    "BOTH_POSITIONS_UNSUPPORTED",
+                },
+            )
+        _v22_response_nonblank(payload["rationale"])
+        disputes = _v2_list(
+            _object(request["payload"], location="request payload")[
+                "material_disputes"
+            ],
+            location="material disputes",
+        )
+        if len(disputes) != 1:
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+        issued = {
+            cast(str, _object(item, location="evidence")["evidence_ref"])
+            for item in _v2_list(
+                _object(disputes[0], location="dispute")["evidence"],
+                location="evidence",
+            )
+        }
+        evidence_refs = _v2_list(payload["evidence_refs"], location="evidence refs")
+        if (
+            not 1 <= len(evidence_refs) <= 128
+            or any(
+                type(item) is not str
+                or re.fullmatch(r"EVID-[0-9]{4}", item) is None
+                for item in evidence_refs
+            )
+            or len(evidence_refs) != len(set(cast(list[str], evidence_refs)))
+            or not set(cast(list[str], evidence_refs)) <= issued
+        ):
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+    elif operation == "ordinary_grade_fragment":
+        bound = _object(request["payload"], location="request payload")
+        if set(payload) != {"schema_version", "anonymous_label", "grader_lane", "batch_ref", "baseline_fingerprint", "report_fingerprint", "requirement_grades", "rationale"} or any(payload[key] != bound[key] for key in ("anonymous_label", "grader_lane", "batch_ref", "baseline_fingerprint", "report_fingerprint")):
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+        _v22_response_nonblank(payload["rationale"])
+        requirements = cast(
+            list[JsonObject],
+            _v2_list(bound["requirements"], location="requirements"),
+        )
+        grades = _v2_list(payload["requirement_grades"], location="requirement grades")
+        if not 1 <= len(grades) <= 5 or len(grades) != len(requirements):
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+        report = _v22_response_nonblank(bound["report_text"])
+        for grade_value, requirement in zip(grades, requirements, strict=True):
+            grade = _object(grade_value, location="requirement grade")
+            if (
+                set(grade)
+                != {
+                    "requirement_id",
+                    "disposition",
+                    "report_passages",
+                    "rationale",
+                    "omission",
+                }
+                or grade["requirement_id"] != requirement["requirement_id"]
+            ):
+                raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+            _v22_response_member(grade["disposition"], _V22_ENUMS["disposition"])
+            _v22_response_nonblank(grade["rationale"])
+            if grade["omission"] is not None:
+                _v22_response_nonblank(grade["omission"])
+            report_passages = _v2_list(
+                grade["report_passages"], location="report passages"
+            )
+            if len(report_passages) > 128 or any(
+                type(item) is not str
+                or not item.strip()
+                or report.count(item) != 1
+                for item in report_passages
+            ):
+                raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+    elif operation == "contested_grade_fragment":
+        bound = _object(request["payload"], location="request payload")
+        contested = _object(bound["contested_requirement"], location="contested requirement")
+        if set(payload) != {"schema_version", "anonymous_label", "grader_lane", "contested_requirement_id", "baseline_fingerprint", "report_fingerprint", "reviewer_alternative_grade", "auditor_alternative_grade", "ambiguity_disposition", "rationale"} or any(payload[key] != bound[key] for key in ("anonymous_label", "grader_lane", "baseline_fingerprint", "report_fingerprint")) or payload["contested_requirement_id"] != contested["contested_requirement_id"]:
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+        _v22_response_member(
+            payload["ambiguity_disposition"], _V22_ENUMS["ambiguity_disposition"]
+        )
+        _v22_response_nonblank(payload["rationale"])
+        report = _v22_response_nonblank(bound["report_text"])
+        for key in ("reviewer_alternative_grade", "auditor_alternative_grade"):
+            alternative = _object(payload[key], location="alternative grade")
+            if (
+                set(alternative) != {"disposition", "report_passages", "rationale"}
+            ):
+                raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+            _v22_response_member(
+                alternative["disposition"], _V22_ENUMS["disposition"]
+            )
+            _v22_response_nonblank(alternative["rationale"])
+            report_passages = _v2_list(
+                alternative["report_passages"], location="report passages"
+            )
+            if len(report_passages) > 128 or any(
+                type(item) is not str
+                or not item.strip()
+                or report.count(item) != 1
+                for item in report_passages
+            ):
+                raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+    return cast(JsonObject, _copy_json(response))
+
+
+def _v22_score(observations: list[tuple[str, str]]) -> tuple[str, list[str]]:
+    if any(disposition == "uncertain" for _, disposition in observations):
+        return "INCONCLUSIVE", ["GRADE_UNCERTAIN"]
+    credit = {"met": 1.0, "partially_met": 0.5, "not_met": 0.0}
+    weights = cast(dict[str, int], _V22_RUBRIC["importance_weights"])
+    total = sum(weights[importance] for importance, _ in observations)
+    credited = sum(weights[importance] * credit[disposition] for importance, disposition in observations)
+    critical = [credit[disposition] for importance, disposition in observations if importance == "critical"]
+    reasons: list[str] = []
+    if (sum(critical) / len(critical) if critical else 1.0) < 1.0:
+        reasons.append("CRITICAL_RECALL_BELOW_FLOOR")
+    if total and credited / total < 0.9:
+        reasons.append("WEIGHTED_COVERAGE_BELOW_FLOOR")
+    return ("FAIL" if reasons else "PASS"), reasons
+
+
+def _v22_grade_artifacts(
+    calls: list[JsonObject], files: dict[str, bytes], baseline: JsonObject,
+    envelope: JsonObject, batches: list[JsonObject],
+) -> tuple[dict[str, bytes], list[str], list[str], list[JsonObject]]:
+    additions: dict[str, bytes] = {}
+    aggregate_hashes: list[str] = []
+    sensitivity_hashes: list[str] = []
+    reports: list[JsonObject] = []
+    labels = _v22_labels(envelope)
+    all_steps = _v22_grade_steps(baseline, batches, labels)
+    accepted = [call for call in calls if call["state"] == "accepted" and call["operation"] in {"ordinary_grade_fragment", "contested_grade_fragment"}]
+    by_coordinate: dict[tuple[str, int], JsonObject] = {}
+    for label in labels:
+        for lane in (1, 2):
+            lane_steps = [step for step in all_steps if step[1:3] == (label, lane)]
+            lane_calls = [call for call in accepted if (call["anonymous_label"], call["grader_lane"]) == (label, lane)]
+            if len(lane_calls) != len(lane_steps):
+                continue
+            ordinary: list[JsonObject] = []
+            contested: list[JsonObject] = []
+            for call in lane_calls:
+                path = cast(str, call["response_artifact_path"])
+                response = _object(parse_canonical_json_bytes(files[path], location=path), location=path)
+                target = ordinary if call["operation"] == "ordinary_grade_fragment" else contested
+                target.append(_object(response["payload"], location="grade payload"))
+            report_hash = _sha256(cast(str, _v22_report(envelope, label)["report_text"]).encode("utf-8"))
+            body: JsonObject = {
+                "anonymous_label": label, "grader_lane": lane,
+                "baseline_fingerprint": baseline["baseline_fingerprint"],
+                "report_fingerprint": report_hash,
+                "ordinary_fragments": ordinary, "contested_fragments": contested,
+            }
+            aggregate = {**body, "aggregate_fingerprint": _sha256(canonical_json_bytes(body))}
+            additions[f"aggregates/grade-{label}-{lane}.json"] = canonical_json_bytes(aggregate)
+            aggregate_hashes.append(cast(str, aggregate["aggregate_fingerprint"]))
+            by_coordinate[(label, lane)] = aggregate
+        if (label, 1) not in by_coordinate or (label, 2) not in by_coordinate:
+            continue
+        first, second = by_coordinate[(label, 1)], by_coordinate[(label, 2)]
+        def view(aggregate: JsonObject) -> object:
+            return (
+                [[(grade["requirement_id"], grade["disposition"], grade["report_passages"]) for grade in cast(list[JsonObject], fragment["requirement_grades"])] for fragment in cast(list[JsonObject], aggregate["ordinary_fragments"])],
+                [[fragment["contested_requirement_id"], cast(JsonObject, fragment["reviewer_alternative_grade"])["disposition"], cast(JsonObject, fragment["auditor_alternative_grade"])["disposition"], fragment["ambiguity_disposition"]] for fragment in cast(list[JsonObject], aggregate["contested_fragments"])],
+            )
+        grades = {
+            grade["requirement_id"]: grade
+            for fragment in cast(list[JsonObject], first["ordinary_fragments"])
+            for grade in cast(list[JsonObject], fragment["requirement_grades"])
+        }
+        ordinary_observations = [
+            (cast(str, requirement["importance"]), cast(str, grades[requirement["requirement_id"]]["disposition"]))
+            for requirement in cast(list[JsonObject], baseline["requirements"])
+        ]
+        disposition, reasons = _v22_score(ordinary_observations)
+        if view(first) != view(second):
+            disposition, reasons = "INCONCLUSIVE", ["GRADER_DISAGREEMENT"]
+        reconciliation_body: JsonObject = {
+            "anonymous_label": label, "absolute_disposition": disposition,
+            "reason_codes": reasons, "grader_aggregates": [first, second],
+        }
+        reconciliation = {**reconciliation_body, "reconciliation_fingerprint": _sha256(canonical_json_bytes(reconciliation_body))}
+        changing: list[str] = []
+        sensitivity_disposition, sensitivity_reasons = disposition, reasons
+        if not baseline["requirements"] and not baseline["contested_requirements"]:
+            sensitivity_disposition, sensitivity_reasons = "INCONCLUSIVE", ["BASELINE_EVIDENCE_INSUFFICIENT"]
+        elif disposition != "INCONCLUSIVE":
+            contested_by_id = {item["contested_requirement_id"]: item for item in cast(list[JsonObject], baseline["contested_requirements"])}
+            reviewer_world = list(ordinary_observations)
+            auditor_world = list(ordinary_observations)
+            differing: list[str] = []
+            for fragment in cast(list[JsonObject], first["contested_fragments"]):
+                item = contested_by_id[fragment["contested_requirement_id"]]
+                reviewer = cast(JsonObject | None, item["reviewer_alternative"])
+                auditor = cast(JsonObject | None, item["auditor_alternative"])
+                reviewer_observation = None if reviewer is None else (cast(str, reviewer["importance"]), cast(str, cast(JsonObject, fragment["reviewer_alternative_grade"])["disposition"]))
+                auditor_observation = None if auditor is None else (cast(str, auditor["importance"]), cast(str, cast(JsonObject, fragment["auditor_alternative_grade"])["disposition"]))
+                if reviewer_observation is not None:
+                    reviewer_world.append(reviewer_observation)
+                if auditor_observation is not None:
+                    auditor_world.append(auditor_observation)
+                if reviewer_observation != auditor_observation:
+                    differing.append(cast(str, fragment["contested_requirement_id"]))
+            reviewer_result, reviewer_reasons = _v22_score(reviewer_world)
+            auditor_result, auditor_reasons = _v22_score(auditor_world)
+            if "INCONCLUSIVE" in {reviewer_result, auditor_result}:
+                sensitivity_disposition, sensitivity_reasons = "INCONCLUSIVE", ["BASELINE_EVIDENCE_INSUFFICIENT"]
+            elif reviewer_result != auditor_result:
+                changing = differing
+                sensitivity_disposition, sensitivity_reasons = "INCONCLUSIVE", ["OUTCOME_SENSITIVE_BASELINE_DISPUTE"]
+            else:
+                sensitivity_disposition = reviewer_result
+                sensitivity_reasons = sorted(set(reviewer_reasons + auditor_reasons))
+        sensitivity_body: JsonObject = {
+            "anonymous_label": label, "baseline_fingerprint": baseline["baseline_fingerprint"],
+            "reconciliation_fingerprint": reconciliation["reconciliation_fingerprint"],
+            "absolute_disposition": sensitivity_disposition,
+            "reason_codes": sensitivity_reasons,
+            "outcome_determinative_contested_ids": changing,
+        }
+        sensitivity = {**sensitivity_body, "sensitivity_fingerprint": _sha256(canonical_json_bytes(sensitivity_body))}
+        additions[f"sensitivities/{label}.json"] = canonical_json_bytes(sensitivity)
+        sensitivity_hashes.append(cast(str, sensitivity["sensitivity_fingerprint"]))
+        report_body: JsonObject = {"anonymous_label": label, "reconciliation": reconciliation, "sensitivity": sensitivity}
+        reports.append({**report_body, "result_fingerprint": _sha256(canonical_json_bytes(report_body))})
+    return additions, aggregate_hashes, sensitivity_hashes, reports
+
+
+def _v22_comparison(envelope: JsonObject, reports: list[JsonObject]) -> JsonObject | None:
+    if len(reports) == 1:
+        return None
+    roles = {
+        cast(str, item["candidate_id"]): cast(str, item["role"])
+        for item in cast(list[JsonObject], _object(envelope["case"], location="case")["candidates"])
+    }
+    labels = {
+        roles[cast(str, item["candidate_id"])]: cast(str, item["anonymous_label"])
+        for item in cast(list[JsonObject], envelope["assignments"])
+    }
+    if set(labels) != {"candidate", "comparator"}:
+        raise EvaluationIntegrityError("EVALUATOR_V22_COMPARISON_ROLES")
+    dispositions = {
+        cast(str, item["anonymous_label"]): cast(str, _object(item["sensitivity"], location="sensitivity")["absolute_disposition"])
+        for item in reports
+    }
+    candidate, comparator = labels["candidate"], labels["comparator"]
+    values = set(dispositions.values())
+    if "INCONCLUSIVE" in values:
+        disposition, winner, rationale = "inconclusive", None, "At least one report is inconclusive."
+    else:
+        passing = [label for label in ("A", "B") if dispositions[label] == "PASS"]
+        if len(passing) == 1:
+            winner = passing[0]
+            if winner == candidate:
+                disposition, rationale = "candidate_win", "Only the candidate report passed the rubric."
+            else:
+                disposition, rationale = "comparator_win", "Only the comparator report passed the rubric."
+        elif passing:
+            disposition, winner, rationale = "tie", None, "Both reports passed the rubric."
+        else:
+            disposition, winner, rationale = "neither", None, "Neither report passed the rubric."
+    return {
+        "disposition": disposition, "winner_label": winner,
+        "candidate_label": candidate, "comparator_label": comparator,
+        "rationale": rationale,
+    }
+
+
+def _v22_result(
+    envelope: JsonObject, baseline: JsonObject, reports: list[JsonObject]
+) -> JsonObject:
+    terminal = "INCONCLUSIVE" if any(_object(item["sensitivity"], location="sensitivity")["absolute_disposition"] == "INCONCLUSIVE" for item in reports) else "COMPLETED"
+    body: JsonObject = {
+        "schema_version": "2.2", "rubric": _copy_json(_V22_RUBRIC),
+        "baseline": _copy_json(baseline), "reports": _copy_json(reports),
+        "comparison": _v22_comparison(envelope, reports), "terminal_status": terminal,
+    }
+    return {**body, "result_fingerprint": _sha256(canonical_json_bytes(body))}
+
+
+def _v22_manifest(
+    envelope: JsonObject, files: Mapping[str, bytes], calls: list[JsonObject],
+    *, phase: str, review: JsonObject | None, audit: JsonObject | None,
+    referee: JsonObject | None, baseline: JsonObject | None,
+    disputes: list[JsonObject], batches: list[JsonObject],
+    aggregate_hashes: list[str], sensitivity_hashes: list[str],
+    result: JsonObject | None,
+) -> JsonObject:
+    case_bytes = files["inputs/case.json"]
+    build_bytes = files["inputs/build.json"]
+    rubric_bytes = files["rubric.json"]
+    manifest: JsonObject = {
+        "protocol_version": "2.2",
+        "case_fingerprint": envelope["case_fingerprint"],
+        "case_envelope_hash": _sha256(case_bytes),
+        "build_fingerprint": _sha256(build_bytes),
+        "rubric_fingerprint": _sha256(rubric_bytes),
+        "compiler_contract_fingerprint": _V22_COMPILER_CONTRACT_FINGERPRINT,
+        "compiler_version": _V22_COMPILER_VERSION,
+        "source_review_aggregate_fingerprint": None if review is None else review["aggregate_fingerprint"],
+        "source_audit_aggregate_fingerprint": None if audit is None else audit["aggregate_fingerprint"],
+        "referee_aggregate_fingerprint": None if referee is None else referee["aggregate_fingerprint"],
+        "baseline_fingerprint": None if baseline is None else baseline["baseline_fingerprint"],
+        "grader_aggregate_fingerprints": aggregate_hashes,
+        "sensitivity_fingerprints": sensitivity_hashes,
+        "result_hash": None if result is None else result["result_fingerprint"],
+        "phase": phase,
+        "terminal_status": None if result is None else result["terminal_status"],
+        "calls": _copy_json(calls),
+        "artifacts": [
+            {"artifact_path": path, "artifact_hash": _sha256(data)}
+            for path, data in sorted(files.items())
+        ],
+        "referee_disputes": _copy_json(disputes),
+        "ordinary_grade_batches": _copy_json(batches),
+        "manifest_fingerprint": "0" * 64,
+    }
+    body = cast(JsonObject, _copy_json(manifest))
+    body.pop("manifest_fingerprint")
+    manifest["manifest_fingerprint"] = _sha256(canonical_json_bytes(body))
+    return manifest
+
+
+def _v22_state(manifest: JsonObject) -> JsonObject:
+    pending = [call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"]
+    return {
+        "schema_version": "2.2", "case_fingerprint": manifest["case_fingerprint"],
+        "phase": manifest["phase"],
+        "current_call_id": None if not pending else pending[0]["call_id"],
+        "terminal_status": manifest["terminal_status"],
+        "manifest_fingerprint": manifest["manifest_fingerprint"],
+    }
+
+
+def _v22_snapshot(
+    envelope: JsonObject, responses: list[JsonObject]
+) -> tuple[JsonObject, dict[str, bytes]]:
+    case_bytes = canonical_json_bytes(envelope)
+    files: dict[str, bytes] = {
+        "inputs/case.json": case_bytes,
+        "inputs/build.json": canonical_json_bytes(_V22_BUILD),
+        "rubric.json": canonical_json_bytes(_V22_RUBRIC),
+    }
+    review_fragments: list[JsonObject] = []
+    audit_fragments: list[JsonObject] = []
+    referee_fragments: list[JsonObject] = []
+    review: JsonObject | None = None
+    audit: JsonObject | None = None
+    referee: JsonObject | None = None
+    baseline: JsonObject | None = None
+    disputes: list[JsonObject] = []
+    batches: list[JsonObject] = []
+    aggregate_hashes: list[str] = []
+    sensitivity_hashes: list[str] = []
+    result: JsonObject | None = None
+    phase = "source_review"
+    request = _v22_review_request(envelope, review_fragments)
+    call = _v22_call("source-review-0001", request, fragment=1)
+    calls = [call]
+    files[cast(str, call["request_artifact_path"])] = canonical_json_bytes(request)
+    for raw_response in responses:
+        if result is not None or calls[-1]["state"] != "pending":
+            raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+        request_path = cast(str, calls[-1]["request_artifact_path"])
+        pending_request = _object(parse_canonical_json_bytes(files[request_path], location=request_path), location=request_path)
+        response = _v22_validate_response(pending_request, raw_response)
+        accepted = _v22_accept(calls[-1], response)
+        calls[-1] = accepted
+        response_path = cast(str, accepted["response_artifact_path"])
+        files[response_path] = canonical_json_bytes(response)
+        operation = accepted["operation"]
+        response_payload = _object(response["payload"], location="response payload")
+        if operation == "source_review_fragment":
+            review_fragments.append(
+                {
+                    "fragment_ordinal": accepted["fragment_ordinal"],
+                    "request_fingerprint": accepted["request_fingerprint"],
+                    "response_fingerprint": accepted["response_fingerprint"],
+                    "payload": _copy_json(response_payload),
+                }
+            )
+            if not response_payload["review_complete"]:
+                if (
+                    len(review_fragments) >= 128
+                    or sum(
+                        len(
+                            cast(
+                                list[object],
+                                _object(
+                                    item["payload"], location="review fragment payload"
+                                )["proposals"],
+                            )
+                        )
+                        for item in review_fragments
+                    )
+                    >= 640
+                ):
+                    raise PortableEvaluationInputError("DRAFT_LIMIT_EXCEEDED")
+                request = _v22_review_request(envelope, review_fragments)
+                ordinal = len(review_fragments) + 1
+                call = _v22_call(f"source-review-{ordinal:04d}", request, fragment=ordinal)
+                calls.append(call)
+                files[cast(str, call["request_artifact_path"])] = canonical_json_bytes(request)
+                continue
+            review = _v22_review_aggregate(review_fragments)
+            files["aggregates/source-review.json"] = canonical_json_bytes(review)
+            request = _v22_audit_request(envelope, review, audit_fragments)
+            call = _v22_call("source-audit-0001", request, fragment=1)
+            calls.append(call)
+            files[cast(str, call["request_artifact_path"])] = canonical_json_bytes(request)
+            phase = "source_audit"
+            continue
+        if review is None:
+            raise EvaluationIntegrityError("EVALUATOR_V22_SOURCE_REVIEW")
+        if operation == "source_audit_fragment":
+            audit_fragments.append(
+                {
+                    "fragment_ordinal": accepted["fragment_ordinal"],
+                    "request_fingerprint": accepted["request_fingerprint"],
+                    "response_fingerprint": accepted["response_fingerprint"],
+                    "payload": _copy_json(response_payload),
+                }
+            )
+            if not response_payload["audit_complete"]:
+                if (
+                    len(audit_fragments) >= 128
+                    or sum(
+                        len(
+                            cast(
+                                list[object],
+                                _object(
+                                    item["payload"], location="audit fragment payload"
+                                )["concerns"],
+                            )
+                        )
+                        for item in audit_fragments
+                    )
+                    >= 640
+                ):
+                    raise PortableEvaluationInputError("DRAFT_LIMIT_EXCEEDED")
+                request = _v22_audit_request(envelope, review, audit_fragments)
+                ordinal = len(audit_fragments) + 1
+                call = _v22_call(f"source-audit-{ordinal:04d}", request, fragment=ordinal)
+                calls.append(call)
+                files[cast(str, call["request_artifact_path"])] = canonical_json_bytes(request)
+                continue
+            audit = _v22_audit_aggregate(review, audit_fragments)
+            files["aggregates/source-audit.json"] = canonical_json_bytes(audit)
+            disputes = _v22_disputes(envelope, review, audit)
+            if disputes:
+                request = _v22_referee_request(envelope, disputes, 0)
+                call = _v22_call("referee-D0001", request, dispute_id="D0001")
+                calls.append(call)
+                files[cast(str, call["request_artifact_path"])] = canonical_json_bytes(request)
+                phase = "source_referee"
+                continue
+            referee = _v22_referee_aggregate([], [])
+        elif operation == "source_referee_fragment":
+            if audit is None:
+                raise EvaluationIntegrityError("EVALUATOR_V22_SOURCE_AUDIT")
+            dispute = disputes[len(referee_fragments)]
+            referee_fragments.append(
+                {
+                    "case_fingerprint": envelope["case_fingerprint"],
+                    "dispute_id": dispute["dispute_id"],
+                    "dispute_fingerprint": dispute["dispute_fingerprint"],
+                    "decision": _copy_json(response_payload),
+                    "response_fingerprint": accepted["response_fingerprint"],
+                }
+            )
+            if len(referee_fragments) < len(disputes):
+                dispute = disputes[len(referee_fragments)]
+                request = _v22_referee_request(envelope, disputes, len(referee_fragments))
+                call = _v22_call(f"referee-{dispute['dispute_id']}", request, dispute_id=cast(str, dispute["dispute_id"]))
+                calls.append(call)
+                files[cast(str, call["request_artifact_path"])] = canonical_json_bytes(request)
+                continue
+            referee = _v22_referee_aggregate(disputes, referee_fragments)
+        elif operation not in {"ordinary_grade_fragment", "contested_grade_fragment"}:
+            raise EvaluationIntegrityError("EVALUATOR_V22_OPERATION")
+
+        if operation in {"source_audit_fragment", "source_referee_fragment"}:
+            if audit is None or referee is None:
+                raise EvaluationIntegrityError("EVALUATOR_V22_SOURCE_AGGREGATE")
+            files["aggregates/referee.json"] = canonical_json_bytes(referee)
+            baseline = _v22_baseline(envelope, review, audit, disputes, referee_fragments)
+            files["baseline.json"] = canonical_json_bytes(baseline)
+            batches = _v22_batches(baseline, _v22_labels(envelope))
+
+        if baseline is None:
+            raise EvaluationIntegrityError("EVALUATOR_V22_BASELINE")
+        grade_files, aggregate_hashes, sensitivity_hashes, reports = _v22_grade_artifacts(
+            calls, files, baseline, envelope, batches
+        )
+        files.update(grade_files)
+        steps = _v22_grade_steps(baseline, batches, _v22_labels(envelope))
+        accepted_grade_count = sum(call["state"] == "accepted" and call["operation"] in {"ordinary_grade_fragment", "contested_grade_fragment"} for call in calls)
+        if accepted_grade_count < len(steps):
+            step = steps[accepted_grade_count]
+            request = _v22_grade_request(envelope, baseline, step)
+            call = _v22_call_for_grade(request, step)
+            calls.append(call)
+            files[cast(str, call["request_artifact_path"])] = canonical_json_bytes(request)
+            phase = "ordinary_grading" if step[0] == "ordinary_grade_fragment" else "contested_grading"
+        else:
+            result = _v22_result(envelope, baseline, reports)
+            files["result.json"] = canonical_json_bytes(result)
+            phase = "inconclusive" if result["terminal_status"] == "INCONCLUSIVE" else "completed"
+
+    manifest = _v22_manifest(
+        envelope, files, calls, phase=phase, review=review, audit=audit,
+        referee=referee, baseline=baseline, disputes=disputes, batches=batches,
+        aggregate_hashes=aggregate_hashes, sensitivity_hashes=sensitivity_hashes,
+        result=result,
+    )
+    return manifest, files
+
+
+def _v22_verify_envelope(envelope: JsonObject) -> None:
+    case = _object(envelope.get("case"), location="case envelope")
+    validate_case(case)
+    if (
+        set(envelope) != {"schema_version", "case", "assignments", "case_fingerprint", "seed_fingerprint"}
+        or envelope.get("schema_version") != "1.0"
+        or envelope.get("case_fingerprint") != _model_fingerprint(case)
+        or type(envelope.get("seed_fingerprint")) is not str
+    ):
+        raise EvaluationIntegrityError("EVALUATOR_V22_CASE_BUILD_BINDING")
+    seed = cast(str, envelope["seed_fingerprint"])
+    candidates = cast(list[JsonObject], case["candidates"])
+    ordered = sorted(
+        candidates,
+        key=lambda item: (
+            _sha256(f"{seed}:{item['candidate_id']}".encode()), item["candidate_id"]
+        ),
+    )
+    expected = [
+        {"anonymous_label": "A" if index == 0 else "B", "candidate_id": item["candidate_id"]}
+        for index, item in enumerate(ordered)
+    ]
+    if envelope.get("assignments") != expected:
+        raise EvaluationIntegrityError("EVALUATOR_V22_CASE_BUILD_BINDING")
+
+
+def _v22_verified_storage(storage: _PosixRunStorage) -> tuple[JsonObject, dict[str, bytes]]:
+    initial = set(storage.scan_inventory())
+    manifest_data = storage.read_artifact("run-manifest.json", max_bytes=16 * 1024 * 1024)
+    manifest = _object(parse_canonical_json_bytes(manifest_data, location="run-manifest.json"), location="run-manifest.json")
+    if manifest.get("protocol_version") != "2.2":
+        raise EvaluationIntegrityError("EVALUATOR_V22_PROTOCOL")
+    body = cast(JsonObject, _copy_json(manifest))
+    fingerprint = body.pop("manifest_fingerprint", None)
+    if fingerprint != _sha256(canonical_json_bytes(body)):
+        raise EvaluationIntegrityError("EVALUATOR_V22_MANIFEST_FINGERPRINT")
+    artifacts = _v2_list(manifest.get("artifacts"), location="artifacts")
+    files: dict[str, bytes] = {}
+    for raw in artifacts:
+        record = _object(raw, location="artifact")
+        if set(record) != {"artifact_path", "artifact_hash"}:
+            raise EvaluationIntegrityError("EVALUATOR_V22_INVENTORY")
+        path = _string(record["artifact_path"], location="artifact path", nonblank=True)
+        if path in files:
+            raise EvaluationIntegrityError("EVALUATOR_V22_INVENTORY")
+        data = storage.read_artifact(path, max_bytes=16 * 1024 * 1024)
+        if record["artifact_hash"] != _sha256(data):
+            raise EvaluationIntegrityError("EVALUATOR_V22_ARTIFACT_HASH")
+        files[path] = data
+    directories = {
+        f"{PurePosixPath(path).parent.as_posix()}/"
+        for path in files if PurePosixPath(path).parent.as_posix() != "."
+    }
+    if initial != set(files) | directories | {"run-manifest.json"}:
+        raise EvaluationIntegrityError("EVALUATOR_V22_INVENTORY")
+    try:
+        envelope = _object(parse_canonical_json_bytes(files["inputs/case.json"], location="inputs/case.json"), location="inputs/case.json")
+        _v22_verify_envelope(envelope)
+        response_values: list[JsonObject] = []
+        calls = _v2_list(manifest.get("calls"), location="calls")
+        for raw_call in calls:
+            call = _object(raw_call, location="call")
+            if call.get("state") != "accepted":
+                continue
+            response_path = call.get("response_artifact_path")
+            if type(response_path) is not str or response_path not in files:
+                raise EvaluationIntegrityError("EVALUATOR_V22_CALL_HISTORY")
+            response_values.append(
+                _object(
+                    parse_canonical_json_bytes(
+                        files[response_path], location=response_path
+                    ),
+                    location=response_path,
+                )
+            )
+        expected_manifest, expected_files = _v22_snapshot(envelope, response_values)
+        if manifest != expected_manifest or files != expected_files:
+            raise EvaluationIntegrityError("EVALUATOR_V22_SEMANTIC_REPLAY")
+    except (KeyError, IndexError, StopIteration, PortableEvaluationInputError, TypeError, ValueError) as error:
+        raise EvaluationIntegrityError("EVALUATOR_V22_SEMANTIC_REPLAY") from error
+    if set(storage.scan_inventory()) != initial:
+        raise EvaluationIntegrityError("EVALUATOR_V22_INVENTORY_CHANGED")
+    storage.assert_root_identity()
+    return manifest, files
+
+
+def _v22_verified(run_dir: Path) -> tuple[JsonObject, dict[str, bytes]]:
+    with _open_run_storage(run_dir) as storage:
+        return _v22_verified_storage(storage)
+
+
+@contextmanager
+def _v22_submission_guard(run_dir: Path) -> Iterator[None]:
+    try:
+        before = os.stat(run_dir, follow_symlinks=False)
+    except OSError as error:
+        raise EvaluationIntegrityError("EVALUATOR_V22_STORAGE_ROOT") from error
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise EvaluationIntegrityError("EVALUATOR_V22_STORAGE_ROOT")
+    identity = (before.st_dev, before.st_ino)
+    lock = _V22_SUBMISSION_LOCKS[hash(identity) % len(_V22_SUBMISSION_LOCKS)]
+    with lock:
+        current = os.stat(run_dir, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != identity or not stat.S_ISDIR(current.st_mode):
+            raise EvaluationIntegrityError("EVALUATOR_V22_STORAGE_ROOT")
+        yield
+        after = os.stat(run_dir, follow_symlinks=False)
+        if (after.st_dev, after.st_ino) != identity or not stat.S_ISDIR(after.st_mode):
+            raise EvaluationIntegrityError("EVALUATOR_V22_STORAGE_ROOT")
+
+
+def _v22_commit_snapshot(
+    run_dir: Path, prior_fingerprint: str | None, successor: JsonObject,
+    successor_files: Mapping[str, bytes], *, initialize: bool = False,
+) -> None:
+    with _open_run_storage(run_dir, initialize=initialize) as storage:
+        inherited: dict[str, bytes] = {}
+        prior_manifest: JsonObject | None = None
+        prior_bytes: bytes | None = None
+        if storage.scan_inventory():
+            prior_manifest, inherited = _v22_verified_storage(storage)
+            prior_bytes = storage.read_artifact("run-manifest.json", max_bytes=16 * 1024 * 1024)
+            if prior_fingerprint is None or prior_manifest["manifest_fingerprint"] != prior_fingerprint:
+                raise EvaluationIntegrityError("EVALUATOR_V22_STALE_TRANSITION")
+        elif prior_fingerprint is not None:
+            raise EvaluationIntegrityError("EVALUATOR_V22_STALE_TRANSITION")
+        additions = {path: data for path, data in successor_files.items() if path not in inherited}
+        if any(inherited.get(path, data) != data for path, data in successor_files.items()):
+            raise EvaluationIntegrityError("EVALUATOR_V22_IMMUTABLE_ARTIFACT")
+        manifest_bytes = canonical_json_bytes(successor)
+        created: list[tuple[str, bytes, _NodeIdentity]] = []
+        manifest_installed = False
+        manifest_identity: _NodeIdentity | None = None
+        try:
+            for path in sorted(additions):
+                try:
+                    made = storage.atomic_write(path, additions[path], mutable=False)
+                except _AtomicWriteOwnershipError as error:
+                    if error.created and error.identity is not None:
+                        created.append((path, additions[path], error.identity))
+                    raise
+                if made:
+                    receipt = storage.atomic_write_receipt(path)
+                    if receipt is None or receipt.identity is None:
+                        raise EvaluationIntegrityError("EVALUATOR_V22_ROLLBACK_FAILED")
+                    created.append((path, additions[path], receipt.identity))
+            try:
+                manifest_installed = storage.atomic_write(
+                    "run-manifest.json", manifest_bytes, mutable=prior_manifest is not None
+                )
+                receipt = storage.atomic_write_receipt("run-manifest.json")
+                if manifest_installed:
+                    manifest_identity = None if receipt is None else receipt.identity
+                    if manifest_identity is None:
+                        raise EvaluationIntegrityError("EVALUATOR_V22_ROLLBACK_FAILED")
+            except _AtomicWriteOwnershipError as error:
+                if error.created or error.replaced:
+                    manifest_installed = True
+                    manifest_identity = error.identity
+                raise
+            checked, checked_files = _v22_verified_storage(storage)
+            if checked != successor or checked_files != dict(successor_files):
+                raise EvaluationIntegrityError("EVALUATOR_V22_STALE_TRANSITION")
+        except BaseException as error:
+            cleanup: BaseException | None = None
+            try:
+                observed = storage.read_optional_artifact_with_identity("run-manifest.json", max_bytes=16 * 1024 * 1024)
+                if manifest_installed and manifest_identity is not None and observed is not None and observed[0] == manifest_bytes and _same_filesystem_object(observed[1], manifest_identity):
+                    if prior_bytes is None:
+                        storage.remove_artifact("run-manifest.json", expected_identity=manifest_identity, expected_data=manifest_bytes)
+                    else:
+                        storage.replace_artifact_if_owned("run-manifest.json", prior_bytes, owned_identity=manifest_identity, owned_data=manifest_bytes)
+                elif manifest_installed:
+                    raise EvaluationIntegrityError("EVALUATOR_V22_ROLLBACK_FAILED")
+            except BaseException as rollback:
+                cleanup = rollback
+            for path, data, identity in reversed(created):
+                try:
+                    storage.remove_artifact(path, expected_identity=identity, expected_data=data)
+                except BaseException as rollback:
+                    cleanup = rollback
+            if cleanup is not None:
+                raise EvaluationIntegrityError("EVALUATOR_V22_ROLLBACK_FAILED") from cleanup
+            raise error
+
+
+def initialize_evaluation_v22(
+    case: object, output_dir: Path, *, seed_hex: str,
+    generation_capsule_paths: Mapping[str, Path] | None = None,
+    generation_substrate: Any | None = None,
+) -> JsonObject:
+    snapshot = _verify_generation_capsules_for_initialization(
+        case,
+        generation_capsule_paths=generation_capsule_paths,
+        generation_substrate=generation_substrate,
+    )
+    if snapshot.get("schema_version") != "1.1":
+        raise PortableEvaluationInputError("case schema 1.1 is required for new evaluation runs")
+    envelope = freeze_case(snapshot, seed_hex=seed_hex)
+    manifest, files = _v22_snapshot(envelope, [])
+    _v22_commit_snapshot(output_dir, None, manifest, files, initialize=True)
+    return _v22_state(manifest)
+
+
+def resume_evaluation_v22(run_dir: Path) -> JsonObject:
+    manifest, _ = _v22_verified(run_dir)
+    return _v22_state(manifest)
+
+
+def next_evaluator_request_v22(run_dir: Path) -> JsonObject | None:
+    manifest, files = _v22_verified(run_dir)
+    if manifest["terminal_status"] is not None:
+        return None
+    pending = [call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"]
+    if len(pending) != 1:
+        raise EvaluationIntegrityError("EVALUATOR_V22_PENDING_CALL")
+    path = cast(str, pending[0]["request_artifact_path"])
+    return _object(parse_canonical_json_bytes(files[path], location=path), location=path)
+
+
+def preflight_evaluator_response_v22(run_dir: Path, response: object) -> JsonObject:
+    manifest, files = _v22_verified(run_dir)
+    pending = [
+        call
+        for call in cast(list[JsonObject], manifest["calls"])
+        if call["state"] == "pending"
+    ]
+    if manifest["terminal_status"] is not None or len(pending) != 1:
+        return {"valid": False, "diagnostics": ["EXTERNAL_RESPONSE_INVALID"]}
+    request_path = cast(str, pending[0]["request_artifact_path"])
+    request = _object(
+        parse_canonical_json_bytes(files[request_path], location=request_path),
+        location=request_path,
+    )
+    try:
+        checked = _v22_validate_response(request, response)
+    except PortableEvaluationInputError:
+        return {"valid": False, "diagnostics": ["EXTERNAL_RESPONSE_INVALID"]}
+    operation = checked["operation"]
+    prior_responses = [
+        _object(
+            parse_canonical_json_bytes(
+                files[cast(str, call["response_artifact_path"])], location="response"
+            ),
+            location="response",
+        )
+        for call in cast(list[JsonObject], manifest["calls"])
+        if call["state"] == "accepted" and call["operation"] == operation
+    ]
+    key = "proposals" if operation == "source_review_fragment" else "concerns"
+    if operation in {"source_review_fragment", "source_audit_fragment"}:
+        values = [
+            value
+            for prior in [*prior_responses, checked]
+            for value in cast(
+                list[JsonObject],
+                _object(prior["payload"], location="response payload")[key],
+            )
+        ]
+        try:
+            _v22_validate_fragment_semantics(
+                values, proposal=operation == "source_review_fragment"
+            )
+        except _V22ExternalResponseSemanticsError:
+            return {"valid": False, "diagnostics": ["EXTERNAL_RESPONSE_INVALID"]}
+    return {"valid": True, "diagnostics": []}
+
+
+def guarded_submit_evaluator_response_v22(run_dir: Path, response: object) -> JsonObject:
+    with _v22_submission_guard(run_dir):
+        preflight = preflight_evaluator_response_v22(run_dir, response)
+        if not preflight["valid"]:
+            return {"accepted": False, "preflight": preflight}
+        manifest, files = _v22_verified(run_dir)
+        request = next_evaluator_request_v22(run_dir)
+        assert request is not None
+        checked = _v22_validate_response(request, response)
+        envelope = _object(parse_canonical_json_bytes(files["inputs/case.json"], location="inputs/case.json"), location="inputs/case.json")
+        prior_responses = [
+            _object(parse_canonical_json_bytes(files[cast(str, call["response_artifact_path"])], location="response"), location="response")
+            for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "accepted"
+        ]
+        successor, successor_files = _v22_snapshot(envelope, [*prior_responses, checked])
+        _v22_commit_snapshot(run_dir, cast(str, manifest["manifest_fingerprint"]), successor, successor_files)
+        return {"accepted": True, "preflight": preflight, "state": _v22_state(successor)}
+
+
+def submit_evaluator_response_v22(run_dir: Path, response: object) -> JsonObject:
+    result = guarded_submit_evaluator_response_v22(run_dir, response)
+    if not result["accepted"]:
+        raise PortableEvaluationInputError("EXTERNAL_RESPONSE_INVALID")
+    return cast(JsonObject, result["state"])
+
+
+def _v2_protocol(run_dir: Path) -> str | None:  # type: ignore[no-redef]
+    try:
+        with _open_run_storage(run_dir) as storage:
+            data = storage.read_optional_artifact(
+                "run-manifest.json", max_bytes=_V22_MAX_JSON_BYTES
+            )
+            storage.assert_root_identity()
+    except EvaluationIntegrityError:
+        return None
+    if data is None:
+        return None
+    try:
+        raw = _object(parse_canonical_json_bytes(data, location="run-manifest.json"), location="run-manifest.json")
+    except (EvaluationIntegrityError, PortableEvaluationInputError):
+        return "invalid"
+    version = raw.get("protocol_version")
+    if version in {_V22_PROTOCOL, _V21_PROTOCOL, _V2_PROTOCOL}:
+        return str(version)
+    if raw.get("schema_version") == "1.3":
+        return "1.3"
+    if "protocol_version" in raw:
+        return "unknown"
+    if "schema_version" not in raw:
+        return None
+    return (
+        "invalid-schema"
+        if raw.get("schema_version") in {"1.0", "2.0", "2.1", "2.2"}
+        else "unknown"
+    )
+
+
+def resume_evaluation(run_dir: Path) -> JsonObject:  # type: ignore[no-redef]
+    protocol = _v2_protocol(run_dir)
+    if protocol == "2.2":
+        return resume_evaluation_v22(run_dir)
+    if protocol == "2.1":
+        manifest, _ = _v21_verified(run_dir)
+        return _v21_state(manifest)
+    if protocol == "2.0":
+        manifest, _ = _v2_verified(run_dir)
+        return _v2_state(manifest)
+    if protocol == "1.3":
+        return _resume_evaluation_v1(run_dir)
+    raise EvaluationIntegrityError("EVALUATOR_PROTOCOL_UNSUPPORTED")
+
+
+def next_judge_request(run_dir: Path) -> JsonObject | None:  # type: ignore[no-redef]
+    protocol = _v2_protocol(run_dir)
+    if protocol == _V22_PROTOCOL:
+        return next_evaluator_request_v22(run_dir)
+    if protocol == _V21_PROTOCOL:
+        manifest, files = _v21_verified(run_dir)
+        if manifest["terminal_status"] is not None:
+            return None
+        pending = [call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"]
+        if len(pending) != 1:
+            raise EvaluationIntegrityError("EVALUATOR_V21_PENDING_CALL")
+        path = cast(str, pending[0]["request_artifact_path"])
+        return _object(parse_canonical_json_bytes(files[path], location=path), location=path)
+    if protocol == _V2_PROTOCOL:
+        manifest, files = _v2_verified(run_dir)
+        pending = [call for call in cast(list[JsonObject], manifest["calls"]) if call["state"] == "pending"]
+        if manifest["terminal_status"] is not None:
+            return None
+        if len(pending) != 1:
+            raise EvaluationIntegrityError("EVALUATOR_V2_PENDING_CALL")
+        path = cast(str, pending[0]["request_artifact_path"])
+        return _object(parse_canonical_json_bytes(files[path], location=path), location=path)
+    if protocol in {"1.3", "2.0"}:
+        raise PortableEvaluationInputError(f"Protocol {protocol} evaluation runs are read-only.")
+    raise EvaluationIntegrityError("EVALUATOR_PROTOCOL_UNSUPPORTED")
+
+
+def preflight_judge_response(run_dir: Path, response_value: object) -> JsonObject:  # type: ignore[no-redef]
+    if _v2_protocol(run_dir) == _V22_PROTOCOL:
+        return preflight_evaluator_response_v22(run_dir, response_value)
+    try:
+        if _v2_protocol(run_dir) != _V21_PROTOCOL:
+            raise PortableEvaluationInputError("retained protocol is read-only")
+        request = next_judge_request(run_dir)
+        if request is None:
+            raise PortableEvaluationInputError("evaluation is terminal")
+        _v21_response(response_value, request)
+        return {"valid": True, "diagnostics": []}
+    except (EvaluationIntegrityError, PortableEvaluationInputError, TypeError, ValueError):
+        return {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]}
+
+
+def guarded_submit_judge_response(run_dir: Path, response_value: object) -> JsonObject:  # type: ignore[no-redef]
+    if _v2_protocol(run_dir) == _V22_PROTOCOL:
+        return guarded_submit_evaluator_response_v22(run_dir, response_value)
+    preflight = preflight_judge_response(run_dir, response_value)
+    if not preflight["valid"]:
+        return {"accepted": False, "preflight": preflight}
+    try:
+        request = next_judge_request(run_dir)
+        assert request is not None
+        response = _v21_response(response_value, request)
+        if request["operation"] == "source_review":
+            state = _v21_commit_source_review(run_dir, response)
+        elif request["operation"] == "source_audit":
+            state = _v21_commit_source_audit(run_dir, response)
+        elif request["operation"] == "source_referee_fragment":
+            state = _v21_commit_referee(run_dir, response)
+        elif request["operation"] in {
+            "ordinary_grade_fragment", "contested_grade_fragment"
+        }:
+            state = _v21_commit_grade(run_dir, response)
+        else:
+            raise PortableEvaluationInputError("protocol 2.1 transition is not mirrored")
+        return {"accepted": True, "preflight": preflight, "state": state}
+    except (EvaluationIntegrityError, PortableEvaluationInputError, TypeError, ValueError):
+        return {
+            "accepted": False,
+            "preflight": {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]},
+        }
+
+
+def submit_judge_response(run_dir: Path, response_value: object) -> JsonObject:  # type: ignore[no-redef]
+    result = guarded_submit_judge_response(run_dir, response_value)
+    if not result["accepted"]:
+        raise PortableEvaluationInputError(
+            "EXTERNAL_RESPONSE_INVALID"
+            if _v2_protocol(run_dir) == _V22_PROTOCOL
+            else "MECHANICAL_RESPONSE_INVALID"
+        )
+    return cast(JsonObject, result["state"])
+
+
+def stop_evaluation_v21_inconclusive(run_dir: Path, reason: str) -> JsonObject:
+    if reason != "MECHANICAL_RESPONSE_INVALID":
+        raise PortableEvaluationInputError("unsupported inconclusive reason")
+    manifest, files = _v21_verified(run_dir)
+    if manifest["terminal_status"] is not None:
+        raise PortableEvaluationInputError("evaluation run is already terminal")
+    pending = [
+        call for call in cast(list[JsonObject], manifest["calls"])
+        if call["state"] == "pending"
+    ]
+    if len(pending) != 1:
+        raise EvaluationIntegrityError("EVALUATOR_V21_PENDING_CALL")
+    calls = [
+        call for call in cast(list[JsonObject], manifest["calls"])
+        if call["state"] == "accepted"
+    ]
+    updated = dict(files)
+    updated["terminal-reason.json"] = canonical_json_bytes({"reason": reason})
+    successor = _v21_manifest(
+        manifest,
+        case_fingerprint=cast(str, manifest["case_fingerprint"]),
+        case_hash=cast(str, manifest["case_envelope_hash"]),
+        build_hash=cast(str, manifest["build_fingerprint"]),
+        rubric_hash=cast(str, manifest["rubric_fingerprint"]), calls=calls,
+        files=updated, phase="inconclusive_mechanical",
+        baseline_fingerprint=cast(str | None, manifest["baseline_fingerprint"]),
+        referee_fingerprint=cast(str | None, manifest["referee_aggregate_fingerprint"]),
+        aggregate_fingerprints=cast(list[str], manifest["grader_aggregate_fingerprints"]),
+        sensitivity_fingerprints=cast(list[str], manifest["sensitivity_fingerprints"]),
+        terminal_status="INCONCLUSIVE_MECHANICAL",
+        disputes=cast(list[JsonObject], manifest["referee_disputes"]),
+        batches=cast(list[JsonObject], manifest["ordinary_grade_batches"]),
+    )
+    _v21_commit_transition(
+        run_dir,
+        cast(str, manifest["manifest_fingerprint"]),
+        {"terminal-reason.json": updated["terminal-reason.json"]},
+        successor,
+    )
+    return _v21_state(successor)
+
+
+def verify_evaluation_run(run_dir: Path) -> EvaluationVerification:  # type: ignore[no-redef]
+    protocol = _v2_protocol(run_dir)
+    if protocol == _V22_PROTOCOL:
+        try:
+            manifest, _ = _v22_verified(run_dir)
+        except EvaluationIntegrityError:
+            return EvaluationVerification(
+                valid=False,
+                issues=("EVALUATION_INTEGRITY_INVALID",),
+                root_hash=None,
+            )
+        return EvaluationVerification(
+            valid=True,
+            issues=(),
+            root_hash=cast(str, manifest["manifest_fingerprint"]),
+        )
+    if protocol == _V21_PROTOCOL:
+        try:
+            manifest, _ = _v21_verified(run_dir)
+        except EvaluationIntegrityError:
+            return EvaluationVerification(
+                valid=False, issues=("EVALUATION_INTEGRITY_INVALID",), root_hash=None
+            )
+        return EvaluationVerification(
+            valid=True,
+            issues=(),
+            root_hash=cast(str, manifest["manifest_fingerprint"]),
+        )
+    if protocol == _V2_PROTOCOL:
+        return _v20_verify_evaluation_run(run_dir)
+    if protocol in {"1.3", None}:
+        return _verify_evaluation_run_v1(run_dir)
+    raise EvaluationIntegrityError("EVALUATOR_PROTOCOL_UNSUPPORTED")

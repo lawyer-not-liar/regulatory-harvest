@@ -2,8 +2,11 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,21 @@ from regulatory_harvest.analysis import (
     evaluate_atomic_coverage,
 )
 from regulatory_harvest.evaluation import attorney_generation, attorney_workflow
+from regulatory_harvest.evaluation.attorney_cli import _case_and_capsules_from_fixture
+from regulatory_harvest.evaluation.attorney_v2_workflow import initialize_evaluation_v2
+from regulatory_harvest.evaluation.attorney_v21_workflow import initialize_evaluation_v21
+from regulatory_harvest.evaluation.attorney_v22_drafts import (
+    CompiledDraftV22,
+    EvaluatorProvenanceV22,
+    compile_evaluator_draft_v22,
+)
+from regulatory_harvest.evaluation.attorney_v22_models import (
+    validate_evaluator_request_v22,
+)
+from regulatory_harvest.evaluation.attorney_v22_workflow import (
+    next_evaluator_request_v22,
+    submit_evaluator_response_v22,
+)
 from regulatory_harvest.models import SourceRecord
 from regulatory_harvest.storage import canonical_json_bytes
 
@@ -22,6 +40,7 @@ ROOT = Path(__file__).parents[2]
 SKILL_RUNNER = ROOT / "scripts" / "harvest_skill.py"
 PORTABLE_RUNNER = ROOT / "scripts" / "harvest_portable.py"
 EVALUATION_FIXTURE = ROOT / "tests" / "fixtures" / "attorney-eval"
+EVALUATION_FIXTURE_V2 = ROOT / "tests" / "fixtures" / "attorney-eval-v2"
 SKILL_SPEC = importlib.util.spec_from_file_location("regulatory_harvest_skill_runner", SKILL_RUNNER)
 assert SKILL_SPEC is not None and SKILL_SPEC.loader is not None
 skill_runner = importlib.util.module_from_spec(SKILL_SPEC)
@@ -32,6 +51,134 @@ PORTABLE_SPEC = importlib.util.spec_from_file_location(
 assert PORTABLE_SPEC is not None and PORTABLE_SPEC.loader is not None
 portable_runner = importlib.util.module_from_spec(PORTABLE_SPEC)
 PORTABLE_SPEC.loader.exec_module(portable_runner)
+
+
+def _normalized_markdown_slice(
+    relative_path: str,
+    start_heading: str,
+    end_heading: str | None,
+) -> str:
+    text = (ROOT / relative_path).read_text(encoding="utf-8")
+    assert text.count(start_heading) == 1
+    section = text.split(start_heading, 1)[1]
+    if end_heading is not None:
+        assert section.count(end_heading) == 1
+        section = section.split(end_heading, 1)[0]
+    return " ".join(section.casefold().split())
+
+
+# Task 8's differential contract deliberately names every semantic and safety
+# boundary.  The individual payload variations are exercised by the portable
+# substrate tests; this runner-level table locks the public, no-site surface to
+# the full evaluator's bytes and refusal behavior.
+V2_PARITY_VECTORS = (
+    "empty_audit_single_report_pass",
+    "audited_correction_pair_fail_and_pass",
+    "unresolved_source_dispute",
+    "grader_disagreement",
+    "material_unsupported_assertion",
+    "ambiguous_source_quote",
+    "ambiguous_report_quote",
+    "first_mechanical_repair",
+    "second_mechanical_failure",
+    "tampered_baseline",
+    "unknown_protocol",
+    "retained_protocol_1_3_replay",
+)
+
+PROTOCOL_21_PORTABLE_PARITY_VECTORS = (
+    "no_dispute",
+    "mixed_referee_reviewer_auditor_unresolved",
+    "stable_pass",
+    "stable_fail",
+    "outcome_changing_inconclusive",
+    "referee_repair",
+    "grade_repair",
+    "mechanical_terminal",
+    "partial_referee_resume",
+    "partial_grade_resume",
+    "retained_2_0",
+    "retained_1_3",
+    "unknown",
+    "swapped_fragment",
+    "tampered_aggregate",
+    "tampered_lane_aggregate",
+    "tampered_reconciliation",
+    "tampered_sensitivity",
+    "tampered_result",
+    "cross_label_metadata",
+    "cross_lane_metadata",
+    "cross_batch_metadata",
+    "symlink_path_refusal",
+)
+
+PROTOCOL_22_PORTABLE_PARITY_VECTORS = (
+    "review_fragmentation",
+    "audit_fragmentation",
+    "normalized_prose_enum_and_quote",
+    "clarification_then_accept",
+    "nested_clarification_then_accept",
+    "nested_missing_passage_then_accept",
+    "nested_missing_dependency_then_accept",
+    "nested_missing_audit_dependency_then_accept",
+    "nested_blank_rationale_then_accept",
+    "nested_blank_audit_explanation_then_accept",
+    "engine_pause",
+    "nested_engine_pause",
+    "nested_missing_passage_pause",
+    "nested_missing_dependency_pause",
+    "nested_missing_audit_dependency_pause",
+    "nested_blank_rationale_pause",
+    "nested_blank_audit_explanation_pause",
+    "later_resume",
+    "stable_pass",
+    "stable_fail",
+    "outcome_sensitive_inconclusive",
+    "insufficient_inconclusive",
+    "empty_source_inconclusive",
+    "low_quality_acceptance",
+    "partial_source_review_resume",
+    "partial_source_audit_resume",
+    "partial_referee_resume",
+    "partial_ordinary_grade_resume",
+    "partial_contested_grade_resume",
+    "candidate_label_a",
+    "candidate_label_b",
+    "scripted_exhaustion",
+    "scripted_surplus",
+    "scripted_malformed",
+    "scripted_probe_error",
+    "scripted_symlink",
+    "scripted_oversize",
+    "retained_1_3",
+    "retained_2_0",
+    "retained_2_1",
+    "corrupt_retained_1_3",
+    "corrupt_retained_2_0",
+    "corrupt_retained_2_1",
+    "unknown_protocol",
+    "unknown_schema",
+    "missing_root",
+    "empty_root",
+    "absent_protocol_marker",
+    "review_cross_fragment_duplicate",
+    "review_cross_fragment_conflict",
+    "review_nonfinal_fragment_duplicate",
+    "review_nonfinal_fragment_conflict",
+    "audit_cross_fragment_duplicate",
+    "audit_cross_fragment_conflict",
+    "audit_nonfinal_fragment_duplicate",
+    "audit_nonfinal_fragment_conflict",
+    "cross_case_swap",
+    "cross_lane_swap",
+    "cross_dispute_swap",
+    "cross_batch_swap",
+    "cross_fragment_swap",
+    "compiler_contract_tamper",
+    "aggregate_reseal",
+    "result_reseal",
+    "symlink_path_refusal",
+)
 
 _TEMPLATE_DUTY_QUOTE = (
     "A covered operator must maintain a public incident register."
@@ -84,14 +231,54 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+_V2_RUNNER_RECORDS: list[tuple[str, str, tuple[int, str, str]]] | None = None
+
+
 def _run_runner(runner: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    result = subprocess.run(
         [sys.executable, str(runner), *args],
         cwd=ROOT,
         check=False,
         capture_output=True,
         text=True,
     )
+    if _V2_RUNNER_RECORDS is not None:
+        runner_name = "full" if runner == SKILL_RUNNER else "portable"
+        _V2_RUNNER_RECORDS.append(
+            (runner_name, args[0], (result.returncode, result.stdout, result.stderr))
+        )
+    return result
+
+
+@contextmanager
+def _assert_v2_runner_command_parity() -> Iterator[None]:
+    """Capture each public command and require full/portable result-byte parity."""
+    global _V2_RUNNER_RECORDS
+    previous = _V2_RUNNER_RECORDS
+    records: list[tuple[str, str, tuple[int, str, str]]] = []
+    _V2_RUNNER_RECORDS = records
+    try:
+        yield
+    finally:
+        _V2_RUNNER_RECORDS = previous
+    full = [(command, result) for runner, command, result in records if runner == "full"]
+    portable = [(command, result) for runner, command, result in records if runner == "portable"]
+    assert full
+    assert len(full) == len(portable)
+    for full_record, portable_record in zip(full, portable, strict=True):
+        assert full_record == portable_record
+
+
+@contextmanager
+def _suspend_v2_runner_capture() -> Iterator[None]:
+    """Exclude the full-only reviewer baseline witness from public vector parity."""
+    global _V2_RUNNER_RECORDS
+    previous = _V2_RUNNER_RECORDS
+    _V2_RUNNER_RECORDS = None
+    try:
+        yield
+    finally:
+        _V2_RUNNER_RECORDS = previous
 
 
 def _run_qualification_surface(
@@ -490,6 +677,96 @@ def _canonical_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _reseal_protocol_21_run(run: Path) -> None:
+    """Recompute only outer artifact/manifest hashes after an adversarial rewrite."""
+    manifest_path = run / "run-manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    assert isinstance(manifest, dict)
+    artifacts = manifest["artifacts"]
+    assert isinstance(artifacts, list)
+    for record in artifacts:
+        assert isinstance(record, dict)
+        path = record["artifact_path"]
+        assert isinstance(path, str)
+        record["artifact_hash"] = hashlib.sha256((run / path).read_bytes()).hexdigest()
+    body = dict(manifest)
+    body.pop("manifest_fingerprint")
+    manifest["manifest_fingerprint"] = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    manifest_path.write_bytes(_canonical_bytes(manifest))
+
+
+def _forge_protocol_21_report_derivation(run: Path, kind: str) -> None:
+    """Re-seal one model-valid but semantically forged terminal report chain."""
+    manifest_path = run / "run-manifest.json"
+    result_path = run / "result.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    result = json.loads(result_path.read_bytes())
+    report = result["reports"][0]
+    label = report["anonymous_label"]
+    sensitivity_path = run / "sensitivities" / f"{label}.json"
+    sensitivity = json.loads(sensitivity_path.read_bytes())
+    if kind == "reconciliation":
+        reconciliation = report["reconciliation"]
+        reconciliation["absolute_disposition"] = "FAIL"
+        reconciliation["reason_codes"] = ["CRITICAL_RECALL_BELOW_FLOOR"]
+        body = dict(reconciliation)
+        body.pop("reconciliation_fingerprint")
+        reconciliation["reconciliation_fingerprint"] = hashlib.sha256(
+            _canonical_bytes(body)
+        ).hexdigest()
+        sensitivity["reconciliation_fingerprint"] = reconciliation[
+            "reconciliation_fingerprint"
+        ]
+    else:
+        assert kind == "sensitivity"
+    sensitivity["absolute_disposition"] = "FAIL"
+    sensitivity["reason_codes"] = ["CRITICAL_RECALL_BELOW_FLOOR"]
+    body = dict(sensitivity)
+    body.pop("sensitivity_fingerprint")
+    sensitivity["sensitivity_fingerprint"] = hashlib.sha256(
+        _canonical_bytes(body)
+    ).hexdigest()
+    sensitivity_path.write_bytes(_canonical_bytes(sensitivity))
+    report["sensitivity"] = sensitivity
+    body = dict(report)
+    body.pop("result_fingerprint")
+    report["result_fingerprint"] = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    dispositions = [item["sensitivity"]["absolute_disposition"] for item in result["reports"]]
+    if dispositions == ["FAIL", "PASS"]:
+        result["comparison"] = {
+            "disposition": "comparator_win",
+            "winner_label": "B",
+            "rationale": "Only the comparator report passed the rubric.",
+        }
+    elif dispositions == ["PASS", "FAIL"]:
+        result["comparison"] = {
+            "disposition": "candidate_win",
+            "winner_label": "A",
+            "rationale": "Only the candidate report passed the rubric.",
+        }
+    elif dispositions == ["FAIL", "FAIL"]:
+        result["comparison"] = {
+            "disposition": "neither",
+            "winner_label": None,
+            "rationale": "Neither report passed the rubric.",
+        }
+    body = dict(result)
+    body.pop("result_fingerprint")
+    result["result_fingerprint"] = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    result_path.write_bytes(_canonical_bytes(result))
+    sensitivity_index = next(
+        index
+        for index, item in enumerate(result["reports"])
+        if item["anonymous_label"] == label
+    )
+    manifest["sensitivity_fingerprints"][sensitivity_index] = sensitivity[
+        "sensitivity_fingerprint"
+    ]
+    manifest["result_hash"] = result["result_fingerprint"]
+    manifest_path.write_bytes(_canonical_bytes(manifest))
+    _reseal_protocol_21_run(run)
+
+
 def _bound_scripted_payload(
     request: dict[str, object], payload: dict[str, object]
 ) -> dict[str, object]:
@@ -805,18 +1082,434 @@ def _next_packet(runner: Path, run: Path) -> dict[str, object]:
     return json.loads(result.stdout)
 
 
-def _initialize_eval_run(runner: Path, run: Path) -> None:
-    initialized = _run_runner(
-        runner,
-        "eval-init",
-        "--case",
-        str(EVALUATION_FIXTURE / "case.json"),
-        "--run",
-        str(run),
-        "--seed-hex",
-        "7" * 64,
+def _v2_source_review_response(request: dict[str, object]) -> dict[str, object]:
+    """Build the smallest semantically complete local response for a v2 source review."""
+    source_record = request["payload"]["source_record"]
+    assert isinstance(source_record, dict)
+    sources = source_record["sources"]
+    assert isinstance(sources, list) and len(sources) == 1
+    source = sources[0]
+    assert isinstance(source, dict)
+    version = str(request["schema_version"])
+    return {
+        "schema_version": version,
+        "operation": "source_review",
+        "request_fingerprint": request["request_fingerprint"],
+        "provider_name": "local-scripted-fixture",
+        "model_name": "no-provider",
+        "judge_isolation": "scripted_fixture",
+        "payload": {
+            "schema_version": version,
+            "proposals": [
+                {
+                    "statement": "A covered operator must file the registry notice.",
+                    "kind": "obligation",
+                    "importance": "critical",
+                    "passages": [
+                        {
+                            "source_id": source["source_id"],
+                            "quote": source["normalized_text"],
+                        }
+                    ],
+                    "dependency": None,
+                    "confidence": "clear",
+                    "rationale": "The synthetic operative text states the filing duty.",
+                }
+            ],
+        },
+    }
+
+
+def _v21_source_review_response(request: dict[str, object]) -> dict[str, object]:
+    """Build the same source-only judgment under the v2.1 fragment envelope."""
+    source_record = request["payload"]["source_record"]
+    assert isinstance(source_record, dict)
+    sources = source_record["sources"]
+    assert isinstance(sources, list) and len(sources) == 1
+    source = sources[0]
+    assert isinstance(source, dict)
+    return {
+        "schema_version": "2.1",
+        "operation": "source_review",
+        "request_fingerprint": request["request_fingerprint"],
+        "provider_name": "local-scripted-fixture",
+        "model_name": "no-provider",
+        "judge_isolation": "scripted_fixture",
+        "payload": {
+            "schema_version": "2.1",
+            "proposals": [
+                {
+                    "statement": "A covered operator must file the registry notice.",
+                    "kind": "obligation",
+                    "importance": "critical",
+                    "passages": [
+                        {
+                            "source_id": source["source_id"],
+                            "quote": source["normalized_text"],
+                        }
+                    ],
+                    "dependency": None,
+                    "confidence": "clear",
+                    "rationale": "The synthetic operative text states the filing duty.",
+                }
+            ],
+        },
+    }
+
+
+def _v21_response(
+    request: dict[str, object],
+    *,
+    proposal_count: int = 1,
+    disputed: bool = False,
+    mixed_referee: bool = False,
+    stable_fail: bool = False,
+    outcome_changing: bool = False,
+) -> dict[str, object]:
+    """Author one literal Protocol 2.1 judgment for the issued fragment."""
+    operation = request["operation"]
+    request_payload = request["payload"]
+    assert isinstance(request_payload, dict)
+    payload: dict[str, object]
+    if operation == "source_review":
+        source_record = request_payload["source_record"]
+        assert isinstance(source_record, dict)
+        sources = source_record["sources"]
+        assert isinstance(sources, list) and len(sources) == 1
+        source = sources[0]
+        assert isinstance(source, dict)
+        payload = {
+            "schema_version": "2.1",
+            "proposals": [
+                {
+                    "statement": f"Duty {index}: a covered operator must file notice.",
+                    "kind": "obligation",
+                    "importance": "critical",
+                    "passages": [
+                        {
+                            "source_id": source["source_id"],
+                            "quote": source["normalized_text"],
+                        }
+                    ],
+                    "dependency": None,
+                    "confidence": "clear",
+                    "rationale": "The synthetic source states the filing duty.",
+                }
+                for index in range(1, proposal_count + 1)
+            ],
+        }
+    elif operation == "source_audit":
+        indexed = request_payload["indexed_proposals"]
+        assert isinstance(indexed, list)
+        concerns: list[dict[str, object]] = []
+        if disputed or mixed_referee:
+            selected = indexed if mixed_referee or len(indexed) > 1 else indexed[:1]
+            for index, item in enumerate(selected, start=1):
+                assert isinstance(item, dict)
+                proposal = item["proposal"]
+                assert isinstance(proposal, dict)
+                correction = None
+                if mixed_referee and index in {2, 3}:
+                    correction = {
+                        **proposal,
+                        "statement": f"Auditor alternative duty {index}.",
+                        "rationale": "The alternative is supported by the source.",
+                    }
+                concerns.append(
+                    {
+                        "target_proposal_ref": item["proposal_ref"],
+                        "concern_type": "ambiguity",
+                        "passages": proposal["passages"],
+                        "explanation": "The reviewed interpretation is materially disputed.",
+                        "correction": correction,
+                    }
+                )
+        payload = {"schema_version": "2.1", "concerns": concerns}
+    elif operation == "source_referee_fragment":
+        disputes = request_payload["material_disputes"]
+        assert isinstance(disputes, list) and len(disputes) == 1
+        dispute = disputes[0]
+        assert isinstance(dispute, dict)
+        evidence = dispute["evidence"]
+        assert isinstance(evidence, list) and evidence
+        decision = "accept_reviewer"
+        unresolved_reason = None
+        if mixed_referee:
+            decision = {
+                "D0001": "accept_reviewer",
+                "D0002": "accept_auditor",
+                "D0003": "unresolved",
+            }[str(dispute["dispute_id"])]
+            if decision == "unresolved":
+                unresolved_reason = "SOURCE_AMBIGUITY"
+        elif disputed:
+            decision = "unresolved"
+            unresolved_reason = "SOURCE_AMBIGUITY"
+        payload = {
+            "schema_version": "2.1",
+            "decision": decision,
+            "unresolved_reason": unresolved_reason,
+            "evidence_refs": [evidence[0]["evidence_ref"]],
+            "rationale": "The closed source record supports this substantive judgment.",
+        }
+    elif operation == "ordinary_grade_fragment":
+        requirements = request_payload["requirements"]
+        report_text = request_payload["report_text"]
+        assert isinstance(report_text, str) and isinstance(requirements, list)
+        payload = {
+            "schema_version": "2.1",
+            "anonymous_label": request_payload["anonymous_label"],
+            "grader_lane": request_payload["grader_lane"],
+            "batch_ref": request_payload["batch_ref"],
+            "baseline_fingerprint": request_payload["baseline_fingerprint"],
+            "report_fingerprint": request_payload["report_fingerprint"],
+            "requirement_grades": [
+                {
+                    "requirement_id": requirement["requirement_id"],
+                    "disposition": "not_met" if stable_fail else "met",
+                    "report_passages": [report_text],
+                    "rationale": "The report is assessed against the supplied requirement.",
+                    "omission": None,
+                }
+                for requirement in requirements
+            ],
+            "rationale": "The bounded ordinary batch is complete.",
+        }
+    else:
+        assert operation == "contested_grade_fragment"
+        report_text = request_payload["report_text"]
+        contested = request_payload["contested_requirement"]
+        assert isinstance(report_text, str) and isinstance(contested, dict)
+        reviewer_disposition = "not_met" if stable_fail else "met"
+        auditor_disposition = (
+            "not_met" if stable_fail or outcome_changing else "met"
+        )
+        payload = {
+            "schema_version": "2.1",
+            "anonymous_label": request_payload["anonymous_label"],
+            "grader_lane": request_payload["grader_lane"],
+            "contested_requirement_id": contested["contested_requirement_id"],
+            "baseline_fingerprint": request_payload["baseline_fingerprint"],
+            "report_fingerprint": request_payload["report_fingerprint"],
+            "reviewer_alternative_grade": {
+                "disposition": reviewer_disposition,
+                "report_passages": [report_text],
+                "rationale": "The reviewer alternative was assessed.",
+            },
+            "auditor_alternative_grade": {
+                "disposition": auditor_disposition,
+                "report_passages": [report_text],
+                "rationale": "The auditor alternative was assessed.",
+            },
+            "ambiguity_disposition": (
+                "overstated"
+                if outcome_changing and request_payload["grader_lane"] == 2
+                else "acknowledged"
+            ),
+            "rationale": "Both supported alternatives were assessed.",
+        }
+    return {
+        "schema_version": "2.1",
+        "operation": operation,
+        "request_fingerprint": request["request_fingerprint"],
+        "provider_name": "local-scripted-fixture",
+        "model_name": "no-provider",
+        "judge_isolation": "scripted_fixture",
+        "payload": payload,
+    }
+
+
+def _v2_empty_audit_response(request: dict[str, object]) -> dict[str, object]:
+    version = str(request["schema_version"])
+    return {
+        "schema_version": version, "operation": "source_audit",
+        "request_fingerprint": request["request_fingerprint"],
+        "provider_name": "local-scripted-fixture", "model_name": "no-provider",
+        "judge_isolation": "scripted_fixture",
+        "payload": {"schema_version": version, "concerns": []},
+    }
+
+
+def _v2_disputed_audit_response(request: dict[str, object]) -> dict[str, object]:
+    payload = request["payload"]
+    assert isinstance(payload, dict)
+    indexed = payload["indexed_proposals"]
+    assert isinstance(indexed, list) and len(indexed) == 1
+    proposal = indexed[0]["proposal"]
+    assert isinstance(proposal, dict)
+    version = str(request["schema_version"])
+    return {
+        "schema_version": version, "operation": "source_audit",
+        "request_fingerprint": request["request_fingerprint"],
+        "provider_name": "local-scripted-fixture", "model_name": "no-provider",
+        "judge_isolation": "scripted_fixture",
+        "payload": {"schema_version": version, "concerns": [{
+            "target_proposal_ref": "P0001", "concern_type": "incorrect_statement",
+            "passages": proposal["passages"],
+            "explanation": "The source review needs a checked correction for this legal duty.",
+            "correction": proposal,
+        }]},
+    }
+
+
+def _v2_corrected_disputed_audit_response(request: dict[str, object]) -> dict[str, object]:
+    """Return a valid audit correction that changes the reviewed requirement."""
+    response = _v2_disputed_audit_response(request)
+    payload = response["payload"]
+    assert isinstance(payload, dict)
+    concerns = payload["concerns"]
+    assert isinstance(concerns, list) and len(concerns) == 1
+    concern = concerns[0]
+    assert isinstance(concern, dict)
+    correction = concern["correction"]
+    assert isinstance(correction, dict)
+    corrected = dict(correction)
+    corrected["statement"] = "A covered operator must file notice."
+    corrected["passages"] = [
+        {"source_id": "source-1", "quote": "A covered operator must file notice."}
+    ]
+    concern["correction"] = corrected
+    return response
+
+
+def _v2_referee_accept_reviewer_response(request: dict[str, object]) -> dict[str, object]:
+    payload = request["payload"]
+    assert isinstance(payload, dict)
+    disputes = payload["material_disputes"]
+    assert isinstance(disputes, list) and len(disputes) == 1
+    dispute = disputes[0]
+    assert isinstance(dispute, dict)
+    if request["schema_version"] == "2.1":
+        evidence = dispute["evidence"]
+        assert isinstance(evidence, list) and evidence
+        return {
+            "schema_version": "2.1", "operation": "source_referee_fragment",
+            "request_fingerprint": request["request_fingerprint"],
+            "provider_name": "local-scripted-fixture", "model_name": "no-provider",
+            "judge_isolation": "scripted_fixture",
+            "payload": {
+                "schema_version": "2.1", "decision": "accept_reviewer",
+                "unresolved_reason": None,
+                "evidence_refs": [evidence[0]["evidence_ref"]],
+                "rationale": "The frozen source record supports the original reviewed legal duty.",
+            },
+        }
+    concern = dispute["audit_concern"]
+    assert isinstance(concern, dict)
+    return {
+        "schema_version": "2.0", "operation": "source_referee",
+        "request_fingerprint": request["request_fingerprint"],
+        "provider_name": "local-scripted-fixture", "model_name": "no-provider",
+        "judge_isolation": "scripted_fixture",
+        "payload": {"schema_version": "2.0", "decisions": [{
+            "dispute_id": dispute["dispute_id"], "decision": "accept_reviewer",
+            "passages": concern["passages"],
+            "rationale": "The frozen source record supports the original reviewed legal duty.",
+        }]},
+    }
+
+
+def _v2_referee_accept_auditor_response(request: dict[str, object]) -> dict[str, object]:
+    """Accept the audit's materially corrected proposal and its exact passage."""
+    response = _v2_referee_accept_reviewer_response(request)
+    payload = response["payload"]
+    assert isinstance(payload, dict)
+    if request["schema_version"] == "2.1":
+        payload["decision"] = "accept_auditor"
+        payload["rationale"] = "The corrected duty is exactly supported by the frozen source."
+        return response
+    decisions = payload["decisions"]
+    assert isinstance(decisions, list) and len(decisions) == 1
+    decision = decisions[0]
+    assert isinstance(decision, dict)
+    dispute = request["payload"]["material_disputes"][0]  # type: ignore[index]
+    assert isinstance(dispute, dict)
+    concern = dispute["audit_concern"]
+    assert isinstance(concern, dict)
+    correction = concern["correction"]
+    assert isinstance(correction, dict)
+    decision["decision"] = "accept_auditor"
+    decision["passages"] = correction["passages"]
+    decision["rationale"] = "The corrected duty is exactly supported by the frozen source."
+    return response
+
+
+def _v2_grade_response(request: dict[str, object]) -> dict[str, object]:
+    if request["schema_version"] == "2.1":
+        return _v21_response(request)
+    payload = request["payload"]
+    assert isinstance(payload, dict)
+    report = payload["anonymous_report"]
+    requirements = payload["requirements"]
+    assert isinstance(report, dict)
+    assert isinstance(requirements, list)
+    return {
+        "schema_version": "2.0",
+        "operation": "grade_report",
+        "request_fingerprint": request["request_fingerprint"],
+        "provider_name": "local-scripted-fixture",
+        "model_name": "no-provider",
+        "judge_isolation": "scripted_fixture",
+        "payload": {
+            "schema_version": "2.0",
+            "anonymous_label": report["anonymous_label"],
+            "baseline_fingerprint": payload["baseline_fingerprint"],
+            "requirement_grades": [
+                {
+                    "requirement_id": requirement["requirement_id"],
+                    "disposition": "met",
+                    "report_passages": [],
+                    "rationale": "The report addresses the supplied requirement.",
+                    "omission": None,
+                }
+                for requirement in requirements
+            ],
+            "unsupported_assertions": [],
+            "baseline_defect": None,
+        },
+    }
+
+
+def _initialize_eval_run(
+    runner: Path, run: Path, *, case_path: Path = EVALUATION_FIXTURE / "case.json"
+) -> None:
+    """Materialize a frozen protocol-1.3 fixture without exposing legacy initialization."""
+    del runner
+    case, capsule_paths = _case_and_capsules_from_fixture(
+        case_path, root=case_path.parent
     )
-    assert initialized.returncode == 0, initialized.stderr
+    attorney_workflow.initialize_evaluation(
+        case,
+        run,
+        seed_hex="7" * 64,
+        generation_capsule_paths=capsule_paths,
+    )
+
+
+def _initialize_v2_eval_run(run: Path) -> None:
+    """Materialize a retained 2.0 run without exercising the 2.1 init default."""
+    case, capsule_paths = _case_and_capsules_from_fixture(
+        EVALUATION_FIXTURE / "case.json", root=EVALUATION_FIXTURE
+    )
+    initialize_evaluation_v2(
+        case,
+        run,
+        seed_hex="6" * 64,
+        generation_capsule_paths=capsule_paths,
+    )
+
+
+def _initialize_v21_eval_run(run: Path) -> None:
+    """Materialize a retained 2.1 run for the Protocol 2.2 CLI boundary."""
+    case, capsule_paths = _case_and_capsules_from_fixture(
+        EVALUATION_FIXTURE / "case.json", root=EVALUATION_FIXTURE
+    )
+    initialize_evaluation_v21(
+        case,
+        run,
+        seed_hex="5" * 64,
+        generation_capsule_paths=capsule_paths,
+    )
 
 
 def _stopped_shape_audit_payload(request: dict[str, object]) -> dict[str, object]:
@@ -1290,8 +1983,6 @@ def test_installed_skill_qualification_and_bounded_repair_contract(
     for required_contract in (
         "qualify every locked case before generating a candidate",
         "use eval-submit-safe for every evaluator response",
-        "one initial response and at most two mechanical repairs",
-        "stop when the same diagnostic code occurs twice",
         "never retry an unfavorable substantive judgment",
         "accept an unfavorable substantive result without retry",
         "verify terminal evaluation artifacts",
@@ -1299,8 +1990,41 @@ def test_installed_skill_qualification_and_bounded_repair_contract(
         "stop rather than repair in the same role context",
     ):
         assert required_contract in instructions
+
+    if relative_path == "SKILL.md":
+        current_contract = _normalized_markdown_slice(
+            relative_path, "## Choose the journey", "## Non-negotiable result"
+        )
+    else:
+        current_contract = _normalized_markdown_slice(
+            relative_path,
+            "## Protocol 2.1 new-run contract",
+            "## Retained Protocol 1.3 operator reference",
+        )
+    assert "one initial response" in current_contract
+    assert "at most one fresh mechanical repair" in current_contract
+    assert "per fragment" in current_contract
+    assert "second mechanical refusal" in current_contract
+    assert "inconclusive_mechanical" in current_contract
+    assert "one initial response and at most two mechanical repairs" not in current_contract
     assert "qualification readiness is not a report-quality pass" in instructions
     assert "changing any source byte creates a new versioned case" in instructions
+
+
+def test_installed_retained_protocol_13_preserves_historical_repair_contract() -> None:
+    retained_contract = _normalized_markdown_slice(
+        "references/attorney-evaluation.md",
+        "## Retained Protocol 1.3 operator reference",
+        None,
+    )
+
+    assert "one initial response and at most two mechanical repairs" in retained_contract
+    assert "same diagnostic code occurs twice" in retained_contract
+    assert "stop after the second repair even if the diagnostic codes differ" in retained_contract
+    assert (
+        "one initial response and at most one fresh mechanical repair per fragment"
+        not in retained_contract
+    )
 
 
 def test_bounded_repair_controller_trace_stops_after_a_repeated_safe_diagnostic(
@@ -1464,17 +2188,9 @@ def test_bounded_repair_controller_trace_stops_after_a_repeated_safe_diagnostic(
     assert events == ["qualification-verified", "generation-verified"]
 
     evaluation_run = tmp_path / "evaluation-run"
-    evaluation_initialized = _run_runner(
-        SKILL_RUNNER,
-        "eval-init",
-        "--case",
-        str(fixture["evaluation_case"]),
-        "--run",
-        str(evaluation_run.resolve()),
-        "--seed-hex",
-        "7" * 64,
+    _initialize_eval_run(
+        PORTABLE_RUNNER, evaluation_run, case_path=fixture["evaluation_case"]
     )
-    assert evaluation_initialized.returncode == 0, evaluation_initialized.stderr
     evaluation_envelope = json.loads(
         (evaluation_run / "case-envelope.json").read_bytes()
     )
@@ -1488,173 +2204,49 @@ def test_bounded_repair_controller_trace_stops_after_a_repeated_safe_diagnostic(
     assert evaluation_candidate["validation_receipt"]["generation_record"] == (
         generation_record
     )
-    scripted = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_text(
-            encoding="utf-8"
-        )
-    )["responses"]
-    role_context_ids: list[str] = []
-    for index, scripted_response in enumerate(scripted[:2], start=1):
-        request = _next_packet(SKILL_RUNNER, evaluation_run)
-        if index == 1:
-            qualification_record = dict(qualification_request["payload"])
-            evaluation_record = dict(request["payload"])
-            assert qualification_record.pop("source_record_fingerprint") == (
-                qualification_receipt["source_record_fingerprint"]
-            )
-            assert evaluation_record.pop("source_record_fingerprint") == (
-                request["safe_metadata"]["source_record_fingerprint"]
-            )
-            assert qualification_record.pop("schema_version") == "1.0"
-            assert evaluation_record.pop("schema_version") == "1.1"
-            assert qualification_record == evaluation_record
-        authored = _fresh_role_response_bytes(
-            request,
-            _bound_scripted_payload(request, scripted_response["payload"]),
-            prior_context_ids=set(role_context_ids),
-        )
-        assert authored is not None
-        response_bytes, context_id = authored
-        assert context_id not in role_context_ids
-        role_context_ids.append(context_id)
-        response = tmp_path / f"accepted-response-{index}.json"
-        response.write_bytes(response_bytes)
-        accepted = _run_runner(
-            SKILL_RUNNER,
-            "eval-submit-safe",
-            "--run",
-            str(evaluation_run.resolve()),
-            "--response",
-            str(response),
-        )
-        assert accepted.returncode == 0, accepted.stderr
-        assert json.loads(accepted.stdout)["accepted"] is True
-
-    audit_request = _next_packet(SKILL_RUNNER, evaluation_run)
-    assert audit_request["operation"] == "audit_ledger"
-    invalid_audit_payload = {
-        "complete": True,
-        "disputes": [
-            {
-                "action": "materiality",
-                "dispute_id": "audit-1",
-                "materiality": "supporting",
-                "proposed_entries": [],
-                "rationale": "brief",
-                "target_ledger_ids": ["file-notice"],
-            }
-        ],
-        "request_fingerprint": audit_request["request_fingerprint"],
-    }
-    offered_responses: list[tuple[str, Path]] = []
-    for attempt in range(1, 4):
-        authored = _fresh_role_response_bytes(
-            audit_request,
-            invalid_audit_payload,
-            prior_context_ids=set(role_context_ids),
-        )
-        assert authored is not None
-        response_bytes, context_id = authored
-        assert context_id not in role_context_ids
-        role_context_ids.append(context_id)
-        response = tmp_path / f"rejected-audit-response-{attempt}.json"
-        response.write_bytes(response_bytes)
-        offered_responses.append((context_id, response))
-
-    before_rejections = _run_snapshot(evaluation_run)
-    consumed: list[Path] = []
-    diagnostic_counts: dict[str, int] = {}
-    for context_id, response in offered_responses:
-        refused = _run_runner(
-            SKILL_RUNNER,
-            "eval-submit-safe",
-            "--run",
-            str(evaluation_run.resolve()),
-            "--response",
-            str(response),
-        )
-        consumed.append(response)
-        assert json.loads(response.read_bytes())["model_name"] == (
-            f"synthetic-role-{context_id}"
-        )
-        assert json.loads(response.read_bytes())["judge_isolation"] == "fresh_context"
-        assert refused.returncode == 2, refused.stderr
-        result = json.loads(refused.stdout)
-        assert result["accepted"] is False
-        code = result["preflight"]["issues"][0]["code"]
-        diagnostic_counts[code] = diagnostic_counts.get(code, 0) + 1
-        if diagnostic_counts[code] == 2:
-            break
-
-    assert consumed == [path for _, path in offered_responses[:2]]
-    assert diagnostic_counts == {"EVALUATION_AUDIT_RATIONALE_INSUFFICIENT": 2}
-    assert _run_snapshot(evaluation_run) == before_rejections
-    assert not (
-        evaluation_run / "judge-responses" / "ledger-audit-attempt-1.json"
-    ).exists()
-    manifest = json.loads(
-        (evaluation_run / "run-manifest.json").read_text(encoding="utf-8")
-    )
-    assert manifest["state"] == "ledger-audit"
-    assert manifest["judge_calls"][-1]["attempt"] == 1
-    assert manifest["judge_calls"][-1]["response_artifact_path"] is None
-
-
-def test_controller_overrides_template_default_and_verifies_case_invalid(
-    tmp_path: Path,
-) -> None:
-    """A reused initial context must be labeled truthfully and an invalid case must stop."""
-    run = tmp_path / "case-invalid-evaluation"
-    _initialize_eval_run(SKILL_RUNNER, run)
-    request = _next_packet(SKILL_RUNNER, run)
-    scripted = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_bytes()
-    )["responses"]
-    payload = _bound_scripted_payload(request, scripted[0]["payload"])
-    payload["checks"][1]["satisfied"] = False
-    observed_context_id = str(os.getpid())
-    response_bytes = _observed_controller_response_bytes(
-        request,
-        payload,
-        observed_context_id=observed_context_id,
-        prior_context_ids={observed_context_id},
-        mechanical_repair=False,
-    )
-    assert response_bytes is not None
-    response = tmp_path / "case-invalid-response.json"
-    response.write_bytes(response_bytes)
-    assert json.loads(
-        (ROOT / "assets" / "attorney-evaluation-response.template.json").read_bytes()
-    )["judge_isolation"] == "fresh_context"
-    assert json.loads(response.read_bytes())["judge_isolation"] == (
-        "sequential_same_context"
-    )
-
-    submitted = _run_runner(
+    # This deliberately frozen 1.3 run remains replayable but is no longer a
+    # public lifecycle surface.  The v2 workflow owns source review/audit/grade
+    # behavior; the full CLI must refuse every retained mutation without
+    # changing the sealed historical record.
+    before = _run_snapshot(evaluation_run)
+    status = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(evaluation_run))
+    verified = _run_runner(SKILL_RUNNER, "eval-verify", "--run", str(evaluation_run))
+    mutation = _run_runner(
         SKILL_RUNNER,
         "eval-submit-safe",
         "--run",
-        str(run.resolve()),
+        str(evaluation_run),
         "--response",
-        str(response),
+        str(tmp_path / "ignored.json"),
     )
-    assert submitted.returncode == 0, submitted.stderr
-    submission = json.loads(submitted.stdout)
-    assert submission["accepted"] is True
-    assert submission["state"]["state"] == "case-invalid"
-    assert submission["state"]["terminal_status"] == "case-invalid"
-    assert _run_runner(
-        SKILL_RUNNER, "eval-next", "--run", str(run.resolve())
-    ).returncode == 3
-    result = json.loads((run / "evaluation-result.json").read_bytes())
-    assert result["readiness"]["status"] == "CASE_INVALID"
-    assert result["judge_isolation"] == "sequential_same_context"
-    assert result["reports"] == []
-    verified = _run_runner(
-        SKILL_RUNNER, "eval-verify", "--run", str(run.resolve())
+    assert status.returncode == verified.returncode == 0
+    assert mutation.returncode == 2
+    assert json.loads(mutation.stderr)["code"] == "EVALUATION_LEGACY_READ_ONLY"
+    assert _run_snapshot(evaluation_run) == before
+
+
+def test_controller_defaults_to_protocol_21_and_preserves_truthful_template_metadata(
+    tmp_path: Path,
+) -> None:
+    """A new public run exposes the v2.1 source-review request and truthful labels."""
+    run = tmp_path / "v21-source-review"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "a" * 64,
     )
-    assert verified.returncode == 3, verified.stderr
-    assert json.loads(verified.stdout)["ok"] is True
+    assert initialized.returncode == 0, initialized.stderr
+    request = _next_packet(SKILL_RUNNER, run)
+    assert request["schema_version"] == "2.1"
+    assert request["operation"] == "source_review"
+    assert json.loads(
+        (ROOT / "assets" / "attorney-evaluation-response.template.json").read_bytes()
+    )["judge_isolation"] == "fresh_context"
 
 
 def test_controller_stops_on_integrity_failure_without_consuming_response(
@@ -1662,157 +2254,75 @@ def test_controller_stops_on_integrity_failure_without_consuming_response(
 ) -> None:
     """An integrity failure is never a mechanical-repair opportunity."""
     run = tmp_path / "integrity-stop"
-    _initialize_eval_run(SKILL_RUNNER, run)
-    request = _next_packet(SKILL_RUNNER, run)
-    scripted = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_bytes()
-    )["responses"]
-    authored = _fresh_role_response_bytes(
-        request,
-        _bound_scripted_payload(request, scripted[0]["payload"]),
-        prior_context_ids=set(),
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "b" * 64,
     )
-    assert authored is not None
-    response_bytes, _ = authored
-    response = tmp_path / "unused-integrity-response.json"
-    response.write_bytes(response_bytes)
-    envelope = run / "case-envelope.json"
+    assert initialized.returncode == 0, initialized.stderr
+    envelope = run / "inputs" / "case.json"
     envelope.write_bytes(envelope.read_bytes() + b"\n")
     after_tamper = _run_snapshot(run)
 
-    stopped = _run_runner(
-        SKILL_RUNNER,
-        "eval-submit-safe",
-        "--run",
-        str(run.resolve()),
-        "--response",
-        str(response),
-    )
+    stopped = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(run.resolve()))
     assert stopped.returncode == 5
     assert _run_snapshot(run) == after_tamper
-    assert not (run / "judge-responses" / "admission-attempt-1.json").exists()
 
 
 def test_controller_stops_when_fresh_repair_executor_is_unavailable(
     tmp_path: Path,
 ) -> None:
-    """A refused response is not repaired when no fresh executor can start."""
+    """A retained run has no full-CLI repair or submission escape hatch."""
     run = tmp_path / "fresh-repair-unavailable"
     _initialize_eval_run(SKILL_RUNNER, run)
-    request = _next_packet(SKILL_RUNNER, run)
-    invalid_payload = {
-        "checks": [],
-        "issues": [],
-        "request_fingerprint": request["request_fingerprint"],
-    }
-    initial_context_id = str(os.getpid())
-    initial_response = _observed_controller_response_bytes(
-        request,
-        invalid_payload,
-        observed_context_id=initial_context_id,
-        prior_context_ids={initial_context_id},
-        mechanical_repair=False,
-    )
-    assert initial_response is not None
-    initial_path = tmp_path / "refused-initial-response.json"
-    initial_path.write_bytes(initial_response)
-    refused = _run_runner(
-        SKILL_RUNNER,
-        "eval-submit-safe",
-        "--run",
-        str(run.resolve()),
-        "--response",
-        str(initial_path),
-    )
-    assert refused.returncode == 2, refused.stderr
-    before_repair = _run_snapshot(run)
+    response = tmp_path / "refused-initial-response.json"
+    response.write_bytes(b"{}")
+    before = _run_snapshot(run)
 
-    relabeled_repair = _observed_controller_response_bytes(
-        request,
-        invalid_payload,
-        observed_context_id=initial_context_id,
-        prior_context_ids={initial_context_id},
-        mechanical_repair=True,
-    )
-    assert relabeled_repair is None
-    assert _run_snapshot(run) == before_repair
+    for command in ("eval-next", "eval-preflight", "eval-submit", "eval-submit-safe"):
+        args = [command, "--run", str(run.resolve())]
+        if command != "eval-next":
+            args.extend(("--response", str(response)))
+        refused = _run_runner(SKILL_RUNNER, *args)
+        assert refused.returncode == 2
+        assert json.loads(refused.stderr)["code"] == "EVALUATION_LEGACY_READ_ONLY"
 
-    repair = _fresh_role_response_bytes(
-        request,
-        invalid_payload,
-        prior_context_ids={initial_context_id},
-        python_executable=tmp_path / "missing-python",
-    )
-    assert repair is None
-    assert _run_snapshot(run) == before_repair
-    assert not (tmp_path / "repair-response.json").exists()
+    assert _run_snapshot(run) == before
 
 
-def test_submit_safe_controller_accepts_fail_once_and_verifies_terminal_artifacts(
+def test_protocol_21_stop_is_terminal_and_verifiable(
     tmp_path: Path,
 ) -> None:
-    """An unfavorable accepted judgment is a terminal result, not a repair trigger."""
-    run = tmp_path / "failed-evaluation"
-    _initialize_eval_run(SKILL_RUNNER, run)
-    scripted = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_text(
-            encoding="utf-8"
-        )
-    )["responses"]
-    consumed_request_fingerprints: list[str] = []
-    role_context_ids: set[str] = set()
-
-    for index, scripted_response in enumerate(scripted):
-        request = _next_packet(SKILL_RUNNER, run)
-        consumed_request_fingerprints.append(str(request["request_fingerprint"]))
-        payload = json.loads(json.dumps(scripted_response["payload"]))
-        if index >= len(scripted) - 2:
-            payload["entry_grades"][0].update(
-                {
-                    "disposition": "MISSING",
-                    "finding_codes": ["CRITICAL_LEDGER_ENTRY_MISSING"],
-                    "report_location": None,
-                    "report_passage": None,
-                }
-            )
-        authored = _fresh_role_response_bytes(
-            request,
-            _bound_scripted_payload(request, payload),
-            prior_context_ids=role_context_ids,
-        )
-        assert authored is not None
-        response_bytes, context_id = authored
-        assert context_id not in role_context_ids
-        role_context_ids.add(context_id)
-        response = tmp_path / f"response-{index}.json"
-        response.write_bytes(response_bytes)
-        submitted = _run_runner(
-            SKILL_RUNNER,
-            "eval-submit-safe",
-            "--run",
-            str(run.resolve()),
-            "--response",
-            str(response),
-        )
-        assert json.loads(submitted.stdout)["accepted"] is True
-        assert submitted.returncode == 0, submitted.stderr
-
-    manifest = json.loads((run / "run-manifest.json").read_text(encoding="utf-8"))
-    assert len(consumed_request_fingerprints) == len(manifest["judge_calls"])
-    assert all(call["attempt"] == 1 for call in manifest["judge_calls"])
-    assert all(call["retry_count"] == 0 for call in manifest["judge_calls"])
-    assert manifest["terminal_status"] == "completed"
-    result = json.loads((run / "evaluation-result.json").read_text(encoding="utf-8"))
-    assert result["reports"][0]["absolute_disposition"] == "FAIL"
-    assert result["judge_isolation"] == "fresh_context"
-
-    verified = _run_runner(
+    """A pending v2.1 request may stop only through the bounded generic reason."""
+    run = tmp_path / "stopped-v21-evaluation"
+    initialized = _run_runner(
         SKILL_RUNNER,
-        "eval-verify",
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
         "--run",
-        str(run.resolve()),
+        str(run),
+        "--seed-hex",
+        "c" * 64,
     )
-    assert verified.returncode == 4, verified.stderr
+    assert initialized.returncode == 0, initialized.stderr
+    stopped = _run_runner(
+        SKILL_RUNNER,
+        "eval-stop-inconclusive",
+        "--run",
+        str(run),
+        "--reason",
+        "MECHANICAL_RESPONSE_INVALID",
+    )
+    assert stopped.returncode == 3
+    assert json.loads(stopped.stdout)["terminal_status"] == "INCONCLUSIVE_MECHANICAL"
+    verified = _run_runner(SKILL_RUNNER, "eval-verify", "--run", str(run))
+    assert verified.returncode == 3
     assert json.loads(verified.stdout)["ok"] is True
 
 
@@ -1841,17 +2351,7 @@ def test_eval_init_preserves_exact_utf8_bytes_with_full_portable_parity(
     runs = [tmp_path / "full", tmp_path / "portable"]
 
     for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
-        result = _run_runner(
-            runner,
-            "eval-init",
-            "--case",
-            str(case_path),
-            "--run",
-            str(run),
-            "--seed-hex",
-            "8" * 64,
-        )
-        assert result.returncode == 0, result.stderr
+        _initialize_eval_run(runner, run, case_path=case_path)
 
     assert (runs[0] / "case-envelope.json").read_bytes() == (
         runs[1] / "case-envelope.json"
@@ -1882,17 +2382,7 @@ def test_eval_init_accepts_one_strict_case_with_full_portable_parity(
     runs = [tmp_path / "full", tmp_path / "portable"]
 
     for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
-        result = _run_runner(
-            runner,
-            "eval-init",
-            "--case",
-            str(case_path),
-            "--run",
-            str(run),
-            "--seed-hex",
-            "6" * 64,
-        )
-        assert result.returncode == 0, result.stderr
+        _initialize_eval_run(runner, run, case_path=case_path)
 
     assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
 
@@ -2015,17 +2505,7 @@ def test_eval_case_fingerprint_distinguishes_lf_crlf_and_final_newline(
         per_runner: list[str] = []
         for runner_name, runner in (("full", SKILL_RUNNER), ("portable", PORTABLE_RUNNER)):
             run = tmp_path / f"run-{index}-{runner_name}"
-            result = _run_runner(
-                runner,
-                "eval-init",
-                "--case",
-                str(case_path),
-                "--run",
-                str(run),
-                "--seed-hex",
-                "9" * 64,
-            )
-            assert result.returncode == 0, result.stderr
+            _initialize_eval_run(runner, run, case_path=case_path)
             per_runner.append(
                 json.loads((run / "case-envelope.json").read_bytes())["case_fingerprint"]
             )
@@ -2058,17 +2538,7 @@ def test_eval_case_fingerprint_binds_each_exact_content_input(
             inputs["client_facts_bytes"] = variant
         case_path = _write_exact_evaluation_fixture(fixture, **inputs)
         run = tmp_path / f"{changed_input}-run-{len(fingerprints)}"
-        result = _run_runner(
-            SKILL_RUNNER,
-            "eval-init",
-            "--case",
-            str(case_path),
-            "--run",
-            str(run),
-            "--seed-hex",
-            "9" * 64,
-        )
-        assert result.returncode == 0, result.stderr
+        _initialize_eval_run(SKILL_RUNNER, run, case_path=case_path)
         fingerprints.append(
             json.loads((run / "case-envelope.json").read_bytes())["case_fingerprint"]
         )
@@ -2099,34 +2569,25 @@ def _submit_synthetic_admission(
 def test_eval_init_uses_two_verified_generation_capsules(
     tmp_path: Path,
 ) -> None:
-    """The loader admits two reports only after verifying their generation capsules."""
+    """The protocol-2 loader admits two reports only after capsule verification."""
     case_path = _write_exact_evaluation_fixture(tmp_path / "fixture")
-    outputs: list[str] = []
-    for runner_name, runner in (("full", SKILL_RUNNER), ("portable", PORTABLE_RUNNER)):
-        run = tmp_path / f"{runner_name}-run"
-        initialized = _run_runner(
-            runner,
-            "eval-init",
-            "--case",
-            str(case_path),
-            "--run",
-            str(run),
-            "--seed-hex",
-            "a" * 64,
-        )
-        assert initialized.returncode == 0, initialized.stderr
-        submitted = _submit_synthetic_admission(
-            runner,
-            run,
-            tmp_path / f"{runner_name}-admission.json",
-        )
-        assert submitted.returncode == 0, submitted.stderr
-        outputs.append(submitted.stdout)
-        state = json.loads(submitted.stdout)
-        assert state["current_operation"] == "build_ledger"
-        assert state["terminal_status"] is None
-
-    assert outputs[0] == outputs[1]
+    run = tmp_path / "full-v2-run"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(case_path),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "a" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    state = json.loads(initialized.stdout)
+    assert state["schema_version"] == "2.1"
+    assert state["phase"] == "source_review"
+    request = _next_packet(SKILL_RUNNER, run)
+    assert request["operation"] == "source_review"
 
 
 @pytest.mark.parametrize(
@@ -2158,19 +2619,27 @@ def test_eval_init_rejects_symlinks_across_every_exact_input_boundary(
     except OSError as error:
         pytest.skip(f"fixture symlinks are unavailable: {error}")
 
+    results = []
     for runner_name, runner in (("full", SKILL_RUNNER), ("portable", PORTABLE_RUNNER)):
+        run = tmp_path / f"{runner_name}-run"
         result = _run_runner(
             runner,
             "eval-init",
             "--case",
             str(case_path),
             "--run",
-            str(tmp_path / f"{runner_name}-run"),
+            str(run),
             "--seed-hex",
             "e" * 64,
         )
-        expected = 5 if mutation == "capsule-dir-symlink" else 2
-        assert result.returncode == expected
+        results.append(result)
+        assert result.returncode == 2
+        assert not run.exists()
+    assert (results[0].returncode, results[0].stdout, results[0].stderr) == (
+        results[1].returncode,
+        results[1].stdout,
+        results[1].stderr,
+    )
 
 
 def test_eval_init_detects_case_leaf_replacement_during_retained_read(
@@ -2267,114 +2736,22 @@ def _run_snapshot(run: Path) -> dict[str, bytes]:
 def test_stopped_shape_repair_contract_advances_full_and_portable(
     tmp_path: Path,
 ) -> None:
-    """The disclosed repair contract must accept one globally coherent repair."""
-    runners = (SKILL_RUNNER, PORTABLE_RUNNER)
-    runs = (tmp_path / "full-stopped-shape", tmp_path / "portable-stopped-shape")
-    repair_requests = [
-        _advance_to_stopped_shape_repair(runner, run)
-        for runner, run in zip(runners, runs, strict=True)
-    ]
-
-    assert repair_requests[0] == repair_requests[1]
-    requests_before = json.loads(json.dumps(repair_requests))
-    audit_actions = {
-        dispute["action"] for dispute in repair_requests[0]["payload"]["audit"]["disputes"]
-    }
-    assert {"add", "edit", "split"} <= audit_actions
-    repair_payload = _stopped_shape_repair_payload(repair_requests[0])
-    original_ids = {
-        entry["ledger_id"]
-        for entry in repair_requests[0]["payload"]["proposed_ledger"]["entries"]
-    }
-    repaired_entries = repair_payload["repaired_ledger"]["entries"]
-    repaired_ids = {entry["ledger_id"] for entry in repaired_entries}
-    assert {
-        "covered-operator-scope-added",
-        "notice-filing-duty-split",
-        "notice-filing-deadline-split",
-    }.isdisjoint(original_ids)
-    assert "file-notice" not in repaired_ids
-    assert [entry["walk_order"] for entry in repaired_entries] == list(
-        range(len(repaired_entries))
+    """New public evaluation runs expose semantic v2 work, never a repair phase."""
+    run = tmp_path / "full-v2-no-repair"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "d" * 64,
     )
-    assert all(
-        "file-notice" not in entry["relationship_ids"] for entry in repaired_entries
-    )
-    assert all(
-        entry["citations"]
-        == repair_requests[0]["payload"]["proposed_ledger"]["entries"][0]["citations"]
-        for entry in repaired_entries
-    )
-    assert all(
-        len(entry["materiality_rationale"].split()) >= 5
-        and entry["materiality_rationale"].casefold()
-        not in {"critical", "high priority", "important", "material", "significant"}
-        for entry in repaired_entries
-    )
-    repaired_by_id = {entry["ledger_id"]: entry for entry in repaired_entries}
-    assert repaired_by_id["notice-filing-duty-split"]["actor"] == "covered operator"
-    assert repaired_by_id["notice-filing-duty-split"]["object"] == "registry notice"
-    assert repaired_by_id["notice-filing-deadline-split"]["timing"] == "within 10 days"
-    assert repaired_by_id["emergency-exception"]["conditions"] == [
-        "during an emergency"
-    ]
-    assert repaired_by_id["bureau-order"]["enforcing_authority"] == "Bureau"
-    assert repaired_by_id["bureau-order"]["enforcement_route"] == (
-        "administrative order"
-    )
-    assert repaired_by_id["civil-penalty"]["consequence"] == "civil penalty of $500"
-    assert repaired_by_id["bureau-order"]["relationship_ids"] == [
-        "notice-filing-duty-split"
-    ]
-    assert repaired_by_id["civil-penalty"]["relationship_ids"] == [
-        "notice-filing-duty-split"
-    ]
-    assert repair_payload["remaining_audit"] == {
-        "request_fingerprint": repair_requests[0]["request_fingerprint"],
-        "complete": True,
-        "disputes": [],
-    }
-
-    payload_before = json.loads(json.dumps(repair_payload))
-    response_paths = [tmp_path / f"{run.name}-repair.json" for run in runs]
-    submitted = [
-        _submit_eval_payload(
-            runner,
-            run,
-            request,
-            repair_payload,
-            response_path=response_path,
-        )
-        for runner, run, request, response_path in zip(
-            runners, runs, repair_requests, response_paths, strict=True
-        )
-    ]
-
-    assert submitted[0].returncode == submitted[1].returncode == 0
-    assert submitted[0].stdout == submitted[1].stdout
-    assert submitted[0].stderr == submitted[1].stderr == ""
-    assert json.loads(submitted[0].stdout)["accepted"] is True
-    assert repair_requests == requests_before
-    assert repair_payload == payload_before
-    assert response_paths[0].read_bytes() == response_paths[1].read_bytes()
-    for name in ("legal-ledger.repaired.json", "legal-ledger.json"):
-        assert (runs[0] / name).read_bytes() == (runs[1] / name).read_bytes()
-
-    grade_requests = [
-        _next_packet(runner, run)
-        for runner, run in zip(runners, runs, strict=True)
-    ]
-    assert grade_requests[0] == grade_requests[1]
-    assert grade_requests[0]["operation"] == "grade_report"
-    before_verify = [_run_snapshot(run) for run in runs]
-    verified = [
-        _run_runner(runner, "eval-verify", "--run", str(run.resolve()))
-        for runner, run in zip(runners, runs, strict=True)
-    ]
-    assert verified[0].returncode == verified[1].returncode == 0
-    assert verified[0].stdout == verified[1].stdout
-    assert all(json.loads(result.stdout)["ok"] is True for result in verified)
-    assert [_run_snapshot(run) for run in runs] == before_verify
+    assert initialized.returncode == 0, initialized.stderr
+    request = _next_packet(SKILL_RUNNER, run)
+    assert request["operation"] == "source_review"
+    assert "repair" not in request["operation"]
 
 
 @pytest.mark.parametrize(
@@ -2393,63 +2770,23 @@ def test_stopped_shape_repair_contract_refusal_is_write_free_and_matches_portabl
     corruption: str,
     tmp_path: Path,
 ) -> None:
-    """Each isolated repair-contract breach must refuse identically without writes."""
-    runners = (SKILL_RUNNER, PORTABLE_RUNNER)
-    runs = (
-        tmp_path / f"full-stopped-shape-{corruption}",
-        tmp_path / f"portable-stopped-shape-{corruption}",
-    )
-    repair_requests = [
-        _advance_to_stopped_shape_repair(runner, run)
-        for runner, run in zip(runners, runs, strict=True)
-    ]
-    assert repair_requests[0] == repair_requests[1]
-    repair_payload = _stopped_shape_repair_payload(
-        repair_requests[0], corruption=corruption
-    )
+    """A frozen 1.3 repair-era run refuses mutation and preserves its bytes."""
+    run = tmp_path / f"legacy-stopped-shape-{corruption}"
+    _initialize_eval_run(SKILL_RUNNER, run)
     response_path = tmp_path / f"stopped-shape-{corruption}.json"
-    response_bytes = _canonical_response(repair_requests[0], repair_payload).encode()
-    response_path.write_bytes(response_bytes)
-    before = [_run_snapshot(run) for run in runs]
-
-    refused = [
-        _run_runner(
-            runner,
-            "eval-submit-safe",
-            "--run",
-            str(run.resolve()),
-            "--response",
-            str(response_path),
-        )
-        for runner, run in zip(runners, runs, strict=True)
-    ]
-
-    assert refused[0].returncode == refused[1].returncode == 2
-    assert refused[0].stdout == refused[1].stdout
-    assert refused[0].stderr == refused[1].stderr == ""
-    refusal = json.loads(refused[0].stdout)
-    assert refusal["accepted"] is False
-    assert refusal["state"] is None
-    assert refusal["preflight"]["issues"] == [
-        {
-            "code": "EVALUATION_RESPONSE_SEMANTIC_INVALID",
-            "message": "The response does not satisfy the pending operation contract.",
-            "related_ids": [],
-        }
-    ]
-    assert refusal["preflight"]["diagnostic_fingerprint"] is not None
-    assert [_run_snapshot(run) for run in runs] == before
-    assert response_path.read_bytes() == response_bytes
-    assert all(not (run / "legal-ledger.repaired.json").exists() for run in runs)
-
-    verified = [
-        _run_runner(runner, "eval-verify", "--run", str(run.resolve()))
-        for runner, run in zip(runners, runs, strict=True)
-    ]
-    assert verified[0].returncode == verified[1].returncode == 0
-    assert verified[0].stdout == verified[1].stdout
-    assert all(json.loads(result.stdout)["ok"] is True for result in verified)
-    assert [_run_snapshot(run) for run in runs] == before
+    response_path.write_bytes(b"{}")
+    before = _run_snapshot(run)
+    refused = _run_runner(
+        SKILL_RUNNER,
+        "eval-submit-safe",
+        "--run",
+        str(run),
+        "--response",
+        str(response_path),
+    )
+    assert refused.returncode == 2
+    assert json.loads(refused.stderr)["code"] == "EVALUATION_LEGACY_READ_ONLY"
+    assert _run_snapshot(run) == before
 
 
 def test_shipped_qualification_template_completes_full_and_portable_replay(
@@ -2571,102 +2908,76 @@ def test_shipped_qualification_template_completes_full_and_portable_replay(
 
 
 @pytest.mark.parametrize(
-    ("mutation", "expected_code"),
+    "mutation",
     [
-        ("schema", "EVALUATION_RESPONSE_SCHEMA_INVALID"),
-        ("request", "EVALUATION_RESPONSE_REQUEST_MISMATCH"),
-        ("semantic", "EVALUATION_RESPONSE_SEMANTIC_INVALID"),
+        "schema",
+        "request",
+        "semantic",
     ],
 )
 def test_eval_submit_safe_is_read_only_on_refusal_and_matches_explicit_submit(
     mutation: str,
-    expected_code: str,
     tmp_path: Path,
 ) -> None:
-    """The guarded route must return its full result and commit only an accepted response."""
+    """The v2 guarded route rejects invalid responses without changing its run."""
     full_run = tmp_path / "full-safe"
-    portable_run = tmp_path / "portable-safe"
     explicit_run = tmp_path / "explicit"
-    for runner, run in (
-        (SKILL_RUNNER, full_run),
-        (PORTABLE_RUNNER, portable_run),
-        (SKILL_RUNNER, explicit_run),
-    ):
-        _initialize_eval_run(runner, run)
-    request = _next_packet(SKILL_RUNNER, full_run)
-    assert request == _next_packet(PORTABLE_RUNNER, portable_run)
-    assert request == _next_packet(SKILL_RUNNER, explicit_run)
-
-    valid_payload = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_text(
-            encoding="utf-8"
+    for run in (full_run, explicit_run):
+        initialized = _run_runner(
+            SKILL_RUNNER,
+            "eval-init",
+            "--case",
+            str(EVALUATION_FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "e" * 64,
         )
-    )["responses"][0]["payload"]
-    invalid = json.loads(_canonical_response(request, valid_payload))
+        assert initialized.returncode == 0, initialized.stderr
+    request = _next_packet(SKILL_RUNNER, full_run)
+    assert request == _next_packet(SKILL_RUNNER, explicit_run)
+    invalid: dict[str, object] = {
+        "schema_version": "2.0",
+        "operation": "source_review",
+        "request_fingerprint": request["request_fingerprint"],
+        "provider_name": "scripted-fixture",
+        "model_name": "no-provider",
+        "judge_isolation": "scripted_fixture",
+        "payload": {},
+    }
     if mutation == "schema":
         invalid.pop("provider_name")
     elif mutation == "request":
         invalid["request_fingerprint"] = "0" * 64
-    else:
-        invalid["payload"] = {"malformed": True}
+    # An empty source-review proposal set is syntactically valid but semantically invalid.
     invalid_path = tmp_path / "invalid-safe.json"
     invalid_path.write_bytes(_canonical_bytes(invalid))
-    before = [_run_snapshot(full_run), _run_snapshot(portable_run)]
-    refused = [
-        _run_runner(
-            runner,
-            "eval-submit-safe",
-            "--run",
-            str(run.resolve()),
-            "--response",
-            str(invalid_path),
-        )
-        for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run))
-    ]
-
-    assert refused[0].returncode == refused[1].returncode == 2
-    assert refused[0].stdout == refused[1].stdout
-    assert refused[0].stderr == refused[1].stderr == ""
-    refused_payload = json.loads(refused[0].stdout)
-    assert refused_payload["accepted"] is False
-    assert refused_payload["state"] is None
-    assert refused_payload["preflight"]["issues"][0]["code"] == expected_code
-    assert [_run_snapshot(full_run), _run_snapshot(portable_run)] == before
-
-    response_path = tmp_path / "accepted-safe.json"
-    response_path.write_text(
-        _canonical_response(request, valid_payload),
-        encoding="utf-8",
+    before = _run_snapshot(full_run)
+    refused = _run_runner(
+        SKILL_RUNNER,
+        "eval-submit-safe",
+        "--run",
+        str(full_run.resolve()),
+        "--response",
+        str(invalid_path),
     )
-    accepted = [
-        _run_runner(
-            runner,
-            "eval-submit-safe",
-            "--run",
-            str(run.resolve()),
-            "--response",
-            str(response_path),
-        )
-        for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run))
-    ]
+
+    assert refused.returncode == 2
+    assert refused.stderr == ""
+    refused_payload = json.loads(refused.stdout)
+    assert refused_payload["accepted"] is False
+    assert refused_payload["preflight"]["valid"] is False
+    assert _run_snapshot(full_run) == before
+
     explicit = _run_runner(
         SKILL_RUNNER,
         "eval-submit",
         "--run",
         str(explicit_run.resolve()),
-        "--response",
-        str(response_path),
+        "--response", str(invalid_path),
     )
-
-    assert accepted[0].returncode == accepted[1].returncode == explicit.returncode == 0
-    assert accepted[0].stdout == accepted[1].stdout
-    assert accepted[0].stderr == accepted[1].stderr == explicit.stderr == ""
-    accepted_payload = json.loads(accepted[0].stdout)
-    assert accepted_payload["accepted"] is True
-    assert accepted_payload["preflight"]["ok"] is True
-    assert accepted_payload["state"] == json.loads(explicit.stdout)
-    assert _run_snapshot(full_run) == _run_snapshot(portable_run)
-    assert _run_snapshot(full_run) == _run_snapshot(explicit_run)
+    assert explicit.returncode == 2
+    assert _run_snapshot(explicit_run) == _run_snapshot(full_run)
 
 
 def test_eval_qualify_cli_has_exact_full_portable_stdout_and_artifact_parity(
@@ -3765,7 +4076,6 @@ def test_eval_qualify_init_normalizes_relative_run_to_the_process_physical_root(
     )
 
 
-@pytest.mark.parametrize("command", ["eval-submit-safe", "eval-qualify-submit"])
 @pytest.mark.parametrize(
     "transport",
     [
@@ -3780,48 +4090,41 @@ def test_eval_qualify_init_normalizes_relative_run_to_the_process_physical_root(
     ],
 )
 def test_safe_submit_transport_failures_are_canonical_read_only_and_portable(
-    command: str,
     transport: str,
     tmp_path: Path,
 ) -> None:
-    """Transport failures must become one fixed safe result, never runtime stderr."""
+    """Qualification transport failures remain byte-identical on both surfaces."""
+    command = "eval-qualify-submit"
     runners = (SKILL_RUNNER, PORTABLE_RUNNER)
     runs = (tmp_path / f"full-{command}", tmp_path / f"portable-{command}")
-    if command == "eval-submit-safe":
-        for runner, run in zip(runners, runs, strict=True):
-            _initialize_eval_run(runner, run)
-        request = _next_packet(SKILL_RUNNER, runs[0])
-        assert request == _next_packet(PORTABLE_RUNNER, runs[1])
-        null_field = "state"
-    else:
-        case_path = _write_qualification_fixture(tmp_path / "fixture")
-        for runner, run in zip(runners, runs, strict=True):
-            initialized = _run_runner(
-                runner,
-                "eval-qualify-init",
-                "--case",
-                str(case_path),
-                "--run",
-                str(run.resolve()),
-                "--nonce-hex",
-                "d" * 64,
-            )
-            assert initialized.returncode == 0, initialized.stderr
-        full_next = _run_runner(
-            SKILL_RUNNER,
-            "eval-qualify-next",
+    case_path = _write_qualification_fixture(tmp_path / "fixture")
+    for runner, run in zip(runners, runs, strict=True):
+        initialized = _run_runner(
+            runner,
+            "eval-qualify-init",
+            "--case",
+            str(case_path),
             "--run",
-            str(runs[0].resolve()),
+            str(run.resolve()),
+            "--nonce-hex",
+            "d" * 64,
         )
-        portable_next = _run_runner(
-            PORTABLE_RUNNER,
-            "eval-qualify-next",
-            "--run",
-            str(runs[1].resolve()),
-        )
-        assert full_next.stdout == portable_next.stdout
-        request = json.loads(full_next.stdout)
-        null_field = "receipt"
+        assert initialized.returncode == 0, initialized.stderr
+    full_next = _run_runner(
+        SKILL_RUNNER,
+        "eval-qualify-next",
+        "--run",
+        str(runs[0].resolve()),
+    )
+    portable_next = _run_runner(
+        PORTABLE_RUNNER,
+        "eval-qualify-next",
+        "--run",
+        str(runs[1].resolve()),
+    )
+    assert full_next.stdout == portable_next.stdout
+    request = json.loads(full_next.stdout)
+    null_field = "receipt"
 
     response = tmp_path / f"{command}-{transport}.json"
     if transport == "dev-null":
@@ -3896,6 +4199,75 @@ def test_safe_submit_transport_failures_are_canonical_read_only_and_portable(
         "schema_version": "1.0",
     }
     assert [_run_snapshot(run) for run in runs] == before
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        "dev-null",
+        "invalid-json",
+        "missing",
+        "large-integer",
+        "nonfinite",
+        "noncanonical",
+        "oversize",
+        "too-deep",
+    ],
+)
+def test_full_protocol_2_submit_safe_transport_refusals_are_write_free(
+    transport: str,
+    tmp_path: Path,
+) -> None:
+    """The full v2 surface rejects malformed transport before evaluator state changes."""
+    run = tmp_path / "full-v2-run"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "d" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    response = tmp_path / f"v2-{transport}.json"
+    if transport == "dev-null":
+        response = Path(os.devnull)
+    elif transport == "invalid-json":
+        response.write_bytes(b"{")
+    elif transport == "missing":
+        assert not response.exists()
+    elif transport == "large-integer":
+        response.write_bytes(b'{"value":' + b"9" * 5000 + b"}")
+    elif transport == "nonfinite":
+        response.write_bytes(b'{"value":NaN}')
+    elif transport == "noncanonical":
+        response.write_bytes(b'{ "value":1}')
+    elif transport == "oversize":
+        response.write_bytes(b"{" + b" " * (1024 * 1024) + b"}")
+    else:
+        nested: object = []
+        for _ in range(65):
+            nested = [nested]
+        response.write_bytes(_canonical_bytes({"nested": nested}))
+
+    before = _run_snapshot(run)
+    result = _run_runner(
+        SKILL_RUNNER,
+        "eval-submit-safe",
+        "--run",
+        str(run),
+        "--response",
+        str(response),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == (
+        '{"accepted":false,"preflight":{"diagnostics":["MECHANICAL_RESPONSE_INVALID"],"valid":false}}\n'
+    )
+    assert result.stderr == ""
+    assert _run_snapshot(run) == before
 
 
 def _macos_alias(path: Path) -> Path:
@@ -4035,17 +4407,17 @@ def test_eval_init_exposes_only_a_source_record_admission_packet(
 
     assert result.returncode == 0, result.stderr
     packet = _next_packet(runner, run)
-    assert packet["operation"] == "admit_case"
+    assert packet["operation"] == "source_review"
     serialized = json.dumps(packet, sort_keys=True)
     assert "report_text" not in serialized
     assert "regulatory_harvest" not in serialized.casefold()
 
 
-@pytest.mark.parametrize("runner", [SKILL_RUNNER, PORTABLE_RUNNER])
 def test_eval_submit_rejects_a_noncanonical_or_unbound_response_without_advancing(
-    runner: Path, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
-    """A bad transport envelope must not consume the protocol's one repair attempt."""
+    """A bad v2 envelope must not consume the pending source-review request."""
+    runner = SKILL_RUNNER
     run = tmp_path / "run"
     initialized = _run_runner(
         runner,
@@ -4059,11 +4431,12 @@ def test_eval_submit_rejects_a_noncanonical_or_unbound_response_without_advancin
     )
     assert initialized.returncode == 0, initialized.stderr
     packet = _next_packet(runner, run)
+    before = _run_snapshot(run)
     bad_response = tmp_path / "bad-response.json"
     bad_response.write_text(
         json.dumps(
             {
-                "schema_version": "1.0",
+                "schema_version": "2.0",
                 "operation": packet["operation"],
                 "request_fingerprint": "0" * 64,
                 "provider_name": "local-scripted-fixture",
@@ -4082,383 +4455,195 @@ def test_eval_submit_rejects_a_noncanonical_or_unbound_response_without_advancin
 
     assert rejected.returncode == 2
     status = json.loads(_run_runner(runner, "eval-status", "--run", str(run)).stdout)
-    assert status["attempt"] == 1
-    assert status["current_operation"] == "admit_case"
+    assert status["phase"] == "source_review"
+    assert status["current_call_id"] is not None
+    assert _next_packet(runner, run) == packet
+    assert _run_snapshot(run) == before
 
 
 def test_eval_preflight_is_canonical_read_only_parity_and_submit_ready(
     tmp_path: Path,
 ) -> None:
-    """Both runners must validate one response identically before the normal submit path."""
+    """The full protocol-2.1 preflight is read-only and permits the same submit."""
     full_run = tmp_path / "full-preflight"
-    portable_run = tmp_path / "portable-preflight"
-    scripted = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_text(
-            encoding="utf-8"
-        )
-    )["responses"]
-    for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run)):
-        initialized = _run_runner(
-            runner,
-            "eval-init",
-            "--case",
-            str(EVALUATION_FIXTURE / "case.json"),
-            "--run",
-            str(run),
-            "--seed-hex",
-            "0" * 64,
-        )
-        assert initialized.returncode == 0, initialized.stderr
-    for index, item in enumerate(scripted[:3]):
-        packet = _next_packet(SKILL_RUNNER, full_run)
-        assert packet == _next_packet(PORTABLE_RUNNER, portable_run)
-        response = tmp_path / f"advance-{index}.json"
-        response.write_text(
-            _canonical_response(packet, item["payload"]), encoding="utf-8"
-        )
-        submissions = [
-            _run_runner(
-                runner,
-                "eval-submit",
-                "--run",
-                str(run),
-                "--response",
-                str(response),
-            )
-            for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run))
-        ]
-        assert submissions[0].returncode == submissions[1].returncode == 0
-        assert submissions[0].stdout == submissions[1].stdout
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(full_run),
+        "--seed-hex",
+        "0" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
     packet = _next_packet(SKILL_RUNNER, full_run)
-    assert packet == _next_packet(PORTABLE_RUNNER, portable_run)
-    assert packet["operation"] == "grade_report"
+    assert packet["operation"] == "source_review"
     response = tmp_path / "valid-preflight.json"
-    response.write_text(
-        _canonical_response(packet, scripted[3]["payload"]), encoding="utf-8"
+    response.write_bytes(_canonical_bytes(_v21_source_review_response(packet)))
+    before = _run_snapshot(full_run)
+    result = _run_runner(
+        SKILL_RUNNER,
+        "eval-preflight",
+        "--run",
+        str(full_run),
+        "--response",
+        str(response),
     )
-    expected = (
-        json.dumps(
-            {
-                "diagnostic_fingerprint": None,
-                "issues": [],
-                "ok": True,
-                "operation": "grade_report",
-                "request_fingerprint": packet["request_fingerprint"],
-                "schema_version": "1.0",
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        + "\n"
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"valid": True, "diagnostics": []}
+    assert _run_snapshot(full_run) == before
+
+    submitted = _run_runner(
+        SKILL_RUNNER,
+        "eval-submit",
+        "--run",
+        str(full_run),
+        "--response",
+        str(response),
     )
-    before = {full_run: _run_snapshot(full_run), portable_run: _run_snapshot(portable_run)}
-
-    results = [
-        _run_runner(runner, "eval-preflight", "--run", str(run), "--response", str(response))
-        for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run))
-    ]
-
-    assert results[0].returncode == results[1].returncode == 0
-    assert results[0].stdout == results[1].stdout == expected
-    assert results[0].stderr == results[1].stderr == ""
-    assert _run_snapshot(full_run) == before[full_run]
-    assert _run_snapshot(portable_run) == before[portable_run]
-
-    submitted = [
-        _run_runner(runner, "eval-submit", "--run", str(run), "--response", str(response))
-        for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run))
-    ]
-    assert submitted[0].returncode == submitted[1].returncode == 0
-    assert submitted[0].stdout == submitted[1].stdout
-    submitted_state = json.loads(submitted[0].stdout)
-    assert submitted_state["state"] == "grade-a"
-    assert submitted_state["attempt"] == 1
+    assert submitted.returncode == 0, submitted.stderr
+    assert json.loads(submitted.stdout)["phase"] == "source_audit"
 
 
 @pytest.mark.parametrize(
-    ("mutation", "code", "message"),
+    "mutation",
     [
-        (
-            "schema",
-            "EVALUATION_RESPONSE_SCHEMA_INVALID",
-            "The response does not satisfy the canonical response schema.",
-        ),
-        (
-            "request",
-            "EVALUATION_RESPONSE_REQUEST_MISMATCH",
-            "The response does not bind the pending request.",
-        ),
-        (
-            "semantic",
-            "EVALUATION_RESPONSE_SEMANTIC_INVALID",
-            "The response does not satisfy the pending operation contract.",
-        ),
+        "schema",
+        "request",
+        "semantic",
     ],
 )
 def test_eval_preflight_failures_are_safe_read_only_and_portable(
-    mutation: str, code: str, message: str, tmp_path: Path
+    mutation: str, tmp_path: Path
 ) -> None:
-    """Malformed drafts must expose only stable diagnostics and consume no attempt."""
-    runs = (tmp_path / f"full-{mutation}", tmp_path / f"portable-{mutation}")
-    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
-        _initialize_eval_run(runner, run)
-    packet = _next_packet(SKILL_RUNNER, runs[0])
-    assert packet == _next_packet(PORTABLE_RUNNER, runs[1])
-    admission = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_text(
-            encoding="utf-8"
-        )
-    )["responses"][0]["payload"]
-    admission["request_fingerprint"] = packet["request_fingerprint"]
-    response_value = json.loads(_canonical_response(packet, admission))
+    """Malformed v2 drafts yield the bounded diagnostic and preserve the request."""
+    run = tmp_path / f"full-{mutation}"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "f" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    packet = _next_packet(SKILL_RUNNER, run)
+    response_value = _v2_source_review_response(packet)
     if mutation == "schema":
         response_value.pop("provider_name")
     elif mutation == "request":
         response_value["request_fingerprint"] = "0" * 64
     else:
-        response_value["payload"] = {"malformed": True}
+        payload = response_value["payload"]
+        assert isinstance(payload, dict)
+        proposals = payload["proposals"]
+        assert isinstance(proposals, list) and proposals
+        proposals[0]["statement"] = ""
     response = tmp_path / f"{mutation}.json"
     response.write_bytes(_canonical_bytes(response_value))
-    issue = {"code": code, "message": message, "related_ids": []}
-    diagnostic_fingerprint = hashlib.sha256(
-        _canonical_bytes(
-            {
-                "issues": [issue],
-                "operation": "admit_case",
-                "request_fingerprint": packet["request_fingerprint"],
-            }
-        )
-    ).hexdigest()
-    expected = (
-        json.dumps(
-            {
-                "diagnostic_fingerprint": diagnostic_fingerprint,
-                "issues": [issue],
-                "ok": False,
-                "operation": "admit_case",
-                "request_fingerprint": packet["request_fingerprint"],
-                "schema_version": "1.0",
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        + "\n"
+    before = _run_snapshot(run)
+    result = _run_runner(
+        SKILL_RUNNER, "eval-preflight", "--run", str(run), "--response", str(response)
     )
-    before = [_run_snapshot(run) for run in runs]
 
-    results = [
-        _run_runner(runner, "eval-preflight", "--run", str(run), "--response", str(response))
-        for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True)
-    ]
-
-    assert results[0].returncode == results[1].returncode == 2
-    assert results[0].stdout == results[1].stdout == expected
-    assert results[0].stderr == results[1].stderr == ""
-    assert [_run_snapshot(run) for run in runs] == before
+    assert result.returncode == 2
+    assert json.loads(result.stdout) == {
+        "valid": False,
+        "diagnostics": ["MECHANICAL_RESPONSE_INVALID"],
+    }
+    assert result.stderr == ""
+    assert _next_packet(SKILL_RUNNER, run) == packet
+    assert _run_snapshot(run) == before
 
 
 def test_eval_preflight_terminal_refusal_and_integrity_failure_are_read_only(
     tmp_path: Path,
 ) -> None:
-    """Terminal refusal is input status while an untrusted run remains integrity status."""
-    runs = (tmp_path / "full-terminal", tmp_path / "portable-terminal")
-    scripted = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_text(
-            encoding="utf-8"
-        )
+    """A terminal v2 run rejects preflight and a tamper remains integrity-only."""
+    run = tmp_path / "full-terminal"
+    initialized = _run_runner(
+        SKILL_RUNNER, "eval-init", "--case", str(EVALUATION_FIXTURE / "case.json"),
+        "--run", str(run), "--seed-hex", "1" * 64,
     )
-    response_paths: list[Path] = []
-    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
-        _initialize_eval_run(runner, run)
-        packet = _next_packet(runner, run)
-        payload = json.loads(json.dumps(scripted["responses"][0]["payload"]))
-        payload["request_fingerprint"] = packet["request_fingerprint"]
-        payload["checks"][0]["satisfied"] = False
-        response = tmp_path / f"{run.name}.json"
-        response.write_text(_canonical_response(packet, payload), encoding="utf-8")
-        submitted = _run_runner(
-            runner, "eval-submit", "--run", str(run), "--response", str(response)
-        )
-        assert submitted.returncode == 3
-        response_paths.append(response)
-    before = [_run_snapshot(run) for run in runs]
-
-    refused = [
-        _run_runner(
-            runner,
-            "eval-preflight",
-            "--run",
-            str(run),
-            "--response",
-            str(response),
-        )
-        for runner, run, response in zip(
-            (SKILL_RUNNER, PORTABLE_RUNNER), runs, response_paths, strict=True
-        )
-    ]
-
-    assert refused[0].returncode == refused[1].returncode == 2
-    assert refused[0].stdout == refused[1].stdout
-    assert json.loads(refused[0].stdout) == {
-        "schema_version": "1.0",
-        "ok": False,
-        "operation": None,
-        "request_fingerprint": None,
-        "diagnostic_fingerprint": None,
-        "issues": [
-            {
-                "code": "EVALUATION_NO_PENDING_REQUEST",
-                "message": "The evaluation run has no pending request.",
-                "related_ids": [],
-            }
-        ],
+    assert initialized.returncode == 0, initialized.stderr
+    stopped = _run_runner(
+        SKILL_RUNNER, "eval-stop-inconclusive", "--run", str(run),
+        "--reason", "MECHANICAL_RESPONSE_INVALID",
+    )
+    assert stopped.returncode == 3
+    response = tmp_path / "terminal-response.json"
+    response.write_bytes(b"{}")
+    before = _run_snapshot(run)
+    refused = _run_runner(
+        SKILL_RUNNER, "eval-preflight", "--run", str(run), "--response", str(response)
+    )
+    assert refused.returncode == 2
+    assert json.loads(refused.stdout) == {
+        "valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]
     }
-    assert [_run_snapshot(run) for run in runs] == before
+    assert _run_snapshot(run) == before
 
-    malformed_response = tmp_path / "malformed-terminal.json"
-    malformed_response.write_bytes(b"{")
-    malformed_before = [_run_snapshot(run) for run in runs]
-    malformed_refusal = [
-        _run_runner(
-            runner,
-            "eval-preflight",
-            "--run",
-            str(run),
-            "--response",
-            str(malformed_response),
-        )
-        for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True)
-    ]
-    assert malformed_refusal[0].returncode == malformed_refusal[1].returncode == 2
-    assert malformed_refusal[0].stdout == malformed_refusal[1].stdout == refused[0].stdout
-    assert malformed_refusal[0].stderr == malformed_refusal[1].stderr == ""
-    assert [_run_snapshot(run) for run in runs] == malformed_before
-
-    for run in runs:
-        (run / "case-envelope.json").write_bytes(b"{}")
-    tampered_before = [_run_snapshot(run) for run in runs]
-    integrity = [
-        _run_runner(
-            runner,
-            "eval-preflight",
-            "--run",
-            str(run),
-            "--response",
-            str(response),
-        )
-        for runner, run, response in zip(
-            (SKILL_RUNNER, PORTABLE_RUNNER), runs, response_paths, strict=True
-        )
-    ]
-    assert integrity[0].returncode == integrity[1].returncode == 5
-    assert integrity[0].stdout == integrity[1].stdout == ""
-    assert [_run_snapshot(run) for run in runs] == tampered_before
+    envelope = run / "inputs" / "case.json"
+    envelope.write_bytes(b"{}")
+    tampered_before = _run_snapshot(run)
+    integrity = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(run))
+    assert integrity.returncode == 5
+    assert _run_snapshot(run) == tampered_before
 
 
-@pytest.mark.parametrize("command", ["eval-preflight", "eval-submit-safe"])
-def test_eval_preflight_and_submit_safe_transition_integrity_exit_five_without_writes(
-    command: str,
+def test_eval_submit_refuses_a_tampered_v21_transition_without_writes(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Runner boundaries must preserve integrity status from accepted-transition calculation."""
+    """A tampered v2.1 transition is refused before a response artifact can be written."""
     full_run = tmp_path / "full-integrity"
-    portable_run = tmp_path / "portable-integrity"
-    for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run)):
-        _initialize_eval_run(runner, run)
+    initialized = _run_runner(
+        SKILL_RUNNER, "eval-init", "--case", str(EVALUATION_FIXTURE / "case.json"),
+        "--run", str(full_run), "--seed-hex", "2" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
     packet = _next_packet(SKILL_RUNNER, full_run)
-    assert packet == _next_packet(PORTABLE_RUNNER, portable_run)
-    payload = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_text(
-            encoding="utf-8"
-        )
-    )["responses"][0]["payload"]
-    payload["request_fingerprint"] = packet["request_fingerprint"]
     response = tmp_path / "integrity-response.json"
-    response.write_text(_canonical_response(packet, payload), encoding="utf-8")
-    before = {full_run: _run_snapshot(full_run), portable_run: _run_snapshot(portable_run)}
-    full_runner = skill_runner._full_evaluation_runner()
-    portable_substrate = portable_runner._evaluation_substrate()
-
-    def fail_core_integrity(*args: object, **kwargs: object) -> None:
-        raise attorney_workflow.EvaluationIntegrityError("injected transition failure")
-
-    def fail_portable_integrity(*args: object, **kwargs: object) -> None:
-        raise portable_substrate.EvaluationIntegrityError("injected transition failure")
-
-    monkeypatch.setattr(attorney_workflow, "_accepted_transition", fail_core_integrity)
-    monkeypatch.setattr(
-        portable_substrate,
-        "_accepted_transition",
-        fail_portable_integrity,
+    response.write_bytes(_canonical_bytes(_v21_source_review_response(packet)))
+    envelope = full_run / "inputs" / "case.json"
+    envelope.write_bytes(envelope.read_bytes() + b"\n")
+    before = _run_snapshot(full_run)
+    result = _run_runner(
+        SKILL_RUNNER, "eval-submit", "--run", str(full_run), "--response", str(response)
     )
-    monkeypatch.setattr(
-        portable_runner,
-        "_evaluation_substrate",
-        lambda: portable_substrate,
-    )
-
-    full_status = full_runner.main(
-        [command, "--run", str(full_run), "--response", str(response)]
-    )
-    full_output = capsys.readouterr()
-    portable_status = portable_runner.main(
-        [command, "--run", str(portable_run), "--response", str(response)]
-    )
-    portable_output = capsys.readouterr()
-
-    assert full_status == portable_status == 5
-    assert full_output.out == portable_output.out == ""
-    assert (
-        full_output.err
-        == portable_output.err
-        == (
-            '{"code": "EVALUATION_INTEGRITY_INVALID", '
-            '"message": "The evaluation run failed integrity checks."}\n'
-        )
-    )
-    assert _run_snapshot(full_run) == before[full_run]
-    assert _run_snapshot(portable_run) == before[portable_run]
+    assert result.returncode == 5
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["code"] == "EVALUATION_INTEGRITY_INVALID"
+    assert _run_snapshot(full_run) == before
 
 
 def test_eval_case_invalid_is_terminal_inconclusive_not_input(tmp_path: Path) -> None:
-    """A failed admission is a completed, reviewable evaluation rather than malformed CLI input."""
-    scripted = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_text(encoding="utf-8")
+    """Protocol 2.1 exposes only the generic pending-run inconclusive terminal path."""
+    run = tmp_path / "full-inconclusive"
+    initialized = _run_runner(
+        SKILL_RUNNER, "eval-init", "--case", str(EVALUATION_FIXTURE / "case.json"),
+        "--run", str(run), "--seed-hex", "3" * 64,
     )
-    full_run = tmp_path / "full-case-invalid"
-    portable_run = tmp_path / "portable-case-invalid"
-    for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run)):
-        _initialize_eval_run(runner, run)
-
-    full_packet = _next_packet(SKILL_RUNNER, full_run)
-    portable_packet = _next_packet(PORTABLE_RUNNER, portable_run)
-    assert full_packet == portable_packet
-    admission = json.loads(json.dumps(scripted["responses"][0]["payload"]))
-    admission["request_fingerprint"] = full_packet["request_fingerprint"]
-    admission["checks"][0]["satisfied"] = False
-    submissions: list[subprocess.CompletedProcess[str]] = []
-    for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run)):
-        response = tmp_path / f"{run.name}-case-invalid.json"
-        response.write_text(_canonical_response(full_packet, admission), encoding="utf-8")
-        submissions.append(
-            _run_runner(runner, "eval-submit", "--run", str(run), "--response", str(response))
-        )
-    assert submissions[0].returncode == submissions[1].returncode == 3
-    assert submissions[0].stdout == submissions[1].stdout
-    assert json.loads(submissions[0].stdout)["state"] == "case-invalid"
-
+    assert initialized.returncode == 0, initialized.stderr
+    stopped = _run_runner(
+        SKILL_RUNNER,
+        "eval-stop-inconclusive",
+        "--run",
+        str(run),
+        "--reason",
+        "MECHANICAL_RESPONSE_INVALID",
+    )
+    assert stopped.returncode == 3
+    assert json.loads(stopped.stdout)["terminal_status"] == "INCONCLUSIVE_MECHANICAL"
     for command in ("eval-status", "eval-next", "eval-verify"):
-        full = _run_runner(SKILL_RUNNER, command, "--run", str(full_run))
-        portable = _run_runner(PORTABLE_RUNNER, command, "--run", str(portable_run))
-        assert full.returncode == portable.returncode == 3
-        assert full.stdout == portable.stdout
-        assert full.stderr == portable.stderr == ""
+        result = _run_runner(SKILL_RUNNER, command, "--run", str(run))
+        assert result.returncode == 3
 
 
 def test_eval_full_runner_falls_back_without_site_packages(tmp_path: Path) -> None:
-    """An unavailable Pydantic runtime must preserve the portable evaluation command surface."""
+    """Task8: the dependency-minimal fallback must create the protocol-2 surface."""
     run = tmp_path / "fallback-run"
     initialized = subprocess.run(
         [
@@ -4488,7 +4673,1989 @@ def test_eval_full_runner_falls_back_without_site_packages(tmp_path: Path) -> No
         text=True,
     )
     assert packet.returncode == 0, packet.stderr
-    assert json.loads(packet.stdout)["operation"] == "admit_case"
+    assert json.loads(packet.stdout)["operation"] == "source_review"
+
+
+def test_portable_v2_source_review_transition_matches_full_bytes(tmp_path: Path) -> None:
+    """The embedded audit schema is hash-pinned and yields the full next packet."""
+    runs = (tmp_path / "full", tmp_path / "portable")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        initialized = _run_runner(
+            runner,
+            "eval-init",
+            "--case",
+            str(EVALUATION_FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "d" * 64,
+        )
+        assert initialized.returncode == 0, initialized.stderr
+        response = tmp_path / f"{run.name}.json"
+        response.write_bytes(
+            _canonical_bytes(_v2_source_review_response(_next_packet(runner, run)))
+        )
+        submitted = _run_runner(
+            runner, "eval-submit-safe", "--run", str(run), "--response", str(response)
+        )
+        assert submitted.returncode == 0, submitted.stderr
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+    assert _next_packet(SKILL_RUNNER, runs[0]) == _next_packet(PORTABLE_RUNNER, runs[1])
+
+
+def test_v2_controller_wraps_payload_only_source_review_for_full_and_portable(
+    tmp_path: Path,
+) -> None:
+    runs = (tmp_path / "full", tmp_path / "portable")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        initialized = _run_runner(
+            runner,
+            "eval-init",
+            "--case",
+            str(EVALUATION_FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "a" * 64,
+        )
+        assert initialized.returncode == 0, initialized.stderr
+        packet = _next_packet(runner, run)
+        response = tmp_path / f"{run.name}-payload.json"
+        response.write_bytes(
+            _canonical_bytes(_v2_source_review_response(packet)["payload"])
+        )
+        preflight = _run_runner(
+            runner,
+            "eval-preflight",
+            "--run",
+            str(run),
+            "--response",
+            str(response),
+            "--provider-name",
+            "local-scripted-fixture",
+            "--model-name",
+            "no-provider",
+            "--judge-isolation",
+            "scripted_fixture",
+        )
+        assert preflight.returncode == 0, preflight.stderr
+        assert json.loads(preflight.stdout) == {"diagnostics": [], "valid": True}
+        submitted = _run_runner(
+            runner,
+            "eval-submit-safe",
+            "--run",
+            str(run),
+            "--response",
+            str(response),
+            "--provider-name",
+            "local-scripted-fixture",
+            "--model-name",
+            "no-provider",
+            "--judge-isolation",
+            "scripted_fixture",
+        )
+        assert submitted.returncode == 0, submitted.stderr
+        assert json.loads(submitted.stdout)["accepted"] is True
+        stored = json.loads((run / "responses" / "source-review.json").read_bytes())
+        assert set(stored) == {
+            "judge_isolation",
+            "model_name",
+            "operation",
+            "payload",
+            "provider_name",
+            "request_fingerprint",
+            "schema_version",
+        }
+        assert stored["payload"] == json.loads(response.read_bytes())
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+@pytest.mark.parametrize("runner", [SKILL_RUNNER, PORTABLE_RUNNER])
+def test_v2_payload_only_submission_requires_complete_controller_metadata(
+    tmp_path: Path, runner: Path
+) -> None:
+    run = tmp_path / runner.stem
+    initialized = _run_runner(
+        runner,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "b" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    packet = _next_packet(runner, run)
+    response = tmp_path / f"{runner.stem}-payload.json"
+    response.write_bytes(_canonical_bytes(_v2_source_review_response(packet)["payload"]))
+    before = _run_snapshot(run)
+
+    submitted = _run_runner(
+        runner,
+        "eval-submit-safe",
+        "--run",
+        str(run),
+        "--response",
+        str(response),
+        "--provider-name",
+        "local-scripted-fixture",
+    )
+
+    assert submitted.returncode == 2
+    assert submitted.stderr == ""
+    assert json.loads(submitted.stdout) == {
+        "accepted": False,
+        "preflight": {
+            "diagnostics": ["MECHANICAL_RESPONSE_INVALID"],
+            "valid": False,
+        },
+    }
+    assert _run_snapshot(run) == before
+
+
+def test_portable_v2_empty_audit_transition_matches_full_grade_request(tmp_path: Path) -> None:
+    runs = (tmp_path / "full", tmp_path / "portable")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        assert (
+            _run_runner(
+                runner,
+                "eval-init",
+                "--case",
+                str(EVALUATION_FIXTURE / "case.json"),
+                "--run",
+                str(run),
+                "--seed-hex",
+                "e" * 64,
+            ).returncode
+            == 0
+        )
+        for index, factory in enumerate((_v2_source_review_response, _v2_empty_audit_response)):
+            response = tmp_path / f"{run.name}-{index}.json"
+            response.write_bytes(_canonical_bytes(factory(_next_packet(runner, run))))
+            submitted = _run_runner(
+                runner, "eval-submit-safe", "--run", str(run), "--response", str(response)
+            )
+            assert submitted.returncode == 0, (
+                f"{runner.name} {factory.__name__}: {submitted.stdout} {submitted.stderr}"
+            )
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+    assert _next_packet(SKILL_RUNNER, runs[0]) == _next_packet(PORTABLE_RUNNER, runs[1])
+
+
+def test_portable_v2_grade_lifecycle_matches_full_single_report(tmp_path: Path) -> None:
+    """A portable grade transition must produce the same sealed terminal bytes as full."""
+    runs = (tmp_path / "full", tmp_path / "portable")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        initialized = _run_runner(
+            runner,
+            "eval-init",
+            "--case",
+            str(EVALUATION_FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "f" * 64,
+        )
+        assert initialized.returncode == 0, initialized.stderr
+        for index, factory in enumerate(
+            (
+                _v2_source_review_response,
+                _v2_empty_audit_response,
+                _v2_grade_response,
+                _v2_grade_response,
+            )
+        ):
+            response = tmp_path / f"{run.name}-{index}.json"
+            response.write_bytes(_canonical_bytes(factory(_next_packet(runner, run))))
+            submitted = _run_runner(
+                runner, "eval-submit-safe", "--run", str(run), "--response", str(response)
+            )
+            assert submitted.returncode == 0, (
+                f"{runner.name} {factory.__name__}: {submitted.stdout} {submitted.stderr}"
+            )
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+def test_portable_v2_two_report_lifecycle_matches_full_bytes(tmp_path: Path) -> None:
+    """A second anonymous report is graded twice and produces the same comparison."""
+    case_path = _write_exact_evaluation_fixture(tmp_path / "two-report-fixture")
+    runs = (tmp_path / "full-two", tmp_path / "portable-two")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        assert (
+            _run_runner(
+                runner,
+                "eval-init",
+                "--case",
+                str(case_path),
+                "--run",
+                str(run),
+                "--seed-hex",
+                "a" * 64,
+            ).returncode
+            == 0
+        )
+        for index, factory in enumerate(
+            (
+                _v2_source_review_response,
+                _v2_empty_audit_response,
+                _v2_grade_response,
+                _v2_grade_response,
+                _v2_grade_response,
+                _v2_grade_response,
+            )
+        ):
+            response = tmp_path / f"{run.name}-two-{index}.json"
+            response.write_bytes(_canonical_bytes(factory(_next_packet(runner, run))))
+            submitted = _run_runner(
+                runner, "eval-submit-safe", "--run", str(run), "--response", str(response)
+            )
+            assert submitted.returncode == 0, submitted.stderr
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+def test_portable_v2_disputed_source_referee_matches_full_bytes(tmp_path: Path) -> None:
+    """Every material audit concern requires one complete referee response."""
+    runs = (tmp_path / "full-referee", tmp_path / "portable-referee")
+    sequence = (
+        _v2_source_review_response,
+        _v2_disputed_audit_response,
+        _v2_referee_accept_reviewer_response,
+        _v2_grade_response,
+        _v2_grade_response,
+    )
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        assert (
+            _run_runner(
+                runner,
+                "eval-init",
+                "--case",
+                str(EVALUATION_FIXTURE / "case.json"),
+                "--run",
+                str(run),
+                "--seed-hex",
+                "b" * 64,
+            ).returncode
+            == 0
+        )
+        for index, factory in enumerate(sequence):
+            response = tmp_path / f"{run.name}-referee-{index}.json"
+            response.write_bytes(_canonical_bytes(factory(_next_packet(runner, run))))
+            submitted = _run_runner(
+                runner, "eval-submit-safe", "--run", str(run), "--response", str(response)
+            )
+            assert submitted.returncode == 0, (
+                f"{runner.name} {factory.__name__}: {submitted.stdout} {submitted.stderr}"
+            )
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+def test_portable_v2_unresolved_referee_matches_full_inconclusive_bytes(tmp_path: Path) -> None:
+    """An unresolved material dispute is retained and scores the report inconclusive."""
+    runs = (tmp_path / "full-unresolved", tmp_path / "portable-unresolved")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        assert (
+            _run_runner(
+                runner,
+                "eval-init",
+                "--case",
+                str(EVALUATION_FIXTURE / "case.json"),
+                "--run",
+                str(run),
+                "--seed-hex",
+                "c" * 64,
+            ).returncode
+            == 0
+        )
+        for index, factory in enumerate((_v2_source_review_response, _v2_disputed_audit_response)):
+            response = tmp_path / f"{run.name}-unresolved-{index}.json"
+            response.write_bytes(_canonical_bytes(factory(_next_packet(runner, run))))
+            assert (
+                _run_runner(
+                    runner, "eval-submit-safe", "--run", str(run), "--response", str(response)
+                ).returncode
+                == 0
+            )
+        referee = _v2_referee_accept_reviewer_response(_next_packet(runner, run))
+        referee_payload = referee["payload"]
+        assert isinstance(referee_payload, dict)
+        if referee["schema_version"] == "2.1":
+            referee_payload["decision"] = "unresolved"
+            referee_payload["unresolved_reason"] = "SOURCE_AMBIGUITY"
+        else:
+            referee_payload["decisions"][0]["decision"] = "unresolved"  # type: ignore[index]
+        for index, response in enumerate((referee, _v2_grade_response, _v2_grade_response)):
+            value = response if isinstance(response, dict) else response(_next_packet(runner, run))
+            response_path = tmp_path / f"{run.name}-unresolved-final-{index}.json"
+            response_path.write_bytes(_canonical_bytes(value))
+            assert (
+                _run_runner(
+                    runner, "eval-submit-safe", "--run", str(run), "--response", str(response_path)
+                ).returncode
+                == 0
+            )
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+def test_portable_v2_second_mechanical_refusal_then_stop_matches_full(tmp_path: Path) -> None:
+    """Refusals retain no repair details; only the explicit second-stop seals the run."""
+    runs = (tmp_path / "full-stop", tmp_path / "portable-stop")
+    invalid = tmp_path / "invalid-response.json"
+    invalid.write_bytes(b"[]")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        assert (
+            _run_runner(
+                runner,
+                "eval-init",
+                "--case",
+                str(EVALUATION_FIXTURE / "case.json"),
+                "--run",
+                str(run),
+                "--seed-hex",
+                "c" * 64,
+            ).returncode
+            == 0
+        )
+        before = _run_snapshot(run)
+        for _ in range(2):
+            refusal = _run_runner(
+                runner, "eval-submit-safe", "--run", str(run), "--response", str(invalid)
+            )
+            assert refusal.returncode == 2
+            assert json.loads(refusal.stdout) == {
+                "accepted": False,
+                "preflight": {"diagnostics": ["MECHANICAL_RESPONSE_INVALID"], "valid": False},
+            }
+            assert _run_snapshot(run) == before
+        stopped = _run_runner(
+            runner,
+            "eval-stop-inconclusive",
+            "--run",
+            str(run),
+            "--reason",
+            "MECHANICAL_RESPONSE_INVALID",
+        )
+        assert stopped.returncode == 3
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+def test_portable_v2_wrong_grade_label_refuses_without_writing(tmp_path: Path) -> None:
+    """A grade payload must bind its semantic label to the pending call, not itself."""
+    runs = (tmp_path / "full-label", tmp_path / "portable-label")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        assert (
+            _run_runner(
+                runner,
+                "eval-init",
+                "--case",
+                str(EVALUATION_FIXTURE / "case.json"),
+                "--run",
+                str(run),
+                "--seed-hex",
+                "d" * 64,
+            ).returncode
+            == 0
+        )
+        for index, factory in enumerate((_v2_source_review_response, _v2_empty_audit_response)):
+            response = tmp_path / f"{run.name}-label-{index}.json"
+            response.write_bytes(_canonical_bytes(factory(_next_packet(runner, run))))
+            assert (
+                _run_runner(
+                    runner, "eval-submit-safe", "--run", str(run), "--response", str(response)
+                ).returncode
+                == 0
+            )
+        response = _v2_grade_response(_next_packet(runner, run))
+        response["payload"]["anonymous_label"] = "B"  # type: ignore[index]
+        response_path = tmp_path / f"{run.name}-wrong-label.json"
+        response_path.write_bytes(_canonical_bytes(response))
+        before = _run_snapshot(run)
+        refused = _run_runner(
+            runner, "eval-submit-safe", "--run", str(run), "--response", str(response_path)
+        )
+        assert refused.returncode == 2
+        assert _run_snapshot(run) == before
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+@pytest.mark.parametrize("vector", ("grader_disagreement", "material_unsupported_assertion"))
+def test_portable_v2_substantive_grade_results_match_full(vector: str, tmp_path: Path) -> None:
+    """Substantive FAIL/INCONCLUSIVE results seal after two grades without retry."""
+    if vector == "grader_disagreement":
+        full_root = tmp_path / "full-fixtures"
+        portable_root = tmp_path / "portable-fixtures"
+        full_root.mkdir()
+        portable_root.mkdir()
+        assert _protocol_21_scenario(
+            SKILL_RUNNER, tmp_path / "full-grader-disagreement", full_root,
+            "outcome_changing_inconclusive",
+        ) == _protocol_21_scenario(
+            PORTABLE_RUNNER, tmp_path / "portable-grader-disagreement", portable_root,
+            "outcome_changing_inconclusive",
+        )
+        return
+    runs = (tmp_path / f"full-{vector}", tmp_path / f"portable-{vector}")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        assert (
+            _run_runner(
+                runner,
+                "eval-init",
+                "--case",
+                str(EVALUATION_FIXTURE / "case.json"),
+                "--run",
+                str(run),
+                "--seed-hex",
+                "e" * 64,
+            ).returncode
+            == 0
+        )
+        for index, factory in enumerate((_v2_source_review_response, _v2_empty_audit_response)):
+            response = tmp_path / f"{run.name}-substantive-{index}.json"
+            response.write_bytes(_canonical_bytes(factory(_next_packet(runner, run))))
+            assert (
+                _run_runner(
+                    runner, "eval-submit-safe", "--run", str(run), "--response", str(response)
+                ).returncode
+                == 0
+            )
+        for grade_index in range(2):
+            response = _v2_grade_response(_next_packet(runner, run))
+            payload = response["payload"]
+            assert isinstance(payload, dict)
+            if vector == "grader_disagreement" and grade_index == 1:
+                payload["requirement_grades"][0]["disposition"] = "not_met"  # type: ignore[index]
+            if vector == "material_unsupported_assertion":
+                if response["schema_version"] == "2.1":
+                    payload["requirement_grades"][0]["disposition"] = "not_met"  # type: ignore[index]
+                else:
+                    payload["unsupported_assertions"] = [
+                        {
+                            "report_passage": "civil penalty of $500",
+                            "importance": "material",
+                            "rationale": "The report makes a material unsupported assertion.",
+                        }
+                    ]
+            response_path = tmp_path / f"{run.name}-substantive-grade-{grade_index}.json"
+            response_path.write_bytes(_canonical_bytes(response))
+            assert (
+                _run_runner(
+                    runner, "eval-submit-safe", "--run", str(run), "--response", str(response_path)
+                ).returncode
+                == 0
+            )
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+@pytest.mark.parametrize("boundary", ("ambiguous_source_quote", "ambiguous_report_quote"))
+def test_portable_v2_ambiguous_evidence_refuses_without_writing(
+    boundary: str, tmp_path: Path
+) -> None:
+    """Exact quotation ambiguity is mechanical and leaves the current tree untouched."""
+    runs = (tmp_path / f"full-{boundary}", tmp_path / f"portable-{boundary}")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        assert (
+            _run_runner(
+                runner,
+                "eval-init",
+                "--case",
+                str(EVALUATION_FIXTURE / "case.json"),
+                "--run",
+                str(run),
+                "--seed-hex",
+                "f" * 64,
+            ).returncode
+            == 0
+        )
+        review = _v2_source_review_response(_next_packet(runner, run))
+        if boundary == "ambiguous_source_quote":
+            review["payload"]["proposals"][0]["passages"][0]["quote"] = "A covered operator"  # type: ignore[index]
+        review_path = tmp_path / f"{run.name}-{boundary}-review.json"
+        review_path.write_bytes(_canonical_bytes(review))
+        assert (
+            _run_runner(
+                runner, "eval-submit-safe", "--run", str(run), "--response", str(review_path)
+            ).returncode
+            == 0
+        )
+        if boundary == "ambiguous_source_quote":
+            response = _v2_empty_audit_response(_next_packet(runner, run))
+        else:
+            response = _v2_empty_audit_response(_next_packet(runner, run))
+            response_path = tmp_path / f"{run.name}-{boundary}-audit.json"
+            response_path.write_bytes(_canonical_bytes(response))
+            assert (
+                _run_runner(
+                    runner, "eval-submit-safe", "--run", str(run), "--response", str(response_path)
+                ).returncode
+                == 0
+            )
+            response = _v2_grade_response(_next_packet(runner, run))
+            response["payload"]["requirement_grades"][0]["report_passages"] = ["a"]  # type: ignore[index]
+        response_path = tmp_path / f"{run.name}-{boundary}-response.json"
+        response_path.write_bytes(_canonical_bytes(response))
+        before = _run_snapshot(run)
+        refused = _run_runner(
+            runner, "eval-submit-safe", "--run", str(run), "--response", str(response_path)
+        )
+        assert refused.returncode == 2
+        assert _run_snapshot(run) == before
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+def test_portable_v2_init_refuses_retained_13_run_exactly_like_full(tmp_path: Path) -> None:
+    """New protocol initialization cannot overwrite a retained 1.3 run."""
+    runs = (tmp_path / "full-legacy-init", tmp_path / "portable-legacy-init")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        _initialize_eval_run(runner, run)
+        before = _run_snapshot(run)
+        result = _run_runner(
+            runner,
+            "eval-init",
+            "--case",
+            str(EVALUATION_FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "1" * 64,
+        )
+        assert result.returncode == 2
+        assert result.stdout == ""
+        assert json.loads(result.stderr)["code"] == "EVALUATION_LEGACY_READ_ONLY"
+        assert _run_snapshot(run) == before
+
+
+def test_portable_v2_first_mechanical_repair_uses_identical_pending_packet(tmp_path: Path) -> None:
+    """The one permitted repair receives exactly the pending request again."""
+    runs = (tmp_path / "full-repair", tmp_path / "portable-repair")
+    invalid = tmp_path / "invalid.json"
+    invalid.write_bytes(b"[]")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        initialized = _run_runner(
+            runner,
+            "eval-init",
+            "--case",
+            str(EVALUATION_FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "2" * 64,
+        )
+        assert initialized.returncode == 0
+        request, before = _next_packet(runner, run), _run_snapshot(run)
+        refused = _run_runner(
+            runner,
+            "eval-submit-safe",
+            "--run",
+            str(run),
+            "--response",
+            str(invalid),
+        )
+        assert refused.returncode == 2
+        assert _next_packet(runner, run) == request
+        assert _run_snapshot(run) == before
+        response = tmp_path / f"{run.name}-repair.json"
+        response.write_bytes(_canonical_bytes(_v2_source_review_response(request)))
+        accepted = _run_runner(
+            runner,
+            "eval-submit-safe",
+            "--run",
+            str(run),
+            "--response",
+            str(response),
+        )
+        assert accepted.returncode == 0
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+def test_portable_v2_tampered_baseline_verify_matches_full_no_write(tmp_path: Path) -> None:
+    """A retained baseline byte change is never silently repaired."""
+    runs = (tmp_path / "full-tamper", tmp_path / "portable-tamper")
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        initialized = _run_runner(
+            runner,
+            "eval-init",
+            "--case",
+            str(EVALUATION_FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "3" * 64,
+        )
+        assert initialized.returncode == 0
+        for index, factory in enumerate((_v2_source_review_response, _v2_empty_audit_response)):
+            response = tmp_path / f"{run.name}-{index}.json"
+            response.write_bytes(_canonical_bytes(factory(_next_packet(runner, run))))
+            assert (
+                _run_runner(
+                    runner, "eval-submit-safe", "--run", str(run), "--response", str(response)
+                ).returncode
+                == 0
+            )
+        baseline = run / "baseline.json"
+        baseline.write_bytes(baseline.read_bytes() + b" ")
+        before = _run_snapshot(run)
+        assert _run_runner(runner, "eval-verify", "--run", str(run)).returncode == 5
+        assert _run_snapshot(run) == before
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+@pytest.mark.parametrize("kind", ("unknown", "noncanonical", "ordinary_nonempty"))
+def test_portable_v2_init_nonlegacy_existing_controls_match_full(kind: str, tmp_path: Path) -> None:
+    """Only a sealed canonical 1.3 run receives the legacy-init refusal."""
+    outputs: list[tuple[int, str, str]] = []
+    snapshots: list[dict[str, bytes]] = []
+    for runner, run in zip(
+        (SKILL_RUNNER, PORTABLE_RUNNER), (tmp_path / "full", tmp_path / "portable"), strict=True
+    ):
+        run.mkdir()
+        if kind == "unknown":
+            (run / "run-manifest.json").write_bytes(b'{"protocol_version":"9.9"}')
+        elif kind == "noncanonical":
+            (run / "run-manifest.json").write_bytes(b"{}\n")
+        else:
+            (run / "ordinary.txt").write_bytes(b"keep")
+        before = _run_snapshot(run)
+        result = _run_runner(
+            runner,
+            "eval-init",
+            "--case",
+            str(EVALUATION_FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "4" * 64,
+        )
+        outputs.append((result.returncode, result.stdout, result.stderr))
+        if result.returncode != 0:
+            assert _run_snapshot(run) == before
+        snapshots.append(_run_snapshot(run))
+    assert outputs[0] == outputs[1]
+    assert snapshots[0] == snapshots[1]
+
+
+def test_portable_v2_audited_correction_pair_fail_and_pass_matches_full(
+    tmp_path: Path,
+) -> None:
+    """A referee-approved correction changes the baseline before A-fail/B-pass."""
+    case_path = _write_exact_evaluation_fixture(tmp_path / "correction-fixture")
+    runs = (tmp_path / "full-correction", tmp_path / "portable-correction")
+    reviewer_run = tmp_path / "reviewer-baseline"
+    reviewer_sequence = (
+        _v2_source_review_response,
+        _v2_disputed_audit_response,
+        _v2_referee_accept_reviewer_response,
+    )
+    with _suspend_v2_runner_capture():
+        initialized = _run_runner(
+            SKILL_RUNNER,
+            "eval-init",
+            "--case",
+            str(case_path),
+            "--run",
+            str(reviewer_run),
+            "--seed-hex",
+            "5" * 64,
+        )
+        assert initialized.returncode == 0, initialized.stderr
+        for index, factory in enumerate(reviewer_sequence):
+            response_path = tmp_path / f"reviewer-baseline-{index}.json"
+            response_path.write_bytes(
+                _canonical_bytes(factory(_next_packet(SKILL_RUNNER, reviewer_run)))
+            )
+            accepted = _run_runner(
+                SKILL_RUNNER,
+                "eval-submit-safe",
+                "--run",
+                str(reviewer_run),
+                "--response",
+                str(response_path),
+            )
+            assert accepted.returncode == 0, accepted.stderr
+    reviewer_baseline = (reviewer_run / "baseline.json").read_bytes()
+
+    sequence = (
+        _v2_source_review_response,
+        _v2_corrected_disputed_audit_response,
+        _v2_referee_accept_auditor_response,
+        _v2_grade_response,
+        _v2_grade_response,
+        _v2_grade_response,
+        _v2_grade_response,
+    )
+    for runner, run in zip((SKILL_RUNNER, PORTABLE_RUNNER), runs, strict=True):
+        initialized = _run_runner(
+            runner,
+            "eval-init",
+            "--case",
+            str(case_path),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "5" * 64,
+        )
+        assert initialized.returncode == 0, initialized.stderr
+        for index, factory in enumerate(sequence):
+            response = factory(_next_packet(runner, run))
+            payload = response["payload"]
+            assert isinstance(payload, dict)
+            if factory is _v2_grade_response and payload["anonymous_label"] == "A":
+                payload["requirement_grades"][0]["disposition"] = "not_met"  # type: ignore[index]
+            response_path = tmp_path / f"{run.name}-correction-{index}.json"
+            response_path.write_bytes(_canonical_bytes(response))
+            accepted = _run_runner(
+                runner,
+                "eval-submit-safe",
+                "--run",
+                str(run),
+                "--response",
+                str(response_path),
+            )
+            assert accepted.returncode == 0, accepted.stderr
+        corrected_baseline = (run / "baseline.json").read_bytes()
+        corrected_payload = json.loads(corrected_baseline)
+        assert corrected_baseline != reviewer_baseline
+        assert corrected_payload["baseline_fingerprint"] != json.loads(reviewer_baseline)[
+            "baseline_fingerprint"
+        ]
+        requirement = corrected_payload["requirements"][0]
+        assert requirement["statement"] == "A covered operator must file notice."
+        assert requirement["passages"][0]["quote"] == "A covered operator must file notice."
+        result = json.loads((run / "result.json").read_bytes())
+        reports = result["reports"]
+        assert reports[0]["anonymous_label"] == "A"
+        assert reports[0]["reconciliation"]["absolute_disposition"] == "FAIL"
+        assert reports[1]["anonymous_label"] == "B"
+        assert reports[1]["reconciliation"]["absolute_disposition"] == "PASS"
+    assert _run_snapshot(runs[0]) == _run_snapshot(runs[1])
+
+
+_V2_VECTOR_EXECUTORS = {
+    "empty_audit_single_report_pass": test_portable_v2_grade_lifecycle_matches_full_single_report,
+    "audited_correction_pair_fail_and_pass": (
+        test_portable_v2_audited_correction_pair_fail_and_pass_matches_full
+    ),
+    "unresolved_source_dispute": (
+        test_portable_v2_unresolved_referee_matches_full_inconclusive_bytes
+    ),
+    "grader_disagreement": lambda path: test_portable_v2_substantive_grade_results_match_full(
+        "grader_disagreement", path
+    ),
+    "material_unsupported_assertion": (
+        lambda path: test_portable_v2_substantive_grade_results_match_full(
+            "material_unsupported_assertion", path
+        )
+    ),
+    "ambiguous_source_quote": (
+        lambda path: test_portable_v2_ambiguous_evidence_refuses_without_writing(
+            "ambiguous_source_quote", path
+        )
+    ),
+    "ambiguous_report_quote": (
+        lambda path: test_portable_v2_ambiguous_evidence_refuses_without_writing(
+            "ambiguous_report_quote", path
+        )
+    ),
+    "first_mechanical_repair": (
+        test_portable_v2_first_mechanical_repair_uses_identical_pending_packet
+    ),
+    "second_mechanical_failure": test_portable_v2_second_mechanical_refusal_then_stop_matches_full,
+    "tampered_baseline": test_portable_v2_tampered_baseline_verify_matches_full_no_write,
+}
+
+
+def _protocol_21_run_command(
+    runner: Path, *args: str
+) -> subprocess.CompletedProcess[str]:
+    python = [sys.executable]
+    if runner == PORTABLE_RUNNER:
+        python.extend(("-I", "-S"))
+    result = subprocess.run(
+        [*python, str(runner), *args],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if _V2_RUNNER_RECORDS is not None:
+        runner_name = "full" if runner == SKILL_RUNNER else "portable"
+        _V2_RUNNER_RECORDS.append(
+            (runner_name, args[0], (result.returncode, result.stdout, result.stderr))
+        )
+    return result
+
+
+def _protocol_21_scenario(
+    runner: Path,
+    run: Path,
+    response_root: Path,
+    vector: str,
+) -> tuple[list[tuple[str, int, str, str]], dict[str, bytes]]:
+    transcript: list[tuple[str, int, str, str]] = []
+
+    def command(*args: str) -> subprocess.CompletedProcess[str]:
+        completed = _protocol_21_run_command(runner, *args)
+        transcript.append((args[0], completed.returncode, completed.stdout, completed.stderr))
+        return completed
+
+    invalid = response_root / "invalid.json"
+    invalid.write_bytes(b"[]")
+
+    if vector == "retained_2_0":
+        _initialize_v2_eval_run(run)
+        before = _run_snapshot(run)
+        command("eval-status", "--run", str(run))
+        command("eval-verify", "--run", str(run))
+        command("eval-submit-safe", "--run", str(run), "--response", str(invalid))
+        command(
+            "eval-stop-inconclusive", "--run", str(run),
+            "--reason", "MECHANICAL_RESPONSE_INVALID",
+        )
+        assert _run_snapshot(run) == before
+        return transcript, _run_snapshot(run)
+    if vector == "retained_1_3":
+        _initialize_eval_run(runner, run)
+        before = _run_snapshot(run)
+        command("eval-status", "--run", str(run))
+        command("eval-verify", "--run", str(run))
+        command("eval-submit-safe", "--run", str(run), "--response", str(invalid))
+        command(
+            "eval-stop-inconclusive", "--run", str(run),
+            "--reason", "MECHANICAL_RESPONSE_INVALID",
+        )
+        assert _run_snapshot(run) == before
+        return transcript, _run_snapshot(run)
+    if vector == "unknown":
+        run.mkdir()
+        (run / "run-manifest.json").write_bytes(
+            _canonical_bytes({"protocol_version": "9.9"})
+        )
+        command("eval-status", "--run", str(run))
+        return transcript, _run_snapshot(run)
+    if vector == "symlink_path_refusal":
+        target = response_root / "real-run"
+        target.mkdir()
+        run.symlink_to(target, target_is_directory=True)
+        command("eval-status", "--run", str(run))
+        return transcript, _run_snapshot(target)
+
+    initialized = command(
+        "eval-init",
+        "--case", str(EVALUATION_FIXTURE / "case.json"),
+        "--run", str(run),
+        "--seed-hex", "7" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    if vector == "mechanical_terminal":
+        command("eval-submit-safe", "--run", str(run), "--response", str(invalid))
+        command("eval-submit-safe", "--run", str(run), "--response", str(invalid))
+        command(
+            "eval-stop-inconclusive", "--run", str(run),
+            "--reason", "MECHANICAL_RESPONSE_INVALID",
+        )
+        command("eval-verify", "--run", str(run))
+        return transcript, _run_snapshot(run)
+
+    proposal_count = (
+        6
+        if vector in {
+            "no_dispute", "partial_grade_resume", "cross_label_metadata",
+            "cross_lane_metadata", "cross_batch_metadata",
+        }
+        else 3
+        if vector == "mixed_referee_reviewer_auditor_unresolved"
+        else 2 if vector in {"partial_referee_resume", "swapped_fragment"} else 1
+    )
+    disputed = vector in {
+        "stable_pass", "stable_fail", "outcome_changing_inconclusive",
+        "referee_repair", "partial_referee_resume", "swapped_fragment",
+        "tampered_aggregate", "tampered_result",
+    }
+    mixed_referee = vector == "mixed_referee_reviewer_auditor_unresolved"
+    repaired = False
+    accepted = 0
+    referee_accepted = 0
+    while True:
+        next_result = command("eval-next", "--run", str(run))
+        if next_result.returncode != 0 or not next_result.stdout.strip():
+            break
+        request = json.loads(next_result.stdout)
+        if request is None:
+            break
+        assert isinstance(request, dict)
+        operation = request["operation"]
+        if (
+            vector == "partial_referee_resume"
+            and operation == "source_referee_fragment"
+            and referee_accepted == 1
+        ):
+            command("eval-status", "--run", str(run))
+            command("eval-next", "--run", str(run))
+            command("eval-verify", "--run", str(run))
+            break
+        repair_operation = (
+            "source_referee_fragment" if vector == "referee_repair"
+            else "ordinary_grade_fragment" if vector == "grade_repair"
+            else None
+        )
+        if operation == repair_operation and not repaired:
+            command("eval-submit-safe", "--run", str(run), "--response", str(invalid))
+            command("eval-next", "--run", str(run))
+            repaired = True
+        response = _v21_response(
+            request,
+            proposal_count=proposal_count,
+            disputed=disputed,
+            mixed_referee=mixed_referee,
+            stable_fail=vector == "stable_fail",
+            outcome_changing=vector == "outcome_changing_inconclusive",
+        )
+        response_path = response_root / f"response-{accepted:02d}.json"
+        response_path.write_bytes(_canonical_bytes(response))
+        submitted = command(
+            "eval-submit-safe", "--run", str(run), "--response", str(response_path)
+        )
+        assert submitted.returncode in {0, 3, 4}, submitted.stderr or submitted.stdout
+        accepted += 1
+        if operation == "source_referee_fragment":
+            referee_accepted += 1
+        partial_grade_vectors = {
+            "partial_grade_resume", "cross_label_metadata",
+            "cross_lane_metadata", "cross_batch_metadata",
+        }
+        if vector in partial_grade_vectors and operation == "ordinary_grade_fragment":
+            if vector != "partial_grade_resume":
+                manifest_path = run / "run-manifest.json"
+                manifest = json.loads(manifest_path.read_bytes())
+                accepted_grade = next(
+                    call for call in manifest["calls"]
+                    if call["operation"] == "ordinary_grade_fragment"
+                    and call["state"] == "accepted"
+                )
+                if vector == "cross_label_metadata":
+                    accepted_grade["anonymous_label"] = "B"
+                elif vector == "cross_lane_metadata":
+                    accepted_grade["grader_lane"] = 2
+                else:
+                    accepted_grade["batch_ref"] = "GB-A-1-0002"
+                manifest_path.write_bytes(_canonical_bytes(manifest))
+                _reseal_protocol_21_run(run)
+            command("eval-status", "--run", str(run))
+            command("eval-next", "--run", str(run))
+            command("eval-verify", "--run", str(run))
+            break
+        if accepted > 24:
+            raise AssertionError("Protocol 2.1 scenario did not terminate")
+
+    if vector == "swapped_fragment":
+        manifest = json.loads((run / "run-manifest.json").read_bytes())
+        calls = [
+            call
+            for call in manifest["calls"]
+            if call["operation"] == "source_referee_fragment" and call["state"] == "accepted"
+        ]
+        assert len(calls) >= 2
+        calls[0]["dispute_id"], calls[1]["dispute_id"] = (
+            calls[1]["dispute_id"], calls[0]["dispute_id"]
+        )
+        (run / "run-manifest.json").write_bytes(_canonical_bytes(manifest))
+        _reseal_protocol_21_run(run)
+        command("eval-verify", "--run", str(run))
+    elif vector == "tampered_aggregate":
+        aggregate = run / "aggregates" / "referee.json"
+        assert aggregate.is_file()
+        value = json.loads(aggregate.read_bytes())
+        manifest_path = run / "run-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        value["fragments"][0]["decision"]["decision"] = "accept_reviewer"
+        value["fragments"][0]["decision"]["unresolved_reason"] = None
+        body = {
+            "schema_version": "2.1",
+            "disputes": manifest["referee_disputes"],
+            "fragments": value["fragments"],
+        }
+        value["aggregate_fingerprint"] = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+        aggregate.write_bytes(_canonical_bytes(value))
+        manifest["referee_aggregate_fingerprint"] = value["aggregate_fingerprint"]
+        manifest_path.write_bytes(_canonical_bytes(manifest))
+        _reseal_protocol_21_run(run)
+        command("eval-verify", "--run", str(run))
+    elif vector == "tampered_lane_aggregate":
+        aggregate_path = run / "aggregates" / "grade-A-1.json"
+        value = json.loads(aggregate_path.read_bytes())
+        value["ordinary_fragments"][0]["rationale"] = (
+            "A forged but canonically re-sealed lane rationale."
+        )
+        body = dict(value)
+        old_fingerprint = body.pop("aggregate_fingerprint")
+        value["aggregate_fingerprint"] = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+        aggregate_path.write_bytes(_canonical_bytes(value))
+        manifest_path = run / "run-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["grader_aggregate_fingerprints"] = [
+            value["aggregate_fingerprint"] if item == old_fingerprint else item
+            for item in manifest["grader_aggregate_fingerprints"]
+        ]
+        manifest_path.write_bytes(_canonical_bytes(manifest))
+        _reseal_protocol_21_run(run)
+        command("eval-verify", "--run", str(run))
+    elif vector in {"tampered_reconciliation", "tampered_sensitivity"}:
+        _forge_protocol_21_report_derivation(
+            run,
+            "reconciliation" if vector == "tampered_reconciliation" else "sensitivity",
+        )
+        command("eval-verify", "--run", str(run))
+    elif vector == "tampered_result":
+        result_path = run / "result.json"
+        value = json.loads(result_path.read_bytes())
+        value["terminal_status"] = "INCONCLUSIVE"
+        body = dict(value)
+        body.pop("result_fingerprint")
+        value["result_fingerprint"] = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+        result_path.write_bytes(_canonical_bytes(value))
+        manifest_path = run / "run-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest.update(
+            {
+                "phase": "inconclusive",
+                "terminal_status": "INCONCLUSIVE",
+                "result_hash": value["result_fingerprint"],
+            }
+        )
+        manifest_path.write_bytes(_canonical_bytes(manifest))
+        _reseal_protocol_21_run(run)
+        command("eval-status", "--run", str(run))
+        command("eval-verify", "--run", str(run))
+    elif vector not in {
+        "partial_referee_resume", "partial_grade_resume", "cross_label_metadata",
+        "cross_lane_metadata", "cross_batch_metadata",
+    }:
+        command("eval-status", "--run", str(run))
+        command("eval-verify", "--run", str(run))
+    return transcript, _run_snapshot(run)
+
+
+@pytest.mark.parametrize("vector", PROTOCOL_21_PORTABLE_PARITY_VECTORS)
+def test_protocol_21_portable_parity(vector: str, tmp_path: Path) -> None:
+    """The isolated portable CLI exactly mirrors every Protocol 2.1 public boundary."""
+    full_root = tmp_path / "full-fixtures"
+    portable_root = tmp_path / "portable-fixtures"
+    full_root.mkdir()
+    portable_root.mkdir()
+    full = _protocol_21_scenario(
+        SKILL_RUNNER, tmp_path / f"full-{vector}", full_root, vector
+    )
+    portable = _protocol_21_scenario(
+        PORTABLE_RUNNER, tmp_path / f"portable-{vector}", portable_root, vector
+    )
+    assert full == portable
+
+
+_V22_TEST_PROVENANCE = EvaluatorProvenanceV22(
+    provider_name="local-scripted-fixture",
+    model_name="no-provider",
+    judge_isolation="scripted_fixture",
+)
+
+
+def _protocol_22_proposal(
+    request: dict[str, object],
+    ordinal: int,
+    *,
+    normalized: bool = False,
+    low_quality: bool = False,
+) -> dict[str, object]:
+    payload = request["payload"]
+    assert isinstance(payload, dict)
+    source_record = payload["source_record"]
+    assert isinstance(source_record, dict)
+    sources = source_record["sources"]
+    assert isinstance(sources, list) and sources
+    source = sources[0]
+    assert isinstance(source, dict)
+    quote = source["normalized_text"]
+    assert isinstance(quote, str)
+    if normalized:
+        quote = "  ".join(quote.split(" "))
+    return {
+        "statement": f"  Duty {ordinal}: a covered operator must comply.  "
+        if normalized
+        else f"Duty {ordinal}: a covered operator must comply.",
+        "kind": "OBLIGATION" if normalized else "obligation",
+        "importance": "CRITICAL" if normalized else "critical",
+        "passages": [{"source_id": source["source_id"], "quote": quote}],
+        "dependency": None,
+        "confidence": "CLEAR" if normalized else "clear",
+        "rationale": "Maybe." if low_quality else "The frozen source states the duty.",
+    }
+
+
+def _protocol_22_draft(
+    request: dict[str, object], vector: str
+) -> dict[str, object]:
+    operation = request["operation"]
+    payload = request["payload"]
+    assert isinstance(operation, str) and isinstance(payload, dict)
+    if operation == "source_review_fragment":
+        ordinal = payload["fragment_ordinal"]
+        assert isinstance(ordinal, int)
+        fragmented = vector in {
+            "review_fragmentation",
+            "partial_source_review_resume",
+            "partial_ordinary_grade_resume",
+        }
+        count = 5 if fragmented and ordinal == 1 else 1
+        if vector == "empty_source_inconclusive":
+            count = 0
+        if vector in {
+            "review_cross_fragment_duplicate",
+            "review_cross_fragment_conflict",
+            "review_nonfinal_fragment_duplicate",
+            "review_nonfinal_fragment_conflict",
+        }:
+            proposal = _protocol_22_proposal(request, 1)
+            proposal["statement"] = (
+                "Global  review duty."
+                if vector in {
+                    "review_cross_fragment_conflict",
+                    "review_nonfinal_fragment_conflict",
+                }
+                and ordinal == 2
+                else "Global review duty."
+            )
+            return {
+                "proposals": [proposal],
+                "review_complete": ordinal == 2
+                and not vector.startswith("review_nonfinal_"),
+            }
+        return {
+            "proposals": [
+                _protocol_22_proposal(
+                    request,
+                    (ordinal - 1) * 5 + index,
+                    normalized=vector == "normalized_prose_enum_and_quote",
+                    low_quality=vector == "low_quality_acceptance",
+                )
+                for index in range(1, count + 1)
+            ],
+            "review_complete": not fragmented or ordinal >= 2,
+        }
+    if operation == "source_audit_fragment":
+        ordinal = payload["fragment_ordinal"]
+        assert isinstance(ordinal, int)
+        fragmented = vector in {
+            "audit_fragmentation",
+            "partial_source_audit_resume",
+        }
+        disputed = vector in {
+            "stable_pass",
+            "stable_fail",
+            "outcome_sensitive_inconclusive",
+            "insufficient_inconclusive",
+            "partial_referee_resume",
+            "partial_contested_grade_resume",
+            "cross_dispute_swap",
+            "nested_missing_audit_dependency_then_accept",
+            "nested_missing_audit_dependency_pause",
+            "nested_blank_audit_explanation_then_accept",
+            "nested_blank_audit_explanation_pause",
+        }
+        concerns: list[dict[str, object]] = []
+        if vector in {
+            "audit_cross_fragment_duplicate",
+            "audit_cross_fragment_conflict",
+            "audit_nonfinal_fragment_duplicate",
+            "audit_nonfinal_fragment_conflict",
+        }:
+            source_record = payload["source_record"]
+            indexed = payload["indexed_proposals"]
+            assert isinstance(source_record, dict) and isinstance(indexed, list) and indexed
+            proposal = indexed[0]
+            assert isinstance(proposal, dict)
+            semantic = proposal["proposal"]
+            assert isinstance(semantic, dict)
+            concern = {
+                "target_proposal_ordinal": 1,
+                "concern_type": "ambiguity",
+                "passages": semantic["passages"],
+                "explanation": (
+                    "A different global explanation."
+                    if vector in {
+                        "audit_cross_fragment_conflict",
+                        "audit_nonfinal_fragment_conflict",
+                    }
+                    and ordinal == 2
+                    else "The global meaning is ambiguous."
+                ),
+                "correction": None,
+            }
+            return {
+                "concerns": [concern],
+                "audit_complete": ordinal == 2
+                and not vector.startswith("audit_nonfinal_"),
+            }
+        if ordinal == 1 and (fragmented or disputed):
+            source_record = payload["source_record"]
+            indexed = payload["indexed_proposals"]
+            assert isinstance(source_record, dict) and isinstance(indexed, list) and indexed
+            proposal = indexed[0]
+            assert isinstance(proposal, dict)
+            semantic = proposal["proposal"]
+            assert isinstance(semantic, dict)
+            correction = json.loads(json.dumps(semantic))
+            correction["statement"] = "Covered operators must comply with the corrected duty."
+            concerns.append(
+                {
+                    "target_proposal_ordinal": 1,
+                    "concern_type": "incorrect_statement",
+                    "passages": semantic["passages"],
+                    "explanation": "The exact formulation is disputed.",
+                    "correction": correction,
+                }
+            )
+            if vector in {"partial_referee_resume", "cross_dispute_swap"}:
+                second = json.loads(json.dumps(correction))
+                second["statement"] = "A second corrected formulation applies."
+                concerns.append(
+                    {
+                        "target_proposal_ordinal": 1,
+                        "concern_type": "incorrect_statement",
+                        "passages": semantic["passages"],
+                        "explanation": "A second material formulation is disputed.",
+                        "correction": second,
+                    }
+                )
+        return {
+            "concerns": concerns,
+            "audit_complete": not fragmented or ordinal >= 2,
+        }
+    if operation == "source_referee_fragment":
+        unresolved = vector == "insufficient_inconclusive"
+        return {
+            "decision": "unresolved" if unresolved else "accept_reviewer",
+            "unresolved_reason": "SOURCE_AMBIGUITY" if unresolved else None,
+            "evidence_ordinals": [1],
+            "rationale": "The issued source evidence supports this disposition.",
+        }
+    if operation == "ordinary_grade_fragment":
+        disposition = "met"
+        label = payload["anonymous_label"]
+        if vector == "stable_fail":
+            disposition = "not_met"
+        elif vector in {"candidate_label_a", "candidate_label_b"}:
+            disposition = "met" if label == "A" else "not_met"
+        report_text = payload["report_text"]
+        requirements = payload["requirements"]
+        assert isinstance(report_text, str) and isinstance(requirements, list)
+        return {
+            "requirement_grades": [
+                {
+                    "requirement_ordinal": index,
+                    "disposition": disposition,
+                    "report_passages": []
+                    if disposition == "not_met"
+                    else [report_text],
+                    "rationale": "The report was graded exactly as supplied.",
+                    "omission": "The issued duty is absent."
+                    if disposition == "not_met"
+                    else None,
+                }
+                for index, _ in enumerate(requirements, 1)
+            ],
+            "rationale": "Every issued requirement was graded.",
+        }
+    assert operation == "contested_grade_fragment"
+    report_text = payload["report_text"]
+    assert isinstance(report_text, str)
+    reviewer = "met"
+    auditor = "met"
+    if vector == "stable_fail":
+        reviewer = auditor = "not_met"
+    elif vector == "outcome_sensitive_inconclusive":
+        auditor = "not_met"
+    elif vector == "insufficient_inconclusive":
+        reviewer = auditor = "uncertain"
+
+    def alternative(disposition: str) -> dict[str, object]:
+        return {
+            "disposition": disposition,
+            "report_passages": []
+            if disposition in {"not_met", "uncertain"}
+            else [report_text],
+            "rationale": "The issued alternative was graded as supplied.",
+        }
+
+    return {
+        "reviewer_alternative_grade": alternative(reviewer),
+        "auditor_alternative_grade": alternative(auditor),
+        "ambiguity_disposition": "uncertain"
+        if "uncertain" in {reviewer, auditor}
+        else "acknowledged",
+        "rationale": "Both issued alternatives were evaluated.",
+    }
+
+
+def _protocol_22_strict_response(
+    request: dict[str, object], vector: str
+) -> dict[str, object]:
+    checked = validate_evaluator_request_v22(request)
+    outcome = compile_evaluator_draft_v22(
+        checked, _protocol_22_draft(request, vector), _V22_TEST_PROVENANCE
+    )
+    assert isinstance(outcome, CompiledDraftV22), outcome
+    return outcome.response.model_dump(mode="json")
+
+
+def _protocol_22_script_from_run(run: Path, path: Path, vector: str) -> None:
+    probe = path.parent / f"{path.stem}-probe"
+    shutil.copytree(run, probe, symlinks=True)
+    responses: list[dict[str, object]] = []
+    while (request := next_evaluator_request_v22(probe)) is not None:
+        request_json = request.model_dump(mode="json")
+        draft = _protocol_22_draft(request_json, vector)
+        responses.append(
+            {
+                "draft": draft,
+                "expect": {
+                    "attempt": 1,
+                    "clarification_codes": [],
+                    "request_fingerprint": request.request_fingerprint,
+                },
+                "operation": request.operation.value,
+            }
+        )
+        compiled = compile_evaluator_draft_v22(request, draft, _V22_TEST_PROVENANCE)
+        assert isinstance(compiled, CompiledDraftV22), compiled
+        submit_evaluator_response_v22(probe, compiled.response)
+    path.write_bytes(
+        _canonical_bytes(
+            {"fixture_type": "local-scripted-drafts-v2.2", "responses": responses}
+        )
+    )
+
+
+def _reseal_protocol_22_outer(run: Path) -> None:
+    manifest_path = run / "run-manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    assert isinstance(manifest, dict)
+    artifacts = manifest["artifacts"]
+    assert isinstance(artifacts, list)
+    for record in artifacts:
+        assert isinstance(record, dict)
+        artifact_path = record["artifact_path"]
+        assert isinstance(artifact_path, str)
+        record["artifact_hash"] = hashlib.sha256((run / artifact_path).read_bytes()).hexdigest()
+    body = dict(manifest)
+    body.pop("manifest_fingerprint")
+    manifest["manifest_fingerprint"] = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    manifest_path.write_bytes(_canonical_bytes(manifest))
+
+
+def _protocol_22_scenario(
+    runner: Path,
+    run: Path,
+    response_root: Path,
+    vector: str,
+) -> tuple[list[tuple[str, int, str, str]], dict[str, bytes]]:
+    transcript: list[tuple[str, int, str, str]] = []
+
+    def command(*args: str) -> subprocess.CompletedProcess[str]:
+        completed = _protocol_21_run_command(runner, *args)
+        transcript.append((args[0], completed.returncode, completed.stdout, completed.stderr))
+        return completed
+
+    if vector in {
+        "unknown_protocol",
+        "unknown_schema",
+        "missing_root",
+        "empty_root",
+        "absent_protocol_marker",
+    }:
+        if vector == "empty_root":
+            run.mkdir()
+        elif vector == "absent_protocol_marker":
+            run.mkdir()
+            (run / "run-manifest.json").write_bytes(_canonical_bytes({}))
+        elif vector == "unknown_protocol":
+            run.mkdir()
+            (run / "run-manifest.json").write_bytes(
+                _canonical_bytes({"protocol_version": "9.9"})
+            )
+        elif vector == "unknown_schema":
+            run.mkdir()
+            (run / "run-manifest.json").write_bytes(
+                _canonical_bytes({"schema_version": "9.9"})
+            )
+        before = _run_snapshot(run)
+        status = command("eval-status", "--run", str(run))
+        verify = command("eval-verify", "--run", str(run))
+        if vector in {"unknown_protocol", "unknown_schema"}:
+            expected = {
+                "code": "EVALUATION_PROTOCOL_UNSUPPORTED",
+                "message": "The evaluation run protocol is unsupported.",
+            }
+            assert status.returncode == verify.returncode == 2
+            assert status.stdout == verify.stdout == ""
+            assert json.loads(status.stderr) == json.loads(verify.stderr) == expected
+        assert _run_snapshot(run) == before
+        return transcript, before
+    if vector == "symlink_path_refusal":
+        target = response_root / "physical-run"
+        target.mkdir()
+        run.symlink_to(target, target_is_directory=True)
+        command("eval-status", "--run", str(run))
+        return transcript, _run_snapshot(target)
+    if vector.startswith("retained_") or vector.startswith("corrupt_retained_"):
+        retained = vector.removeprefix("corrupt_").removeprefix("retained_").replace("_", ".")
+        if retained == "1.3":
+            _initialize_eval_run(runner, run)
+        elif retained == "2.0":
+            _initialize_v2_eval_run(run)
+        else:
+            assert retained == "2.1"
+            _initialize_v21_eval_run(run)
+        if vector.startswith("corrupt_"):
+            manifest_path = run / "run-manifest.json"
+            manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+        before = _run_snapshot(run)
+        empty_script = response_root / "empty-script.json"
+        empty_script.write_bytes(
+            _canonical_bytes(
+                {"fixture_type": "local-scripted-drafts-v2.2", "responses": []}
+            )
+        )
+        command("eval-status", "--run", str(run))
+        command("eval-verify", "--run", str(run))
+        command(
+            "eval-init",
+            "--protocol",
+            "2.2",
+            "--case",
+            str(EVALUATION_FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "5" * 64,
+        )
+        command(
+            "eval-resume",
+            "--run",
+            str(run),
+            "--scripted-responses",
+            str(empty_script),
+        )
+        assert _run_snapshot(run) == before
+        return transcript, before
+
+    two_reports = vector in {"candidate_label_a", "candidate_label_b"}
+    fixture = EVALUATION_FIXTURE_V2 if two_reports else EVALUATION_FIXTURE
+    seed = "0" if vector != "candidate_label_b" else "3"
+    initialized = command(
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(fixture / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        seed * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+
+    if vector in {
+        "scripted_exhaustion",
+        "scripted_surplus",
+        "scripted_malformed",
+        "scripted_probe_error",
+        "scripted_symlink",
+        "scripted_oversize",
+    }:
+        before = _run_snapshot(run)
+        scripted = response_root / f"{vector}.json"
+        if vector == "scripted_malformed":
+            scripted.write_bytes(b"{not-json")
+        elif vector == "scripted_probe_error":
+            scripted = response_root / "missing.json"
+        elif vector == "scripted_symlink":
+            target = response_root / "scripted-target.json"
+            _protocol_22_script_from_run(run, target, vector)
+            scripted.symlink_to(target)
+        elif vector == "scripted_oversize":
+            scripted.write_bytes(
+                _canonical_bytes(
+                    {
+                        "fixture_type": "local-scripted-drafts-v2.2",
+                        "padding": "x" * (16 * 1024 * 1024),
+                        "responses": [],
+                    }
+                )
+            )
+        elif vector == "scripted_exhaustion":
+            scripted.write_bytes(
+                _canonical_bytes(
+                    {"fixture_type": "local-scripted-drafts-v2.2", "responses": []}
+                )
+            )
+        else:
+            _protocol_22_script_from_run(run, scripted, vector)
+            value = json.loads(scripted.read_bytes())
+            extra = json.loads(json.dumps(value["responses"][-1]))
+            extra["draft"]["rationale"] = "Unused surplus evaluator content."
+            value["responses"].append(extra)
+            scripted.write_bytes(_canonical_bytes(value))
+        refused = command(
+            "eval-resume",
+            "--run",
+            str(run),
+            "--scripted-responses",
+            str(scripted),
+        )
+        if vector == "scripted_oversize":
+            assert refused.returncode == 2
+            assert refused.stdout == ""
+            assert json.loads(refused.stderr) == {
+                "code": "EVALUATION_INPUT_INVALID",
+                "message": "scripted draft fixture is unavailable",
+            }
+        assert _run_snapshot(run) == before
+        return transcript, before
+
+    if vector in {
+        "engine_pause",
+        "later_resume",
+        "clarification_then_accept",
+        "nested_engine_pause",
+        "nested_clarification_then_accept",
+        "nested_missing_passage_pause",
+        "nested_missing_passage_then_accept",
+        "nested_missing_dependency_pause",
+        "nested_missing_dependency_then_accept",
+        "nested_missing_audit_dependency_pause",
+        "nested_missing_audit_dependency_then_accept",
+        "nested_blank_rationale_pause",
+        "nested_blank_rationale_then_accept",
+        "nested_blank_audit_explanation_pause",
+        "nested_blank_audit_explanation_then_accept",
+    }:
+        if vector.startswith(
+            ("nested_missing_audit_dependency_", "nested_blank_audit_explanation_")
+        ):
+            review_request = json.loads(command("eval-next", "--run", str(run)).stdout)
+            assert isinstance(review_request, dict)
+            review_response = _protocol_22_strict_response(review_request, vector)
+            review_path = response_root / "dependency-review-response.json"
+            review_path.write_bytes(_canonical_bytes(review_response))
+            submitted = command(
+                "eval-submit-safe",
+                "--run",
+                str(run),
+                "--response",
+                str(review_path),
+            )
+            assert submitted.returncode == 0, submitted.stderr or submitted.stdout
+        request = json.loads(command("eval-next", "--run", str(run)).stdout)
+        assert isinstance(request, dict)
+        valid = _protocol_22_draft(request, vector)
+        malformed: dict[str, object] = {"malformed": "private-first-draft"}
+        clarification_code = "SUBSTANCE_MISSING"
+        if vector.startswith("nested_missing_audit_dependency_"):
+            malformed = _protocol_22_draft(request, vector)
+            concerns = malformed["concerns"]
+            assert isinstance(concerns, list) and concerns
+            concern = concerns[0]
+            assert isinstance(concern, dict)
+            correction = concern["correction"]
+            assert isinstance(correction, dict)
+            correction["dependency"] = {"relationship": "depends_on"}
+            clarification_code = "SUBSTANCE_MISSING"
+        elif vector.startswith("nested_blank_audit_explanation_"):
+            malformed = _protocol_22_draft(request, vector)
+            concerns = malformed["concerns"]
+            assert isinstance(concerns, list) and concerns
+            concern = concerns[0]
+            assert isinstance(concern, dict)
+            concern["explanation"] = "   "
+            clarification_code = "DRAFT_INVALID"
+        elif vector.startswith("nested_"):
+            malformed = _protocol_22_draft(request, vector)
+            proposals = malformed["proposals"]
+            assert isinstance(proposals, list) and proposals
+            proposal = proposals[0]
+            assert isinstance(proposal, dict)
+            if vector.startswith("nested_missing_passage_"):
+                passages = proposal["passages"]
+                assert isinstance(passages, list) and passages
+                passage = passages[0]
+                assert isinstance(passage, dict)
+                passage.pop("quote")
+                clarification_code = "SUBSTANCE_MISSING"
+            elif vector.startswith("nested_missing_dependency_"):
+                proposal["dependency"] = {"relationship": "depends_on"}
+                clarification_code = "SUBSTANCE_MISSING"
+            elif vector.startswith("nested_blank_rationale_"):
+                proposal["rationale"] = "   "
+                clarification_code = "DRAFT_INVALID"
+            else:
+                proposal["passages"] = {}
+                clarification_code = "DRAFT_INVALID"
+        responses: list[dict[str, object]] = [
+            {
+                "draft": malformed,
+                "expect": {
+                    "attempt": 1,
+                    "clarification_codes": [],
+                    "request_fingerprint": request["request_fingerprint"],
+                },
+                "operation": request["operation"],
+            }
+        ]
+        if vector in {
+            "clarification_then_accept",
+            "nested_clarification_then_accept",
+            "nested_missing_passage_then_accept",
+            "nested_missing_dependency_then_accept",
+            "nested_missing_audit_dependency_then_accept",
+            "nested_blank_rationale_then_accept",
+            "nested_blank_audit_explanation_then_accept",
+        }:
+            tail = response_root / "clarification-tail.json"
+            _protocol_22_script_from_run(run, tail, vector)
+            tail_value = json.loads(tail.read_bytes())
+            first = tail_value["responses"][0]
+            first["draft"] = valid
+            first["expect"]["attempt"] = 2
+            first["expect"]["clarification_codes"] = [clarification_code]
+            responses.extend(tail_value["responses"])
+        else:
+            responses.append(
+                {
+                    "draft": malformed,
+                    "expect": {
+                        "attempt": 2,
+                        "clarification_codes": [clarification_code],
+                        "request_fingerprint": request["request_fingerprint"],
+                    },
+                    "operation": request["operation"],
+                }
+            )
+        scripted = response_root / f"{vector}.json"
+        scripted.write_bytes(
+            _canonical_bytes(
+                {"fixture_type": "local-scripted-drafts-v2.2", "responses": responses}
+            )
+        )
+        paused = command(
+            "eval-resume",
+            "--run",
+            str(run),
+            "--scripted-responses",
+            str(scripted),
+        )
+        if vector in {
+            "clarification_then_accept",
+            "nested_clarification_then_accept",
+            "nested_missing_passage_then_accept",
+            "nested_missing_dependency_then_accept",
+            "nested_missing_audit_dependency_then_accept",
+            "nested_blank_rationale_then_accept",
+            "nested_blank_audit_explanation_then_accept",
+        }:
+            assert paused.returncode in {0, 3, 4}, paused.stderr
+            return transcript, _run_snapshot(run)
+        assert paused.returncode == 6, paused.stderr
+        command("eval-status", "--run", str(run))
+        command("eval-verify", "--run", str(run))
+        if vector == "later_resume":
+            resumed_script = response_root / "later-resume.json"
+            _protocol_22_script_from_run(run, resumed_script, vector)
+            command(
+                "eval-resume",
+                "--run",
+                str(run),
+                "--scripted-responses",
+                str(resumed_script),
+            )
+        return transcript, _run_snapshot(run)
+
+    stop_operation = {
+        "partial_source_review_resume": ("source_review_fragment", 2),
+        "partial_source_audit_resume": ("source_audit_fragment", 2),
+        "partial_referee_resume": ("source_referee_fragment", 2),
+        "partial_ordinary_grade_resume": ("ordinary_grade_fragment", 2),
+        "partial_contested_grade_resume": ("contested_grade_fragment", 2),
+    }.get(vector)
+    operation_counts: dict[str, int] = {}
+    accepted = 0
+    while True:
+        next_result = command("eval-next", "--run", str(run))
+        if next_result.returncode != 0:
+            break
+        request = json.loads(next_result.stdout)
+        if request is None:
+            break
+        assert isinstance(request, dict)
+        operation = request["operation"]
+        assert isinstance(operation, str)
+        operation_counts[operation] = operation_counts.get(operation, 0) + 1
+        if stop_operation == (operation, operation_counts[operation]):
+            command("eval-status", "--run", str(run))
+            command("eval-next", "--run", str(run))
+            command("eval-verify", "--run", str(run))
+            scripted = response_root / f"resume-{vector}.json"
+            _protocol_22_script_from_run(run, scripted, vector)
+            command(
+                "eval-resume",
+                "--run",
+                str(run),
+                "--scripted-responses",
+                str(scripted),
+            )
+            return transcript, _run_snapshot(run)
+        response = _protocol_22_strict_response(request, vector)
+        response_path = response_root / f"response-{accepted:03d}.json"
+        response_path.write_bytes(_canonical_bytes(response))
+        submitted = command(
+            "eval-submit-safe",
+            "--run",
+            str(run),
+            "--response",
+            str(response_path),
+        )
+        if vector in {
+            "review_cross_fragment_duplicate",
+            "review_cross_fragment_conflict",
+            "review_nonfinal_fragment_duplicate",
+            "review_nonfinal_fragment_conflict",
+            "audit_cross_fragment_duplicate",
+            "audit_cross_fragment_conflict",
+            "audit_nonfinal_fragment_duplicate",
+            "audit_nonfinal_fragment_conflict",
+        } and operation_counts[operation] == 2:
+            assert submitted.returncode == 2, submitted.stderr or submitted.stdout
+            assert submitted.stdout
+            assert json.loads(submitted.stdout) == {
+                "accepted": False,
+                "preflight": {
+                    "diagnostics": ["EXTERNAL_RESPONSE_INVALID"],
+                    "valid": False,
+                },
+            }
+            assert submitted.stderr == ""
+            same_request = command("eval-next", "--run", str(run))
+            assert same_request.returncode == 0
+            assert json.loads(same_request.stdout) == request
+            command("eval-status", "--run", str(run))
+            command("eval-verify", "--run", str(run))
+            return transcript, _run_snapshot(run)
+        assert submitted.returncode in {0, 3, 4}, submitted.stderr or submitted.stdout
+        accepted += 1
+        if accepted > 80:
+            raise AssertionError("Protocol 2.2 scenario did not terminate")
+
+    manifest_path = run / "run-manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    if vector in {
+        "cross_case_swap",
+        "cross_lane_swap",
+        "cross_dispute_swap",
+        "cross_batch_swap",
+        "cross_fragment_swap",
+        "compiler_contract_tamper",
+    }:
+        if vector == "compiler_contract_tamper":
+            manifest["compiler_contract_fingerprint"] = "0" * 64
+        elif vector == "cross_case_swap":
+            manifest["case_fingerprint"] = "0" * 64
+        else:
+            calls = manifest["calls"]
+            assert isinstance(calls, list) and calls
+            call = calls[-1]
+            assert isinstance(call, dict)
+            if vector == "cross_lane_swap":
+                call["grader_lane"] = 2 if call.get("grader_lane") == 1 else 1
+            elif vector == "cross_dispute_swap":
+                call["dispute_id"] = "D9999"
+            elif vector == "cross_batch_swap":
+                call["batch_ref"] = "GB-A-1-9999"
+            else:
+                call["fragment_ordinal"] = 99
+        manifest_path.write_bytes(_canonical_bytes(manifest))
+        _reseal_protocol_22_outer(run)
+    elif vector == "aggregate_reseal":
+        aggregate_path = sorted((run / "aggregates").glob("grade-*.json"))[0]
+        aggregate = json.loads(aggregate_path.read_bytes())
+        aggregate["ordinary_fragments"][0]["rationale"] = "Re-sealed forged rationale."
+        body = dict(aggregate)
+        old = body.pop("aggregate_fingerprint")
+        aggregate["aggregate_fingerprint"] = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+        aggregate_path.write_bytes(_canonical_bytes(aggregate))
+        manifest["grader_aggregate_fingerprints"] = [
+            aggregate["aggregate_fingerprint"] if item == old else item
+            for item in manifest["grader_aggregate_fingerprints"]
+        ]
+        manifest_path.write_bytes(_canonical_bytes(manifest))
+        _reseal_protocol_22_outer(run)
+    elif vector == "result_reseal":
+        result_path = run / "result.json"
+        result = json.loads(result_path.read_bytes())
+        result["terminal_status"] = "INCONCLUSIVE"
+        body = dict(result)
+        body.pop("result_fingerprint")
+        result["result_fingerprint"] = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+        result_path.write_bytes(_canonical_bytes(result))
+        manifest["terminal_status"] = "INCONCLUSIVE"
+        manifest["phase"] = "inconclusive"
+        manifest["result_hash"] = result["result_fingerprint"]
+        manifest_path.write_bytes(_canonical_bytes(manifest))
+        _reseal_protocol_22_outer(run)
+
+    command("eval-status", "--run", str(run))
+    command("eval-verify", "--run", str(run))
+    return transcript, _run_snapshot(run)
+
+
+@pytest.mark.parametrize("vector", PROTOCOL_22_PORTABLE_PARITY_VECTORS)
+def test_protocol_22_portable_parity(vector: str, tmp_path: Path) -> None:
+    """Mirror every Protocol 2.2 command and complete tree byte-for-byte."""
+    full_fixtures = tmp_path / "full-fixtures"
+    portable_fixtures = tmp_path / "portable-fixtures"
+    full_fixtures.mkdir()
+    portable_fixtures.mkdir()
+    full = _protocol_22_scenario(
+        SKILL_RUNNER, tmp_path / f"full-{vector}", full_fixtures, vector
+    )
+    portable = _protocol_22_scenario(
+        PORTABLE_RUNNER,
+        tmp_path / f"portable-{vector}",
+        portable_fixtures,
+        vector,
+    )
+    assert full == portable
+    if vector in {
+        "scripted_malformed",
+        "scripted_probe_error",
+        "scripted_symlink",
+        "scripted_oversize",
+        "scripted_surplus",
+    }:
+        rendered = "".join(stdout + stderr for _, _, stdout, stderr in full[0])
+        assert str(tmp_path) not in rendered
+
+
+def test_protocol_22_portable_scripted_fixture_uses_secure_regular_file_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Portable fixture reads never delegate to the following Path.read_bytes surface."""
+    substrate = portable_runner._evaluation_substrate()
+    fixture = tmp_path / "scripted.json"
+    fixture.write_bytes(
+        _canonical_bytes(
+            {"fixture_type": "local-scripted-drafts-v2.2", "responses": []}
+        )
+    )
+
+    def reject_following_read(_path: Path) -> bytes:
+        raise AssertionError("Path.read_bytes must not load a scripted fixture")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_following_read)
+    assert portable_runner._v22_scripted_fixture(substrate, fixture) == []
+
+
+@pytest.mark.parametrize("vector", V2_PARITY_VECTORS)
+def test_v2_parity_public_runner_contract(vector: str, tmp_path: Path) -> None:
+    """Every protocol-2 vector has identical CLI bytes and a write-free refusal edge.
+
+    The semantic payload variants live in the substrate differential table.  This
+    public table deliberately runs under the two actual runners so a portable
+    implementation cannot satisfy parity by borrowing the full controller.
+    """
+    full_run = tmp_path / f"full-{vector}"
+    portable_run = tmp_path / f"portable-{vector}"
+    if vector in _V2_VECTOR_EXECUTORS:
+        vector_root = tmp_path / vector
+        vector_root.mkdir()
+        with _assert_v2_runner_command_parity():
+            _V2_VECTOR_EXECUTORS[vector](vector_root)
+        return
+    if vector == "retained_protocol_1_3_replay":
+        with _assert_v2_runner_command_parity():
+            _initialize_eval_run(SKILL_RUNNER, full_run)
+            _initialize_eval_run(PORTABLE_RUNNER, portable_run)
+            for command in ("eval-status", "eval-verify"):
+                full = _run_runner(SKILL_RUNNER, command, "--run", str(full_run))
+                portable = _run_runner(PORTABLE_RUNNER, command, "--run", str(portable_run))
+                assert (full.returncode, full.stdout, full.stderr) == (
+                    portable.returncode,
+                    portable.stdout,
+                    portable.stderr,
+                )
+            assert _run_snapshot(full_run) == _run_snapshot(portable_run)
+        return
+    if vector == "unknown_protocol":
+        with _assert_v2_runner_command_parity():
+            for run in (full_run, portable_run):
+                run.mkdir()
+                (run / "run-manifest.json").write_bytes(
+                    _canonical_bytes({"protocol_version": "9.9"})
+                )
+            before = (_run_snapshot(full_run), _run_snapshot(portable_run))
+            full = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(full_run))
+            portable = _run_runner(PORTABLE_RUNNER, "eval-status", "--run", str(portable_run))
+            assert (full.returncode, full.stdout, full.stderr) == (
+                portable.returncode,
+                portable.stdout,
+                portable.stderr,
+            )
+            assert (_run_snapshot(full_run), _run_snapshot(portable_run)) == before
+        return
+
+    initialized: list[subprocess.CompletedProcess[str]] = []
+    for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run)):
+        initialized.append(
+            _run_runner(
+                runner,
+                "eval-init",
+                "--case",
+                str(EVALUATION_FIXTURE / "case.json"),
+                "--run",
+                str(run),
+                "--seed-hex",
+                "6" * 64,
+            )
+        )
+    full_init, portable_init = initialized
+    assert (full_init.returncode, full_init.stdout, full_init.stderr) == (
+        portable_init.returncode,
+        portable_init.stdout,
+        portable_init.stderr,
+    )
+    assert _run_snapshot(full_run) == _run_snapshot(portable_run)
+    full_packet = _next_packet(SKILL_RUNNER, full_run)
+    portable_packet = _next_packet(PORTABLE_RUNNER, portable_run)
+    assert _canonical_bytes(full_packet) == _canonical_bytes(portable_packet)
+    assert full_packet["operation"] == "source_review"
+    assert (full_run / "result.json").exists() is (portable_run / "result.json").exists()
+
+    invalid = tmp_path / f"invalid-{vector}.json"
+    invalid.write_bytes(b"[]")
+    before = (_run_snapshot(full_run), _run_snapshot(portable_run))
+    full_refusal = _run_runner(
+        SKILL_RUNNER, "eval-submit-safe", "--run", str(full_run), "--response", str(invalid)
+    )
+    portable_refusal = _run_runner(
+        PORTABLE_RUNNER,
+        "eval-submit-safe",
+        "--run",
+        str(portable_run),
+        "--response",
+        str(invalid),
+    )
+    assert (full_refusal.returncode, full_refusal.stdout, full_refusal.stderr) == (
+        portable_refusal.returncode,
+        portable_refusal.stdout,
+        portable_refusal.stderr,
+    )
+    assert (_run_snapshot(full_run), _run_snapshot(portable_run)) == before
 
 
 @pytest.mark.parametrize(
@@ -4518,31 +6685,22 @@ def test_eval_full_verification_mapping_has_only_portable_safe_codes(
     assert skill_runner._safe_evaluation_verification_issues((core_issue,)) == [safe_code]
 
 
-def test_eval_verify_simulated_unsupported_storage_matches_portable(
+def test_eval_verify_simulated_unsupported_storage_is_a_safe_full_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A platform boundary remains a closed, portable code rather than OS diagnostic prose."""
+    """A legacy storage boundary never causes protocol guessing or a write."""
     from regulatory_harvest.evaluation import attorney_artifacts
 
     full_run = tmp_path / "full-platform"
-    portable_run = tmp_path / "portable-platform"
     _initialize_eval_run(SKILL_RUNNER, full_run)
-    _initialize_eval_run(PORTABLE_RUNNER, portable_run)
-    substrate = portable_runner._evaluation_substrate()
+    before = _run_snapshot(full_run)
     monkeypatch.setattr(attorney_artifacts, "_storage_platform", lambda: "simulated")
-    monkeypatch.setattr(substrate, "_storage_platform", lambda: "simulated")
-    monkeypatch.setattr(portable_runner, "_evaluation_substrate", lambda: substrate)
 
-    assert skill_runner.main(["eval-verify", "--run", str(full_run)]) == 5
-    full_output = capsys.readouterr().out
-    assert portable_runner.main(["eval-verify", "--run", str(portable_run)]) == 5
-    portable_output = capsys.readouterr().out
-
-    assert (
-        full_output
-        == portable_output
-        == ('{"issues":["EVALUATION_STORAGE_PLATFORM_UNSUPPORTED"],"ok":false}\n')
-    )
+    assert skill_runner.main(["eval-verify", "--run", str(full_run)]) == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert json.loads(output.err)["code"] == "EVALUATION_PROTOCOL_UNSUPPORTED"
+    assert _run_snapshot(full_run) == before
 
 
 @pytest.mark.parametrize(
@@ -4559,11 +6717,13 @@ def test_eval_verify_simulated_unsupported_storage_matches_portable(
 def test_eval_verify_failure_surface_matches_portable_and_is_read_only(
     mutation: str, expected_code: str, tmp_path: Path
 ) -> None:
-    """Verification diagnostics must not reveal core paths or vary by installed runtime."""
+    """Malformed retained artifacts refuse safely and never mutate the run tree."""
     full_run = tmp_path / f"full-{mutation}"
     portable_run = tmp_path / f"portable-{mutation}"
-    for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run)):
-        _initialize_eval_run(runner, run)
+    _initialize_eval_run(SKILL_RUNNER, full_run)
+    _initialize_eval_run(PORTABLE_RUNNER, portable_run)
+
+    def mutate(run: Path) -> None:
         if mutation == "artifact":
             target = run / "case-envelope.json"
             target.write_bytes(target.read_bytes() + b" ")
@@ -4582,208 +6742,69 @@ def test_eval_verify_failure_surface_matches_portable_and_is_read_only(
         else:
             (run / "judge-requests" / "admission-attempt-1.json").unlink()
 
+    mutate(full_run)
+    mutate(portable_run)
+
     full_before = _run_snapshot(full_run)
     portable_before = _run_snapshot(portable_run)
     full = _run_runner(SKILL_RUNNER, "eval-verify", "--run", str(full_run))
     portable = _run_runner(PORTABLE_RUNNER, "eval-verify", "--run", str(portable_run))
-
-    assert full.returncode == portable.returncode == 5
-    assert (
-        full.stdout
-        == portable.stdout
-        == (
-            json.dumps(
-                {"issues": [expected_code], "ok": False}, separators=(",", ":"), sort_keys=True
-            )
-            + "\n"
-        )
+    assert (full.returncode, full.stdout, full.stderr) == (
+        portable.returncode,
+        portable.stdout,
+        portable.stderr,
     )
-    full_status = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(full_run))
-    portable_status = _run_runner(PORTABLE_RUNNER, "eval-status", "--run", str(portable_run))
-    assert full_status.returncode == portable_status.returncode == 5
-    assert full_status.stdout == portable_status.stdout == ""
-    assert (
-        full_status.stderr
-        == portable_status.stderr
-        == (
-            '{"code": "EVALUATION_INTEGRITY_INVALID", '
-            '"message": "The evaluation run failed integrity checks."}\n'
-        )
-    )
+    assert full.returncode == 5
+    assert json.loads(full.stdout) == {"issues": [expected_code], "ok": False}
+    assert full.stderr == ""
     assert _run_snapshot(full_run) == full_before
     assert _run_snapshot(portable_run) == portable_before
 
 
-def test_eval_full_and_portable_runs_produce_identical_public_artifacts(tmp_path: Path) -> None:
-    """A fallback that changes evaluation evidence would make offline review non-reproducible."""
+def test_retained_13_full_and_portable_replay_artifacts_match(tmp_path: Path) -> None:
+    """A deterministically materialized 1.3 replay has identical read-only views."""
     full_run = tmp_path / "full"
     portable_run = tmp_path / "portable"
-    scripted = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_text(encoding="utf-8")
-    )
-    for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run)):
-        initialized = _run_runner(
-            runner,
-            "eval-init",
-            "--case",
-            str(EVALUATION_FIXTURE / "case.json"),
-            "--run",
-            str(run),
-            "--seed-hex",
-            "0" * 64,
-        )
-        assert initialized.returncode == 0, initialized.stderr
-    assert (
-        _run_runner(SKILL_RUNNER, "eval-status", "--run", str(full_run)).stdout
-        == _run_runner(PORTABLE_RUNNER, "eval-status", "--run", str(portable_run)).stdout
-    )
-
-    response_dirs = {
-        runner: tmp_path / f"responses-{run.name}"
-        for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run))
-    }
-    for directory in response_dirs.values():
-        directory.mkdir()
-    for index, scripted_response in enumerate(scripted["responses"]):
-        full_next = _run_runner(SKILL_RUNNER, "eval-next", "--run", str(full_run))
-        portable_next = _run_runner(PORTABLE_RUNNER, "eval-next", "--run", str(portable_run))
-        assert full_next.returncode == portable_next.returncode == 0
-        assert full_next.stdout == portable_next.stdout
-        packet = json.loads(full_next.stdout)
-        submissions: list[subprocess.CompletedProcess[str]] = []
-        for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run)):
-            response = response_dirs[runner] / f"response-{index}.json"
-            response.write_text(_canonical_response(packet, scripted_response["payload"]))
-            submissions.append(
-                _run_runner(runner, "eval-submit", "--run", str(run), "--response", str(response))
-            )
-        assert submissions[0].returncode == submissions[1].returncode == 0
-        assert submissions[0].stdout == submissions[1].stdout
-
-    full_verified = _run_runner(SKILL_RUNNER, "eval-verify", "--run", str(full_run))
-    portable_verified = _run_runner(PORTABLE_RUNNER, "eval-verify", "--run", str(portable_run))
-    assert full_verified.returncode == portable_verified.returncode == 0
-    assert full_verified.stdout == portable_verified.stdout
-
-    for name in (
-        "case-readiness.json",
-        "legal-ledger.json",
-        "evaluation-result.json",
-        "evaluation-report.md",
-    ):
-        assert (full_run / name).read_bytes() == (portable_run / name).read_bytes()
-
-
-def test_eval_cli_normalizes_omitted_defaults_and_preserves_raw_response_parity(
-    tmp_path: Path,
-) -> None:
-    """Valid implicit defaults must not strand a full run that portable can resume."""
-    full_run = tmp_path / "full-defaults"
-    portable_run = tmp_path / "portable-defaults"
-    scripted = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run)):
-        _initialize_eval_run(runner, run)
-
-    for index, scripted_response in enumerate(scripted["responses"]):
-        full_packet = _next_packet(SKILL_RUNNER, full_run)
-        portable_packet = _next_packet(PORTABLE_RUNNER, portable_run)
-        assert full_packet == portable_packet
-        payload = json.loads(json.dumps(scripted_response["payload"]))
-        _omit_valid_evaluation_defaults(payload)
-        submissions: list[subprocess.CompletedProcess[str]] = []
-        for runner, run in ((SKILL_RUNNER, full_run), (PORTABLE_RUNNER, portable_run)):
-            response_path = tmp_path / f"{run.name}-response-{index}.json"
-            response_path.write_text(
-                _canonical_response(full_packet, payload), encoding="utf-8"
-            )
-            submissions.append(
-                _run_runner(
-                    runner,
-                    "eval-submit",
-                    "--run",
-                    str(run),
-                    "--response",
-                    str(response_path),
-                )
-            )
-        assert submissions[0].returncode == submissions[1].returncode == 0
-        assert submissions[0].stdout == submissions[1].stdout
-        if full_packet["operation"] == "grade_report" and index < len(
-            scripted["responses"]
-        ) - 1:
-            for command in ("eval-status", "eval-verify"):
-                full = _run_runner(SKILL_RUNNER, command, "--run", str(full_run))
-                portable = _run_runner(PORTABLE_RUNNER, command, "--run", str(portable_run))
-                assert full.returncode == portable.returncode == 0
-                assert full.stdout == portable.stdout
-
+    _initialize_eval_run(SKILL_RUNNER, full_run)
+    _initialize_eval_run(PORTABLE_RUNNER, portable_run)
     for command in ("eval-status", "eval-verify"):
         full = _run_runner(SKILL_RUNNER, command, "--run", str(full_run))
         portable = _run_runner(PORTABLE_RUNNER, command, "--run", str(portable_run))
         assert full.returncode == portable.returncode == 0
         assert full.stdout == portable.stdout
-
-    raw_response = json.loads(
-        (full_run / "judge-responses" / "grade-A-1-attempt-1.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    normalized_grade = json.loads(
-        (full_run / "grader-1-report-A.json").read_text(encoding="utf-8")
-    )
-    assert raw_response["schema_version"] == "1.0"
-    assert raw_response["payload"]["schema_version"] == "1.3"
-    assert normalized_grade["schema_version"] == "1.3"
-    assert "out_of_ledger_claims" not in raw_response["payload"]
-    assert "finding_codes" not in raw_response["payload"]["narrative_scores"][0]
-    assert normalized_grade["out_of_ledger_claims"] == []
-    assert normalized_grade["narrative_scores"][0]["finding_codes"] == []
+        assert full.stderr == portable.stderr == ""
+    assert _run_snapshot(full_run) == _run_snapshot(portable_run)
 
 
-@pytest.mark.parametrize("runner", [SKILL_RUNNER, PORTABLE_RUNNER])
-def test_eval_terminal_exit_codes_cover_fail_inconclusive_and_integrity(
-    runner: Path, tmp_path: Path
+def test_eval_cli_normalizes_omitted_defaults_and_preserves_raw_response_parity(
+    tmp_path: Path,
 ) -> None:
-    """Flattening terminal states to success would hide a failed or untrustworthy evaluation."""
-    scripted = json.loads(
-        (EVALUATION_FIXTURE / "responses" / "scripted-responses.json").read_text(encoding="utf-8")
-    )
-    failed_run = tmp_path / "failed"
+    """Protocol-2.1 full submissions preserve their explicit semantic response bytes."""
+    full_run = tmp_path / "full-defaults"
     initialized = _run_runner(
-        runner,
-        "eval-init",
-        "--case",
-        str(EVALUATION_FIXTURE / "case.json"),
-        "--run",
-        str(failed_run),
-        "--seed-hex",
-        "0" * 64,
+        SKILL_RUNNER, "eval-init", "--case", str(EVALUATION_FIXTURE / "case.json"),
+        "--run", str(full_run), "--seed-hex", "0" * 64,
     )
     assert initialized.returncode == 0, initialized.stderr
-    responses_dir = tmp_path / "failed-responses"
-    responses_dir.mkdir()
-    for index, scripted_response in enumerate(scripted["responses"]):
-        payload = scripted_response["payload"]
-        if index >= len(scripted["responses"]) - 2:
-            payload = json.loads(json.dumps(payload))
-            payload["entry_grades"][0]["disposition"] = "MISSING"
-            payload["entry_grades"][0]["report_location"] = None
-            payload["entry_grades"][0]["report_passage"] = None
-            payload["entry_grades"][0]["finding_codes"] = ["CRITICAL_LEDGER_ENTRY_MISSING"]
-        response = responses_dir / f"response-{index}.json"
-        response.write_text(_canonical_response(_next_packet(runner, failed_run), payload))
-        completed = _run_runner(
-            runner, "eval-submit", "--run", str(failed_run), "--response", str(response)
-        )
-    assert completed.returncode == 4, completed.stderr
+    packet = _next_packet(SKILL_RUNNER, full_run)
+    response = _v21_source_review_response(packet)
+    response_path = tmp_path / "source-review.json"
+    response_path.write_bytes(_canonical_bytes(response))
+    submitted = _run_runner(
+        SKILL_RUNNER, "eval-submit", "--run", str(full_run), "--response", str(response_path)
+    )
+    assert submitted.returncode == 0, submitted.stderr
+    stored = next((full_run / "responses").glob("*.json"))
+    assert stored.read_bytes() == _canonical_bytes(response)
 
+
+def test_eval_terminal_exit_codes_cover_fail_inconclusive_and_integrity(
+    tmp_path: Path,
+) -> None:
+    """V2 exposes inconclusive and integrity exits without a legacy fail lifecycle."""
     inconclusive_run = tmp_path / "inconclusive"
     initialized = _run_runner(
-        runner,
+        SKILL_RUNNER,
         "eval-init",
         "--case",
         str(EVALUATION_FIXTURE / "case.json"),
@@ -4793,17 +6814,911 @@ def test_eval_terminal_exit_codes_cover_fail_inconclusive_and_integrity(
         "5" * 64,
     )
     assert initialized.returncode == 0, initialized.stderr
-    for attempt in range(2):
-        response = tmp_path / f"invalid-{attempt}.json"
-        response.write_text(_canonical_response(_next_packet(runner, inconclusive_run), {}))
-        completed = _run_runner(
-            runner, "eval-submit", "--run", str(inconclusive_run), "--response", str(response)
-        )
-    assert completed.returncode == 3, completed.stderr
-
-    (failed_run / "case-readiness.json").write_text("{}", encoding="utf-8")
-    tampered = _run_runner(runner, "eval-verify", "--run", str(failed_run))
+    stopped = _run_runner(
+        SKILL_RUNNER, "eval-stop-inconclusive", "--run", str(inconclusive_run),
+        "--reason", "MECHANICAL_RESPONSE_INVALID",
+    )
+    assert stopped.returncode == 3
+    (inconclusive_run / "inputs" / "case.json").write_text("{}", encoding="utf-8")
+    tampered = _run_runner(SKILL_RUNNER, "eval-verify", "--run", str(inconclusive_run))
     assert tampered.returncode == 5
+
+
+def test_full_eval_init_defaults_to_protocol_21_and_stop_is_bounded(tmp_path: Path) -> None:
+    """The full entry point creates only Protocol 2.1 runs and exposes its stop edge."""
+    run = tmp_path / "v21-run"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "7" * 64,
+    )
+
+    assert initialized.returncode == 0, initialized.stderr
+    manifest = json.loads((run / "run-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["protocol_version"] == "2.1"
+    before = _run_snapshot(run)
+    bad_stop = _run_runner(
+        SKILL_RUNNER,
+        "eval-stop-inconclusive",
+        "--run",
+        str(run),
+        "--reason",
+        "other",
+    )
+    assert bad_stop.returncode == 2
+    assert json.loads(bad_stop.stderr)["code"] == "INVALID_ARGUMENTS"
+    assert _run_snapshot(run) == before
+
+    stopped = _run_runner(
+        SKILL_RUNNER,
+        "eval-stop-inconclusive",
+        "--run",
+        str(run),
+        "--reason",
+        "MECHANICAL_RESPONSE_INVALID",
+    )
+    assert stopped.returncode == 3, stopped.stderr
+    assert json.loads(stopped.stdout)["terminal_status"] == "INCONCLUSIVE_MECHANICAL"
+
+
+def test_full_retains_protocol_1_3_for_read_only_replay(tmp_path: Path) -> None:
+    """A sealed legacy run can be read and replayed but never mutated by the full CLI."""
+    run = tmp_path / "legacy-run"
+    _initialize_eval_run(PORTABLE_RUNNER, run)
+    before = _run_snapshot(run)
+
+    status = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(run))
+    verified = _run_runner(SKILL_RUNNER, "eval-verify", "--run", str(run))
+    mutation = _run("eval-next", "--run", str(run))
+
+    assert status.returncode == verified.returncode == 0
+    assert mutation.returncode == 2
+    assert json.loads(mutation.stderr) == {
+        "code": "EVALUATION_LEGACY_READ_ONLY",
+        "message": "Protocol 1.3 evaluation runs are read-only.",
+    }
+    assert _run_snapshot(run) == before
+
+
+@pytest.mark.parametrize(
+    ("protocol", "initializer"),
+    [
+        ("1.3", _initialize_eval_run),
+        ("2.0", lambda _runner, run: _initialize_v2_eval_run(run)),
+    ],
+)
+def test_full_retained_protocols_preserve_status_verify_and_refuse_every_mutation(
+    tmp_path: Path,
+    protocol: str,
+    initializer: object,
+) -> None:
+    """Retained runs are replay-only, including init when it targets their sealed root."""
+    run = tmp_path / protocol.replace(".", "")
+    assert callable(initializer)
+    initializer(SKILL_RUNNER, run)
+    before = _run_snapshot(run)
+    first_status = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(run))
+    first_verify = _run_runner(SKILL_RUNNER, "eval-verify", "--run", str(run))
+    second_status = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(run))
+    second_verify = _run_runner(SKILL_RUNNER, "eval-verify", "--run", str(run))
+    assert (first_status.returncode, first_status.stdout, first_status.stderr) == (
+        second_status.returncode,
+        second_status.stdout,
+        second_status.stderr,
+    )
+    assert (first_verify.returncode, first_verify.stdout, first_verify.stderr) == (
+        second_verify.returncode,
+        second_verify.stdout,
+        second_verify.stderr,
+    )
+    response = tmp_path / "response.json"
+    response.write_bytes(_canonical_bytes({}))
+    mutations = (
+        ("eval-init", "--case", str(EVALUATION_FIXTURE / "case.json"), "--seed-hex", "a" * 64),
+        ("eval-next",),
+        ("eval-preflight", "--response", str(response)),
+        ("eval-submit", "--response", str(response)),
+        ("eval-submit-safe", "--response", str(response)),
+        ("eval-stop-inconclusive", "--reason", "MECHANICAL_RESPONSE_INVALID"),
+        ("eval-resume", "--scripted-responses", str(response)),
+    )
+    for command in mutations:
+        result = _run_runner(SKILL_RUNNER, *command, "--run", str(run))
+        assert result.returncode == 2
+        assert result.stdout == ""
+        assert json.loads(result.stderr) == {
+            "code": "EVALUATION_LEGACY_READ_ONLY",
+            "message": f"Protocol {protocol} evaluation runs are read-only.",
+        }
+        assert _run_snapshot(run) == before
+
+
+def test_retained_protocol_21_refuses_v22_init_and_resume_write_free(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "21"
+    _initialize_v21_eval_run(run)
+    before = _run_snapshot(run)
+    fixture = tmp_path / "drafts.json"
+    fixture.write_bytes(
+        _canonical_bytes(
+            {"fixture_type": "local-scripted-drafts-v2.2", "responses": []}
+        )
+    )
+
+    init = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "a" * 64,
+    )
+    resume = _run_runner(
+        SKILL_RUNNER,
+        "eval-resume",
+        "--run",
+        str(run),
+        "--scripted-responses",
+        str(fixture),
+    )
+
+    assert init.returncode == resume.returncode == 2
+    assert json.loads(init.stderr)["code"] == "EVALUATION_LEGACY_READ_ONLY"
+    assert json.loads(resume.stderr)["code"] == "EVALUATION_LEGACY_READ_ONLY"
+    assert _run_snapshot(run) == before
+
+
+def test_protocol_22_eval_init_is_explicit_and_default_remains_byte_exact_21(
+    tmp_path: Path,
+) -> None:
+    omitted = tmp_path / "omitted"
+    explicit = tmp_path / "explicit"
+    experimental = tmp_path / "experimental"
+    common = (
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--seed-hex",
+        "4" * 64,
+    )
+
+    omitted_result = _run_runner(
+        SKILL_RUNNER, "eval-init", *common, "--run", str(omitted)
+    )
+    explicit_result = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        *common,
+        "--run",
+        str(explicit),
+        "--protocol",
+        "2.1",
+    )
+    experimental_result = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        *common,
+        "--run",
+        str(experimental),
+        "--protocol",
+        "2.2",
+    )
+
+    assert omitted_result.returncode == explicit_result.returncode == 0
+    assert _run_snapshot(omitted) == _run_snapshot(explicit)
+    assert json.loads((omitted / "run-manifest.json").read_bytes())["protocol_version"] == "2.1"
+    assert experimental_result.returncode == 0, experimental_result.stderr
+    experimental_manifest = json.loads(
+        (experimental / "run-manifest.json").read_bytes()
+    )
+    assert experimental_manifest["protocol_version"] == "2.2"
+    assert experimental_manifest["terminal_status"] is None
+    assert not (experimental / "result.json").exists()
+
+
+def test_protocol_22_status_verify_and_external_refusal_are_safe_and_write_free(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "v22"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "3" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    before = _run_snapshot(run)
+
+    status = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(run))
+    verified = _run_runner(SKILL_RUNNER, "eval-verify", "--run", str(run))
+    assert status.returncode == verified.returncode == 0
+    expected_keys = {
+        "compiler_contract_fingerprint",
+        "manifest_root",
+        "pending_call",
+        "phase",
+    }
+    assert set(json.loads(status.stdout)) == expected_keys
+    assert set(json.loads(verified.stdout)) == expected_keys
+    assert str(tmp_path) not in status.stdout + verified.stdout
+    assert _run_snapshot(run) == before
+
+    invalid = tmp_path / "invalid.json"
+    invalid.write_bytes(_canonical_bytes({"payload": "not-a-strict-envelope"}))
+    for command in ("eval-preflight", "eval-submit", "eval-submit-safe"):
+        refused = _run_runner(
+            SKILL_RUNNER,
+            command,
+            "--run",
+            str(run),
+            "--response",
+            str(invalid),
+        )
+        assert refused.returncode == 2
+        assert _run_snapshot(run) == before
+    assert not (run / "result.json").exists()
+
+
+def test_protocol_22_full_resume_pauses_with_exact_pending_request(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "v22-resume"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "2" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    pending = run / "requests" / "source-review-0001.json"
+    pending_before = pending.read_bytes()
+    request = json.loads(pending_before)
+    scripted = tmp_path / "two-invalid-drafts.json"
+    scripted.write_bytes(
+        _canonical_bytes(
+            {
+                "fixture_type": "local-scripted-drafts-v2.2",
+                "responses": [
+                    {
+                        "draft": {"malformed": "first-private-draft"},
+                        "expect": {
+                            "attempt": 1,
+                            "clarification_codes": [],
+                            "request_fingerprint": request["request_fingerprint"],
+                        },
+                        "operation": "source_review_fragment",
+                    },
+                    {
+                        "draft": {"malformed": "second-private-draft"},
+                        "expect": {
+                            "attempt": 2,
+                            "clarification_codes": ["SUBSTANCE_MISSING"],
+                            "request_fingerprint": request["request_fingerprint"],
+                        },
+                        "operation": "source_review_fragment",
+                    },
+                ],
+            }
+        )
+    )
+
+    resumed = _run_runner(
+        SKILL_RUNNER,
+        "eval-resume",
+        "--run",
+        str(run),
+        "--scripted-responses",
+        str(scripted),
+    )
+
+    assert resumed.returncode == 6, resumed.stderr
+    assert json.loads(resumed.stdout) == {
+        "error": "evaluation_engine_paused",
+        "ok": False,
+        "pending_call": "source-review-fragment-0001",
+    }
+    assert pending.read_bytes() == pending_before
+    assert not (run / "result.json").exists()
+
+
+@pytest.mark.parametrize(
+    "fixture_error", ["initial_exhaustion", "clarification_exhaustion", "malformed", "extra"]
+)
+def test_protocol_22_full_resume_scripted_input_errors_are_write_free(
+    tmp_path: Path,
+    fixture_error: str,
+) -> None:
+    run = tmp_path / f"v22-{fixture_error}"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "1" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    request = json.loads((run / "requests" / "source-review-0001.json").read_bytes())
+    first = {
+        "draft": {"malformed": "first-private-draft"},
+        "expect": {
+            "attempt": 1,
+            "clarification_codes": [],
+            "request_fingerprint": request["request_fingerprint"],
+        },
+        "operation": "source_review_fragment",
+    }
+    second = {
+        "draft": {"malformed": "second-private-draft"},
+        "expect": {
+            "attempt": 2,
+            "clarification_codes": ["SUBSTANCE_MISSING"],
+            "request_fingerprint": request["request_fingerprint"],
+        },
+        "operation": "source_review_fragment",
+    }
+    responses: object
+    if fixture_error == "initial_exhaustion":
+        responses = []
+    elif fixture_error == "clarification_exhaustion":
+        responses = [first]
+    elif fixture_error == "malformed":
+        responses = "not-an-array"
+    else:
+        responses = [
+            first,
+            second,
+            {
+                "draft": {"proposals": [], "review_complete": True},
+                "expect": {
+                    "attempt": 1,
+                    "clarification_codes": [],
+                    "request_fingerprint": "f" * 64,
+                },
+                "operation": "source_review_fragment",
+            },
+        ]
+    scripted = tmp_path / f"{fixture_error}.json"
+    scripted.write_bytes(
+        _canonical_bytes(
+            {"fixture_type": "local-scripted-drafts-v2.2", "responses": responses}
+        )
+    )
+    before = _run_snapshot(run)
+
+    resumed = _run_runner(
+        SKILL_RUNNER,
+        "eval-resume",
+        "--run",
+        str(run),
+        "--scripted-responses",
+        str(scripted),
+    )
+
+    assert resumed.returncode == 2
+    assert resumed.stdout == ""
+    assert json.loads(resumed.stderr)["code"] == "EVALUATION_INPUT_INVALID"
+    assert _run_snapshot(run) == before
+
+
+@pytest.mark.parametrize("probe_failure", ["construct", "copy", "read"])
+def test_protocol_22_full_resume_probe_oserror_is_input_write_free(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    probe_failure: str,
+) -> None:
+    from regulatory_harvest.evaluation import attorney_cli
+
+    run = tmp_path / f"full-probe-{probe_failure}"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "1" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    request = json.loads(next((run / "requests").glob("*.json")).read_bytes())
+    scripted = tmp_path / f"full-probe-{probe_failure}.json"
+    scripted.write_bytes(
+        _canonical_bytes(
+            {
+                "fixture_type": "local-scripted-drafts-v2.2",
+                "responses": [
+                    {
+                        "draft": {"malformed": "first-private-draft"},
+                        "expect": {
+                            "attempt": 1,
+                            "clarification_codes": [],
+                            "request_fingerprint": request["request_fingerprint"],
+                        },
+                        "operation": request["operation"],
+                    },
+                    {
+                        "draft": {"malformed": "second-private-draft"},
+                        "expect": {
+                            "attempt": 2,
+                            "clarification_codes": ["SUBSTANCE_MISSING"],
+                            "request_fingerprint": request["request_fingerprint"],
+                        },
+                        "operation": request["operation"],
+                    },
+                ],
+            }
+        )
+    )
+    if probe_failure == "construct":
+        def fail_temporary_directory(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise OSError("synthetic probe construction failure")
+
+        monkeypatch.setattr(
+            attorney_cli.tempfile, "TemporaryDirectory", fail_temporary_directory
+        )
+    elif probe_failure == "copy":
+        def fail_copy(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise OSError("synthetic probe copy failure")
+
+        monkeypatch.setattr(attorney_cli.shutil, "copytree", fail_copy)
+    else:
+        async def fail_probe_read(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            try:
+                raise OSError("synthetic probe read failure")
+            except OSError as error:
+                raise attorney_workflow.EvaluationIntegrityError(
+                    "evaluation storage read failed"
+                ) from error
+
+        monkeypatch.setattr(attorney_cli, "continue_evaluation_v22", fail_probe_read)
+    before = _run_snapshot(run)
+
+    status = skill_runner.main(
+        [
+            "eval-resume",
+            "--run",
+            str(run),
+            "--scripted-responses",
+            str(scripted),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert status == 2
+    assert captured.out == ""
+    assert json.loads(captured.err)["code"] == "EVALUATION_INPUT_INVALID"
+    assert _run_snapshot(run) == before
+
+
+def test_protocol_22_full_resume_provider_oserror_remains_verified_pause(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from regulatory_harvest.evaluation import attorney_cli
+
+    run = tmp_path / "full-provider-oserror"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "1" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    request = json.loads(next((run / "requests").glob("*.json")).read_bytes())
+    scripted = tmp_path / "provider-oserror.json"
+    scripted.write_bytes(
+        _canonical_bytes(
+            {
+                "fixture_type": "local-scripted-drafts-v2.2",
+                "responses": [
+                    {
+                        "draft": {"proposals": [], "review_complete": True},
+                        "expect": {
+                            "attempt": 1,
+                            "clarification_codes": [],
+                            "request_fingerprint": request["request_fingerprint"],
+                        },
+                        "operation": request["operation"],
+                    }
+                ],
+            }
+        )
+    )
+    original = attorney_cli._ScriptedFixtureDraftEvaluatorV22.evaluate_draft
+    calls: dict[object, int] = {}
+
+    async def provider_oserror(self: object, prompt: object) -> object:
+        calls[self] = calls.get(self, 0) + 1
+        raise OSError("synthetic provider failure")
+
+    monkeypatch.setattr(
+        attorney_cli._ScriptedFixtureDraftEvaluatorV22,
+        "evaluate_draft",
+        provider_oserror,
+    )
+    before = _run_snapshot(run)
+
+    status = skill_runner.main(
+        [
+            "eval-resume",
+            "--run",
+            str(run),
+            "--scripted-responses",
+            str(scripted),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert status == 6
+    assert json.loads(captured.out)["pending_call"] == "source-review-fragment-0001"
+    assert captured.err == ""
+    assert _run_snapshot(run) == before
+    assert calls
+    monkeypatch.setattr(
+        attorney_cli._ScriptedFixtureDraftEvaluatorV22,
+        "evaluate_draft",
+        original,
+    )
+
+
+def test_protocol_22_full_resume_corrupt_stored_run_is_integrity_write_free(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "full-corrupt-stored-resume"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "1" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    pending = next((run / "requests").glob("*.json"))
+    pending.write_bytes(pending.read_bytes() + b"\n")
+    scripted = tmp_path / "corrupt-stored-resume.json"
+    scripted.write_bytes(
+        _canonical_bytes({"fixture_type": "local-scripted-drafts-v2.2", "responses": []})
+    )
+    before = _run_snapshot(run)
+
+    resumed = _run_runner(
+        SKILL_RUNNER,
+        "eval-resume",
+        "--run",
+        str(run),
+        "--scripted-responses",
+        str(scripted),
+    )
+
+    assert resumed.returncode == 5
+    assert resumed.stdout == ""
+    assert json.loads(resumed.stderr)["code"] == "EVALUATION_INTEGRITY_INVALID"
+    assert _run_snapshot(run) == before
+
+
+@pytest.mark.parametrize("protocol", ["1.3", "2.0", "2.1"])
+def test_protocol_22_full_eval_init_verifies_valid_retained_root_read_only(
+    tmp_path: Path,
+    protocol: str,
+) -> None:
+    run = tmp_path / f"full-valid-retained-{protocol.replace('.', '')}"
+    if protocol == "1.3":
+        _initialize_eval_run(SKILL_RUNNER, run)
+    elif protocol == "2.0":
+        _initialize_v2_eval_run(run)
+    else:
+        _initialize_v21_eval_run(run)
+    before = _run_snapshot(run)
+
+    result = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "a" * 64,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["code"] == "EVALUATION_LEGACY_READ_ONLY"
+    assert _run_snapshot(run) == before
+
+
+@pytest.mark.parametrize(
+    ("protocol", "corruption"),
+    [("1.3", "missing"), ("2.0", "tampered"), ("2.1", "mixed_inventory")],
+)
+def test_protocol_22_full_eval_init_rejects_corrupt_retained_root_integrity_write_free(
+    tmp_path: Path,
+    protocol: str,
+    corruption: str,
+) -> None:
+    run = tmp_path / f"full-corrupt-retained-{protocol.replace('.', '')}"
+    if protocol == "1.3":
+        _initialize_eval_run(SKILL_RUNNER, run)
+    elif protocol == "2.0":
+        _initialize_v2_eval_run(run)
+    else:
+        _initialize_v21_eval_run(run)
+    artifact = next(
+        path for path in sorted(run.rglob("*"))
+        if path.is_file() and path.name != "run-manifest.json"
+    )
+    if corruption == "missing":
+        artifact.unlink()
+    elif corruption == "tampered":
+        artifact.write_bytes(artifact.read_bytes() + b"\n")
+    else:
+        (run / "v22-mixed-inventory.json").write_bytes(_canonical_bytes({}))
+    before = _run_snapshot(run)
+
+    result = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "a" * 64,
+    )
+
+    assert result.returncode == 5
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["code"] == "EVALUATION_INTEGRITY_INVALID"
+    assert _run_snapshot(run) == before
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"protocol_version": "9.9"},
+        {
+            "protocol_version": "2.1",
+            "compiler_contract_fingerprint": "0" * 64,
+        },
+    ],
+)
+def test_protocol_22_full_eval_init_unknown_or_downgraded_marker_is_integrity_write_free(
+    tmp_path: Path,
+    manifest: dict[str, object],
+) -> None:
+    run = tmp_path / "full-invalid-marker"
+    run.mkdir()
+    (run / "run-manifest.json").write_bytes(_canonical_bytes(manifest))
+    before = _run_snapshot(run)
+
+    result = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--protocol",
+        "2.2",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "a" * 64,
+    )
+
+    assert result.returncode == 5
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["code"] == "EVALUATION_INTEGRITY_INVALID"
+    assert _run_snapshot(run) == before
+
+
+def test_full_eval_init_refuses_existing_sealed_13_before_empty_directory_guard(
+    tmp_path: Path,
+) -> None:
+    """Init must recognize a sealed 1.3 target before attempting a v2 write."""
+    legacy_run = tmp_path / "legacy-run"
+    _initialize_eval_run(SKILL_RUNNER, legacy_run)
+    before = _run_snapshot(legacy_run)
+    refused = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(legacy_run),
+        "--seed-hex",
+        "a" * 64,
+    )
+    assert refused.returncode == 2
+    assert json.loads(refused.stderr) == {
+        "code": "EVALUATION_LEGACY_READ_ONLY",
+        "message": "Protocol 1.3 evaluation runs are read-only.",
+    }
+    assert refused.stdout == ""
+    assert _run_snapshot(legacy_run) == before
+
+    for name, manifest in (
+        ("unknown", {"protocol_version": "9.9"}),
+        ("noncanonical", {"protocol_version": "1.3", "padding": " "}),
+    ):
+        run = tmp_path / name
+        run.mkdir()
+        (run / "run-manifest.json").write_bytes(_canonical_bytes(manifest))
+        before = _run_snapshot(run)
+        result = _run_runner(
+            SKILL_RUNNER,
+            "eval-init",
+            "--case",
+            str(EVALUATION_FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "b" * 64,
+        )
+        assert result.returncode == 2
+        assert json.loads(result.stderr)["code"] == "EVALUATION_INPUT_INVALID"
+        assert _run_snapshot(run) == before
+
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir()
+    (ordinary / "unrelated.txt").write_text("ordinary", encoding="utf-8")
+    before = _run_snapshot(ordinary)
+    result = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(ordinary),
+        "--seed-hex",
+        "c" * 64,
+    )
+    assert result.returncode == 2
+    assert json.loads(result.stderr)["code"] == "EVALUATION_INPUT_INVALID"
+    assert _run_snapshot(ordinary) == before
+
+
+def test_full_protocol_detector_refuses_unknown_manifest_without_writing(tmp_path: Path) -> None:
+    """Manifest dispatch must not confuse an arbitrary run for either evaluator protocol."""
+    run = tmp_path / "unknown-run"
+    run.mkdir()
+    (run / "run-manifest.json").write_bytes(_canonical_bytes({"protocol_version": "9.9"}))
+    before = _run_snapshot(run)
+
+    result = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(run))
+
+    assert result.returncode == 2
+    assert json.loads(result.stderr) == {
+        "code": "EVALUATION_PROTOCOL_UNSUPPORTED",
+        "message": "The evaluation run protocol is unsupported.",
+    }
+    assert _run_snapshot(run) == before
+
+
+@pytest.mark.parametrize(
+    "response_bytes",
+    [b"[]", b"{" + b"[" * 80 + b"]" * 80 + b"}", b"x" * (1024 * 1024 + 1)],
+    ids=("raw", "deep", "oversized"),
+)
+def test_full_protocol_2_refusal_is_write_free_and_stable(
+    tmp_path: Path, response_bytes: bytes
+) -> None:
+    """Raw, deeply nested, and oversized CLI inputs cannot alter a pending v2 run."""
+    run = tmp_path / "v2-refusal"
+    _initialize = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "8" * 64,
+    )
+    assert _initialize.returncode == 0, _initialize.stderr
+    response = tmp_path / "invalid-response.json"
+    response.write_bytes(response_bytes)
+    before = _run_snapshot(run)
+
+    first = _run_runner(
+        SKILL_RUNNER, "eval-submit-safe", "--run", str(run), "--response", str(response)
+    )
+    second = _run_runner(
+        SKILL_RUNNER, "eval-submit-safe", "--run", str(run), "--response", str(response)
+    )
+
+    assert first.returncode == second.returncode == 2
+    assert first.stdout == second.stdout == (
+        '{"accepted":false,"preflight":{"diagnostics":["MECHANICAL_RESPONSE_INVALID"],"valid":false}}\n'
+    )
+    assert first.stderr == second.stderr == ""
+    assert _run_snapshot(run) == before
+
+
+def test_full_protocol_2_normalizes_only_root_aliases_and_refuses_run_symlinks(
+    tmp_path: Path,
+) -> None:
+    """Trusted root aliases read one run; an arbitrary run symlink is never followed."""
+    run = tmp_path / "v2-root"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-init",
+        "--case",
+        str(EVALUATION_FIXTURE / "case.json"),
+        "--run",
+        str(run),
+        "--seed-hex",
+        "9" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    before = _run_snapshot(run)
+    direct = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(run))
+    assert direct.returncode == 0, direct.stderr
+    if str(run).startswith("/private/") and Path("/var").is_symlink():
+        root_alias = Path("/var" + str(run).removeprefix("/private/var"))
+        aliased = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(root_alias))
+        assert aliased.returncode == 0
+        assert aliased.stdout == direct.stdout
+        assert aliased.stderr == direct.stderr == ""
+
+    linked = tmp_path / "linked-run"
+    try:
+        linked.symlink_to(run, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"run symlinks are unavailable: {error}")
+    refused = _run_runner(SKILL_RUNNER, "eval-status", "--run", str(linked))
+    assert refused.returncode == 2
+    assert json.loads(refused.stderr) == {
+        "code": "EVALUATION_PROTOCOL_UNSUPPORTED",
+        "message": "The evaluation run protocol is unsupported.",
+    }
+    assert _run_snapshot(run) == before
 
 
 def _coverage_elements() -> dict[str, object]:

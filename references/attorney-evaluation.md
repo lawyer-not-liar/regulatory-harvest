@@ -24,13 +24,88 @@ Keep the controller attorney-hidden.
 
 - Qualify every locked case before generating a candidate.
 - Use eval-submit-safe for every evaluator response.
-- For each role, allow one initial response and at most two mechanical repairs.
+- For each Protocol 2.1 fragment, allow one initial response and at most one fresh mechanical repair per fragment.
 - Start every mechanical repair in a genuinely fresh role context.
 - If a genuinely fresh repair context is unavailable, stop rather than repair in the same role context.
-- Stop when the same diagnostic code occurs twice.
+- Stop inconclusively after a second mechanical refusal.
 - Never retry an unfavorable substantive judgment.
 - Accept an unfavorable substantive result without retry.
 - Verify terminal evaluation artifacts before delivery.
+
+## Protocol 2.2 new-run contract
+
+Protocol 2.2 is explicit experimental behavior; Protocol 2.1 remains the new-run
+default. Each internal role authors a bounded semantic draft, never a persisted
+envelope. Deterministic code applies safe normalization only to mechanically provable
+equivalents, assigns controller-owned fields, and creates the strict compiled
+response. Content quality remains the responsibility of independent source audit,
+refereeing, isolated grading, and reconciliation.
+
+Source-review and source-audit fragments contain at most five new items. A driver may
+request one initial draft and one fresh clarification for the same pending fragment.
+Two invalid internal drafts return exit 6 and leave the exact request pending without
+an accepted-response write. Resume reuses that verified request and never repeats an
+accepted fragment. Protocol 2.2 terminal outcomes are `COMPLETED` and substantive
+INCONCLUSIVE; an engine pause is not an evaluation disposition. Protocols 1.3,
+2.0, and 2.1 retain their existing replay/read-only contracts and are never migrated
+or resumed as 2.2. This path makes no benchmark claim, and qualified-attorney
+validation remains required before legal advice.
+
+## Retained Protocol 2.1 operator reference
+
+## Protocol 2.1 new-run contract
+
+Protocol 2.1 is the experimental default for new evaluation runs only after the
+public verification gate passes. Protocols 1.3 and 2.0 are retained for replay and
+read-only verification; do not mutate, upgrade, or use them for a new run. Protocol
+2.1 starts with `source_review` and `source_audit`, then issues one source-only
+`source_referee_fragment` packet per material dispute. Deterministic code owns IDs,
+ordering, fingerprints, hashes, scoring, aggregation, and transactions.
+
+Each referee fragment accepts the reviewer, accepts the auditor, or records a valid
+substantive unresolved judgment. An unresolved fragment preserves both supported
+alternatives as a contested requirement and proceeds to grading. Two isolated grader
+lanes process ordinary requirements in batches of at most five and each contested
+requirement individually. Deterministic outcome sensitivity returns substantive
+`INCONCLUSIVE` only when the unresolved baseline changes the result or cannot be
+meaningfully graded; it does not use a raw unresolved-count threshold.
+
+Each role returns only the operation-specific inner payload required by the pending
+packet's `json_schema`. The controller, not the role, supplies truthful
+provider/model/isolation metadata and deterministically constructs the seven-key
+outer envelope. Use `assets/attorney-evaluation-v21-response.template.json` only as a
+compatibility reference for already-authored full envelopes. A refused response is
+write-free and discarded. Each Protocol 2.1 fragment gets one initial response and at
+most one fresh mechanical repair per fragment.
+Stop as `INCONCLUSIVE_MECHANICAL` after a second mechanical refusal. Never retry an
+accepted substantive `FAIL` or `INCONCLUSIVE`.
+
+Do not submit while a role is still writing or validating its payload. After the role
+finishes, hash the exact final canonical payload for the private controller record,
+then call `eval-submit-safe` with `--provider-name`, `--model-name`, and
+`--judge-isolation`. The runner copies the pending operation and request fingerprint
+and seals the canonical outer envelope itself. Never expose or reuse rejected payload
+content in a repair role.
+
+```bash
+python3 <skill-directory>/scripts/harvest_skill.py eval-submit-safe \
+  --run <run-directory> \
+  --response <control-directory>/inner-payload.json \
+  --provider-name <actual-provider> \
+  --model-name <actual-model> \
+  --judge-isolation <fresh_context-or-scripted_fixture>
+```
+
+PASS means the report satisfied this versioned evaluation rubric. It does not
+establish legal correctness, completeness, currency, applicability, or advice
+suitability. Requirement-level findings are the primary product, and attorney review remains required.
+Protocols 1.3 and 2.0 are retained for replay and read-only verification; do not
+mutate, upgrade, or use their legacy flows for a new run.
+
+## Retained Protocol 1.3 operator reference
+
+The remaining ledger-oriented instructions describe retained Protocol 1.3 behavior,
+not the current new-run contract.
 
 Do not expose commands, JSON, role packets, role queues, or repair mechanics
 unless the user asks for technical detail.

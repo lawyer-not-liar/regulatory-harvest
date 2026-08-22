@@ -34,6 +34,7 @@ EVAL_EXIT_INPUT = 2
 EVAL_EXIT_INCONCLUSIVE = 3
 EVAL_EXIT_FAIL = 4
 EVAL_EXIT_INTEGRITY = 5
+EVAL_EXIT_ENGINE_PAUSED = 6
 _EVAL_RESPONSE_MAX_BYTES = 1024 * 1024
 _EVAL_RESPONSE_MAX_DEPTH = 64
 STAGES = ("collect", "organize", "map", "build", "inspect", "note", "export")
@@ -8401,6 +8402,16 @@ def finalize(
     return receipt, 0 if completed else 4
 
 
+def _add_payload_response_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--provider-name", default=argparse.SUPPRESS)
+    parser.add_argument("--model-name", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--judge-isolation",
+        choices=("fresh_context", "scripted_fixture"),
+        default=argparse.SUPPRESS,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = JsonArgumentParser(prog="harvest-skill")
     subparsers = parser.add_subparsers(
@@ -8415,6 +8426,9 @@ def _parser() -> argparse.ArgumentParser:
     finalize_parser.add_argument("--host", default="host-agent")
     finalize_parser.add_argument("--model", default="host-configured-model")
     eval_init_parser = subparsers.add_parser("eval-init")
+    eval_init_parser.add_argument(
+        "--protocol", choices=("2.1", "2.2"), default="2.1"
+    )
     eval_init_parser.add_argument("--case", required=True)
     eval_init_parser.add_argument("--run", required=True)
     eval_init_parser.add_argument("--seed-hex", required=True)
@@ -8423,16 +8437,24 @@ def _parser() -> argparse.ArgumentParser:
     eval_preflight_parser = subparsers.add_parser("eval-preflight")
     eval_preflight_parser.add_argument("--run", required=True)
     eval_preflight_parser.add_argument("--response", required=True)
+    _add_payload_response_arguments(eval_preflight_parser)
     eval_submit_parser = subparsers.add_parser("eval-submit")
     eval_submit_parser.add_argument("--run", required=True)
     eval_submit_parser.add_argument("--response", required=True)
     eval_submit_safe_parser = subparsers.add_parser("eval-submit-safe")
     eval_submit_safe_parser.add_argument("--run", required=True)
     eval_submit_safe_parser.add_argument("--response", required=True)
+    _add_payload_response_arguments(eval_submit_safe_parser)
     eval_status_parser = subparsers.add_parser("eval-status")
     eval_status_parser.add_argument("--run", required=True)
     eval_verify_parser = subparsers.add_parser("eval-verify")
     eval_verify_parser.add_argument("--run", required=True)
+    eval_stop_parser = subparsers.add_parser("eval-stop-inconclusive")
+    eval_stop_parser.add_argument("--run", required=True)
+    eval_stop_parser.add_argument("--reason", required=True)
+    eval_resume_parser = subparsers.add_parser("eval-resume")
+    eval_resume_parser.add_argument("--run", required=True)
+    eval_resume_parser.add_argument("--scripted-responses", required=True)
     eval_qualify_init_parser = subparsers.add_parser("eval-qualify-init")
     eval_qualify_init_parser.add_argument("--case", required=True)
     eval_qualify_init_parser.add_argument("--run", required=True)
@@ -8538,7 +8560,7 @@ def _portable_evaluation_case(
             or any(part in {"", ".", ".."} for part in relative.split("/"))
         ):
             raise PortableInputError(
-                "EVALUATION_CASE_INVALID", f"{name} has an unsafe fixture path."
+                "EVALUATION_CASE_INVALID", f"{name} has an unsafe fixture path"
             )
         return relative
 
@@ -8548,7 +8570,7 @@ def _portable_evaluation_case(
             return cast(bytes, storage.read_artifact(relative))
         except sub.EvaluationIntegrityError as error:
             raise PortableInputError(
-                "EVALUATION_CASE_INVALID", f"{name} is unavailable."
+                "EVALUATION_CASE_INVALID", f"{name} is unavailable"
             ) from error
 
     def exact_text(storage: Any, relative: object, *, name: str) -> str:
@@ -8584,12 +8606,12 @@ def _portable_evaluation_case(
                 "schema_version",
             }:
                 raise PortableInputError(
-                    "EVALUATION_CASE_INVALID", "The case fixture has an unexpected shape."
+                    "EVALUATION_CASE_INVALID", "case fixture has an unexpected shape"
                 )
             if value["schema_version"] != "1.1":
                 raise PortableInputError(
                     "EVALUATION_CASE_INVALID",
-                    "The case fixture schema version is unsupported for initialization.",
+                    "case fixture schema version is unsupported for initialization",
                 )
             if type(value["question"]) is not str:
                 raise PortableInputError(
@@ -8679,7 +8701,7 @@ def _portable_evaluation_case(
                     "role",
                 }:
                     raise PortableInputError(
-                        "EVALUATION_CASE_INVALID", "A case report has an unexpected shape."
+                        "EVALUATION_CASE_INVALID", "case candidate has an unexpected shape"
                     )
                 candidate_id = item["candidate_id"]
                 if type(candidate_id) is not str:
@@ -8691,7 +8713,7 @@ def _portable_evaluation_case(
                 if (capsule_path is None) == (external_path is None):
                     raise PortableInputError(
                         "EVALUATION_CASE_INVALID",
-                        "A case candidate must identify exactly one report source.",
+                        "case candidate must identify exactly one report source",
                     )
                 if capsule_path is not None:
                     capsule_relative = safe_fixture_path(
@@ -8706,11 +8728,11 @@ def _portable_evaluation_case(
                     except gen.GenerationInputError as error:
                         raise PortableInputError(
                             "EVALUATION_CASE_INVALID",
-                            "The generation capsule is incomplete.",
+                            "generation capsule is incomplete",
                         ) from error
                     except gen.GenerationIntegrityError as error:
-                        raise _GenerationIntegrityError(
-                            gen.GENERATION_INTEGRITY_INVALID
+                        raise PortableInputError(
+                            "EVALUATION_CASE_INVALID", str(error)
                         ) from error
                     try:
                         text = report_bytes.decode("utf-8")
@@ -8728,18 +8750,21 @@ def _portable_evaluation_case(
                     if record["candidate_id"] != candidate_id:
                         raise PortableInputError(
                             "EVALUATION_CASE_INVALID",
-                            "The generation capsule candidate_id does not match the case.",
+                            "generation capsule candidate_id does not match the case",
                         )
                     if record["source_hashes"] != expected_source_hashes:
-                        raise sub.EvaluationSourceParityUnprovenError(
+                        raise PortableInputError(
+                            "EVALUATION_CASE_INVALID",
                             "Generation capsule sources do not match the common case evidence."
                         )
                     if record["client_facts_hash"] != expected_client_facts_hash:
-                        raise sub.EvaluationSourceParityUnprovenError(
+                        raise PortableInputError(
+                            "EVALUATION_CASE_INVALID",
                             "Generation capsule client facts do not match the common case evidence."
                         )
                     if request["question"] != case_question:
-                        raise sub.EvaluationSourceParityUnprovenError(
+                        raise PortableInputError(
+                            "EVALUATION_CASE_INVALID",
                             "Generation capsule question does not match the evaluation question."
                         )
                     generation_capsule_paths[candidate_id] = root / capsule_relative
@@ -8993,10 +9018,92 @@ def _eval_exit(sub: Any, state: dict[str, object], run: Path) -> int:
     terminal = state["terminal_status"]
     if terminal is None:
         return EVAL_EXIT_SUCCESS
+    protocol = sub._v2_protocol(run)
+    if protocol == "2.2":
+        if terminal == "INCONCLUSIVE":
+            return EVAL_EXIT_INCONCLUSIVE
+        manifest, files = sub._v22_verified(run)
+        if manifest["terminal_status"] != "COMPLETED":
+            raise sub.EvaluationIntegrityError("EVALUATOR_V22_TERMINAL_STATUS")
+        result = cast(
+            dict[str, object],
+            sub.parse_canonical_json_bytes(files["result.json"], location="result.json"),
+        )
+        v22_reports = cast(list[dict[str, object]], result["reports"])
+        return (
+            EVAL_EXIT_FAIL
+            if any(
+                cast(dict[str, object], report["sensitivity"])["absolute_disposition"]
+                == "FAIL"
+                for report in v22_reports
+            )
+            else EVAL_EXIT_SUCCESS
+        )
+    if protocol == "2.1":
+        if terminal in {"INCONCLUSIVE", "INCONCLUSIVE_MECHANICAL"}:
+            return EVAL_EXIT_INCONCLUSIVE
+        manifest, files = sub._v21_verified(run)
+        if manifest["terminal_status"] != "COMPLETED":
+            raise sub.EvaluationIntegrityError("EVALUATOR_V21_TERMINAL_STATUS")
+        try:
+            result = sub.parse_canonical_json_bytes(files["result.json"], location="result.json")
+        except KeyError as error:
+            raise sub.EvaluationIntegrityError("EVALUATOR_V21_RESULT_REQUIRED") from error
+        if type(result) is not dict or type(result.get("reports")) is not list:
+            raise sub.EvaluationIntegrityError("EVALUATOR_V21_RESULT")
+        v21_reports = cast(list[dict[str, object]], result["reports"])
+        dispositions = [
+            cast(dict[str, object], report.get("reconciliation", {})).get(
+                "absolute_disposition"
+            )
+            for report in v21_reports
+        ]
+        if not dispositions or any(
+            disposition not in {"PASS", "FAIL", "INCONCLUSIVE"}
+            for disposition in dispositions
+        ):
+            raise sub.EvaluationIntegrityError("EVALUATOR_V21_RESULT")
+        return EVAL_EXIT_FAIL if "FAIL" in dispositions else EVAL_EXIT_SUCCESS
     if terminal == "case-invalid":
         return EVAL_EXIT_INCONCLUSIVE
     if terminal == "inconclusive":
         return EVAL_EXIT_INCONCLUSIVE
+    if protocol == "2.0":
+        manifest, files = sub._v2_verified(run)
+        if manifest["terminal_status"] != "completed":
+            raise sub.EvaluationIntegrityError("EVALUATOR_V2_TERMINAL_STATUS")
+        try:
+            result = sub.parse_canonical_json_bytes(files["result.json"], location="result.json")
+        except KeyError as error:
+            raise sub.EvaluationIntegrityError("EVALUATOR_V2_RESULT_REQUIRED") from error
+        if type(result) is not dict:
+            raise sub.EvaluationIntegrityError("EVALUATOR_V2_RESULT")
+        result_fingerprint = result.get("result_fingerprint")
+        result_without_fingerprint = dict(result)
+        result_without_fingerprint.pop("result_fingerprint", None)
+        calculated_fingerprint = sub._sha256(sub.canonical_json_bytes(result_without_fingerprint))
+        if (
+            type(result_fingerprint) is not str
+            or result_fingerprint != calculated_fingerprint
+            or manifest["result_hash"] != result_fingerprint
+        ):
+            raise sub.EvaluationIntegrityError("EVALUATOR_V2_RESULT_FINGERPRINT")
+        reports = result.get("reports")
+        if (
+            type(reports) is not list
+            or not reports
+            or any(
+                type(report) is not dict
+                or report.get("absolute_disposition") not in {"PASS", "FAIL", "INCONCLUSIVE"}
+                for report in reports
+            )
+        ):
+            raise sub.EvaluationIntegrityError("EVALUATOR_V2_RESULT")
+        return (
+            EVAL_EXIT_FAIL
+            if any(report["absolute_disposition"] == "FAIL" for report in reports)
+            else EVAL_EXIT_SUCCESS
+        )
     _, result = sub.load_verified_evaluation_run(run)
     reports = cast(list[dict[str, object]], result["reports"])
     return (
@@ -9050,6 +9157,39 @@ def _portable_guarded_eval_response(
         return None
 
 
+def _portable_guarded_v2_response(
+    sub: Any,
+    args: argparse.Namespace,
+    run: Path,
+) -> dict[str, object] | None:
+    """Read a full response or deterministically wrap one role-authored payload."""
+    value = _portable_guarded_eval_response(sub, Path(args.response))
+    if value is None:
+        return None
+    metadata = (
+        getattr(args, "provider_name", None),
+        getattr(args, "model_name", None),
+        getattr(args, "judge_isolation", None),
+    )
+    if not any(item is not None for item in metadata):
+        return value
+    if any(item is None for item in metadata):
+        return None
+    request = sub.next_judge_request(run)
+    if not isinstance(request, dict):
+        return None
+    provider_name, model_name, judge_isolation = metadata
+    return {
+        "schema_version": sub._v2_protocol(run),
+        "operation": request["operation"],
+        "request_fingerprint": request["request_fingerprint"],
+        "provider_name": provider_name,
+        "model_name": model_name,
+        "judge_isolation": judge_isolation,
+        "payload": value,
+    }
+
+
 def _assert_eval_json_depth(value: object) -> None:
     pending: list[tuple[object, int]] = [(value, 1)]
     while pending:
@@ -9064,15 +9204,360 @@ def _assert_eval_json_depth(value: object) -> None:
             pending.extend((child, depth + 1) for child in current)
 
 
+def _v22_scripted_fixture(sub: Any, path: Path) -> list[dict[str, object]]:
+    try:
+        fixture = Path(os.path.abspath(path))
+        root = Path(os.path.abspath(path.parent))
+        relative = fixture.relative_to(root)
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            raise ValueError("unsafe scripted draft fixture")
+        with sub._open_run_storage(root) as storage:
+            data = storage.read_artifact(
+                relative.as_posix(), max_bytes=sub._V22_MAX_JSON_BYTES
+            )
+            storage.assert_root_identity()
+    except (OSError, ValueError, sub.EvaluationIntegrityError) as error:
+        raise PortableInputError(
+            "EVALUATION_INPUT_INVALID",
+            "scripted draft fixture is unavailable",
+        ) from error
+    try:
+        value = sub.parse_canonical_json_bytes(data, location="scripted draft fixture")
+    except sub.EvaluationIntegrityError as error:
+        raise PortableInputError(
+            "EVALUATION_INPUT_INVALID",
+            "scripted draft fixture is not canonical JSON",
+        ) from error
+    if (
+        type(value) is not dict
+        or set(value) != {"fixture_type", "responses"}
+        or value.get("fixture_type") != "local-scripted-drafts-v2.2"
+    ):
+        raise PortableInputError(
+            "EVALUATION_INPUT_INVALID",
+            "scripted drafts are not a Protocol 2.2 local fixture",
+        )
+    responses = value.get("responses")
+    if type(responses) is not list:
+        raise PortableInputError("EVALUATION_INPUT_INVALID", "scripted drafts must be an array")
+    result: list[dict[str, object]] = []
+    seen: set[bytes] = set()
+    codes = {
+        "DRAFT_INVALID", "DRAFT_TOO_LARGE", "EVIDENCE_NOT_FOUND",
+        "EVIDENCE_AMBIGUOUS", "REFERENCE_UNKNOWN", "SUBSTANCE_MISSING",
+        "ITEM_LIMIT_EXCEEDED", "CONFLICTING_ITEMS",
+    }
+    for raw in responses:
+        if type(raw) is not dict or set(raw) != {"draft", "expect", "operation"}:
+            raise PortableInputError(
+                "EVALUATION_INPUT_INVALID",
+                "scripted draft has an unexpected shape",
+            )
+        expectation = raw.get("expect")
+        if type(raw.get("operation")) is not str or type(expectation) is not dict:
+            raise PortableInputError("EVALUATION_INPUT_INVALID", "scripted draft is malformed")
+        if set(expectation) != {
+            "attempt",
+            "clarification_codes",
+            "request_fingerprint",
+        }:
+            raise PortableInputError(
+                "EVALUATION_INPUT_INVALID",
+                "scripted draft expectation has an unexpected shape",
+            )
+        clarification = expectation.get("clarification_codes")
+        if (
+            type(expectation.get("attempt")) is not int
+            or expectation["attempt"] not in {1, 2}
+            or type(expectation.get("request_fingerprint")) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", cast(str, expectation["request_fingerprint"])) is None
+            or type(clarification) is not list
+            or any(type(code) is not str for code in clarification)
+        ):
+            raise PortableInputError(
+                "EVALUATION_INPUT_INVALID",
+                "scripted draft expectation is malformed",
+            )
+        if raw["operation"] not in sub._V22_OPERATIONS or any(
+            code not in codes for code in clarification
+        ):
+            raise PortableInputError(
+                "EVALUATION_INPUT_INVALID",
+                "scripted draft expectation is unsupported",
+            )
+        signature = sub.canonical_json_bytes(raw)
+        if signature in seen:
+            raise PortableInputError("EVALUATION_INPUT_INVALID", "scripted draft is duplicated")
+        seen.add(signature)
+        result.append(cast(dict[str, object], raw))
+    return result
+
+
+def _v22_drive_script(
+    sub: Any, run: Path, scripted: list[dict[str, object]]
+) -> tuple[bool, int]:
+    entries = list(scripted)
+    while (request := sub.next_evaluator_request_v22(run)) is not None:
+        clarification: tuple[str, ...] = ()
+        accepted = False
+        for attempt in (1, 2):
+            if not entries:
+                raise PortableInputError("EVALUATION_INPUT_INVALID", "scripted drafts exhausted")
+            entry = entries.pop(0)
+            expectation = cast(dict[str, object], entry["expect"])
+            if (
+                entry["operation"] != request["operation"]
+                or expectation["request_fingerprint"] != request["request_fingerprint"]
+                or expectation["attempt"] != attempt
+                or expectation["clarification_codes"] != list(clarification)
+            ):
+                raise PortableInputError(
+                    "EVALUATION_INPUT_INVALID",
+                    "scripted draft prompt mismatched",
+                )
+            response, clarification = sub._v22_compile_draft(
+                request,
+                entry["draft"],
+                {
+                    "provider_name": "local-scripted-fixture",
+                    "model_name": "no-provider",
+                    "judge_isolation": "scripted_fixture",
+                },
+            )
+            if response is not None:
+                sub.submit_evaluator_response_v22(run, response)
+                accepted = True
+                break
+        if not accepted:
+            if entries:
+                raise PortableInputError(
+                    "EVALUATION_INPUT_INVALID", "scripted drafts contain unused entries"
+                )
+            return True, EVAL_EXIT_ENGINE_PAUSED
+    if entries:
+        raise PortableInputError(
+            "EVALUATION_INPUT_INVALID", "scripted drafts contain unused entries"
+        )
+    state = sub.resume_evaluation_v22(run)
+    return False, _eval_exit(sub, state, run)
+
+
+def _v22_nonterminal_payload(sub: Any, run: Path) -> dict[str, object]:
+    manifest, _ = sub._v22_verified(run)
+    pending = [call for call in manifest["calls"] if call["state"] == "pending"]
+    if len(pending) != 1 or manifest["terminal_status"] is not None:
+        raise sub.EvaluationIntegrityError("EVALUATOR_V22_PENDING_CALL")
+    call = pending[0]
+    public = call["call_id"]
+    if call["operation"] in {"source_review_fragment", "source_audit_fragment"}:
+        public = f"{str(call['operation']).replace('_', '-')}-{int(call['fragment_ordinal']):04d}"
+    return {
+        "compiler_contract_fingerprint": manifest["compiler_contract_fingerprint"],
+        "manifest_root": manifest["manifest_fingerprint"],
+        "pending_call": public, "phase": manifest["phase"],
+    }
+
+
+def _v22_result_payload(
+    sub: Any, run: Path, *, judge_mode: str
+) -> dict[str, object]:
+    manifest, files = sub._v22_verified(run)
+    result = cast(
+        dict[str, object],
+        sub.parse_canonical_json_bytes(
+            files["result.json"], location="result.json"
+        ),
+    )
+    reports = [
+        {
+            "absolute_disposition": cast(
+                dict[str, object], item["sensitivity"]
+            )["absolute_disposition"],
+            "reason_codes": cast(dict[str, object], item["sensitivity"])["reason_codes"],
+        }
+        for item in cast(list[dict[str, object]], result["reports"])
+    ]
+    return {
+        "all_issue_codes": sorted(
+            {
+                code
+                for report in reports
+                for code in cast(list[str], report["reason_codes"])
+            }
+        ),
+        "comparative_disposition": None
+        if result["comparison"] is None
+        else cast(dict[str, object], result["comparison"])["disposition"],
+        "judge_mode": judge_mode, "manifest_root": manifest["manifest_fingerprint"],
+        "reports": reports, "terminal_state": result["terminal_status"],
+    }
+
+
+def _run_v22_eval_command(sub: Any, args: argparse.Namespace, run: Path) -> int:
+    if args.command == "eval-next":
+        request = sub.next_evaluator_request_v22(run)
+        if request is None:
+            state = sub.resume_evaluation_v22(run)
+            _eval_json(sub, None)
+            return _eval_exit(sub, state, run)
+        _eval_json(sub, request)
+        return EVAL_EXIT_SUCCESS
+    if args.command == "eval-preflight":
+        try:
+            response = _portable_eval_response(sub, Path(args.response))
+            result = sub.preflight_evaluator_response_v22(run, response)
+        except PortableInputError:
+            result = {"valid": False, "diagnostics": ["EXTERNAL_RESPONSE_INVALID"]}
+        _eval_json(sub, result)
+        return EVAL_EXIT_SUCCESS if result["valid"] else EVAL_EXIT_INPUT
+    if args.command == "eval-submit":
+        response = _portable_eval_response(sub, Path(args.response))
+        try:
+            state = sub.submit_evaluator_response_v22(run, response)
+        except (sub.PortableEvaluationInputError, TypeError, ValueError) as error:
+            raise PortableInputError(
+                "EXTERNAL_RESPONSE_INVALID",
+                "The strict response does not bind the pending request.",
+            ) from error
+        _eval_json(sub, state)
+        return _eval_exit(sub, state, run)
+    if args.command == "eval-submit-safe":
+        try:
+            response = _portable_eval_response(sub, Path(args.response))
+            guarded = sub.guarded_submit_evaluator_response_v22(run, response)
+        except PortableInputError:
+            guarded = {
+                "accepted": False,
+                "preflight": {
+                    "valid": False,
+                    "diagnostics": ["EXTERNAL_RESPONSE_INVALID"],
+                },
+            }
+        except (TypeError, ValueError) as error:
+            raise PortableInputError("EVALUATION_INPUT_INVALID", str(error)) from error
+        _eval_json(sub, guarded)
+        return EVAL_EXIT_SUCCESS if guarded["accepted"] else EVAL_EXIT_INPUT
+    if args.command == "eval-stop-inconclusive":
+        raise PortableInputError(
+            "EVALUATION_MUTATION_UNSUPPORTED",
+            "Protocol 2.2 has no mechanical terminalization command.",
+        )
+    if args.command == "eval-resume":
+        scripted = _v22_scripted_fixture(sub, Path(args.scripted_responses))
+        sub._v22_verified(run)
+        try:
+            with tempfile.TemporaryDirectory(prefix="regulatory-harvest-v22-probe-") as temporary:
+                probe = Path(os.path.realpath(temporary)) / "run"
+                shutil.copytree(run, probe, symlinks=True)
+                _v22_drive_script(sub, probe, scripted)
+        except PortableInputError:
+            raise
+        except OSError as error:
+            raise PortableInputError(
+                "EVALUATION_INPUT_INVALID", "scripted draft probe could not be constructed"
+            ) from error
+        paused, exit_code = _v22_drive_script(sub, run, scripted)
+        if paused:
+            _eval_json(
+                sub,
+                {
+                    "error": "evaluation_engine_paused",
+                    "ok": False,
+                    "pending_call": _v22_nonterminal_payload(sub, run)[
+                        "pending_call"
+                    ],
+                },
+            )
+            return EVAL_EXIT_ENGINE_PAUSED
+        _eval_json(sub, _v22_result_payload(sub, run, judge_mode="local-scripted-fixture"))
+        return exit_code
+    if args.command == "eval-status":
+        state = sub.resume_evaluation_v22(run)
+        _eval_json(
+            sub,
+            _v22_nonterminal_payload(sub, run)
+            if state["terminal_status"] is None
+            else _v22_result_payload(sub, run, judge_mode="status-only"),
+        )
+        return _eval_exit(sub, state, run)
+    verification = sub.verify_evaluation_run(run)
+    if not verification.valid:
+        _eval_json(sub, {"ok": False, "issues": list(verification.issues)})
+        return EVAL_EXIT_INTEGRITY
+    state = sub.resume_evaluation_v22(run)
+    _eval_json(
+        sub,
+        _v22_nonterminal_payload(sub, run)
+        if state["terminal_status"] is None
+        else _v22_result_payload(sub, run, judge_mode="verification-only"),
+    )
+    return _eval_exit(sub, state, run)
+
+
 def _run_eval_command(args: argparse.Namespace) -> int:
     sub = _evaluation_substrate()
-    run = Path(args.run)
+    run = _physical_eval_run_path(args.run)
     try:
         if args.command == "eval-init":
+            if args.protocol == "2.2":
+                if run.exists():
+                    try:
+                        with sub._open_run_storage(run) as storage:
+                            nonempty = bool(storage.scan_inventory())
+                            storage.assert_root_identity()
+                    except sub.EvaluationIntegrityError:
+                        raise
+                    protocol = sub._v2_protocol(run) if nonempty else None
+                    if nonempty and protocol is None:
+                        raise sub.EvaluationIntegrityError("EVALUATION_RETAINED_RUN_INVALID")
+                    if protocol in {"1.3", "2.0", "2.1"}:
+                        verification = sub.verify_evaluation_run(run)
+                        if not verification.valid:
+                            raise sub.EvaluationIntegrityError("EVALUATION_RETAINED_RUN_INVALID")
+                        raise PortableInputError(
+                            "EVALUATION_LEGACY_READ_ONLY",
+                            f"Protocol {protocol} evaluation runs are read-only.",
+                        )
+                gen = _generation_substrate()
+                try:
+                    case, capsule_paths = _portable_evaluation_case(
+                        Path(args.case), substrate=sub, generation_substrate=gen
+                    )
+                    state = sub.initialize_evaluation_v22(
+                        case,
+                        run,
+                        seed_hex=args.seed_hex,
+                        generation_capsule_paths=capsule_paths,
+                        generation_substrate=gen,
+                    )
+                except gen.GenerationIntegrityError as error:
+                    raise _GenerationIntegrityError(gen.GENERATION_INTEGRITY_INVALID) from error
+                except sub.EvaluationSourceParityUnprovenError as error:
+                    raise PortableInputError("EVALUATION_INPUT_INVALID", str(error)) from error
+                _eval_json(sub, state)
+                return EVAL_EXIT_SUCCESS
+            if run.exists() and sub._v2_protocol(run) == "1.3":
+                raise PortableInputError(
+                    "EVALUATION_LEGACY_READ_ONLY",
+                    "Protocol 1.3 evaluation runs are read-only.",
+                )
+            if run.exists():
+                try:
+                    with sub._open_run_storage(run, initialize=True):
+                        pass
+                except sub.EvaluationIntegrityError as error:
+                    if str(error) == "run directory must be empty":
+                        raise PortableInputError(
+                            "EVALUATION_INPUT_INVALID", str(error)
+                        ) from error
+                    raise
             gen = _generation_substrate()
-            case, capsule_paths = _portable_evaluation_case(
-                Path(args.case), substrate=sub, generation_substrate=gen
-            )
+            try:
+                case, capsule_paths = _portable_evaluation_case(
+                    Path(args.case), substrate=sub, generation_substrate=gen
+                )
+            except PortableInputError as error:
+                raise PortableInputError("EVALUATION_INPUT_INVALID", str(error)) from error
             try:
                 state = sub.initialize_evaluation(
                     case,
@@ -9085,8 +9570,83 @@ def _run_eval_command(args: argparse.Namespace) -> int:
                 raise _GenerationIntegrityError(
                     gen.GENERATION_INTEGRITY_INVALID
                 ) from error
+            except sub.EvaluationSourceParityUnprovenError as error:
+                raise PortableInputError("EVALUATION_INPUT_INVALID", str(error)) from error
             _eval_json(sub, state)
             return EVAL_EXIT_SUCCESS
+        protocol = sub._v2_protocol(run)
+        if protocol in {None, "unknown"}:
+            _write_error(
+                "EVALUATION_PROTOCOL_UNSUPPORTED",
+                "The evaluation run protocol is unsupported.",
+            )
+            return EVAL_EXIT_INPUT
+        if protocol in {"invalid", "invalid-schema"} and args.command in {
+            "eval-verify",
+            "eval-resume",
+        }:
+            _eval_json(
+                sub,
+                {
+                    "ok": False,
+                    "issues": [
+                        "EVALUATION_ARTIFACT_SCHEMA_UNSUPPORTED"
+                        if protocol == "invalid-schema"
+                        else "EVALUATION_INTEGRITY_INVALID"
+                    ],
+                },
+            )
+            return EVAL_EXIT_INTEGRITY
+        if protocol == "2.2":
+            return _run_v22_eval_command(sub, args, run)
+        if protocol == "2.1" and args.command == "eval-resume":
+            _write_error(
+                "EVALUATION_LEGACY_READ_ONLY",
+                "Protocol 2.1 evaluation runs cannot use Protocol 2.2 resume.",
+            )
+            return EVAL_EXIT_INPUT
+        if protocol in {"1.3", "2.0"} and args.command in {
+            "eval-next",
+            "eval-preflight",
+            "eval-submit",
+            "eval-submit-safe",
+            "eval-stop-inconclusive",
+            "eval-resume",
+        }:
+            _write_error(
+                "EVALUATION_LEGACY_READ_ONLY",
+                f"Protocol {protocol} evaluation runs are read-only.",
+            )
+            return EVAL_EXIT_INPUT
+        if protocol == "2.1" and args.command == "eval-preflight":
+            try:
+                response = _portable_guarded_v2_response(sub, args, run)
+                if response is None:
+                    raise PortableInputError(
+                        "EVALUATION_RESPONSE_INVALID", "The response is invalid."
+                    )
+                result = sub.preflight_judge_response(run, response)
+            except (PortableInputError, sub.PortableEvaluationInputError):
+                result = {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]}
+            _eval_json(sub, result)
+            return EVAL_EXIT_SUCCESS if result["valid"] else EVAL_EXIT_INPUT
+        if protocol == "2.1" and args.command == "eval-submit-safe":
+            guarded_response = _portable_guarded_v2_response(sub, args, run)
+            if guarded_response is None:
+                result = {
+                    "accepted": False,
+                    "preflight": {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]},
+                }
+            else:
+                result = sub.guarded_submit_judge_response(run, guarded_response)
+            _eval_json(sub, result)
+            return EVAL_EXIT_SUCCESS if result["accepted"] else EVAL_EXIT_INPUT
+        if protocol == "2.1" and args.command == "eval-stop-inconclusive":
+            if args.reason != "MECHANICAL_RESPONSE_INVALID":
+                raise PortableInputError("INVALID_ARGUMENTS", "The terminal reason is unsupported.")
+            state = sub.stop_evaluation_v21_inconclusive(run, args.reason)
+            _eval_json(sub, state)
+            return EVAL_EXIT_INCONCLUSIVE
         if args.command == "eval-next":
             request = sub.next_judge_request(run)
             if request is None:

@@ -6,6 +6,7 @@ import ntpath
 import os
 import shutil
 import stat
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -53,6 +54,36 @@ _WIN_FILE_SHARE_DELETE = 0x4
 _WIN_CREATE_NEW = 1
 _WIN_OPEN_EXISTING = 3
 
+_STORAGE_NAMESPACE_CONTRACT_ID = (
+    "cooperative-exclusive-directory-namespace-per-operation-v1"
+)
+
+
+def test_storage_directory_namespace_contract_is_operation_wide_and_consistent() -> None:
+    expected = (
+        _STORAGE_NAMESPACE_CONTRACT_ID,
+        "during each evaluator storage operation",
+        "does not defend against arbitrary same-UID directory rename or replacement "
+        "between syscalls",
+    )
+    assert expected == attorney_artifacts.STORAGE_DIRECTORY_NAMESPACE_CONTRACT
+
+    repository_root = Path(__file__).parents[2]
+    contract_documents = (
+        repository_root
+        / "docs/superpowers/specs/2026-08-19-evaluator-protocol-2-2-design.md",
+        repository_root
+        / "docs/superpowers/plans/2026-08-19-evaluator-protocol-2-2.md",
+    )
+    for contract_document in contract_documents:
+        text = contract_document.read_text(encoding="utf-8")
+        assert _STORAGE_NAMESPACE_CONTRACT_ID in text
+        assert "during each evaluator storage operation" in text
+        assert (
+            "does not defend against arbitrary same-UID directory rename or replacement "
+            "between syscalls"
+        ) in text
+
 
 class _FakeWin32API:
     def __init__(self, *, probe_error: OSError | None = None) -> None:
@@ -75,12 +106,14 @@ class _FakeWin32API:
         self.deleted_names: list[str] = []
         self.cleanup_events: list[tuple[str, str, int]] = []
         self.read_parent_paths: list[str] = []
+        self.read_limits: list[int | None] = []
         self.write_parent_paths: list[str] = []
         self.path_child_calls = 0
         self.before_path_open: object | None = None
         self.before_relative_open: object | None = None
         self.after_relative_open: object | None = None
         self.before_file_info: object | None = None
+        self.before_read_file: object | None = None
         self.before_query_names: object | None = None
         self.after_query_names: object | None = None
         self.before_rename: object | None = None
@@ -411,10 +444,14 @@ class _FakeWin32API:
         parent = self._resolve_absolute(path, follow_final_reparse=True)
         return sorted(child.name for child in parent.children.values())
 
-    def read_file(self, handle: int) -> bytes:
+    def read_file(self, handle: int, *, max_bytes: int | None = None) -> bytes:
+        self._call_hook(self.before_read_file, handle)
         node = self.handles[handle]
+        self.read_limits.append(max_bytes)
         if node.parent is not None:
             self.read_parent_paths.append(self._key(self._node_path(node.parent)))
+        if max_bytes is not None and len(node.content) > max_bytes:
+            raise EvaluationIntegrityError("artifact exceeds maximum size")
         return node.content
 
     def write_file(self, handle: int, data: bytes) -> None:
@@ -452,7 +489,10 @@ class _FakeWin32API:
         existing = parent.children.get(key)
         if existing is not None and existing is not node and not replace:
             raise FileExistsError(new_name)
-        if node.parent is not None:
+        if (
+            node.parent is not None
+            and node.parent.children.get(ntpath.normcase(node.name)) is node
+        ):
             node.parent.children.pop(ntpath.normcase(node.name), None)
         if existing is not None and existing is not node:
             existing.parent = None
@@ -520,6 +560,39 @@ def _fake_windows_artifact_storage() -> tuple[
         follow_final_reparse=False,
     )
     return api, storage, parent
+
+
+def _streaming_ctypes_win32_api(
+    total_size: int,
+) -> tuple[attorney_artifacts._CtypesWin32API, list[int], list[int]]:
+    api = object.__new__(attorney_artifacts._CtypesWin32API)
+    requested: list[int] = []
+    returned: list[int] = []
+    offset = 0
+
+    def read_file(
+        _: object,
+        buffer: object,
+        size: int,
+        read_count: object,
+        __: object,
+    ) -> int:
+        nonlocal offset
+        requested.append(size)
+        count = min(size, total_size - offset)
+        if count:
+            attorney_artifacts.ctypes.memset(buffer, ord("x"), count)
+        output = attorney_artifacts.ctypes.cast(
+            read_count,
+            attorney_artifacts.ctypes.POINTER(attorney_artifacts._WinDword),
+        )
+        output.contents.value = count
+        returned.append(count)
+        offset += count
+        return 1
+
+    api._read_file = read_file
+    return api, requested, returned
 
 
 def _write_canonical(path: Path, payload: object) -> None:
@@ -1687,7 +1760,29 @@ def test_posix_directory_open_uses_platform_errno_constants(
         attorney_artifacts._open_posix_directory(None, "unsafe")
 
 
-def test_posix_write_fsyncs_file_and_parent_and_renames_relative(
+@pytest.mark.skipif(os.name != "posix", reason="descriptor reads are POSIX-specific")
+def test_posix_bounded_read_rejects_sparse_metadata_before_allocation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "bounded-read"
+    run_dir.mkdir()
+    artifact = run_dir / "oversized.json"
+    artifact.touch()
+    with artifact.open("r+b") as handle:
+        handle.truncate(16 * 1024 * 1024 + 1)
+
+    def forbid_read(*_: object, **__: object) -> bytes:
+        raise AssertionError("oversized descriptor must not be read")
+
+    monkeypatch.setattr(attorney_artifacts, "_read_all", forbid_read)
+    with (
+        attorney_artifacts.open_evaluation_storage(run_dir) as storage,
+        pytest.raises(EvaluationIntegrityError, match="maximum size"),
+    ):
+        storage.read_artifact("oversized.json", max_bytes=16 * 1024 * 1024)
+
+
+def test_posix_immutable_write_fsyncs_and_links_relative_without_clobber(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1697,43 +1792,702 @@ def test_posix_write_fsyncs_file_and_parent_and_renames_relative(
         run_dir,
         seed_hex="9" * 64,
     )
-    original_replace = os.replace
+    original_link = os.link
     original_fsync = os.fsync
-    replace_calls: list[tuple[object, object, int | None, int | None]] = []
+    link_calls: list[tuple[object, object, int | None, int | None, bool]] = []
     fsync_modes: list[int] = []
 
-    def recording_replace(
+    def recording_link(
         source: object,
         destination: object,
         *,
         src_dir_fd: int | None = None,
         dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
     ) -> None:
-        replace_calls.append((source, destination, src_dir_fd, dst_dir_fd))
-        original_replace(
+        link_calls.append(
+            (source, destination, src_dir_fd, dst_dir_fd, follow_symlinks)
+        )
+        original_link(
             source,
             destination,
             src_dir_fd=src_dir_fd,
             dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
         )
 
     def recording_fsync(descriptor: int) -> None:
         fsync_modes.append(os.fstat(descriptor).st_mode)
         original_fsync(descriptor)
 
-    monkeypatch.setattr(attorney_artifacts.os, "replace", recording_replace)
+    monkeypatch.setattr(attorney_artifacts.os, "link", recording_link)
     monkeypatch.setattr(attorney_artifacts.os, "fsync", recording_fsync)
 
     with attorney_artifacts._open_run_storage(run_dir) as storage:
-        storage.atomic_write("anchored.json", b"{}\n", mutable=False)
+        assert storage.atomic_write("anchored.json", b"{}\n", mutable=False)
+        assert not storage.atomic_write("anchored.json", b"{}\n", mutable=False)
 
-    assert len(replace_calls) == 1
-    source, destination, src_dir_fd, dst_dir_fd = replace_calls[0]
+    assert len(link_calls) == 1
+    source, destination, src_dir_fd, dst_dir_fd, follow_symlinks = link_calls[0]
     assert isinstance(source, str) and "/" not in source
     assert destination == "anchored.json"
     assert src_dir_fd is not None and src_dir_fd == dst_dir_fd
+    assert not follow_symlinks
     assert any(stat.S_ISREG(mode) for mode in fsync_modes)
     assert any(stat.S_ISDIR(mode) for mode in fsync_modes)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="link ownership is POSIX-specific")
+def test_posix_atomic_write_reports_owned_path_after_post_link_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "post-link-ownership"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    original_fsync = attorney_artifacts.os.fsync
+    original_link = attorney_artifacts.os.link
+    linked = False
+
+    def record_link(*args: object, **kwargs: object) -> None:
+        nonlocal linked
+        original_link(*args, **kwargs)  # type: ignore[arg-type]
+        linked = True
+
+    def fail_directory_fsync_after_link(descriptor: int) -> None:
+        if linked and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("injected post-link directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(attorney_artifacts.os, "link", record_link)
+    monkeypatch.setattr(attorney_artifacts.os, "fsync", fail_directory_fsync_after_link)
+    try:
+        with pytest.raises(attorney_artifacts._AtomicWriteOwnershipError) as raised:
+            storage.atomic_write("owned.json", b"owned\n", mutable=False)
+    finally:
+        storage.close()
+
+    assert linked
+    assert raised.value.created is True
+    assert raised.value.identity is not None
+    assert storage.atomic_write_receipt("owned.json") is not None
+    assert (run_dir / "owned.json").read_bytes() == b"owned\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="leaf identity is POSIX-specific")
+@pytest.mark.parametrize("same_bytes", [True, False])
+def test_posix_owned_remove_and_restore_preserve_replacement_competitors(
+    tmp_path: Path, same_bytes: bool
+) -> None:
+    run_dir = tmp_path / f"owned-conditional-{same_bytes}"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    competitor = b"new\n" if same_bytes else b"competitor\n"
+    try:
+        assert storage.atomic_write("owned.json", b"old\n", mutable=False)
+        assert storage.atomic_write("owned.json", b"new\n", mutable=True)
+        receipt = storage.atomic_write_receipt("owned.json")
+        assert receipt is not None and receipt.identity is not None
+        (run_dir / "owned.json").unlink()
+        (run_dir / "owned.json").write_bytes(competitor)
+
+        with pytest.raises(EvaluationIntegrityError, match="transaction-owned artifact changed"):
+            storage.remove_artifact(
+                "owned.json",
+                expected_identity=receipt.identity,
+                expected_data=b"new\n",
+            )
+        with pytest.raises(EvaluationIntegrityError, match="transaction-owned artifact changed"):
+            storage.replace_artifact_if_owned(
+                "owned.json",
+                b"old\n",
+                owned_identity=receipt.identity,
+                owned_data=b"new\n",
+            )
+    finally:
+        storage.close()
+
+    assert (run_dir / "owned.json").read_bytes() == competitor
+
+
+@pytest.mark.skipif(os.name != "posix", reason="claim race is POSIX-specific")
+def test_posix_owned_remove_claim_never_unlinks_a_last_moment_competitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "owned-remove-claim-race"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("owned.json", b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt("owned.json")
+    assert receipt is not None and receipt.identity is not None
+    competitor_path = run_dir / "competitor.tmp"
+    competitor_path.write_bytes(b"competitor\n")
+    original_claim = attorney_artifacts._rename_posix_noreplace
+    original_unlink = attorney_artifacts.os.unlink
+    raced = False
+
+    def install_competitor() -> None:
+        nonlocal raced
+        if raced:
+            return
+        raced = True
+        original_unlink(run_dir / "owned.json")
+        os.replace(competitor_path, run_dir / "owned.json")
+
+    def racing_claim(
+        source: str,
+        destination: str,
+        *,
+        source_directory: int,
+        destination_directory: int,
+    ) -> None:
+        if source == "owned.json":
+            install_competitor()
+        original_claim(
+            source,
+            destination,
+            source_directory=source_directory,
+            destination_directory=destination_directory,
+        )
+
+    def racing_unlink(path: object, *args: object, **kwargs: object) -> None:
+        if path == "owned.json":
+            install_competitor()
+        original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(attorney_artifacts, "_rename_posix_noreplace", racing_claim)
+    monkeypatch.setattr(attorney_artifacts.os, "unlink", racing_unlink)
+    try:
+        with pytest.raises(EvaluationIntegrityError):
+            storage.remove_artifact(
+                "owned.json",
+                expected_identity=receipt.identity,
+                expected_data=b"owned\n",
+            )
+    finally:
+        storage.close()
+
+    assert raced
+    assert (run_dir / "owned.json").read_bytes() == b"competitor\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="claim race is POSIX-specific")
+def test_posix_owned_restore_never_replaces_a_last_moment_competitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "owned-restore-claim-race"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("manifest.json", b"old\n", mutable=False)
+    assert storage.atomic_write("manifest.json", b"owned-new\n", mutable=True)
+    receipt = storage.atomic_write_receipt("manifest.json")
+    assert receipt is not None and receipt.identity is not None
+    competitor_path = run_dir / "competitor.tmp"
+    competitor_path.write_bytes(b"competitor\n")
+    original_claim = attorney_artifacts._rename_posix_noreplace
+    original_replace = attorney_artifacts.os.replace
+    raced = False
+
+    def install_competitor() -> None:
+        nonlocal raced
+        if raced:
+            return
+        raced = True
+        with suppress(FileNotFoundError):
+            os.unlink(run_dir / "manifest.json")
+        original_replace(competitor_path, run_dir / "manifest.json")
+
+    def racing_claim(
+        source: str,
+        destination: str,
+        *,
+        source_directory: int,
+        destination_directory: int,
+    ) -> None:
+        if destination == "manifest.json" and source.endswith(".restore"):
+            install_competitor()
+        original_claim(
+            source,
+            destination,
+            source_directory=source_directory,
+            destination_directory=destination_directory,
+        )
+
+    def racing_replace(
+        source: object,
+        destination: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if destination == "manifest.json" or destination == run_dir / "manifest.json":
+            install_competitor()
+        original_replace(source, destination, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(attorney_artifacts, "_rename_posix_noreplace", racing_claim)
+    monkeypatch.setattr(attorney_artifacts.os, "replace", racing_replace)
+    try:
+        with pytest.raises(EvaluationIntegrityError):
+            storage.replace_artifact_if_owned(
+                "manifest.json",
+                b"old\n",
+                owned_identity=receipt.identity,
+                owned_data=b"owned-new\n",
+            )
+    finally:
+        storage.close()
+
+    assert raced
+    assert (run_dir / "manifest.json").read_bytes() == b"competitor\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="claim collision is POSIX-specific")
+def test_posix_claim_never_overwrites_a_preplanted_recovery_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "claim-destination-collision"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("owned.json", b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt("owned.json")
+    assert receipt is not None and receipt.identity is not None
+    original_claim = attorney_artifacts._rename_posix_noreplace
+    planted = False
+    planted_path: Path | None = None
+
+    def preplant_claim(
+        source_name: str,
+        destination_name: str,
+        *,
+        source_directory: int,
+        destination_directory: int,
+    ) -> None:
+        nonlocal planted, planted_path
+        if not planted and destination_name.endswith(".claim"):
+            planted = True
+            leaf = os.open(
+                destination_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=destination_directory,
+            )
+            try:
+                os.write(leaf, b"external-claim-bytes\n")
+            finally:
+                os.close(leaf)
+            planted_path = tmp_path / destination_name
+        original_claim(
+            source_name,
+            destination_name,
+            source_directory=source_directory,
+            destination_directory=destination_directory,
+        )
+
+    monkeypatch.setattr(
+        attorney_artifacts, "_rename_posix_noreplace", preplant_claim
+    )
+    try:
+        storage.remove_artifact(
+            "owned.json",
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    finally:
+        storage.close()
+
+    assert planted
+    assert planted_path is not None
+    assert planted_path.read_bytes() == b"external-claim-bytes\n"
+    assert not (run_dir / "owned.json").exists()
+    assert any(
+        path.read_bytes() == b"owned\n"
+        for path in tmp_path.glob(".regulatory-harvest-recovery-*.claim")
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="claim mutation is POSIX-specific")
+@pytest.mark.parametrize("competitor", [b"owned\n", b"external-after-check\n"])
+def test_posix_validated_claim_is_never_path_unlinked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    competitor: bytes,
+) -> None:
+    run_dir = tmp_path / f"post-validation-claim-{len(competitor)}"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("owned.json", b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt("owned.json")
+    assert receipt is not None and receipt.identity is not None
+    original_unlink = attorney_artifacts.os.unlink
+    raced = False
+
+    def racing_unlink(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal raced
+        if path == "artifact" and not raced:
+            raced = True
+            dir_fd = kwargs.get("dir_fd")
+            assert isinstance(dir_fd, int)
+            original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+            replacement = os.open(
+                "artifact",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=dir_fd,
+            )
+            try:
+                os.write(replacement, competitor)
+            finally:
+                os.close(replacement)
+        original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(attorney_artifacts.os, "unlink", racing_unlink)
+    try:
+        storage.remove_artifact(
+            "owned.json",
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    finally:
+        storage.close()
+
+    assert not raced
+    assert not (run_dir / "owned.json").exists()
+    recovered = [
+        path.read_bytes()
+        for path in tmp_path.glob(".regulatory-harvest-recovery-*.claim")
+        if path.is_file()
+    ]
+    assert b"owned\n" in recovered
+
+
+@pytest.mark.skipif(os.name != "posix", reason="claim cleanup is POSIX-specific")
+def test_posix_sidecar_collision_is_no_clobber_and_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "claim-open-failure"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("owned.json", b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt("owned.json")
+    assert receipt is not None and receipt.identity is not None
+    original_open = attorney_artifacts.os.open
+    planted_path: Path | None = None
+
+    def preplant_sidecar(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal planted_path
+        if (
+            planted_path is None
+            and isinstance(path, str)
+            and path.startswith(".regulatory-harvest-recovery-")
+            and path.endswith(".json")
+        ):
+            directory = kwargs.get("dir_fd")
+            assert isinstance(directory, int)
+            planted = original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+            try:
+                os.write(planted, b"external-sidecar\n")
+            finally:
+                os.close(planted)
+            planted_path = tmp_path / path
+        return original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(attorney_artifacts.os, "open", preplant_sidecar)
+    try:
+        storage.remove_artifact(
+            "owned.json",
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    finally:
+        storage.close()
+
+    assert planted_path is not None
+    assert planted_path.read_bytes() == b"external-sidecar\n"
+    assert list(run_dir.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="claim durability is POSIX-specific")
+def test_posix_claim_fsyncs_recovery_parent_before_cross_directory_move(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "claim-parent-durability"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("owned.json", b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt("owned.json")
+    assert receipt is not None and receipt.identity is not None
+    original_fsync = attorney_artifacts.os.fsync
+    original_claim = attorney_artifacts._rename_posix_noreplace
+    synced: set[int] = set()
+
+    def record_fsync(descriptor: int) -> None:
+        synced.add(descriptor)
+        original_fsync(descriptor)
+
+    def require_durable_parent(
+        source: str,
+        destination: str,
+        *,
+        source_directory: int,
+        destination_directory: int,
+    ) -> None:
+        assert destination_directory in synced
+        original_claim(
+            source,
+            destination,
+            source_directory=source_directory,
+            destination_directory=destination_directory,
+        )
+
+    monkeypatch.setattr(attorney_artifacts.os, "fsync", record_fsync)
+    monkeypatch.setattr(
+        attorney_artifacts, "_rename_posix_noreplace", require_durable_parent
+    )
+    try:
+        storage.remove_artifact(
+            "owned.json",
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    finally:
+        storage.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="claim durability is POSIX-specific")
+def test_posix_destination_fsync_failure_restores_run_and_retains_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "claim-destination-fsync"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("owned.json", b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt("owned.json")
+    assert receipt is not None and receipt.identity is not None
+    original_fsync = attorney_artifacts.os.fsync
+    original_claim = attorney_artifacts._rename_posix_noreplace
+    recovery_parent: int | None = None
+    moved = False
+    failed = False
+
+    def record_claim(
+        source_name: str,
+        destination_name: str,
+        *,
+        source_directory: int,
+        destination_directory: int,
+    ) -> None:
+        nonlocal recovery_parent, moved
+        original_claim(
+            source_name,
+            destination_name,
+            source_directory=source_directory,
+            destination_directory=destination_directory,
+        )
+        if destination_name.endswith(".claim"):
+            recovery_parent = destination_directory
+            moved = True
+
+    def fail_claim_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if descriptor == recovery_parent and moved and not failed:
+            failed = True
+            raise OSError("injected destination claim fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(attorney_artifacts, "_rename_posix_noreplace", record_claim)
+    monkeypatch.setattr(attorney_artifacts.os, "fsync", fail_claim_fsync)
+    try:
+        with pytest.raises(OSError, match="destination claim fsync failure"):
+            storage.remove_artifact(
+                "owned.json",
+                expected_identity=receipt.identity,
+                expected_data=b"owned\n",
+            )
+    finally:
+        storage.close()
+
+    assert failed
+    assert (run_dir / "owned.json").read_bytes() == b"owned\n"
+    recovered = [
+        path.read_bytes()
+        for path in tmp_path.glob(".regulatory-harvest-recovery-*.claim")
+        if path.is_file()
+    ]
+    assert b"owned\n" in recovered
+
+
+@pytest.mark.skipif(os.name != "posix", reason="claim cleanup is POSIX-specific")
+def test_posix_recovery_claim_directory_is_never_path_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "claim-directory-retained"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("owned.json", b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt("owned.json")
+    assert receipt is not None and receipt.identity is not None
+    original_rmdir = attorney_artifacts.os.rmdir
+    attempted = False
+
+    def reject_claim_rmdir(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal attempted
+        if isinstance(path, str) and (
+            path.startswith("claim-") or path.endswith(".claim")
+        ):
+            attempted = True
+            raise AssertionError("recovery claims must never be path-removed")
+        original_rmdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(attorney_artifacts.os, "rmdir", reject_claim_rmdir)
+    try:
+        storage.remove_artifact(
+            "owned.json",
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    finally:
+        storage.close()
+
+    assert not attempted
+
+
+@pytest.mark.skipif(os.name != "posix", reason="recovery metadata is POSIX-specific")
+def test_posix_recovery_receipt_persists_exact_target_identity_and_bytes(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "recovery-receipt"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    try:
+        assert storage.atomic_write("nested/owned.json", b"owned\n", mutable=False)
+        write_receipt = storage.atomic_write_receipt("nested/owned.json")
+        assert write_receipt is not None and write_receipt.identity is not None
+        storage.remove_artifact(
+            "nested/owned.json",
+            expected_identity=write_receipt.identity,
+            expected_data=b"owned\n",
+        )
+        recovery_receipts = storage.recovery_receipts()
+    finally:
+        storage.close()
+
+    assert len(recovery_receipts) == 1
+    recovery_receipt = recovery_receipts[0]
+    assert recovery_receipt.artifact_path == "nested/owned.json"
+    assert recovery_receipt.operation == "remove"
+    assert recovery_receipt.expected_identity == write_receipt.identity
+    assert recovery_receipt.expected_sha256 == hashlib.sha256(b"owned\n").hexdigest()
+    assert recovery_receipt.claimed_identity is not None
+    assert (
+        recovery_receipt.claimed_identity.device,
+        recovery_receipt.claimed_identity.inode,
+    ) == (write_receipt.identity.device, write_receipt.identity.inode)
+    assert recovery_receipt.claimed_sha256 == hashlib.sha256(b"owned\n").hexdigest()
+    recovery_dir = Path(recovery_receipt.recovery_directory)
+    claim_path = recovery_dir / recovery_receipt.recovery_name
+    assert claim_path.read_bytes() == b"owned\n"
+    token = recovery_receipt.recovery_name.removesuffix(".claim")
+    intent = json.loads((recovery_dir / f"{token}.json").read_bytes())
+    verified = json.loads(
+        (recovery_dir / f"{recovery_receipt.recovery_name}.verified.json").read_bytes()
+    )
+    assert intent["artifact_path"] == "nested/owned.json"
+    assert intent["expected_identity"]["inode"] == write_receipt.identity.inode
+    assert verified["claimed_sha256"] == hashlib.sha256(b"owned\n").hexdigest()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="recovery boundary is POSIX-specific")
+def test_posix_ordinary_success_creates_no_recovery_boundary(tmp_path: Path) -> None:
+    run_dir = tmp_path / "ordinary-no-recovery"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    try:
+        assert storage.atomic_write("ordinary.json", b"ordinary\n", mutable=False)
+        assert storage.recovery_receipts() == ()
+    finally:
+        storage.close()
+
+    assert list(tmp_path.glob(".regulatory-harvest-recovery-*")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="claim close is POSIX-specific")
+def test_posix_claim_close_failure_reports_error_and_retains_exact_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "claim-close-failure"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("owned.json", b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt("owned.json")
+    assert receipt is not None and receipt.identity is not None
+    original_open = attorney_artifacts.os.open
+    original_close = attorney_artifacts.os.close
+    claim_descriptor: int | None = None
+    failed = False
+
+    def record_claim(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal claim_descriptor
+        descriptor = original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+        if isinstance(path, str) and path.endswith(".claim"):
+            claim_descriptor = descriptor
+        return descriptor
+
+    def fail_claim_close(descriptor: int) -> None:
+        nonlocal failed
+        if descriptor == claim_descriptor and not failed:
+            failed = True
+            original_close(descriptor)
+            raise OSError("injected claim close failure")
+        original_close(descriptor)
+
+    monkeypatch.setattr(attorney_artifacts.os, "open", record_claim)
+    monkeypatch.setattr(attorney_artifacts.os, "close", fail_claim_close)
+    try:
+        with pytest.raises(OSError, match="claim close failure"):
+            storage.remove_artifact(
+                "owned.json",
+                expected_identity=receipt.identity,
+                expected_data=b"owned\n",
+            )
+        recovery_receipt = storage.recovery_receipts()[-1]
+    finally:
+        storage.close()
+
+    assert failed
+    assert not (run_dir / "owned.json").exists()
+    assert (
+        Path(recovery_receipt.recovery_directory) / recovery_receipt.recovery_name
+    ).read_bytes() == b"owned\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="replace identity is POSIX-specific")
+def test_posix_mutable_write_reports_receipt_after_post_replace_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "post-replace-receipt"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("manifest.json", b"old\n", mutable=False)
+    original_replace = attorney_artifacts.os.replace
+    original_fsync = attorney_artifacts.os.fsync
+    replaced = False
+
+    def record_replace(*args: object, **kwargs: object) -> None:
+        nonlocal replaced
+        original_replace(*args, **kwargs)  # type: ignore[arg-type]
+        replaced = True
+
+    def fail_after_replace(descriptor: int) -> None:
+        if replaced and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("injected post-replace directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(attorney_artifacts.os, "replace", record_replace)
+    monkeypatch.setattr(attorney_artifacts.os, "fsync", fail_after_replace)
+    try:
+        with pytest.raises(attorney_artifacts._AtomicWriteOwnershipError) as raised:
+            storage.atomic_write("manifest.json", b"new\n", mutable=True)
+        receipt = storage.atomic_write_receipt("manifest.json")
+    finally:
+        storage.close()
+
+    assert replaced
+    assert raised.value.replaced and raised.value.identity is not None
+    assert receipt is not None and receipt.replaced and receipt.identity is not None
+    assert (run_dir / "manifest.json").read_bytes() == b"new\n"
 
 
 def test_posix_write_root_swap_never_mutates_replacement_tree(
@@ -1751,29 +2505,31 @@ def test_posix_write_root_swap_never_mutates_replacement_tree(
     sentinel = replacement / "outside.txt"
     sentinel.write_bytes(b"outside\n")
     parked = tmp_path / "write-race-parked"
-    original_replace = os.replace
+    original_link = os.link
     swapped = False
 
-    def racing_replace(
+    def racing_link(
         source: object,
         destination: object,
         *,
         src_dir_fd: int | None = None,
         dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
     ) -> None:
         nonlocal swapped
         if not swapped and destination == "anchored.json":
             run_dir.rename(parked)
             replacement.rename(run_dir)
             swapped = True
-        original_replace(
+        original_link(
             source,
             destination,
             src_dir_fd=src_dir_fd,
             dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
         )
 
-    monkeypatch.setattr(attorney_artifacts.os, "replace", racing_replace)
+    monkeypatch.setattr(attorney_artifacts.os, "link", racing_link)
 
     with (
         pytest.raises(EvaluationIntegrityError, match=r"identity|changed"),
@@ -1962,7 +2718,9 @@ def test_win32_directory_create_collision_never_opens_or_follows_reparse() -> No
 
     api.before_relative_open = race_relative
 
-    with pytest.raises(EvaluationIntegrityError, match="reparse"):
+    with pytest.raises(
+        EvaluationIntegrityError, match="directory creation collision"
+    ):
         attorney_artifacts._WindowsRunStorage.open(
             Path("C:\\safe\\evaluation-run"),
             initialize=True,
@@ -1974,13 +2732,9 @@ def test_win32_directory_create_collision_never_opens_or_follows_reparse() -> No
     assert [call[4] for call in target_calls] == [
         attorney_artifacts._WIN_FILE_OPEN,
         attorney_artifacts._WIN_FILE_CREATE,
-        attorney_artifacts._WIN_FILE_OPEN,
     ]
     create_call = target_calls[1]
     assert create_call[5] == attorney_artifacts._windows_directory_create_options()
-    safe_open = target_calls[2]
-    assert safe_open[5] == attorney_artifacts._windows_directory_options()
-    assert safe_open[5] & attorney_artifacts._WIN_FILE_OPEN_REPARSE_POINT
     assert api.path_child_calls == 0
     assert api.created_directories == []
     assert api.handles == {}
@@ -2834,6 +3588,7 @@ def test_win32_atomic_write_reports_close_failure_without_masking_primary() -> N
     assert close_attempts == [temp_handle]
     assert temp_handle in api.handles
     assert any(name.startswith(".rh-") for name in parent.children)
+    assert any(name.startswith(".rh-") for name in parent.children)
 
 
 def test_win32_atomic_write_orders_multiple_cleanup_failures() -> None:
@@ -2875,7 +3630,7 @@ def test_win32_atomic_write_orders_multiple_cleanup_failures() -> None:
     assert api.temporary_handles[-1] in api.handles
 
 
-def test_win32_atomic_write_surfaces_cleanup_only_failure_after_successful_rename() -> None:
+def test_win32_atomic_write_reports_ownership_after_successful_rename_cleanup_failure() -> None:
     api, storage, parent = _fake_windows_artifact_storage()
     close_error = OSError("injected renamed handle close failure")
 
@@ -2886,23 +3641,996 @@ def test_win32_atomic_write_surfaces_cleanup_only_failure_after_successful_renam
     api.before_close_handle = fail_close
 
     try:
-        with pytest.raises(EvaluationIntegrityError, match="cleanup failed") as raised:
+        with pytest.raises(attorney_artifacts._AtomicWriteOwnershipError) as raised:
             storage.atomic_write(
                 "judge-responses/response.json",
                 b"trusted write\n",
                 mutable=False,
             )
     finally:
+        api.before_close_handle = None
         storage.close()
 
-    assert raised.value.__cause__ is close_error
-    assert "close renamed artifact" in str(raised.value)
+    assert raised.value.created is True
+    assert raised.value.identity is not None
+    assert isinstance(raised.value.__cause__, EvaluationIntegrityError)
+    assert raised.value.__cause__.__cause__ is close_error
+    assert "close renamed artifact" in str(raised.value.__cause__)
     assert ntpath.normcase("response.json") in parent.children
     assert parent.children[ntpath.normcase("response.json")].content == b"trusted write\n"
     assert not any(name.startswith(".rh-") for name in parent.children)
     temp_handle = api.temporary_handles[-1]
-    assert temp_handle in api.handles
-    assert temp_handle not in api.deleted_handles
+    assert temp_handle not in api.handles
+    assert api.closed_handles.count(temp_handle) == 1
+
+
+@pytest.mark.parametrize("same_bytes", [True, False])
+def test_win32_owned_remove_and_restore_preserve_replacement_competitors(
+    same_bytes: bool,
+) -> None:
+    api, storage, parent = _fake_windows_artifact_storage()
+    path = "C:\\safe\\evaluation-run\\judge-responses\\owned.json"
+    competitor = b"new\n" if same_bytes else b"competitor\n"
+    try:
+        assert storage.atomic_write(
+            "judge-responses/owned.json", b"old\n", mutable=False
+        )
+        assert storage.atomic_write(
+            "judge-responses/owned.json", b"new\n", mutable=True
+        )
+        receipt = storage.atomic_write_receipt("judge-responses/owned.json")
+        assert receipt is not None and receipt.identity is not None
+        parent.children.pop(ntpath.normcase("owned.json"))
+        api._rebuild_indexes()
+        api.add_file(path, competitor)
+
+        with pytest.raises(EvaluationIntegrityError, match="transaction-owned artifact changed"):
+            storage.remove_artifact(
+                "judge-responses/owned.json",
+                expected_identity=receipt.identity,
+                expected_data=b"new\n",
+            )
+        with pytest.raises(EvaluationIntegrityError, match="transaction-owned artifact changed"):
+            storage.replace_artifact_if_owned(
+                "judge-responses/owned.json",
+                b"old\n",
+                owned_identity=receipt.identity,
+                owned_data=b"new\n",
+            )
+    finally:
+        storage.close()
+
+    assert parent.children[ntpath.normcase("owned.json")].content == competitor
+
+
+def test_win32_owned_remove_claim_never_deletes_a_last_moment_competitor() -> None:
+    api, storage, parent = _fake_windows_artifact_storage()
+    path = "C:\\safe\\evaluation-run\\judge-responses\\owned.json"
+    assert storage.atomic_write(
+        "judge-responses/owned.json", b"owned\n", mutable=False
+    )
+    receipt = storage.atomic_write_receipt("judge-responses/owned.json")
+    assert receipt is not None and receipt.identity is not None
+    raced = False
+
+    def install_competitor() -> None:
+        nonlocal raced
+        if raced:
+            return
+        raced = True
+        parent.children.pop(ntpath.normcase("owned.json"))
+        api._rebuild_indexes()
+        api.add_file(path, b"competitor\n")
+
+    def before_delete(handle: int) -> None:
+        if api.handles[handle].name == "owned.json":
+            install_competitor()
+
+    def before_rename(handle: int, _: int, new_name: str) -> None:
+        if api.handles[handle].name == "owned.json" and new_name.startswith(".rh-"):
+            install_competitor()
+
+    api.before_delete_handle = before_delete
+    api.before_rename = before_rename
+    try:
+        storage.remove_artifact(
+            "judge-responses/owned.json",
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    finally:
+        storage.close()
+
+    assert raced
+    assert parent.children[ntpath.normcase("owned.json")].content == b"competitor\n"
+
+
+def test_win32_owned_restore_never_replaces_a_last_moment_competitor() -> None:
+    api, storage, parent = _fake_windows_artifact_storage()
+    path = "C:\\safe\\evaluation-run\\judge-responses\\manifest.json"
+    artifact_path = "judge-responses/manifest.json"
+    assert storage.atomic_write(artifact_path, b"old\n", mutable=False)
+    assert storage.atomic_write(artifact_path, b"owned-new\n", mutable=True)
+    receipt = storage.atomic_write_receipt(artifact_path)
+    assert receipt is not None and receipt.identity is not None
+    raced = False
+
+    def before_rename(handle: int, _: int, new_name: str) -> None:
+        nonlocal raced
+        node = api.handles[handle]
+        if raced or not node.name.startswith(".rh-") or new_name != "manifest.json":
+            return
+        raced = True
+        parent.children.pop(ntpath.normcase("manifest.json"), None)
+        api._rebuild_indexes()
+        api.add_file(path, b"competitor\n")
+
+    api.before_rename = before_rename
+    try:
+        with pytest.raises(EvaluationIntegrityError):
+            storage.replace_artifact_if_owned(
+                artifact_path,
+                b"old\n",
+                owned_identity=receipt.identity,
+                owned_data=b"owned-new\n",
+            )
+    finally:
+        storage.close()
+
+    assert raced
+    assert parent.children[ntpath.normcase("manifest.json")].content == b"competitor\n"
+    safe = api._resolve_absolute("C:\\safe", follow_final_reparse=False)
+    recovery = next(
+        node
+        for node in safe.children.values()
+        if node.name.startswith(".regulatory-harvest-recovery-")
+    )
+    assert any(
+        node.content == b"old\n"
+        for node in recovery.children.values()
+        if not node.attributes & _WIN_FILE_ATTRIBUTE_DIRECTORY
+    )
+
+
+@pytest.mark.parametrize("operation", ["remove", "restore"])
+@pytest.mark.parametrize("competitor", [b"owned-new\n", b"external-after-check\n"])
+def test_win32_owned_action_excludes_post_validation_writers(
+    operation: str,
+    competitor: bytes,
+) -> None:
+    api, storage, parent = _fake_windows_artifact_storage()
+    artifact_path = "judge-responses/owned.json"
+    assert storage.atomic_write(artifact_path, b"old\n", mutable=False)
+    assert storage.atomic_write(artifact_path, b"owned-new\n", mutable=True)
+    receipt = storage.atomic_write_receipt(artifact_path)
+    assert receipt is not None and receipt.identity is not None
+    attempted = False
+
+    def mutate_before_delete(handle: int) -> None:
+        nonlocal attempted
+        node = api.handles[handle]
+        if attempted or not node.name.startswith(".rh-"):
+            return
+        attempted = True
+        writer = api._new_handle(
+            node,
+            _WIN_FILE_WRITE_DATA,
+            _WIN_FILE_SHARE_READ | _WIN_FILE_SHARE_WRITE | _WIN_FILE_SHARE_DELETE,
+        )
+        try:
+            api.write_file(writer, competitor)
+        finally:
+            api.close_handle(writer)
+
+    api.before_delete_handle = mutate_before_delete
+    api.before_close_handle = mutate_before_delete
+    try:
+        with pytest.raises((EvaluationIntegrityError, PermissionError)):
+            if operation == "remove":
+                storage.remove_artifact(
+                    artifact_path,
+                    expected_identity=receipt.identity,
+                    expected_data=b"owned-new\n",
+                )
+            else:
+                storage.replace_artifact_if_owned(
+                    artifact_path,
+                    b"old\n",
+                    owned_identity=receipt.identity,
+                    owned_data=b"owned-new\n",
+                )
+    finally:
+        storage.close()
+
+    assert attempted
+    assert parent.children[ntpath.normcase("owned.json")].content == b"owned-new\n"
+
+
+def test_win32_claim_name_collision_is_no_clobber_and_retryable() -> None:
+    api, storage, _ = _fake_windows_artifact_storage()
+    artifact_path = "judge-responses/owned.json"
+    assert storage.atomic_write(artifact_path, b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt(artifact_path)
+    assert receipt is not None and receipt.identity is not None
+    planted_path: str | None = None
+
+    def collide_once(handle: int, root_handle: int, new_name: str) -> None:
+        nonlocal planted_path
+        if planted_path is not None or not new_name.endswith(".claim"):
+            return
+        recovery = api.handles[root_handle]
+        planted_path = ntpath.join(api._node_path(recovery), new_name)
+        api.add_file(planted_path, b"external-claim-bytes\n")
+
+    api.before_rename = collide_once
+    try:
+        storage.remove_artifact(
+            artifact_path,
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    finally:
+        storage.close()
+
+    assert planted_path is not None
+    assert api.contents[_FakeWin32API._key(planted_path)] == b"external-claim-bytes\n"
+
+
+def test_win32_ordinary_success_creates_no_recovery_boundary() -> None:
+    api, storage, _ = _fake_windows_artifact_storage()
+    safe = api._resolve_absolute("C:\\safe", follow_final_reparse=False)
+    try:
+        assert storage.atomic_write("ordinary.json", b"ordinary\n", mutable=False)
+        assert storage.recovery_receipts() == ()
+        assert not any(
+            node.name.startswith(".regulatory-harvest-recovery-")
+            for node in safe.children.values()
+        )
+    finally:
+        storage.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="recovery swap is POSIX-specific")
+@pytest.mark.parametrize("swap_level", ["root", "claim"])
+def test_posix_recovery_never_opens_a_mkdir_path_that_an_attacker_can_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    swap_level: str,
+) -> None:
+    run_dir = tmp_path / f"mkdir-swap-{swap_level}"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("owned.json", b"private-owned-bytes\n", mutable=False)
+    receipt = storage.atomic_write_receipt("owned.json")
+    assert receipt is not None and receipt.identity is not None
+    original_open_directory = attorney_artifacts._open_posix_directory
+    swapped = False
+    attacker_path: Path | None = None
+
+    def swap_created_directory(parent: int | None, name: str) -> int:
+        nonlocal swapped, attacker_path
+        should_swap = (
+            swap_level == "root" and name.startswith(".regulatory-harvest-recovery-")
+        ) or (swap_level == "claim" and name.startswith("claim-"))
+        if should_swap and not swapped and parent is not None:
+            swapped = True
+            os.rename(name, f"{name}.owned-away", src_dir_fd=parent, dst_dir_fd=parent)
+            os.mkdir(name, mode=0o700, dir_fd=parent)
+            attacker_path = Path(os.readlink(f"/dev/fd/{parent}")) / name
+        return original_open_directory(parent, name)
+
+    monkeypatch.setattr(
+        attorney_artifacts, "_open_posix_directory", swap_created_directory
+    )
+    try:
+        with suppress(EvaluationIntegrityError, OSError):
+            storage.remove_artifact(
+                "owned.json",
+                expected_identity=receipt.identity,
+                expected_data=b"private-owned-bytes\n",
+            )
+    finally:
+        storage.close()
+
+    assert not swapped, "recovery must not mkdir then reopen an attacker-swappable path"
+    if attacker_path is not None:
+        assert not any(attacker_path.iterdir())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="directory claim is POSIX-specific")
+def test_posix_owned_directory_pruning_never_path_removes_a_swapped_competitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "owned-directory-swap"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("nested/owned.json", b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt("nested/owned.json")
+    assert receipt is not None and receipt.identity is not None
+    original_claim = attorney_artifacts._rename_posix_noreplace
+    swapped = False
+
+    def swap_before_claim(
+        source_name: str,
+        destination_name: str,
+        *,
+        source_directory: int,
+        destination_directory: int,
+    ) -> None:
+        nonlocal swapped
+        if source_name == "nested" and destination_name.endswith(".dirclaim") and not swapped:
+            swapped = True
+            os.rename(
+                "nested",
+                "nested-owned-away",
+                src_dir_fd=source_directory,
+                dst_dir_fd=source_directory,
+            )
+            os.mkdir("nested", mode=0o700, dir_fd=source_directory)
+        original_claim(
+            source_name,
+            destination_name,
+            source_directory=source_directory,
+            destination_directory=destination_directory,
+        )
+
+    monkeypatch.setattr(attorney_artifacts, "_rename_posix_noreplace", swap_before_claim)
+    try:
+        with pytest.raises(
+            EvaluationIntegrityError, match=r"directory .*identity changed"
+        ):
+            storage.remove_artifact(
+                "nested/owned.json",
+                expected_identity=receipt.identity,
+                expected_data=b"owned\n",
+            )
+    finally:
+        storage.close()
+
+    assert swapped
+    assert (run_dir / "nested").is_dir(), "the last-moment competitor must survive"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor ownership is POSIX-specific")
+def test_posix_preclaim_metadata_failures_close_every_claim_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "metadata-descriptor-failure"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("owned.json", b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt("owned.json")
+    assert receipt is not None and receipt.identity is not None
+    original_open = attorney_artifacts.os.open
+    descriptors_before = len(os.listdir("/dev/fd"))
+
+    def fail_metadata_open(path: object, *args: object, **kwargs: object) -> int:
+        if isinstance(path, str) and path.startswith(
+            ".regulatory-harvest-recovery-"
+        ) and path.endswith(".json"):
+            raise OSError("injected recovery metadata failure")
+        return original_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(attorney_artifacts.os, "open", fail_metadata_open)
+    try:
+        for _ in range(8):
+            with pytest.raises(OSError, match="recovery metadata failure"):
+                storage.remove_artifact(
+                    "owned.json",
+                    expected_identity=receipt.identity,
+                    expected_data=b"owned\n",
+                )
+        storage.close()
+    finally:
+        storage.close()
+
+    assert len(os.listdir("/dev/fd")) == descriptors_before - len(storage._anchors)
+    assert (run_dir / "owned.json").read_bytes() == b"owned\n"
+
+
+def test_win32_preclaim_metadata_failures_close_source_and_unlock_writer() -> None:
+    api, storage, parent = _fake_windows_artifact_storage()
+    artifact_path = "judge-responses/owned.json"
+    assert storage.atomic_write(artifact_path, b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt(artifact_path)
+    assert receipt is not None and receipt.identity is not None
+    baseline_handles = set(api.handles)
+    artifact_node = parent.children[ntpath.normcase("owned.json")]
+
+    def fail_metadata(parent_handle: int, name: str) -> None:
+        if name.endswith(".json") and name.startswith(".rh-"):
+            raise OSError("injected recovery metadata failure")
+
+    api.before_relative_open = fail_metadata
+    try:
+        for _ in range(8):
+            with pytest.raises(OSError, match="recovery metadata failure"):
+                storage.remove_artifact(
+                    artifact_path,
+                    expected_identity=receipt.identity,
+                    expected_data=b"owned\n",
+                )
+            assert len(api.handles) <= len(baseline_handles) + 1
+            assert all(node is not artifact_node for node in api.handles.values())
+        writer = api._new_handle(
+            artifact_node,
+            _WIN_FILE_WRITE_DATA,
+            _WIN_FILE_SHARE_READ | _WIN_FILE_SHARE_WRITE | _WIN_FILE_SHARE_DELETE,
+        )
+        api.close_handle(writer)
+    finally:
+        api.before_relative_open = None
+        storage.close()
+    assert api.handles == {}
+
+
+def test_win32_storage_close_retries_a_failed_preclaim_source_close() -> None:
+    api, storage, parent = _fake_windows_artifact_storage()
+    artifact_path = "judge-responses/owned.json"
+    assert storage.atomic_write(artifact_path, b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt(artifact_path)
+    assert receipt is not None and receipt.identity is not None
+    artifact_node = parent.children[ntpath.normcase("owned.json")]
+    close_failed = False
+
+    def fail_metadata(parent_handle: int, name: str) -> None:
+        if name.startswith(".rh-") and name.endswith(".json"):
+            raise OSError("injected recovery metadata failure")
+
+    def fail_source_close_once(handle: int) -> None:
+        nonlocal close_failed
+        if api.handles[handle] is artifact_node and not close_failed:
+            close_failed = True
+            raise OSError("injected source close failure")
+
+    api.before_relative_open = fail_metadata
+    api.before_close_handle = fail_source_close_once
+    with pytest.raises(OSError, match="source close failure"):
+        storage.remove_artifact(
+            artifact_path,
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    assert close_failed
+    assert any(node is artifact_node for node in api.handles.values())
+
+    api.before_relative_open = None
+    api.before_close_handle = None
+    storage.close()
+    assert api.handles == {}
+
+
+def test_win32_owned_empty_directory_is_claimed_and_retained_not_deleted() -> None:
+    api, storage, _ = _fake_windows_artifact_storage()
+    artifact_path = "created/owned.json"
+    assert storage.atomic_write(artifact_path, b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt(artifact_path)
+    assert receipt is not None and receipt.identity is not None
+    created = api._resolve_absolute(
+        "C:\\safe\\evaluation-run\\created", follow_final_reparse=False
+    )
+    created_identity = created.file_index
+    try:
+        storage.remove_artifact(
+            artifact_path,
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    finally:
+        storage.close()
+
+    recovery = next(
+        node
+        for node in api._resolve_absolute("C:\\safe", follow_final_reparse=False).children.values()
+        if node.name.startswith(".regulatory-harvest-recovery-")
+    )
+    retained = [
+        node
+        for node in recovery.children.values()
+        if node.name.endswith(".dirclaim")
+    ]
+    assert [node.file_index for node in retained] == [created_identity]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="directory collision is POSIX-specific")
+def test_posix_directory_claim_collision_preserves_both_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "directory-claim-collision"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    assert storage.atomic_write("created/owned.json", b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt("created/owned.json")
+    assert receipt is not None and receipt.identity is not None
+    original_claim = attorney_artifacts._rename_posix_noreplace
+    planted_path: Path | None = None
+
+    def collide_once(
+        source_name: str,
+        destination_name: str,
+        *,
+        source_directory: int,
+        destination_directory: int,
+    ) -> None:
+        nonlocal planted_path
+        if planted_path is None and destination_name.endswith(".dirclaim"):
+            os.mkdir(destination_name, mode=0o700, dir_fd=destination_directory)
+            planted_path = tmp_path / destination_name
+        original_claim(
+            source_name,
+            destination_name,
+            source_directory=source_directory,
+            destination_directory=destination_directory,
+        )
+
+    monkeypatch.setattr(attorney_artifacts, "_rename_posix_noreplace", collide_once)
+    try:
+        storage.remove_artifact(
+            "created/owned.json",
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    finally:
+        storage.close()
+
+    assert planted_path is not None and planted_path.is_dir()
+    assert len(list(tmp_path.glob(".regulatory-harvest-recovery-*.dirclaim"))) == 2
+
+
+def test_win32_sidecar_collision_is_no_clobber_and_retryable() -> None:
+    api, storage, _ = _fake_windows_artifact_storage()
+    artifact_path = "judge-responses/owned.json"
+    assert storage.atomic_write(artifact_path, b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt(artifact_path)
+    assert receipt is not None and receipt.identity is not None
+    planted_path: str | None = None
+
+    def collide_once(parent_handle: int, name: str) -> None:
+        nonlocal planted_path
+        if planted_path is None and name.startswith(".rh-") and name.endswith(".json"):
+            planted_path = ntpath.join(api._node_path(api.handles[parent_handle]), name)
+            api.add_file(planted_path, b"external-sidecar\n")
+
+    api.before_relative_open = collide_once
+    try:
+        storage.remove_artifact(
+            artifact_path,
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    finally:
+        api.before_relative_open = None
+        storage.close()
+
+    assert planted_path is not None
+    assert api.contents[api._key(planted_path)] == b"external-sidecar\n"
+
+
+def test_win32_directory_claim_collision_preserves_both_entries() -> None:
+    api, storage, _ = _fake_windows_artifact_storage()
+    artifact_path = "created/owned.json"
+    assert storage.atomic_write(artifact_path, b"owned\n", mutable=False)
+    receipt = storage.atomic_write_receipt(artifact_path)
+    assert receipt is not None and receipt.identity is not None
+    created = api._resolve_absolute(
+        "C:\\safe\\evaluation-run\\created", follow_final_reparse=False
+    )
+    planted_path: str | None = None
+
+    def collide_once(handle: int, root_handle: int, new_name: str) -> None:
+        nonlocal planted_path
+        if planted_path is None and new_name.endswith(".dirclaim"):
+            planted_path = ntpath.join(api._node_path(api.handles[root_handle]), new_name)
+            api.add_directory(planted_path)
+
+    api.before_rename = collide_once
+    try:
+        storage.remove_artifact(
+            artifact_path,
+            expected_identity=receipt.identity,
+            expected_data=b"owned\n",
+        )
+    finally:
+        storage.close()
+
+    assert planted_path is not None
+    assert api.nodes[api._key(planted_path)].file_index != created.file_index
+    recovery = api._resolve_absolute(ntpath.dirname(planted_path), follow_final_reparse=False)
+    assert any(
+        node.name.endswith(".dirclaim") and node.file_index == created.file_index
+        for node in recovery.children.values()
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mkdir collision is POSIX-specific")
+@pytest.mark.parametrize("target", ["run-root", "nested-parent"])
+def test_posix_mkdir_eexist_race_never_adopts_or_modifies_the_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    run_dir = tmp_path / f"mkdir-eexist-{target}"
+    storage: attorney_artifacts._PosixRunStorage | None = None
+    if target == "nested-parent":
+        storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+        created_name = "nested"
+        external = run_dir / created_name
+    else:
+        created_name = run_dir.name
+        external = run_dir
+    original_mkdir = attorney_artifacts.os.mkdir
+    raced = False
+
+    def race_mkdir(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal raced
+        if path == created_name and not raced:
+            raced = True
+            original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+            directory = kwargs.get("dir_fd")
+            assert isinstance(directory, int)
+            external_descriptor = os.open(
+                created_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+            try:
+                marker = os.open(
+                    "external.marker",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o640,
+                    dir_fd=external_descriptor,
+                )
+                try:
+                    os.write(marker, b"external\n")
+                finally:
+                    os.close(marker)
+            finally:
+                os.close(external_descriptor)
+            os.chmod(external, 0o755)
+            raise FileExistsError(created_name)
+        original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(attorney_artifacts.os, "mkdir", race_mkdir)
+    try:
+        with pytest.raises(EvaluationIntegrityError, match="directory creation collision"):
+            if storage is None:
+                attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+            else:
+                storage.atomic_write("nested/owned.json", b"owned\n", mutable=False)
+    finally:
+        if storage is not None:
+            storage.close()
+
+    assert raced
+    assert stat.S_IMODE(external.stat().st_mode) == 0o755
+    assert {path.name for path in external.iterdir()} == {"external.marker"}
+    assert (external / "external.marker").read_bytes() == b"external\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mkdir swap is POSIX-specific")
+def test_posix_nested_parent_post_mkdir_preopen_swap_is_never_adopted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "mkdir-open-swap"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    original_open_directory = attorney_artifacts._open_posix_directory
+    swapped = False
+
+    def swap_before_open(parent: int | None, name: str) -> int:
+        nonlocal swapped
+        if parent is not None and name == "nested" and not swapped:
+            try:
+                os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return original_open_directory(parent, name)
+            swapped = True
+            os.rename(
+                "nested",
+                "nested-owned-away",
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+            )
+            os.mkdir("nested", mode=0o755, dir_fd=parent)
+        return original_open_directory(parent, name)
+
+    monkeypatch.setattr(attorney_artifacts, "_open_posix_directory", swap_before_open)
+    try:
+        with pytest.raises(EvaluationIntegrityError, match="directory creation race"):
+            storage.atomic_write("nested/owned.json", b"owned\n", mutable=False)
+    finally:
+        storage.close()
+
+    assert swapped
+    assert stat.S_IMODE((run_dir / "nested").stat().st_mode) == 0o755
+    assert list((run_dir / "nested").iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mkdir revalidation is POSIX-specific")
+def test_posix_created_directory_revalidates_an_observed_post_fchmod_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defense in depth outside the cooperative operation-wide namespace contract."""
+    run_dir = tmp_path / "post-fchmod-swap"
+    storage = attorney_artifacts._PosixRunStorage.open(run_dir, initialize=True)
+    original_fchmod = attorney_artifacts.os.fchmod
+    swapped = False
+
+    def swap_after_fchmod(descriptor: int, mode: int) -> None:
+        nonlocal swapped
+        original_fchmod(descriptor, mode)
+        nested = run_dir / "nested"
+        if swapped or not nested.exists():
+            return
+        descriptor_stat = os.fstat(descriptor)
+        named_stat = nested.stat(follow_symlinks=False)
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) != (
+            named_stat.st_dev,
+            named_stat.st_ino,
+        ):
+            return
+        swapped = True
+        nested.rename(run_dir / "nested-owned-away")
+        nested.mkdir(mode=0o755)
+
+    monkeypatch.setattr(attorney_artifacts.os, "fchmod", swap_after_fchmod)
+    try:
+        with pytest.raises(EvaluationIntegrityError, match="directory creation race"):
+            storage.atomic_write("nested/owned.json", b"owned\n", mutable=False)
+    finally:
+        storage.close()
+
+    assert swapped
+    assert stat.S_IMODE((run_dir / "nested").stat().st_mode) == 0o755
+    assert list((run_dir / "nested").iterdir()) == []
+
+
+@pytest.mark.parametrize("target", ["run-root", "nested-parent"])
+def test_win32_create_collision_never_adopts_the_race_winner(target: str) -> None:
+    api = _FakeWin32API()
+    api.add_directory("C:\\")
+    api.add_directory("C:\\safe")
+    storage: attorney_artifacts._WindowsRunStorage | None = None
+    if target == "nested-parent":
+        storage = attorney_artifacts._WindowsRunStorage.open(
+            Path("C:\\safe\\evaluation-run"), initialize=True, api=api
+        )
+        target_name = "nested"
+        target_path = "C:\\safe\\evaluation-run\\nested"
+    else:
+        target_name = "evaluation-run"
+        target_path = "C:\\safe\\evaluation-run"
+    raced = False
+
+    def race_create(parent_handle: int, name: str) -> None:
+        nonlocal raced
+        disposition = api.relative_open_calls[-1][4]
+        if name == target_name and disposition == 2 and not raced:
+            raced = True
+            api.add_directory(target_path)
+            api.add_file(ntpath.join(target_path, "external.marker"), b"external\n")
+
+    api.before_relative_open = race_create
+    try:
+        with pytest.raises(EvaluationIntegrityError, match="directory creation collision"):
+            if storage is None:
+                attorney_artifacts._WindowsRunStorage.open(
+                    Path("C:\\safe\\evaluation-run"), initialize=True, api=api
+                )
+            else:
+                storage.atomic_write("nested/owned.json", b"owned\n", mutable=False)
+    finally:
+        if storage is not None:
+            storage.close()
+
+    assert raced
+    external = api._resolve_absolute(target_path, follow_final_reparse=False)
+    assert set(external.children) == {ntpath.normcase("external.marker")}
+    assert api.contents[api._key(ntpath.join(target_path, "external.marker"))] == b"external\n"
+
+
+def test_win32_close_aggregates_retained_handle_failures_and_is_retryable() -> None:
+    api, storage, parent = _fake_windows_artifact_storage()
+    assert storage.atomic_write(
+        "judge-responses/owned.json", b"owned\n", mutable=False
+    )
+    artifact_node = parent.children[ntpath.normcase("owned.json")]
+    identity = attorney_artifacts._windows_node_identity(artifact_node)
+    ownership_handle = api._new_handle(
+        artifact_node,
+        _WIN_FILE_READ_DATA,
+        _WIN_FILE_SHARE_READ | _WIN_FILE_SHARE_WRITE | _WIN_FILE_SHARE_DELETE,
+    )
+    preclaim_handle = api._new_handle(
+        artifact_node,
+        _WIN_FILE_READ_DATA,
+        _WIN_FILE_SHARE_READ | _WIN_FILE_SHARE_WRITE | _WIN_FILE_SHARE_DELETE,
+    )
+    storage._owned_artifacts["judge-responses/owned.json"] = (
+        attorney_artifacts._WindowsOwnedArtifact(identity, (), ownership_handle)
+    )
+    storage._deferred_recovery_handles.add(preclaim_handle)
+    recovery = storage._ensure_recovery_root()
+    failed_handles = {ownership_handle, recovery.handle}
+
+    def fail_selected(handle: int) -> None:
+        if handle in failed_handles:
+            raise OSError(f"injected close failure {handle}")
+
+    api.before_close_handle = fail_selected
+    with pytest.raises(EvaluationIntegrityError) as raised:
+        storage.close()
+
+    assert str(ownership_handle) in str(raised.value)
+    assert str(recovery.handle) in str(raised.value)
+    assert storage._closed is False
+    assert ownership_handle in api.handles
+    assert recovery.handle in api.handles
+    assert preclaim_handle not in api.handles
+    first_closed = tuple(api.closed_handles)
+
+    api.before_close_handle = None
+    storage.close()
+    assert storage._closed is True
+    assert api.handles == {}
+    assert all(api.closed_handles.count(handle) == 1 for handle in first_closed)
+    final_closed = tuple(api.closed_handles)
+    storage.close()
+    assert tuple(api.closed_handles) == final_closed
+
+
+def test_windows_context_retries_multiple_transient_artifact_parent_handles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _FakeWin32API()
+    api.add_directory("C:\\")
+    api.add_directory("C:\\safe")
+    storage: attorney_artifacts._WindowsRunStorage | None = None
+    binding_handles: set[int] = set()
+    close_attempts: dict[int, int] = {}
+
+    def fail_each_binding_twice(handle: int) -> None:
+        if handle not in binding_handles:
+            return
+        close_attempts[handle] = close_attempts.get(handle, 0) + 1
+        if close_attempts[handle] <= 2:
+            raise OSError(f"injected transient binding close failure {handle}")
+
+    monkeypatch.setattr(attorney_artifacts, "_storage_platform", lambda: "nt")
+    monkeypatch.setattr(attorney_artifacts, "_new_win32_api", lambda: api)
+    with (
+        pytest.raises(
+            EvaluationIntegrityError,
+            match="Windows run storage close",
+        ) as raised,
+        attorney_artifacts._open_run_storage(
+            Path("C:\\safe\\context-bindings"), initialize=True
+        ) as opened,
+    ):
+        assert isinstance(opened, attorney_artifacts._WindowsRunStorage)
+        storage = opened
+        api.add_directory("C:\\safe\\context-bindings\\nested")
+        api.add_directory("C:\\safe\\context-bindings\\nested\\deeper")
+        with storage._artifact_parent(
+            "nested/deeper/owned.json", create=False
+        ) as (_, _, bindings, _):
+            binding_handles.update(binding.handle for binding in bindings)
+            api.before_close_handle = fail_each_binding_twice
+
+    assert storage is not None
+    assert len(binding_handles) == 2
+    assert close_attempts == {handle: 2 for handle in binding_handles}
+    assert all(str(handle) in str(raised.value) for handle in binding_handles)
+    assert storage._closed is False
+    assert binding_handles <= set(api.handles)
+    with pytest.raises(PermissionError, match="sharing violation"):
+        api.open_root(
+            "C:\\safe\\context-bindings\\nested\\deeper",
+            _WIN_FILE_WRITE_DATA | _WIN_DELETE,
+            _WIN_FILE_SHARE_READ | _WIN_FILE_SHARE_WRITE | _WIN_FILE_SHARE_DELETE,
+            0,
+        )
+
+    api.before_close_handle = None
+    storage.close()
+    assert storage._closed is True
+    assert api.handles == {}
+    assert all(api.closed_handles.count(handle) == 1 for handle in binding_handles)
+
+    unlocked = api.open_root(
+        "C:\\safe\\context-bindings\\nested\\deeper",
+        _WIN_FILE_WRITE_DATA | _WIN_DELETE,
+        _WIN_FILE_SHARE_READ | _WIN_FILE_SHARE_WRITE | _WIN_FILE_SHARE_DELETE,
+        0,
+    )
+    api.close_handle(unlocked)
+    final_closed = tuple(api.closed_handles)
+    storage.close()
+    assert tuple(api.closed_handles) == final_closed
+
+
+def test_storage_context_surfaces_windows_close_failure_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _FakeWin32API()
+    api.add_directory("C:\\")
+    api.add_directory("C:\\safe")
+    storage: attorney_artifacts._WindowsRunStorage | None = None
+    failed = False
+
+    def fail_one_close(handle: int) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected context close failure")
+
+    monkeypatch.setattr(attorney_artifacts, "_storage_platform", lambda: "nt")
+    monkeypatch.setattr(attorney_artifacts, "_new_win32_api", lambda: api)
+    with (
+        pytest.raises(EvaluationIntegrityError, match="Windows run storage close"),
+        attorney_artifacts._open_run_storage(
+            Path("C:\\safe\\context-run"), initialize=True
+        ) as opened,
+    ):
+        assert isinstance(opened, attorney_artifacts._WindowsRunStorage)
+        storage = opened
+        api.before_close_handle = fail_one_close
+
+    assert storage is not None and storage._closed is False
+    api.before_close_handle = None
+    storage.close()
+    assert storage._closed is True
+    assert api.handles == {}
+
+
+def test_win32_mutable_write_reports_receipt_after_post_replace_failure() -> None:
+    api, storage, _ = _fake_windows_artifact_storage()
+    assert storage.atomic_write("mutable.json", b"old\n", mutable=False)
+    close_error = OSError("injected replaced handle close failure")
+
+    def fail_close(handle: int) -> None:
+        if api.temporary_handles and handle == api.temporary_handles[-1]:
+            raise close_error
+
+    api.before_close_handle = fail_close
+    try:
+        with pytest.raises(attorney_artifacts._AtomicWriteOwnershipError) as raised:
+            storage.atomic_write("mutable.json", b"new\n", mutable=True)
+        receipt = storage.atomic_write_receipt("mutable.json")
+    finally:
+        storage.close()
+
+    assert raised.value.replaced and raised.value.identity is not None
+    assert receipt is not None and receipt.replaced and receipt.identity is not None
+    assert api.contents[_FakeWin32API._key("C:\\safe\\evaluation-run\\mutable.json")] == b"new\n"
+
+
+def test_win32_removal_is_limited_to_storage_owned_artifacts() -> None:
+    api, storage, parent = _fake_windows_artifact_storage()
+    api.add_file(
+        "C:\\safe\\evaluation-run\\judge-responses\\competitor.json",
+        b"external\n",
+    )
+
+    try:
+        assert storage.atomic_write(
+            "judge-responses/owned.json",
+            b"owned\n",
+            mutable=False,
+        )
+        storage.remove_artifact("judge-responses/owned.json")
+        with pytest.raises(
+            EvaluationIntegrityError,
+            match="secure Windows artifact removal is unavailable",
+        ):
+            storage.remove_artifact("judge-responses/competitor.json")
+    finally:
+        storage.close()
+
+    assert ntpath.normcase("owned.json") not in parent.children
+    assert parent.children[ntpath.normcase("competitor.json")].content == b"external\n"
+    assert api.path_child_calls == 0
+    assert api.handles == {}
 
 
 def test_win32_inventory_rejects_reparse_artifact_without_leaking_handles() -> None:
@@ -3095,6 +4823,50 @@ def test_win32_read_uses_reparse_handle_without_delete_or_write_sharing() -> Non
     assert api.handles == {}
 
 
+@pytest.mark.parametrize(
+    ("content", "max_bytes"),
+    [(b"normal", 16), (b"exact", 5)],
+)
+def test_win32_read_threads_limit_to_retained_handle(
+    content: bytes,
+    max_bytes: int,
+) -> None:
+    api, storage, _ = _fake_windows_artifact_storage()
+    api.add_file("C:\\safe\\evaluation-run\\bounded.json", content)
+
+    try:
+        assert storage.read_artifact("bounded.json", max_bytes=max_bytes) == content
+    finally:
+        storage.close()
+
+    assert api.read_limits == [max_bytes]
+    assert api.handles == {}
+
+
+def test_win32_read_rejects_growth_inside_bounded_read() -> None:
+    api, storage, _ = _fake_windows_artifact_storage()
+    api.add_file("C:\\safe\\evaluation-run\\growing.json", b"safe")
+
+    def grow(handle: int) -> None:
+        node = api.handles[handle]
+        node.content = b"unsafe"
+        node.size = len(node.content)
+        node.write_time += 1
+
+    api.before_read_file = grow
+    try:
+        with pytest.raises(
+            EvaluationIntegrityError,
+            match=r"artifact exceeds maximum size: growing\.json",
+        ):
+            storage.read_artifact("growing.json", max_bytes=4)
+    finally:
+        storage.close()
+
+    assert api.read_limits == [4]
+    assert api.handles == {}
+
+
 def test_win32_inventory_rejects_hard_linked_artifact() -> None:
     api = _FakeWin32API()
     api.add_directory("C:\\")
@@ -3230,6 +5002,28 @@ def test_ctypes_win32_relative_rename_supports_short_leaf_names() -> None:
     assert observed["buffer_size"] >= attorney_artifacts.ctypes.sizeof(
         attorney_artifacts._FileRenameInformation
     )
+
+
+@pytest.mark.parametrize(("total_size", "max_bytes"), [(3, 8), (5, 5)])
+def test_ctypes_win32_bounded_read_accepts_normal_and_exact_limit(
+    total_size: int,
+    max_bytes: int,
+) -> None:
+    api, requested, returned = _streaming_ctypes_win32_api(total_size)
+
+    assert api.read_file(11, max_bytes=max_bytes) == b"x" * total_size
+    assert sum(returned) == total_size
+    assert all(size <= max_bytes + 1 for size in requested)
+
+
+def test_ctypes_win32_bounded_read_stops_at_first_excess_byte() -> None:
+    api, requested, returned = _streaming_ctypes_win32_api(1024 * 1024 * 1024)
+
+    with pytest.raises(EvaluationIntegrityError, match="artifact exceeds maximum size"):
+        api.read_file(11, max_bytes=5)
+
+    assert requested == [6]
+    assert returned == [6]
 
 
 def test_ctypes_win32_cleanup_marks_open_handle_for_disposition() -> None:

@@ -16,6 +16,29 @@ ARCHIVE_ROOT = "regulatory-harvest"
 FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 PACKAGE_MANIFEST = ROOT / "scripts" / "skill-package-files.txt"
 GUARDED_TREES = ("agents", "assets", "references", "src/regulatory_harvest")
+V21_ARCHIVE_REQUIREMENTS = frozenset(
+    {
+        "assets/attorney-evaluation-v21-response.template.json",
+        "src/regulatory_harvest/evaluation/attorney_protocol.py",
+        "src/regulatory_harvest/evaluation/attorney_v21_artifacts.py",
+        "src/regulatory_harvest/evaluation/attorney_v21_compiler.py",
+        "src/regulatory_harvest/evaluation/attorney_v21_models.py",
+        "src/regulatory_harvest/evaluation/attorney_v21_requests.py",
+        "src/regulatory_harvest/evaluation/attorney_v21_rubric.py",
+        "src/regulatory_harvest/evaluation/attorney_v21_workflow.py",
+    }
+)
+V22_ARCHIVE_REQUIREMENTS = frozenset(
+    {
+        "assets/attorney-evaluation-v22-response.template.json",
+        "src/regulatory_harvest/evaluation/attorney_v22_artifacts.py",
+        "src/regulatory_harvest/evaluation/attorney_v22_compiler.py",
+        "src/regulatory_harvest/evaluation/attorney_v22_drafts.py",
+        "src/regulatory_harvest/evaluation/attorney_v22_models.py",
+        "src/regulatory_harvest/evaluation/attorney_v22_requests.py",
+        "src/regulatory_harvest/evaluation/attorney_v22_workflow.py",
+    }
+)
 
 
 class SkillBuildError(RuntimeError):
@@ -40,6 +63,16 @@ def _runtime_files() -> list[Path]:
 
     paths = [ROOT / entry for entry in manifest_entries]
     expected = set(manifest_entries)
+    missing_v21 = sorted(V21_ARCHIVE_REQUIREMENTS - expected)
+    if missing_v21:
+        raise SkillBuildError(
+            f"skill package manifest is missing Protocol 2.1 input: {missing_v21[0]}"
+        )
+    missing_v22 = sorted(V22_ARCHIVE_REQUIREMENTS - expected)
+    if missing_v22:
+        raise SkillBuildError(
+            f"skill package manifest is missing Protocol 2.2 input: {missing_v22[0]}"
+        )
     discovered: set[str] = set()
     for relative in GUARDED_TREES:
         tree = ROOT / relative

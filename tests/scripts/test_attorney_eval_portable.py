@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import copy
 import hashlib
 import importlib.util
@@ -8,6 +9,7 @@ import io
 import json
 import math
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -91,6 +93,24 @@ from regulatory_harvest.evaluation.attorney_scoring import (
     compare_reports as compare_core,
 )
 from regulatory_harvest.evaluation.attorney_scoring import score_report as score_core
+from regulatory_harvest.evaluation.attorney_v22_drafts import (
+    CompiledDraftV22,
+    EvaluatorProvenanceV22,
+    compile_evaluator_draft_v22,
+)
+from regulatory_harvest.evaluation.attorney_v22_models import EvaluatorRequestV22
+from regulatory_harvest.evaluation.attorney_v22_workflow import (
+    guarded_submit_evaluator_response_v22 as guarded_submit_v22_core,
+)
+from regulatory_harvest.evaluation.attorney_v22_workflow import (
+    initialize_evaluation_v22 as initialize_v22_core,
+)
+from regulatory_harvest.evaluation.attorney_v22_workflow import (
+    next_evaluator_request_v22 as next_v22_core,
+)
+from regulatory_harvest.evaluation.attorney_v22_workflow import (
+    preflight_evaluator_response_v22 as preflight_v22_core,
+)
 from regulatory_harvest.evaluation.attorney_workflow import (
     _audit_ledger_request as audit_ledger_request_core,
 )
@@ -120,6 +140,7 @@ from regulatory_harvest.storage.serialization import canonical_json_bytes
 ROOT = Path(__file__).parents[2]
 SCRIPT = ROOT / "scripts" / "attorney_eval_portable.py"
 FIXTURE = ROOT / "tests" / "fixtures" / "attorney-eval"
+V2_FIXTURE = ROOT / "tests" / "fixtures" / "attorney-eval-v2"
 GOLDEN_ARTIFACTS = (
     "case-readiness.json",
     "legal-ledger.json",
@@ -129,12 +150,101 @@ GOLDEN_ARTIFACTS = (
 
 
 def _load_portable() -> ModuleType:
+    """Load the retained 1.3 internals for their isolated algorithm suite.
+
+    New public runs are exercised through the portable CLI differential tests.
+    The established ledger fixtures deliberately retain their internal v1
+    constructor so they never create a fresh legacy run via the public surface.
+    """
     spec = importlib.util.spec_from_file_location("attorney_eval_portable", SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    module.initialize_evaluation = module._initialize_evaluation_v1
+    module.verify_evaluation_run = module._verify_evaluation_run_v1
+    module.resume_evaluation = module._resume_evaluation_v1
+    module.next_judge_request = module._next_judge_request_v1
+    module.preflight_judge_response = module._preflight_judge_response_v1
+    module.guarded_submit_judge_response = module._guarded_submit_judge_response_v1
+    module.submit_judge_response = module._submit_judge_response_v1
     return module
+
+
+def _load_protocol_21_portable() -> ModuleType:
+    """Load the current public portable surface without the retained-1.3 aliases."""
+    spec = importlib.util.spec_from_file_location("attorney_eval_portable_v21", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_protocol_22_portable() -> ModuleType:
+    """Load the current public portable surface for Protocol 2.2 conformance."""
+    spec = importlib.util.spec_from_file_location("attorney_eval_portable_v22", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _protocol_21_test_response(request: dict[str, Any]) -> dict[str, Any]:
+    """Build one valid scripted response for the source/no-dispute grade path."""
+    payload = request["payload"]
+    operation = request["operation"]
+    if operation == "source_review":
+        source = payload["source_record"]["sources"][0]
+        response_payload: dict[str, Any] = {
+            "schema_version": "2.1",
+            "proposals": [
+                {
+                    "statement": "A covered operator must file notice.",
+                    "kind": "obligation",
+                    "importance": "critical",
+                    "passages": [
+                        {"source_id": source["source_id"], "quote": source["normalized_text"]}
+                    ],
+                    "dependency": None,
+                    "confidence": "clear",
+                    "rationale": "The supplied source states the filing duty.",
+                }
+            ],
+        }
+    elif operation == "source_audit":
+        response_payload = {"schema_version": "2.1", "concerns": []}
+    else:
+        assert operation == "ordinary_grade_fragment"
+        response_payload = {
+            "schema_version": "2.1",
+            "anonymous_label": payload["anonymous_label"],
+            "grader_lane": payload["grader_lane"],
+            "batch_ref": payload["batch_ref"],
+            "baseline_fingerprint": payload["baseline_fingerprint"],
+            "report_fingerprint": payload["report_fingerprint"],
+            "requirement_grades": [
+                {
+                    "requirement_id": requirement["requirement_id"],
+                    "disposition": "met",
+                    "report_passages": [payload["report_text"]],
+                    "rationale": "The report was assessed against this requirement.",
+                    "omission": None,
+                }
+                for requirement in payload["requirements"]
+            ],
+            "rationale": "The bounded grade batch is complete.",
+        }
+    return {
+        "schema_version": "2.1",
+        "operation": operation,
+        "request_fingerprint": request["request_fingerprint"],
+        "provider_name": "local-scripted-fixture",
+        "model_name": "no-provider",
+        "judge_isolation": "scripted_fixture",
+        "payload": response_payload,
+    }
 
 
 def _case_payload() -> dict[str, Any]:
@@ -5557,11 +5667,11 @@ def test_failed_atomic_write_cleans_exclusive_temporary_leaf(
     portable = _load_portable()
     run = tmp_path / "run"
 
-    def fail_replace(*args: Any, **kwargs: Any) -> None:
+    def fail_link(*args: Any, **kwargs: Any) -> None:
         raise OSError("race")
 
     with portable._open_run_storage(run, initialize=True) as storage:
-        monkeypatch.setattr(portable.os, "replace", fail_replace)
+        monkeypatch.setattr(portable.os, "link", fail_link)
         with pytest.raises(OSError, match="race"):
             storage.atomic_write("artifact.json", b"{}", mutable=False)
         assert [path.name for path in run.iterdir()] == []
@@ -5768,3 +5878,2600 @@ def test_portable_guarded_submit_propagates_transition_integrity_write_free(
     assert portable.EVAL_EXIT_INTEGRITY == 5
     assert _tree_bytes(portable_run) == portable_before
     assert _tree_bytes(core_run) == core_before
+
+
+def test_protocol_2_fictional_fixture_has_exact_full_portable_command_parity(
+    tmp_path: Path,
+) -> None:
+    """Exercise the public fictional protocol-2 lifecycle through both CLIs."""
+    fixture = tmp_path / "attorney-eval-v2"
+    shutil.copytree(V2_FIXTURE, fixture)
+    full_run = tmp_path / "full"
+    portable_run = tmp_path / "portable"
+    seed = "0" * 64
+    full_runner = ROOT / "scripts" / "harvest_skill.py"
+    portable_runner = ROOT / "scripts" / "harvest_portable.py"
+
+    def invoke(runner: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        command = (
+            [sys.executable, str(runner), *args]
+            if runner == full_runner
+            else ["python3", "-I", "-S", str(runner), *args]
+        )
+        return subprocess.run(
+            command,
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def paired(command: str, *args: str) -> tuple[subprocess.CompletedProcess[str], object | None]:
+        full = invoke(full_runner, command, *args, "--run", str(full_run))
+        portable = invoke(portable_runner, command, *args, "--run", str(portable_run))
+        assert (full.returncode, full.stdout, full.stderr) == (
+            portable.returncode,
+            portable.stdout,
+            portable.stderr,
+        ), (full.stdout, full.stderr, portable.stdout, portable.stderr)
+        payload = None if not full.stdout else json.loads(full.stdout)
+        return full, payload
+
+    init_full, _ = paired(
+        "eval-init", "--case", str(fixture / "case.json"), "--seed-hex", seed
+    )
+    assert init_full.returncode == 0
+    responses = json.loads((fixture / "scripted-responses.json").read_text(encoding="utf-8"))
+    entries = responses["responses"]
+    assert isinstance(entries, list) and len(entries) == 7
+    observed_operations: list[str] = []
+    for index, entry in enumerate(entries, start=1):
+        assert isinstance(entry, dict)
+        next_full, request = paired("eval-next")
+        assert next_full.returncode == 0
+        assert isinstance(request, dict)
+        observed_operations.append(request["operation"])
+        request_payload = request["payload"]
+        assert isinstance(request_payload, dict)
+        if request["operation"] == "source_review":
+            response_payload = copy.deepcopy(entries[0]["payload"])
+            response_payload["schema_version"] = "2.1"
+        elif request["operation"] == "source_audit":
+            response_payload = copy.deepcopy(entries[1]["payload"])
+            response_payload["schema_version"] = "2.1"
+        elif request["operation"] == "source_referee_fragment":
+            dispute = request_payload["material_disputes"][0]
+            response_payload = {
+                "schema_version": "2.1",
+                "decision": "accept_auditor",
+                "unresolved_reason": None,
+                "evidence_refs": [dispute["evidence"][0]["evidence_ref"]],
+                "rationale": "The explicit fictional date supports the corrected requirement.",
+            }
+        else:
+            assert request["operation"] == "ordinary_grade_fragment"
+            label = request_payload["anonymous_label"]
+            disposition = "met" if label == "A" else "not_met"
+            response_payload = {
+                "schema_version": "2.1",
+                "anonymous_label": label,
+                "grader_lane": request_payload["grader_lane"],
+                "batch_ref": request_payload["batch_ref"],
+                "baseline_fingerprint": request_payload["baseline_fingerprint"],
+                "report_fingerprint": request_payload["report_fingerprint"],
+                "requirement_grades": [
+                    {
+                        "requirement_id": requirement["requirement_id"],
+                        "disposition": disposition,
+                        "report_passages": [request_payload["report_text"]]
+                        if disposition == "met" else [],
+                        "rationale": "The fictional report was assessed against this requirement.",
+                        "omission": None,
+                    }
+                    for requirement in request_payload["requirements"]
+                ],
+                "rationale": "The bounded fictional batch is complete.",
+            }
+        response_path = tmp_path / f"response-{index}.json"
+        response_path.write_bytes(canonical_json_bytes(response_payload))
+        submitted, submitted_payload = paired(
+            "eval-submit-safe",
+            "--response",
+            str(response_path),
+            "--provider-name",
+            "local-scripted-fixture",
+            "--model-name",
+            "no-provider",
+            "--judge-isolation",
+            "scripted_fixture",
+        )
+        assert submitted.returncode == 0
+        assert isinstance(submitted_payload, dict)
+        assert submitted_payload["accepted"] is True
+
+    assert observed_operations == [
+        "source_review",
+        "source_audit",
+        "source_referee_fragment",
+        "ordinary_grade_fragment",
+        "ordinary_grade_fragment",
+        "ordinary_grade_fragment",
+        "ordinary_grade_fragment",
+    ]
+    terminal_next, terminal_request = paired("eval-next")
+    assert terminal_next.returncode == 4
+    assert terminal_request is None
+    status, status_payload = paired("eval-status")
+    verify, verify_payload = paired("eval-verify")
+    assert status.returncode == verify.returncode == 4
+    assert isinstance(status_payload, dict) and status_payload["terminal_status"] == "COMPLETED"
+    assert isinstance(verify_payload, dict) and verify_payload["ok"] is True
+    assert _tree_bytes(full_run) == _tree_bytes(portable_run)
+    assert (full_run / "result.json").read_bytes() == (portable_run / "result.json").read_bytes()
+    assert (full_run / "run-manifest.json").read_bytes() == (
+        portable_run / "run-manifest.json"
+    ).read_bytes()
+
+    for run in (full_run, portable_run):
+        result_path = run / "result.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["result_fingerprint"] = "0" * 64
+        result_path.write_bytes(canonical_json_bytes(result))
+    tampered_full = _tree_bytes(full_run)
+    tampered_portable = _tree_bytes(portable_run)
+    invalid_status, invalid_status_payload = paired("eval-status")
+    invalid_verify, invalid_verify_payload = paired("eval-verify")
+    assert invalid_status.returncode == invalid_verify.returncode == 5
+    assert invalid_status_payload is None
+    assert invalid_verify_payload == {
+        "issues": ["EVALUATION_INTEGRITY_INVALID"],
+        "ok": False,
+    }
+    assert _tree_bytes(full_run) == tampered_full
+    assert _tree_bytes(portable_run) == tampered_portable
+
+
+def test_protocol_21_public_mirror_loads_with_only_the_standard_library() -> None:
+    """The 2.1 mirror remains importable when site packages are disabled."""
+    probe = (
+        "import runpy,sys;"
+        f"m=runpy.run_path({str(SCRIPT)!r});"
+        "assert m['_V21_PROTOCOL']=='2.1';"
+        "assert 'pydantic' not in sys.modules"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", probe],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def _portable_v22_review_request() -> dict[str, object]:
+    return {
+        "schema_version": "2.2",
+        "operation": "source_review_fragment",
+        "request_fingerprint": "a" * 64,
+        "system_instructions": "Review the frozen source record.",
+        "json_schema": {"type": "object"},
+        "payload": {
+            "source_record": {
+                "sources": [
+                    {
+                        "source_id": "rule-1",
+                        "normalized_text": "The controller shall act.",
+                    }
+                ]
+            },
+            "max_new_proposals": 5,
+        },
+        "safe_metadata": {},
+    }
+
+
+def _portable_v22_review_draft() -> dict[str, object]:
+    return {
+        "proposals": [
+            {
+                "statement": "A controller must act.",
+                "kind": "obligation",
+                "importance": "critical",
+                "passages": [
+                    {"source_id": "rule-1", "quote": "The controller shall act."}
+                ],
+                "dependency": None,
+                "confidence": "clear",
+                "rationale": "The source uses mandatory language.",
+            }
+        ],
+        "review_complete": True,
+    }
+
+
+def _portable_v22_audit_request() -> dict[str, object]:
+    proposal = copy.deepcopy(_portable_v22_review_draft()["proposals"][0])
+    return {
+        **_portable_v22_review_request(),
+        "operation": "source_audit_fragment",
+        "request_fingerprint": "b" * 64,
+        "payload": {
+            "source_record": _portable_v22_review_request()["payload"]["source_record"],
+            "indexed_proposals": [{"proposal_ref": "P0001", "proposal": proposal}],
+            "accepted_concerns": [],
+            "fragment_ordinal": 1,
+            "max_new_concerns": 5,
+        },
+    }
+
+
+def _portable_v22_contested_request() -> dict[str, object]:
+    return {
+        **_portable_v22_review_request(),
+        "operation": "contested_grade_fragment",
+        "request_fingerprint": "c" * 64,
+        "payload": {
+            "anonymous_label": "A",
+            "grader_lane": 1,
+            "baseline_fingerprint": "d" * 64,
+            "report_fingerprint": "e" * 64,
+            "report_text": "The report satisfies the issued duty.",
+            "contested_requirement": {"contested_requirement_id": "CR0001"},
+        },
+    }
+
+
+def _portable_v22_referee_request() -> dict[str, object]:
+    return {
+        **_portable_v22_review_request(),
+        "operation": "source_referee_fragment",
+        "request_fingerprint": "c" * 64,
+        "payload": {
+            "material_disputes": [
+                {
+                    "evidence": [
+                        {
+                            "evidence_ref": "EVID-0001",
+                            "passage": {
+                                "source_id": "rule-1",
+                                "quote": "The controller shall act.",
+                                "start_char": 0,
+                                "end_char": 25,
+                            },
+                        }
+                    ]
+                }
+            ]
+        },
+    }
+
+
+def _portable_v22_referee_draft() -> dict[str, object]:
+    return {
+        "decision": "accept_reviewer",
+        "unresolved_reason": None,
+        "evidence_ordinals": [1],
+        "rationale": "The sole passage supports the reviewer.",
+    }
+
+
+def _portable_v22_ordinary_request() -> dict[str, object]:
+    return {
+        **_portable_v22_review_request(),
+        "operation": "ordinary_grade_fragment",
+        "request_fingerprint": "d" * 64,
+        "payload": {
+            "anonymous_label": "A",
+            "grader_lane": 1,
+            "batch_ref": "GB-A-1-0001",
+            "baseline_fingerprint": "e" * 64,
+            "report_fingerprint": "f" * 64,
+            "report_text": "The report addresses the requirement.",
+            "requirements": [{"requirement_id": "REQ-0001"}],
+        },
+    }
+
+
+def _portable_v22_ordinary_draft() -> dict[str, object]:
+    return {
+        "requirement_grades": [
+            {
+                "requirement_ordinal": 1,
+                "disposition": "met",
+                "report_passages": ["The report addresses the requirement."],
+                "rationale": "The report addresses the requirement.",
+                "omission": None,
+            }
+        ],
+        "rationale": "The bounded requirement is met.",
+    }
+
+
+def _portable_v22_contested_draft() -> dict[str, object]:
+    alternative = {
+        "disposition": "met",
+        "report_passages": ["The report satisfies the issued duty."],
+        "rationale": "The issued alternative is satisfied.",
+    }
+    return {
+        "reviewer_alternative_grade": copy.deepcopy(alternative),
+        "auditor_alternative_grade": copy.deepcopy(alternative),
+        "ambiguity_disposition": "acknowledged",
+        "rationale": "Both alternatives were evaluated.",
+    }
+
+
+def _portable_v22_audit_draft() -> dict[str, object]:
+    return {
+        "concerns": [
+            {
+                "target_proposal_ordinal": 1,
+                "concern_type": "incorrect_statement",
+                "passages": [
+                    {
+                        "source_id": "rule-1",
+                        "quote": "The controller shall act.",
+                    }
+                ],
+                "explanation": "The formulation requires correction.",
+                "correction": copy.deepcopy(
+                    _portable_v22_review_draft()["proposals"][0]
+                ),
+            }
+        ],
+        "audit_complete": True,
+    }
+
+
+_V22TextCase = tuple[
+    str, dict[str, object], dict[str, object], tuple[str | int, ...]
+]
+
+
+def _portable_v22_required_text_cases() -> list[_V22TextCase]:
+    review = _portable_v22_review_draft
+    audit = _portable_v22_audit_draft
+    referee = _portable_v22_referee_draft
+    ordinary = _portable_v22_ordinary_draft
+    contested = _portable_v22_contested_draft
+    review_request = _portable_v22_review_request
+    audit_request = _portable_v22_audit_request
+    return [
+        ("review-statement", review_request(), review(), ("proposals", 0, "statement")),
+        (
+            "review-source-id",
+            review_request(),
+            review(),
+            ("proposals", 0, "passages", 0, "source_id"),
+        ),
+        (
+            "review-quote",
+            review_request(),
+            review(),
+            ("proposals", 0, "passages", 0, "quote"),
+        ),
+        ("review-rationale", review_request(), review(), ("proposals", 0, "rationale")),
+        (
+            "audit-source-id",
+            audit_request(),
+            audit(),
+            ("concerns", 0, "passages", 0, "source_id"),
+        ),
+        (
+            "audit-quote",
+            audit_request(),
+            audit(),
+            ("concerns", 0, "passages", 0, "quote"),
+        ),
+        ("audit-explanation", audit_request(), audit(), ("concerns", 0, "explanation")),
+        (
+            "audit-correction-statement",
+            audit_request(),
+            audit(),
+            ("concerns", 0, "correction", "statement"),
+        ),
+        (
+            "audit-correction-source-id",
+            audit_request(),
+            audit(),
+            ("concerns", 0, "correction", "passages", 0, "source_id"),
+        ),
+        (
+            "audit-correction-quote",
+            audit_request(),
+            audit(),
+            ("concerns", 0, "correction", "passages", 0, "quote"),
+        ),
+        (
+            "audit-correction-rationale",
+            audit_request(),
+            audit(),
+            ("concerns", 0, "correction", "rationale"),
+        ),
+        (
+            "referee-rationale",
+            _portable_v22_referee_request(),
+            referee(),
+            ("rationale",),
+        ),
+        (
+            "ordinary-grade-rationale",
+            _portable_v22_ordinary_request(),
+            ordinary(),
+            ("requirement_grades", 0, "rationale"),
+        ),
+        (
+            "ordinary-rationale",
+            _portable_v22_ordinary_request(),
+            ordinary(),
+            ("rationale",),
+        ),
+        (
+            "contested-reviewer-rationale",
+            _portable_v22_contested_request(),
+            contested(),
+            ("reviewer_alternative_grade", "rationale"),
+        ),
+        (
+            "contested-auditor-rationale",
+            _portable_v22_contested_request(),
+            contested(),
+            ("auditor_alternative_grade", "rationale"),
+        ),
+        (
+            "contested-rationale",
+            _portable_v22_contested_request(),
+            contested(),
+            ("rationale",),
+        ),
+    ]
+
+
+def _portable_v22_mutate_path(
+    value: dict[str, object], path: tuple[str | int, ...], mode: str
+) -> None:
+    target: Any = value
+    for part in path[:-1]:
+        target = target[part]
+    if mode == "absent":
+        del target[path[-1]]
+    elif mode == "blank":
+        target[path[-1]] = "   "
+    else:
+        assert mode == "non-string"
+        target[path[-1]] = 7
+
+
+@pytest.mark.parametrize("mode", ["absent", "blank", "non-string"])
+@pytest.mark.parametrize(
+    ("case_name", "request_value", "draft", "path"),
+    _portable_v22_required_text_cases(),
+)
+def test_protocol_22_internal_draft_compiler_distinguishes_every_required_text_field(
+    case_name: str,
+    request_value: dict[str, object],
+    draft: dict[str, object],
+    path: tuple[str | int, ...],
+    mode: str,
+) -> None:
+    """All operation text fields distinguish absence from an invalid supplied value."""
+    del case_name
+    portable = _load_protocol_22_portable()
+    provenance = {
+        "provider_name": "scripted",
+        "model_name": "fixture",
+        "judge_isolation": "scripted_fixture",
+    }
+    _portable_v22_mutate_path(draft, path, mode)
+    full = compile_evaluator_draft_v22(
+        EvaluatorRequestV22.model_validate(request_value),
+        draft,
+        EvaluatorProvenanceV22(**provenance),
+    )
+    expected = "SUBSTANCE_MISSING" if mode == "absent" else "DRAFT_INVALID"
+
+    assert type(full).__name__ == "NeedsClarificationV22"
+    assert tuple(code.value for code in full.reason_codes) == (expected,)
+    assert portable._compile_evaluator_draft_v22_for_test(
+        canonical_json_bytes(request_value), canonical_json_bytes(draft), provenance
+    ) == (expected,)
+
+
+@pytest.mark.parametrize("replacement", ["   ", 7])
+def test_protocol_22_internal_draft_compiler_treats_present_invalid_optional_text_as_shape(
+    replacement: object,
+) -> None:
+    """Optional omission may be absent or null, but not malformed when present."""
+    portable = _load_protocol_22_portable()
+    request = _portable_v22_ordinary_request()
+    draft = _portable_v22_ordinary_draft()
+    cast(dict[str, object], cast(list[object], draft["requirement_grades"])[0])[
+        "omission"
+    ] = replacement
+    provenance = {
+        "provider_name": "scripted",
+        "model_name": "fixture",
+        "judge_isolation": "scripted_fixture",
+    }
+    full = compile_evaluator_draft_v22(
+        EvaluatorRequestV22.model_validate(request),
+        draft,
+        EvaluatorProvenanceV22(**provenance),
+    )
+
+    assert type(full).__name__ == "NeedsClarificationV22"
+    assert tuple(code.value for code in full.reason_codes) == ("DRAFT_INVALID",)
+    assert portable._compile_evaluator_draft_v22_for_test(
+        canonical_json_bytes(request), canonical_json_bytes(draft), provenance
+    ) == ("DRAFT_INVALID",)
+
+
+@pytest.mark.parametrize("field", ["provider_name", "model_name"])
+@pytest.mark.parametrize("mode", ["absent", "blank", "non-string"])
+def test_protocol_22_internal_draft_compiler_treats_provenance_as_controller_owned(
+    field: str, mode: str
+) -> None:
+    """Missing or malformed controller provenance is never a draft clarification."""
+    portable = _load_protocol_22_portable()
+    provenance: dict[str, object] = {
+        "provider_name": "scripted",
+        "model_name": "fixture",
+        "judge_isolation": "scripted_fixture",
+    }
+    if mode == "absent":
+        del provenance[field]
+    elif mode == "blank":
+        provenance[field] = "   "
+    else:
+        provenance[field] = 7
+
+    with pytest.raises(
+        portable.EvaluationIntegrityError, match="EVALUATOR_V22_PROVENANCE"
+    ):
+        portable._v22_compile_draft(
+            _portable_v22_review_request(),
+            _portable_v22_review_draft(),
+            provenance,
+        )
+
+
+def _portable_v22_response_text_cases() -> list[_V22TextCase]:
+    ordinary = _portable_v22_ordinary_draft()
+    cast(
+        dict[str, object], cast(list[object], ordinary["requirement_grades"])[0]
+    )["omission"] = "A required item is omitted."
+    review_request = _portable_v22_review_request
+    review = _portable_v22_review_draft
+    audit_request = _portable_v22_audit_request
+    audit = _portable_v22_audit_draft
+    contested_request = _portable_v22_contested_request
+    contested = _portable_v22_contested_draft
+    return [
+        ("provider", review_request(), review(), ("provider_name",)),
+        ("model", review_request(), review(), ("model_name",)),
+        (
+            "audit-explanation",
+            audit_request(),
+            audit(),
+            ("payload", "concerns", 0, "explanation"),
+        ),
+        (
+            "audit-source-id",
+            audit_request(),
+            audit(),
+            ("payload", "concerns", 0, "passages", 0, "source_id"),
+        ),
+        (
+            "audit-quote",
+            audit_request(),
+            audit(),
+            ("payload", "concerns", 0, "passages", 0, "quote"),
+        ),
+        (
+            "referee-rationale",
+            _portable_v22_referee_request(),
+            _portable_v22_referee_draft(),
+            ("payload", "rationale"),
+        ),
+        (
+            "ordinary-rationale",
+            _portable_v22_ordinary_request(),
+            ordinary,
+            ("payload", "rationale"),
+        ),
+        (
+            "ordinary-grade-rationale",
+            _portable_v22_ordinary_request(),
+            ordinary,
+            ("payload", "requirement_grades", 0, "rationale"),
+        ),
+        (
+            "ordinary-omission",
+            _portable_v22_ordinary_request(),
+            ordinary,
+            ("payload", "requirement_grades", 0, "omission"),
+        ),
+        (
+            "contested-rationale",
+            contested_request(),
+            contested(),
+            ("payload", "rationale"),
+        ),
+        (
+            "contested-reviewer-rationale",
+            contested_request(),
+            contested(),
+            ("payload", "reviewer_alternative_grade", "rationale"),
+        ),
+        (
+            "contested-auditor-rationale",
+            contested_request(),
+            contested(),
+            ("payload", "auditor_alternative_grade", "rationale"),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("case_name", "request_value", "draft", "path"),
+    _portable_v22_response_text_cases(),
+)
+def test_protocol_22_strict_response_text_validation_uses_only_input_errors(
+    case_name: str,
+    request_value: dict[str, object],
+    draft: dict[str, object],
+    path: tuple[str | int, ...],
+) -> None:
+    """Invalid response text never enters the semantic-draft clarification channel."""
+    del case_name
+    portable = _load_protocol_22_portable()
+    provenance = EvaluatorProvenanceV22(
+        provider_name="scripted",
+        model_name="fixture",
+        judge_isolation="scripted_fixture",
+    )
+    full = compile_evaluator_draft_v22(
+        EvaluatorRequestV22.model_validate(request_value), draft, provenance
+    )
+    assert isinstance(full, CompiledDraftV22)
+    response = full.response.model_dump(mode="json")
+    _portable_v22_mutate_path(response, path, "blank")
+
+    with pytest.raises(portable.PortableEvaluationInputError):
+        portable._v22_validate_response(request_value, response)
+
+
+_V22LookupCase = tuple[str, str, tuple[str | int, ...]]
+
+
+def _portable_v22_lookup_cases() -> list[_V22LookupCase]:
+    envelope = ("judge-isolation", ("judge_isolation",))
+    return [
+        (f"review-{envelope[0]}", "source_review_fragment", envelope[1]),
+        ("review-kind", "source_review_fragment", ("payload", "proposals", 0, "kind")),
+        (
+            "review-importance",
+            "source_review_fragment",
+            ("payload", "proposals", 0, "importance"),
+        ),
+        (
+            "review-confidence",
+            "source_review_fragment",
+            ("payload", "proposals", 0, "confidence"),
+        ),
+        (
+            "review-dependency-relationship",
+            "source_review_fragment",
+            ("payload", "proposals", 0, "dependency", "relationship"),
+        ),
+        (f"audit-{envelope[0]}", "source_audit_fragment", envelope[1]),
+        (
+            "audit-target-proposal-ref",
+            "source_audit_fragment",
+            ("payload", "concerns", 0, "target_proposal_ref"),
+        ),
+        (
+            "audit-concern-type",
+            "source_audit_fragment",
+            ("payload", "concerns", 0, "concern_type"),
+        ),
+        (
+            "audit-correction-kind",
+            "source_audit_fragment",
+            ("payload", "concerns", 0, "correction", "kind"),
+        ),
+        (
+            "audit-correction-importance",
+            "source_audit_fragment",
+            ("payload", "concerns", 0, "correction", "importance"),
+        ),
+        (
+            "audit-correction-confidence",
+            "source_audit_fragment",
+            ("payload", "concerns", 0, "correction", "confidence"),
+        ),
+        (
+            "audit-correction-dependency-relationship",
+            "source_audit_fragment",
+            ("payload", "concerns", 0, "correction", "dependency", "relationship"),
+        ),
+        (f"referee-{envelope[0]}", "source_referee_fragment", envelope[1]),
+        (
+            "referee-decision",
+            "source_referee_fragment",
+            ("payload", "decision"),
+        ),
+        (
+            "referee-unresolved-reason",
+            "source_referee_fragment",
+            ("payload", "unresolved_reason"),
+        ),
+        (
+            "referee-evidence-ref",
+            "source_referee_fragment",
+            ("payload", "evidence_refs", 0),
+        ),
+        (f"ordinary-{envelope[0]}", "ordinary_grade_fragment", envelope[1]),
+        (
+            "ordinary-requirement-id",
+            "ordinary_grade_fragment",
+            ("payload", "requirement_grades", 0, "requirement_id"),
+        ),
+        (
+            "ordinary-disposition",
+            "ordinary_grade_fragment",
+            ("payload", "requirement_grades", 0, "disposition"),
+        ),
+        (f"contested-{envelope[0]}", "contested_grade_fragment", envelope[1]),
+        (
+            "contested-requirement-id",
+            "contested_grade_fragment",
+            ("payload", "contested_requirement_id"),
+        ),
+        (
+            "contested-ambiguity-disposition",
+            "contested_grade_fragment",
+            ("payload", "ambiguity_disposition"),
+        ),
+        (
+            "contested-reviewer-disposition",
+            "contested_grade_fragment",
+            ("payload", "reviewer_alternative_grade", "disposition"),
+        ),
+        (
+            "contested-auditor-disposition",
+            "contested_grade_fragment",
+            ("payload", "auditor_alternative_grade", "disposition"),
+        ),
+    ]
+
+
+def _portable_v22_request_and_draft(
+    operation: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    return {
+        "source_review_fragment": (
+            _portable_v22_review_request(),
+            _portable_v22_review_draft(),
+        ),
+        "source_audit_fragment": (
+            _portable_v22_audit_request(),
+            _portable_v22_audit_draft(),
+        ),
+        "source_referee_fragment": (
+            _portable_v22_referee_request(),
+            _portable_v22_referee_draft(),
+        ),
+        "ordinary_grade_fragment": (
+            _portable_v22_ordinary_request(),
+            _portable_v22_ordinary_draft(),
+        ),
+        "contested_grade_fragment": (
+            _portable_v22_contested_request(),
+            _portable_v22_contested_draft(),
+        ),
+    }[operation]
+
+
+def _portable_v22_lookup_value(kind: str) -> object:
+    return {
+        "list": ["invalid"],
+        "dict": {"invalid": True},
+        "non-string": 7,
+        "unhashable": [{"nested": []}],
+    }[kind]
+
+
+def _portable_v22_set_path(
+    value: dict[str, object], path: tuple[str | int, ...], replacement: object
+) -> None:
+    target: Any = value
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = replacement
+
+
+def _portable_v22_invalid_lookup_response(
+    valid: dict[str, object],
+    case_name: str,
+    path: tuple[str | int, ...],
+    replacement: object,
+) -> dict[str, object]:
+    response = copy.deepcopy(valid)
+    payload = cast(dict[str, Any], response["payload"])
+    if case_name == "review-dependency-relationship":
+        payload["proposals"][0]["dependency"] = {
+            "relationship": "depends_on",
+            "target_statement": "An issued proposal.",
+        }
+    elif case_name == "audit-correction-dependency-relationship":
+        payload["concerns"][0]["correction"]["dependency"] = {
+            "relationship": "depends_on",
+            "target_statement": "An issued proposal.",
+        }
+    elif case_name == "referee-unresolved-reason":
+        payload["decision"] = "unresolved"
+        payload["unresolved_reason"] = "SOURCE_AMBIGUITY"
+    _portable_v22_set_path(response, path, replacement)
+    return response
+
+
+@pytest.mark.parametrize("value_kind", ["list", "dict", "non-string", "unhashable"])
+@pytest.mark.parametrize(
+    ("case_name", "operation", "path"), _portable_v22_lookup_cases()
+)
+def test_protocol_22_portable_response_lookup_corpus_is_controlled_input(
+    case_name: str,
+    operation: str,
+    path: tuple[str | int, ...],
+    value_kind: str,
+) -> None:
+    """Every untrusted enum/reference lookup rejects malformed JSON values safely."""
+    portable = _load_protocol_22_portable()
+    request, draft = _portable_v22_request_and_draft(operation)
+    compiled = compile_evaluator_draft_v22(
+        EvaluatorRequestV22.model_validate(request),
+        draft,
+        EvaluatorProvenanceV22(
+            provider_name="scripted",
+            model_name="fixture",
+            judge_isolation="scripted_fixture",
+        ),
+    )
+    assert isinstance(compiled, CompiledDraftV22)
+    invalid = _portable_v22_invalid_lookup_response(
+        compiled.response.model_dump(mode="json"),
+        case_name,
+        path,
+        _portable_v22_lookup_value(value_kind),
+    )
+
+    with pytest.raises(portable.PortableEvaluationInputError):
+        portable._v22_validate_response(request, invalid)
+
+
+@pytest.mark.parametrize(
+    ("request_value", "draft", "reason"),
+    [
+        (
+            _portable_v22_review_request(),
+            {
+                **_portable_v22_review_draft(),
+                "proposals": [
+                    {
+                        **_portable_v22_review_draft()["proposals"][0],
+                        "passages": [{"source_id": "rule-1"}],
+                    }
+                ],
+            },
+            "SUBSTANCE_MISSING",
+        ),
+        (
+            _portable_v22_review_request(),
+            {
+                **_portable_v22_review_draft(),
+                "proposals": [
+                    {
+                        **_portable_v22_review_draft()["proposals"][0],
+                        "dependency": {"relationship": "depends_on"},
+                    }
+                ],
+            },
+            "SUBSTANCE_MISSING",
+        ),
+        (
+            _portable_v22_review_request(),
+            {
+                **_portable_v22_review_draft(),
+                "proposals": [
+                    {
+                        **_portable_v22_review_draft()["proposals"][0],
+                        "dependency": {
+                            "relationship": "depends_on",
+                            "target_ordinal": "1",
+                        },
+                    }
+                ],
+            },
+            "DRAFT_INVALID",
+        ),
+        (
+            _portable_v22_audit_request(),
+            {
+                "concerns": [
+                    {
+                        "target_proposal_ordinal": 1,
+                        "concern_type": "incorrect_statement",
+                        "passages": [
+                            {
+                                "source_id": "rule-1",
+                                "quote": "The controller shall act.",
+                            }
+                        ],
+                        "explanation": "The formulation requires correction.",
+                        "correction": {
+                            **_portable_v22_review_draft()["proposals"][0],
+                            "dependency": {"relationship": "depends_on"},
+                        },
+                    }
+                ],
+                "audit_complete": True,
+            },
+            "SUBSTANCE_MISSING",
+        ),
+        (
+            _portable_v22_audit_request(),
+            {
+                "concerns": [
+                    {
+                        "target_proposal_ordinal": 1,
+                        "concern_type": "incorrect_statement",
+                        "passages": [
+                            {
+                                "source_id": "rule-1",
+                                "quote": "The controller shall act.",
+                            }
+                        ],
+                        "explanation": "The formulation requires correction.",
+                        "correction": [],
+                    }
+                ],
+                "audit_complete": True,
+            },
+            "DRAFT_INVALID",
+        ),
+        (
+            _portable_v22_contested_request(),
+            {
+                "reviewer_alternative_grade": {
+                    "disposition": "met",
+                    "report_passages": ["The report satisfies the issued duty."],
+                },
+                "auditor_alternative_grade": {
+                    "disposition": "met",
+                    "report_passages": ["The report satisfies the issued duty."],
+                    "rationale": "The issued alternative is satisfied.",
+                },
+                "ambiguity_disposition": "acknowledged",
+                "rationale": "Both alternatives were evaluated.",
+            },
+            "SUBSTANCE_MISSING",
+        ),
+    ],
+)
+def test_protocol_22_internal_draft_compiler_matches_nested_substance_and_shape(
+    request_value: dict[str, object], draft: dict[str, object], reason: str
+) -> None:
+    """Nested missing fields and malformed shapes use the full reason taxonomy."""
+    portable = _load_protocol_22_portable()
+    provenance = {
+        "provider_name": "scripted",
+        "model_name": "fixture",
+        "judge_isolation": "scripted_fixture",
+    }
+    full = compile_evaluator_draft_v22(
+        EvaluatorRequestV22.model_validate(request_value),
+        draft,
+        EvaluatorProvenanceV22(**provenance),
+    )
+
+    assert type(full).__name__ == "NeedsClarificationV22"
+    assert tuple(code.value for code in full.reason_codes) == (reason,)
+    assert portable._compile_evaluator_draft_v22_for_test(
+        canonical_json_bytes(request_value), canonical_json_bytes(draft), provenance
+    ) == (reason,)
+
+
+def test_protocol_22_internal_draft_compiler_returns_exact_full_bytes_or_reasons() -> None:
+    """The internal conformance hook mirrors the full compiler without a CLI bypass."""
+    portable = _load_protocol_22_portable()
+    request = _portable_v22_review_request()
+    draft = _portable_v22_review_draft()
+    provenance = {
+        "provider_name": "scripted",
+        "model_name": "fixture",
+        "judge_isolation": "scripted_fixture",
+    }
+    full = compile_evaluator_draft_v22(
+        EvaluatorRequestV22.model_validate(request),
+        draft,
+        EvaluatorProvenanceV22(**provenance),
+    )
+    assert isinstance(full, CompiledDraftV22)
+
+    compiled = portable._compile_evaluator_draft_v22_for_test(
+        canonical_json_bytes(request), canonical_json_bytes(draft), provenance
+    )
+    missing = portable._compile_evaluator_draft_v22_for_test(
+        canonical_json_bytes(request), b'{"review_complete":true}', provenance
+    )
+
+    assert compiled == canonical_json_bytes(full.response.model_dump(mode="json"))
+    assert missing == ("SUBSTANCE_MISSING",)
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    [
+        (("proposals", 0), []),
+        (("proposals", 0, "passages"), {}),
+        (("proposals", 0, "passages", 0), []),
+        (("proposals", 0, "dependency"), []),
+    ],
+)
+def test_protocol_22_internal_draft_compiler_recovers_nested_structural_drafts(
+    path: tuple[str | int, ...], replacement: object
+) -> None:
+    """Nested draft shape failures mirror full clarification, not input termination."""
+    portable = _load_protocol_22_portable()
+    request = _portable_v22_review_request()
+    draft = copy.deepcopy(_portable_v22_review_draft())
+    target: Any = draft
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = replacement
+    provenance = {
+        "provider_name": "scripted",
+        "model_name": "fixture",
+        "judge_isolation": "scripted_fixture",
+    }
+    full = compile_evaluator_draft_v22(
+        EvaluatorRequestV22.model_validate(request),
+        draft,
+        EvaluatorProvenanceV22(**provenance),
+    )
+
+    assert type(full).__name__ == "NeedsClarificationV22"
+    assert tuple(code.value for code in full.reason_codes) == ("DRAFT_INVALID",)
+    assert portable._compile_evaluator_draft_v22_for_test(
+        canonical_json_bytes(request), canonical_json_bytes(draft), provenance
+    ) == ("DRAFT_INVALID",)
+
+
+def test_protocol_22_internal_draft_compiler_does_not_swallow_engine_defects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only controlled draft-structure failures enter the clarification channel."""
+    portable = _load_protocol_22_portable()
+
+    def fail_engine(_request: object) -> dict[str, str]:
+        raise RuntimeError("simulated compiler defect")
+
+    monkeypatch.setattr(portable, "_v22_request_sources", fail_engine)
+    with pytest.raises(RuntimeError, match="simulated compiler defect"):
+        portable._v22_compile_draft(
+            _portable_v22_review_request(),
+            _portable_v22_review_draft(),
+            {
+                "provider_name": "scripted",
+                "model_name": "fixture",
+                "judge_isolation": "scripted_fixture",
+            },
+        )
+
+
+def _portable_v22_aggregate_proposal(*, statement: str = "Duty one.") -> dict[str, object]:
+    return {
+        "statement": statement,
+        "kind": "obligation",
+        "importance": "critical",
+        "passages": [{"source_id": "rule-1", "quote": "The controller shall act."}],
+        "dependency": None,
+        "confidence": "clear",
+        "rationale": "The frozen source states the duty.",
+    }
+
+
+def _portable_v22_review_fragments(second: dict[str, object]) -> list[dict[str, object]]:
+    return [
+        {
+            "fragment_ordinal": 1,
+            "request_fingerprint": "1" * 64,
+            "response_fingerprint": "2" * 64,
+            "payload": {
+                "schema_version": "2.2",
+                "proposals": [_portable_v22_aggregate_proposal()],
+                "review_complete": False,
+            },
+        },
+        {
+            "fragment_ordinal": 2,
+            "request_fingerprint": "3" * 64,
+            "response_fingerprint": "4" * 64,
+            "payload": {
+                "schema_version": "2.2",
+                "proposals": [second],
+                "review_complete": True,
+            },
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("conflict", "message"),
+    [
+        (False, "duplicate accepted source-review proposal"),
+        (True, "conflicting accepted source-review proposal"),
+    ],
+)
+def test_protocol_22_review_aggregate_rejects_global_semantic_identity_reuse(
+    conflict: bool, message: str
+) -> None:
+    """Review identities are unique across the complete fragment sequence."""
+    portable = _load_protocol_22_portable()
+    second = _portable_v22_aggregate_proposal(
+        statement="Duty  one." if conflict else "Duty one."
+    )
+    with pytest.raises(ValueError, match=message):
+        portable._v22_review_aggregate(_portable_v22_review_fragments(second))
+
+
+def _portable_v22_audit_concern(*, explanation: str) -> dict[str, object]:
+    return {
+        "target_proposal_ref": "P0001",
+        "concern_type": "ambiguity",
+        "passages": [{"source_id": "rule-1", "quote": "The controller shall act."}],
+        "explanation": explanation,
+        "correction": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("conflict", "message"),
+    [
+        (False, "duplicate accepted source-audit concern"),
+        (True, "conflicting accepted source-audit concern"),
+    ],
+)
+def test_protocol_22_audit_aggregate_rejects_global_semantic_identity_reuse(
+    conflict: bool, message: str
+) -> None:
+    """Audit identities are unique across the complete fragment sequence."""
+    portable = _load_protocol_22_portable()
+    review = portable._v22_review_aggregate(
+        _portable_v22_review_fragments(_portable_v22_aggregate_proposal(statement="Duty two."))
+    )
+    first = _portable_v22_audit_concern(explanation="The meaning is ambiguous.")
+    second = _portable_v22_audit_concern(
+        explanation="A different explanation." if conflict else "The meaning is ambiguous."
+    )
+    fragments = [
+        {
+            "fragment_ordinal": 1,
+            "request_fingerprint": "5" * 64,
+            "response_fingerprint": "6" * 64,
+            "payload": {
+                "schema_version": "2.2",
+                "concerns": [first],
+                "audit_complete": False,
+            },
+        },
+        {
+            "fragment_ordinal": 2,
+            "request_fingerprint": "7" * 64,
+            "response_fingerprint": "8" * 64,
+            "payload": {
+                "schema_version": "2.2",
+                "concerns": [second],
+                "audit_complete": True,
+            },
+        },
+    ]
+    with pytest.raises(ValueError, match=message):
+        portable._v22_audit_aggregate(review, fragments)
+
+
+@pytest.mark.parametrize(
+    ("draft_bytes", "reason"),
+    [
+        (b'{"proposals":[],"proposals":[],"review_complete":true}', "DRAFT_INVALID"),
+        (b" " * 262_145, "DRAFT_TOO_LARGE"),
+        (
+            canonical_json_bytes(
+                {
+                    "proposals": [
+                        _portable_v22_review_draft()["proposals"][0]
+                        for _ in range(6)
+                    ],
+                    "review_complete": True,
+                }
+            ),
+            "ITEM_LIMIT_EXCEEDED",
+        ),
+    ],
+)
+def test_protocol_22_internal_draft_compiler_is_strict_on_raw_bytes_and_bounds(
+    draft_bytes: bytes, reason: str
+) -> None:
+    portable = _load_protocol_22_portable()
+    outcome = portable._compile_evaluator_draft_v22_for_test(
+        canonical_json_bytes(_portable_v22_review_request()),
+        draft_bytes,
+        {
+            "provider_name": "scripted",
+            "model_name": "fixture",
+            "judge_isolation": "scripted_fixture",
+        },
+    )
+
+    assert outcome == (reason,)
+
+
+def test_protocol_22_public_mirror_loads_with_only_the_standard_library() -> None:
+    probe = (
+        "import runpy,sys;"
+        f"m=runpy.run_path({str(SCRIPT)!r});"
+        "assert m['_V22_PROTOCOL']=='2.2';"
+        "assert callable(m['_compile_evaluator_draft_v22_for_test']);"
+        "assert 'pydantic' not in sys.modules"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", probe],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def _protocol_22_storage_response(
+    portable: ModuleType, request: dict[str, Any], *, disputed: bool = True
+) -> dict[str, Any]:
+    """Compile one complete, disputed-world response for storage transition tests."""
+    operation = request["operation"]
+    payload = request["payload"]
+    if operation == "source_review_fragment":
+        source = payload["source_record"]["sources"][0]
+        draft: dict[str, Any] = {
+            "proposals": [
+                {
+                    "statement": statement,
+                    "kind": "obligation",
+                    "importance": "critical",
+                    "passages": [
+                        {
+                            "source_id": source["source_id"],
+                            "quote": source["normalized_text"],
+                        }
+                    ],
+                    "dependency": None,
+                    "confidence": "clear",
+                    "rationale": "The frozen source states the filing duty.",
+                }
+                for statement in (
+                    "A covered operator must file notice.",
+                    "A covered operator must retain the public filing.",
+                )
+            ],
+            "review_complete": True,
+        }
+    elif operation == "source_audit_fragment":
+        concerns: list[dict[str, Any]] = []
+        if disputed:
+            proposal = copy.deepcopy(payload["indexed_proposals"][0]["proposal"])
+            proposal["statement"] = "A covered operator must file corrected notice."
+            concerns.append(
+                {
+                    "target_proposal_ordinal": 1,
+                    "concern_type": "incorrect_statement",
+                    "passages": proposal["passages"],
+                    "explanation": "The exact formulation is disputed.",
+                    "correction": proposal,
+                }
+            )
+        draft = {"concerns": concerns, "audit_complete": True}
+    elif operation == "source_referee_fragment":
+        draft = {
+            "decision": "unresolved",
+            "unresolved_reason": "SOURCE_AMBIGUITY",
+            "evidence_ordinals": [1],
+            "rationale": "The issued evidence supports the reviewer formulation.",
+        }
+    elif operation == "ordinary_grade_fragment":
+        report = payload["report_text"]
+        draft = {
+            "requirement_grades": [
+                {
+                    "requirement_ordinal": index,
+                    "disposition": "met",
+                    "report_passages": [report],
+                    "rationale": "The supplied report states the requirement.",
+                    "omission": None,
+                }
+                for index, _ in enumerate(payload["requirements"], 1)
+            ],
+            "rationale": "Every issued requirement was graded.",
+        }
+    else:
+        assert operation == "contested_grade_fragment"
+        report = payload["report_text"]
+        alternative = {
+            "disposition": "met",
+            "report_passages": [report],
+            "rationale": "The issued alternative is satisfied.",
+        }
+        draft = {
+            "reviewer_alternative_grade": alternative,
+            "auditor_alternative_grade": alternative,
+            "ambiguity_disposition": "acknowledged",
+            "rationale": "Both issued alternatives were evaluated.",
+        }
+    response, reasons = portable._v22_compile_draft(
+        request,
+        draft,
+        {
+            "provider_name": "local-scripted-fixture",
+            "model_name": "no-provider",
+            "judge_isolation": "scripted_fixture",
+        },
+    )
+    assert response is not None, reasons
+    return cast(dict[str, Any], response)
+
+
+def _protocol_22_prepare_response_pair(
+    portable: ModuleType,
+    tmp_path: Path,
+    operation: str,
+) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
+    full_run = tmp_path / f"full-{operation}"
+    portable_run = tmp_path / f"portable-{operation}"
+    case_payload = _case_payload()
+    initialize_v22_core(
+        _core_case_from_payload(case_payload), full_run, seed_hex="1" * 64
+    )
+    portable.initialize_evaluation_v22(
+        case_payload, portable_run, seed_hex="1" * 64
+    )
+    while True:
+        full_request = next_v22_core(full_run)
+        portable_request = portable.next_evaluator_request_v22(portable_run)
+        assert full_request is not None and portable_request is not None
+        full_request_json = full_request.model_dump(mode="json")
+        assert canonical_json_bytes(full_request_json) == portable.canonical_json_bytes(
+            portable_request
+        )
+        response = _protocol_22_storage_response(portable, portable_request)
+        if portable_request["operation"] == operation:
+            return full_run, portable_run, portable_request, response
+        full_submitted = guarded_submit_v22_core(full_run, response)
+        portable_submitted = portable.guarded_submit_evaluator_response_v22(
+            portable_run, response
+        )
+        assert full_submitted.accepted and portable_submitted["accepted"]
+        assert _tree_bytes(full_run) == _tree_bytes(portable_run)
+
+
+def _protocol_22_core_preflight_payload(value: object) -> dict[str, object]:
+    return {
+        "valid": value.valid,
+        "diagnostics": list(value.diagnostics),
+    }
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "source_review_fragment",
+        "source_audit_fragment",
+        "source_referee_fragment",
+        "ordinary_grade_fragment",
+        "contested_grade_fragment",
+    ],
+)
+def test_protocol_22_response_lookup_corpus_has_public_full_portable_parity(
+    operation: str, tmp_path: Path
+) -> None:
+    """Every malformed lookup is write-free, recoverable, and byte-exact publicly."""
+    portable = _load_protocol_22_portable()
+    full_run, portable_run, pending, valid = _protocol_22_prepare_response_pair(
+        portable, tmp_path, operation
+    )
+    initial_tree = _tree_bytes(full_run)
+    assert initial_tree == _tree_bytes(portable_run)
+    failures: list[str] = []
+    cases = [case for case in _portable_v22_lookup_cases() if case[1] == operation]
+
+    for case_name, _operation, path in cases:
+        for value_kind in ("list", "dict", "non-string", "unhashable"):
+            invalid = _portable_v22_invalid_lookup_response(
+                valid,
+                case_name,
+                path,
+                _portable_v22_lookup_value(value_kind),
+            )
+            try:
+                full_preflight = preflight_v22_core(full_run, invalid)
+                portable_preflight = portable.preflight_evaluator_response_v22(
+                    portable_run, invalid
+                )
+                assert portable_preflight == _protocol_22_core_preflight_payload(
+                    full_preflight
+                ) == {
+                    "valid": False,
+                    "diagnostics": ["EXTERNAL_RESPONSE_INVALID"],
+                }
+            except Exception as error:
+                failures.append(
+                    f"{case_name}/{value_kind}/preflight:{type(error).__name__}"
+                )
+            try:
+                full_submitted = guarded_submit_v22_core(full_run, invalid)
+                portable_submitted = portable.guarded_submit_evaluator_response_v22(
+                    portable_run, invalid
+                )
+                expected = {
+                    "accepted": full_submitted.accepted,
+                    "preflight": _protocol_22_core_preflight_payload(
+                        full_submitted.preflight
+                    ),
+                }
+                assert portable_submitted == expected == {
+                    "accepted": False,
+                    "preflight": {
+                        "valid": False,
+                        "diagnostics": ["EXTERNAL_RESPONSE_INVALID"],
+                    },
+                }
+            except Exception as error:
+                failures.append(
+                    f"{case_name}/{value_kind}/safe-submit:{type(error).__name__}"
+                )
+            assert _tree_bytes(full_run) == initial_tree
+            assert _tree_bytes(portable_run) == initial_tree
+            assert next_v22_core(full_run).model_dump(mode="json") == pending
+            assert portable.next_evaluator_request_v22(portable_run) == pending
+
+    full_valid = guarded_submit_v22_core(full_run, valid)
+    portable_valid = portable.guarded_submit_evaluator_response_v22(
+        portable_run, valid
+    )
+    assert full_valid.accepted and portable_valid["accepted"]
+    assert _tree_bytes(full_run) == _tree_bytes(portable_run)
+    assert not failures, failures
+
+
+@pytest.mark.parametrize("blank", ["envelope", "payload"])
+def test_protocol_22_portable_blank_external_response_is_refused_write_free(
+    blank: str, tmp_path: Path
+) -> None:
+    """Blank external text receives the safe refusal payload without losing the request."""
+    portable = _load_protocol_22_portable()
+    run = tmp_path / f"v22-blank-{blank}"
+    portable.initialize_evaluation_v22(_case_payload(), run, seed_hex="1" * 64)
+    request = portable.next_evaluator_request_v22(run)
+    assert request is not None
+    response = _protocol_22_storage_response(portable, request)
+    if blank == "envelope":
+        response["provider_name"] = "   "
+    else:
+        cast(dict[str, Any], response["payload"])["proposals"][0]["rationale"] = "   "
+    before = _tree_bytes(run)
+    pending = copy.deepcopy(request)
+
+    preflight = portable.preflight_evaluator_response_v22(run, response)
+    submitted = portable.guarded_submit_evaluator_response_v22(run, response)
+
+    assert preflight == {
+        "valid": False,
+        "diagnostics": ["EXTERNAL_RESPONSE_INVALID"],
+    }
+    assert submitted == {"accepted": False, "preflight": preflight}
+    assert _tree_bytes(run) == before
+    assert portable.next_evaluator_request_v22(run) == pending
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ("integrity", "input", "type", "value", "storage"),
+)
+def test_protocol_22_portable_preflight_propagates_verified_run_faults(
+    fault: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verified-run faults are never relabeled as an invalid external response."""
+    portable = _load_protocol_22_portable()
+    run = tmp_path / f"v22-preflight-{fault}"
+    portable.initialize_evaluation_v22(_case_payload(), run, seed_hex="1" * 64)
+    request = portable.next_evaluator_request_v22(run)
+    assert request is not None
+    response = _protocol_22_storage_response(portable, request)
+    before = _tree_bytes(run)
+    pending = copy.deepcopy(request)
+    error = {
+        "integrity": portable.EvaluationIntegrityError("injected verification fault"),
+        "input": portable.PortableEvaluationInputError("injected verifier input fault"),
+        "type": TypeError("injected verifier type fault"),
+        "value": ValueError("injected verifier value fault"),
+        "storage": OSError("injected storage fault"),
+    }[fault]
+
+    def fail_verified(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(portable, "_v22_verified", fail_verified)
+        with pytest.raises(type(error), match=str(error)):
+            portable.preflight_evaluator_response_v22(run, response)
+
+    assert _tree_bytes(run) == before
+    assert portable.next_evaluator_request_v22(run) == pending
+
+
+def _protocol_22_is_result_transition(
+    portable: ModuleType,
+    run: Path,
+    response: dict[str, Any],
+) -> bool:
+    manifest, files = portable._v22_verified(run)
+    envelope = portable._object(
+        portable.parse_canonical_json_bytes(
+            files["inputs/case.json"], location="inputs/case.json"
+        ),
+        location="inputs/case.json",
+    )
+    prior = [
+        portable._object(
+            portable.parse_canonical_json_bytes(
+                files[call["response_artifact_path"]], location="response"
+            ),
+            location="response",
+        )
+        for call in manifest["calls"]
+        if call["state"] == "accepted"
+    ]
+    successor, _ = portable._v22_snapshot(envelope, [*prior, response])
+    return successor["terminal_status"] is not None
+
+
+@pytest.mark.parametrize(
+    "transition",
+    (
+        "source_review",
+        "source_audit",
+        "referee",
+        "ordinary_grade",
+        "contested_grade",
+        "result",
+    ),
+)
+@pytest.mark.parametrize(
+    "failure_stage", ("before_manifest", "post_manifest_fsync", "post_commit_replay")
+)
+def test_protocol_22_transition_failure_restores_exact_prior_tree(
+    transition: str,
+    failure_stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every lifecycle transition preserves the prior verified tree on commit failure."""
+    portable = _load_protocol_22_portable()
+    run = tmp_path / f"v22-{transition}-{failure_stage}"
+    portable.initialize_evaluation_v22(_case_payload(), run, seed_hex="6" * 64)
+    disputed = transition in {"referee", "contested_grade", "result"}
+
+    while True:
+        request = portable.next_evaluator_request_v22(run)
+        assert request is not None
+        response = _protocol_22_storage_response(portable, request, disputed=disputed)
+        operation = request["operation"]
+        is_result = _protocol_22_is_result_transition(portable, run, response)
+        current = {
+            "source_review_fragment": "source_review",
+            "source_audit_fragment": "source_audit",
+            "source_referee_fragment": "referee",
+            "ordinary_grade_fragment": "ordinary_grade",
+            "contested_grade_fragment": "result" if is_result else "contested_grade",
+        }[operation]
+        if current == transition:
+            break
+        portable.submit_evaluator_response_v22(run, response)
+
+    before = _tree_bytes(run)
+    original_atomic = portable._PosixRunStorage.atomic_write
+    original_replace = portable.os.replace
+    original_fsync = portable.os.fsync
+    original_verified = portable._v22_verified_storage
+    manifest_replaced = False
+    failed = False
+
+    def fail_before_manifest(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> object:
+        nonlocal failed
+        if path == "run-manifest.json" and not failed:
+            failed = True
+            raise OSError("injected pre-manifest failure")
+        return original_atomic(storage, path, data, mutable=mutable)
+
+    def record_manifest_replace(
+        source: object, destination: object, *args: object, **kwargs: object
+    ) -> None:
+        nonlocal manifest_replaced
+        original_replace(source, destination, *args, **kwargs)
+        if destination == "run-manifest.json":
+            manifest_replaced = True
+
+    def fail_manifest_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if manifest_replaced and not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            failed = True
+            raise OSError("injected post-manifest fsync failure")
+        original_fsync(descriptor)
+
+    verified_calls = 0
+
+    def fail_successor_replay(storage: object) -> object:
+        nonlocal failed, verified_calls
+        verified_calls += 1
+        if verified_calls == 2:
+            failed = True
+            raise OSError("injected post-commit replay failure")
+        return original_verified(storage)
+
+    if failure_stage == "before_manifest":
+        monkeypatch.setattr(portable._PosixRunStorage, "atomic_write", fail_before_manifest)
+    elif failure_stage == "post_manifest_fsync":
+        monkeypatch.setattr(portable.os, "replace", record_manifest_replace)
+        monkeypatch.setattr(portable.os, "fsync", fail_manifest_fsync)
+    else:
+        monkeypatch.setattr(portable, "_v22_verified_storage", fail_successor_replay)
+
+    with pytest.raises((OSError, portable.EvaluationIntegrityError)):
+        portable.submit_evaluator_response_v22(run, response)
+
+    assert failed
+    assert _tree_bytes(run) == before
+    assert portable.verify_evaluation_run(run).valid
+
+
+def test_protocol_22_cooperative_callers_serialize_same_response(
+    tmp_path: Path,
+) -> None:
+    """The portable physical-root lock serializes cooperating in-process callers."""
+    portable = _load_protocol_22_portable()
+    assert (
+        portable._V22_STORAGE_CONCURRENCY_CONTRACT
+        == "cooperative-exclusive-directory-namespace-per-operation-v1"
+    )
+    run = tmp_path / "v22-cooperative-callers"
+    portable.initialize_evaluation_v22(_case_payload(), run, seed_hex="5" * 64)
+    request = portable.next_evaluator_request_v22(run)
+    assert request is not None
+    response = _protocol_22_storage_response(portable, request)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(
+            executor.map(
+                lambda _: portable.guarded_submit_evaluator_response_v22(run, response),
+                range(2),
+            )
+        )
+
+    assert sorted(outcome["accepted"] for outcome in outcomes) == [False, True]
+    assert portable.verify_evaluation_run(run).valid
+
+
+def test_protocol_22_rollback_preserves_same_byte_competing_addition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-byte collision remains external state when the transition rolls back."""
+    portable = _load_protocol_22_portable()
+    run = tmp_path / "v22-same-byte-competitor"
+    portable.initialize_evaluation_v22(_case_payload(), run, seed_hex="4" * 64)
+    request = portable.next_evaluator_request_v22(run)
+    assert request is not None
+    response = _protocol_22_storage_response(portable, request)
+    manifest = json.loads((run / "run-manifest.json").read_bytes())
+    pending = [call for call in manifest["calls"] if call["state"] == "pending"]
+    assert len(pending) == 1
+    target = f"responses/{pending[0]['call_id']}.json"
+    response_bytes = portable.canonical_json_bytes(response)
+    before = _tree_bytes(run)
+    original_atomic = portable._PosixRunStorage.atomic_write
+    collided = False
+
+    def collide_then_fail(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> object:
+        nonlocal collided
+        if path == target and not collided:
+            assert original_atomic(storage, path, data, mutable=False)
+            collided = True
+        if path == "run-manifest.json":
+            raise OSError("injected manifest failure after same-byte collision")
+        return original_atomic(storage, path, data, mutable=mutable)
+
+    monkeypatch.setattr(portable._PosixRunStorage, "atomic_write", collide_then_fail)
+    with pytest.raises(portable.EvaluationIntegrityError):
+        portable.submit_evaluator_response_v22(run, response)
+
+    assert collided
+    assert _tree_bytes(run) == {**before, target: response_bytes}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="inode ownership is POSIX-specific")
+def test_protocol_22_rollback_preserves_identical_manifest_inode_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rollback never overwrites an identical-byte manifest installed by another owner."""
+    portable = _load_protocol_22_portable()
+    run = tmp_path / "v22-manifest-inode-competitor"
+    portable.initialize_evaluation_v22(_case_payload(), run, seed_hex="3" * 64)
+    request = portable.next_evaluator_request_v22(run)
+    assert request is not None
+    response = _protocol_22_storage_response(portable, request)
+    before = _tree_bytes(run)
+    original_replace = portable.os.replace
+    original_fsync = portable.os.fsync
+    competitor_bytes: bytes | None = None
+    competitor_identity: tuple[int, int] | None = None
+    swapped = False
+    failed = False
+
+    def replace_then_swap(
+        source: object, destination: object, *args: object, **kwargs: object
+    ) -> None:
+        nonlocal competitor_bytes, competitor_identity, swapped
+        original_replace(source, destination, *args, **kwargs)
+        if destination != "run-manifest.json" or swapped:
+            return
+        manifest_path = run / "run-manifest.json"
+        competitor_bytes = manifest_path.read_bytes()
+        competitor_path = run / "external-manifest.json"
+        competitor_path.write_bytes(competitor_bytes)
+        identity = os.stat(competitor_path, follow_symlinks=False)
+        competitor_identity = (identity.st_dev, identity.st_ino)
+        original_replace(competitor_path, manifest_path)
+        swapped = True
+
+    def fail_after_swap(descriptor: int) -> None:
+        nonlocal failed
+        if swapped and not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            failed = True
+            raise OSError("injected post-swap directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(portable.os, "replace", replace_then_swap)
+    monkeypatch.setattr(portable.os, "fsync", fail_after_swap)
+    with pytest.raises(portable.EvaluationIntegrityError, match="ROLLBACK_FAILED"):
+        portable.submit_evaluator_response_v22(run, response)
+
+    current = os.stat(run / "run-manifest.json", follow_symlinks=False)
+    assert swapped and failed and competitor_bytes is not None
+    assert competitor_identity == (current.st_dev, current.st_ino)
+    assert _tree_bytes(run) == {**before, "run-manifest.json": competitor_bytes}
+
+
+def test_protocol_22_portable_refuses_unsupported_storage_without_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The portable mirror keeps non-POSIX ownership outside its public contract."""
+    portable = _load_protocol_22_portable()
+    run = tmp_path / "v22-unsupported-storage"
+    monkeypatch.setattr(portable, "_storage_platform", lambda: "simulated")
+
+    with pytest.raises(
+        portable.EvaluationIntegrityError,
+        match="EVALUATION_STORAGE_PLATFORM_UNSUPPORTED",
+    ):
+        portable.initialize_evaluation_v22(_case_payload(), run, seed_hex="2" * 64)
+
+    assert not run.exists()
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    (
+        "post_immutable_signal",
+        "before_replace",
+        "after_replace",
+        "post_commit_verify",
+    ),
+)
+def test_protocol_21_manifest_failure_rolls_back_additions_and_preserves_valid_run(
+    failure_stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manifest failures before or after replacement restore the exact prior tree."""
+    run = tmp_path / "portable-v21-rollback"
+    initialized = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "harvest_portable.py"),
+            "eval-init",
+            "--case",
+            str(FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "9" * 64,
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    portable = _load_protocol_21_portable()
+    request = portable.next_judge_request(run)
+    assert request is not None and request["operation"] == "source_review"
+    source = request["payload"]["source_record"]["sources"][0]
+    response = {
+        "schema_version": "2.1",
+        "operation": "source_review",
+        "request_fingerprint": request["request_fingerprint"],
+        "provider_name": "local-scripted-fixture",
+        "model_name": "no-provider",
+        "judge_isolation": "scripted_fixture",
+        "payload": {
+            "schema_version": "2.1",
+            "proposals": [
+                {
+                    "statement": "A covered operator must file notice.",
+                    "kind": "obligation",
+                    "importance": "critical",
+                    "passages": [
+                        {"source_id": source["source_id"], "quote": source["normalized_text"]}
+                    ],
+                    "dependency": None,
+                    "confidence": "clear",
+                    "rationale": "The synthetic source states the filing duty.",
+                }
+            ],
+        },
+    }
+    before = _tree_bytes(run)
+    original = portable._PosixRunStorage.atomic_write
+    original_replace = portable.os.replace
+    original_fsync = portable.os.fsync
+    failed = False
+    manifest_replaced = False
+
+    def fail_manifest_once(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> object:
+        nonlocal failed
+        if path == "run-manifest.json" and mutable and not failed:
+            failed = True
+            raise OSError("injected manifest failure")
+        return original(storage, path, data, mutable=mutable)
+
+    def record_manifest_replace(
+        source: object,
+        destination: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal manifest_replaced
+        original_replace(source, destination, *args, **kwargs)
+        if destination == "run-manifest.json":
+            manifest_replaced = True
+
+    def fail_post_replace_directory_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if (
+            manifest_replaced
+            and not failed
+            and stat.S_ISDIR(os.fstat(descriptor).st_mode)
+        ):
+            failed = True
+            raise OSError("injected post-replacement directory fsync failure")
+        original_fsync(descriptor)
+
+    def fail_after_reporting_owned_immutable(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> bool:
+        nonlocal failed
+        created = original(storage, path, data, mutable=mutable)
+        if path != "run-manifest.json" and created and not failed:
+            failed = True
+            failure = OSError("injected post-immutable failure")
+            raise portable._AtomicWriteOwnershipError(path, failure) from failure
+        return created
+
+    if failure_stage == "post_commit_verify":
+        original_scan = portable._PosixRunStorage.scan_inventory
+
+        def fail_successor_verification(storage: object) -> object:
+            nonlocal failed
+            inventory = original_scan(storage)
+            current = json.loads((run / "run-manifest.json").read_bytes())
+            if not failed and current["phase"] == "source_audit":
+                failed = True
+                raise OSError("injected post-commit verification failure")
+            return inventory
+
+        monkeypatch.setattr(
+            portable._PosixRunStorage, "scan_inventory", fail_successor_verification
+        )
+    elif failure_stage == "post_immutable_signal":
+        monkeypatch.setattr(
+            portable._PosixRunStorage,
+            "atomic_write",
+            fail_after_reporting_owned_immutable,
+        )
+    elif failure_stage == "after_replace":
+        monkeypatch.setattr(portable.os, "replace", record_manifest_replace)
+        monkeypatch.setattr(portable.os, "fsync", fail_post_replace_directory_fsync)
+    else:
+        monkeypatch.setattr(portable._PosixRunStorage, "atomic_write", fail_manifest_once)
+    refused = portable.guarded_submit_judge_response(run, response)
+
+    assert failed
+    assert refused == {
+        "accepted": False,
+        "preflight": {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]},
+    }
+    assert _tree_bytes(run) == before
+    assert portable.verify_evaluation_run(run).valid
+
+
+@pytest.mark.parametrize("stage", ("source_review", "ordinary_grade"))
+def test_protocol_21_rollback_preserves_same_byte_competing_addition(
+    stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-byte collision is external state and is never rollback-owned."""
+    run = tmp_path / f"portable-v21-collision-{stage}"
+    initialized = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "harvest_portable.py"),
+            "eval-init",
+            "--case",
+            str(FIXTURE / "case.json"),
+            "--run",
+            str(run),
+            "--seed-hex",
+            "8" * 64,
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    portable = _load_protocol_21_portable()
+    if stage == "ordinary_grade":
+        for expected in ("source_review", "source_audit"):
+            request = portable.next_judge_request(run)
+            assert request is not None and request["operation"] == expected
+            portable.submit_judge_response(run, _protocol_21_test_response(request))
+    request = portable.next_judge_request(run)
+    assert request is not None
+    response = _protocol_21_test_response(request)
+    manifest = json.loads((run / "run-manifest.json").read_bytes())
+    pending = [call for call in manifest["calls"] if call["state"] == "pending"]
+    assert len(pending) == 1
+    target_path = f"responses/{pending[0]['call_id']}.json"
+    response_bytes = portable.canonical_json_bytes(response)
+    before = _tree_bytes(run)
+    original = portable._PosixRunStorage.atomic_write
+    collided = False
+
+    def same_byte_competitor_then_manifest_failure(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> bool:
+        nonlocal collided
+        if path == target_path and not collided:
+            assert original(storage, path, data, mutable=False)
+            collided = True
+        if path == "run-manifest.json":
+            raise OSError("injected manifest failure after same-byte collision")
+        return original(storage, path, data, mutable=mutable)
+
+    monkeypatch.setattr(
+        portable._PosixRunStorage,
+        "atomic_write",
+        same_byte_competitor_then_manifest_failure,
+    )
+    refused = portable.guarded_submit_judge_response(run, response)
+
+    assert collided
+    assert refused == {
+        "accepted": False,
+        "preflight": {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]},
+    }
+    assert _tree_bytes(run) == {**before, target_path: response_bytes}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="link ownership is POSIX-specific")
+def test_portable_posix_immutable_write_never_leaves_unreported_path_after_link_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    portable = _load_protocol_21_portable()
+    run = tmp_path / "portable-post-link-failure"
+    storage = portable._PosixRunStorage.open(run, initialize=True)
+    original_fsync = portable.os.fsync
+    original_link = portable.os.link
+    linked = False
+
+    def record_link(*args: object, **kwargs: object) -> None:
+        nonlocal linked
+        original_link(*args, **kwargs)
+        linked = True
+
+    def fail_post_link_directory_fsync(descriptor: int) -> None:
+        if linked and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("injected post-link directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(portable.os, "link", record_link)
+    monkeypatch.setattr(portable.os, "fsync", fail_post_link_directory_fsync)
+    try:
+        with pytest.raises(portable._AtomicWriteOwnershipError) as raised:
+            storage.atomic_write("owned.json", b"{}", mutable=False)
+    finally:
+        storage.close()
+
+    assert linked
+    assert raised.value.created is True
+    assert raised.value.identity is not None
+    current = os.stat(run / "owned.json", follow_symlinks=False)
+    assert (raised.value.identity.device, raised.value.identity.inode) == (
+        current.st_dev,
+        current.st_ino,
+    )
+    assert (run / "owned.json").read_bytes() == b"{}"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="write identity is POSIX-specific")
+def test_portable_posix_successful_write_reports_installed_leaf_identity(
+    tmp_path: Path,
+) -> None:
+    portable = _load_protocol_21_portable()
+    run = tmp_path / "portable-successful-write-identity"
+    storage = portable._PosixRunStorage.open(run, initialize=True)
+    try:
+        assert storage.atomic_write("manifest.json", b"new", mutable=False)
+        receipt = storage.atomic_write_receipt("manifest.json")
+    finally:
+        storage.close()
+
+    current = os.stat(run / "manifest.json", follow_symlinks=False)
+    assert receipt is not None and receipt.identity is not None
+    assert receipt.created is True
+    assert receipt.replaced is False
+    assert (receipt.identity.device, receipt.identity.inode) == (
+        current.st_dev,
+        current.st_ino,
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="replace ownership is POSIX-specific")
+def test_portable_posix_mutable_write_reports_replaced_path_after_directory_fsync_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    portable = _load_protocol_21_portable()
+    run = tmp_path / "portable-post-replace-failure"
+    storage = portable._PosixRunStorage.open(run, initialize=True)
+    assert storage.atomic_write("manifest.json", b"old", mutable=False)
+    original_replace = portable.os.replace
+    original_fsync = portable.os.fsync
+    replaced = False
+
+    def record_replace(*args: object, **kwargs: object) -> None:
+        nonlocal replaced
+        original_replace(*args, **kwargs)
+        replaced = True
+
+    def fail_post_replace_directory_fsync(descriptor: int) -> None:
+        if replaced and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("injected post-replace directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(portable.os, "replace", record_replace)
+    monkeypatch.setattr(portable.os, "fsync", fail_post_replace_directory_fsync)
+    try:
+        with pytest.raises(portable._AtomicWriteOwnershipError) as raised:
+            storage.atomic_write("manifest.json", b"new", mutable=True)
+    finally:
+        storage.close()
+
+    assert replaced
+    assert raised.value.created is False
+    assert raised.value.replaced is True
+    assert raised.value.identity is not None
+    current = os.stat(run / "manifest.json", follow_symlinks=False)
+    assert (raised.value.identity.device, raised.value.identity.inode) == (
+        current.st_dev,
+        current.st_ino,
+    )
+    assert (run / "manifest.json").read_bytes() == b"new"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="inode ownership is POSIX-specific")
+def test_protocol_21_init_preserves_identical_byte_manifest_inode_swap_before_fsync_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    portable = _load_protocol_21_portable()
+    run = tmp_path / "portable-v21-init-manifest-inode-swap"
+    original_link = portable.os.link
+    original_replace = portable.os.replace
+    original_fsync = portable.os.fsync
+    installed_identity: tuple[int, int] | None = None
+    competitor_identity: tuple[int, int] | None = None
+    competitor_bytes: bytes | None = None
+    swapped = False
+    failed = False
+
+    def install_then_swap(
+        source: object,
+        destination: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal installed_identity, competitor_identity, competitor_bytes, swapped
+        original_link(source, destination, *args, **kwargs)
+        if destination != "run-manifest.json":
+            return
+        manifest_path = run / "run-manifest.json"
+        installed = os.stat(manifest_path, follow_symlinks=False)
+        installed_identity = (installed.st_dev, installed.st_ino)
+        competitor_bytes = manifest_path.read_bytes()
+        competitor_path = run / "external-manifest.json"
+        competitor_path.write_bytes(competitor_bytes)
+        competitor = os.stat(competitor_path, follow_symlinks=False)
+        competitor_identity = (competitor.st_dev, competitor.st_ino)
+        original_replace(competitor_path, manifest_path)
+        swapped = True
+
+    def fail_post_swap_directory_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if swapped and not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            failed = True
+            raise OSError("injected post-swap directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(portable.os, "link", install_then_swap)
+    monkeypatch.setattr(portable.os, "fsync", fail_post_swap_directory_fsync)
+
+    with pytest.raises(
+        portable.EvaluationIntegrityError, match="EVALUATOR_V21_ROLLBACK_FAILED"
+    ):
+        portable.initialize_evaluation(_case_payload(), run, seed_hex="3" * 64)
+
+    current = os.stat(run / "run-manifest.json", follow_symlinks=False)
+    assert swapped and failed and competitor_bytes is not None
+    assert installed_identity is not None and competitor_identity is not None
+    assert installed_identity != competitor_identity
+    assert (current.st_dev, current.st_ino) == competitor_identity
+    assert (run / "run-manifest.json").read_bytes() == competitor_bytes
+
+
+def test_protocol_21_init_preserves_same_byte_competing_manifest_after_verify_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    portable = _load_protocol_21_portable()
+    run = tmp_path / "portable-v21-init-manifest-competitor"
+    original_atomic = portable._PosixRunStorage.atomic_write
+    original_scan = portable._PosixRunStorage.scan_inventory
+    competitor_bytes: bytes | None = None
+    collided = False
+    failed = False
+
+    def competing_manifest(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> bool:
+        nonlocal collided, competitor_bytes
+        if path == "run-manifest.json" and not collided:
+            assert original_atomic(storage, path, data, mutable=False)
+            competitor_bytes = data
+            collided = True
+        created = original_atomic(storage, path, data, mutable=mutable)
+        if path == "run-manifest.json":
+            assert created is False
+        return created
+
+    def fail_post_commit_verification(storage: object) -> object:
+        nonlocal failed
+        inventory = original_scan(storage)
+        if collided and not failed and "run-manifest.json" in inventory:
+            failed = True
+            raise OSError("injected post-commit verification failure")
+        return inventory
+
+    monkeypatch.setattr(portable._PosixRunStorage, "atomic_write", competing_manifest)
+    monkeypatch.setattr(
+        portable._PosixRunStorage, "scan_inventory", fail_post_commit_verification
+    )
+    with pytest.raises(portable.EvaluationIntegrityError):
+        portable.initialize_evaluation(_case_payload(), run, seed_hex="7" * 64)
+
+    assert collided and failed and competitor_bytes is not None
+    assert _tree_bytes(run) == {"run-manifest.json": competitor_bytes}
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("before_manifest", "post_manifest_signal", "post_manifest_fsync", "post_verify"),
+)
+def test_protocol_21_init_owned_manifest_failure_restores_empty_tree(
+    failure_stage: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    portable = _load_protocol_21_portable()
+    run = tmp_path / f"portable-v21-init-owned-{failure_stage}"
+    original_atomic = portable._PosixRunStorage.atomic_write
+    original_scan = portable._PosixRunStorage.scan_inventory
+    original_link = portable.os.link
+    original_fsync = portable.os.fsync
+    manifest_written = False
+    manifest_linked = False
+    failed = False
+
+    def fail_manifest(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> bool:
+        nonlocal failed, manifest_written
+        if path != "run-manifest.json":
+            return original_atomic(storage, path, data, mutable=mutable)
+        if failure_stage == "before_manifest":
+            failed = True
+            raise OSError("injected pre-manifest failure")
+        created = original_atomic(storage, path, data, mutable=mutable)
+        manifest_written = created
+        if failure_stage == "post_manifest_signal":
+            failed = True
+            cause = OSError("injected post-manifest failure")
+            raise portable._AtomicWriteOwnershipError(path, cause) from cause
+        return created
+
+    def record_manifest_link(
+        source: object,
+        destination: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal manifest_linked
+        original_link(source, destination, *args, **kwargs)
+        if destination == "run-manifest.json":
+            manifest_linked = True
+
+    def fail_post_manifest_link_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if (
+            manifest_linked
+            and not failed
+            and stat.S_ISDIR(os.fstat(descriptor).st_mode)
+        ):
+            failed = True
+            raise OSError("injected post-manifest directory fsync failure")
+        original_fsync(descriptor)
+
+    def fail_verification(storage: object) -> object:
+        nonlocal failed
+        inventory = original_scan(storage)
+        if manifest_written and not failed:
+            failed = True
+            raise OSError("injected post-commit verification failure")
+        return inventory
+
+    monkeypatch.setattr(portable._PosixRunStorage, "atomic_write", fail_manifest)
+    if failure_stage == "post_manifest_fsync":
+        monkeypatch.setattr(portable.os, "link", record_manifest_link)
+        monkeypatch.setattr(portable.os, "fsync", fail_post_manifest_link_fsync)
+    elif failure_stage == "post_verify":
+        monkeypatch.setattr(portable._PosixRunStorage, "scan_inventory", fail_verification)
+    with pytest.raises(portable.EvaluationIntegrityError):
+        portable.initialize_evaluation(_case_payload(), run, seed_hex="5" * 64)
+
+    assert failed
+    assert _tree_bytes(run) == {}
+
+
+def test_protocol_21_transition_preserves_same_byte_competing_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    portable = _load_protocol_21_portable()
+    run = tmp_path / "portable-v21-transition-manifest-competitor"
+    portable.initialize_evaluation(_case_payload(), run, seed_hex="6" * 64)
+    request = portable.next_judge_request(run)
+    assert request is not None
+    response = _protocol_21_test_response(request)
+    before = _tree_bytes(run)
+    original_atomic = portable._PosixRunStorage.atomic_write
+    original_scan = portable._PosixRunStorage.scan_inventory
+    competitor_bytes: bytes | None = None
+    collided = False
+    failed = False
+
+    def competing_manifest(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> bool:
+        nonlocal collided, competitor_bytes
+        if path == "run-manifest.json" and mutable and not collided:
+            assert original_atomic(storage, path, data, mutable=True)
+            competitor_bytes = data
+            collided = True
+        created = original_atomic(storage, path, data, mutable=mutable)
+        if path == "run-manifest.json":
+            assert created is False
+        return created
+
+    def fail_post_commit_verification(storage: object) -> object:
+        nonlocal failed
+        inventory = original_scan(storage)
+        if collided and not failed:
+            failed = True
+            raise OSError("injected post-commit verification failure")
+        return inventory
+
+    monkeypatch.setattr(portable._PosixRunStorage, "atomic_write", competing_manifest)
+    monkeypatch.setattr(
+        portable._PosixRunStorage, "scan_inventory", fail_post_commit_verification
+    )
+    refused = portable.guarded_submit_judge_response(run, response)
+
+    assert collided and failed and competitor_bytes is not None
+    assert refused == {
+        "accepted": False,
+        "preflight": {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]},
+    }
+    assert _tree_bytes(run) == {**before, "run-manifest.json": competitor_bytes}
+    assert not portable.verify_evaluation_run(run).valid
+    after = _tree_bytes(run)
+    assert portable.guarded_submit_judge_response(run, response)["accepted"] is False
+    assert _tree_bytes(run) == after
+
+
+@pytest.mark.skipif(os.name != "posix", reason="inode ownership is POSIX-specific")
+def test_protocol_21_transition_preserves_identical_byte_manifest_inode_swap_before_fsync_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    portable = _load_protocol_21_portable()
+    run = tmp_path / "portable-v21-transition-manifest-inode-swap"
+    portable.initialize_evaluation(_case_payload(), run, seed_hex="2" * 64)
+    request = portable.next_judge_request(run)
+    assert request is not None
+    response = _protocol_21_test_response(request)
+    before = _tree_bytes(run)
+    original_replace = portable.os.replace
+    original_fsync = portable.os.fsync
+    installed_identity: tuple[int, int] | None = None
+    competitor_identity: tuple[int, int] | None = None
+    competitor_bytes: bytes | None = None
+    swapped = False
+    failed = False
+
+    def install_then_swap(
+        source: object,
+        destination: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal installed_identity, competitor_identity, competitor_bytes, swapped
+        original_replace(source, destination, *args, **kwargs)
+        if destination != "run-manifest.json" or swapped:
+            return
+        manifest_path = run / "run-manifest.json"
+        installed = os.stat(manifest_path, follow_symlinks=False)
+        installed_identity = (installed.st_dev, installed.st_ino)
+        competitor_bytes = manifest_path.read_bytes()
+        competitor_path = run / "external-manifest.json"
+        competitor_path.write_bytes(competitor_bytes)
+        competitor = os.stat(competitor_path, follow_symlinks=False)
+        competitor_identity = (competitor.st_dev, competitor.st_ino)
+        original_replace(competitor_path, manifest_path)
+        swapped = True
+
+    def fail_post_swap_directory_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if swapped and not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            failed = True
+            raise OSError("injected post-swap directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(portable.os, "replace", install_then_swap)
+    monkeypatch.setattr(portable.os, "fsync", fail_post_swap_directory_fsync)
+    refused = portable.guarded_submit_judge_response(run, response)
+
+    current = os.stat(run / "run-manifest.json", follow_symlinks=False)
+    assert swapped and failed and competitor_bytes is not None
+    assert installed_identity is not None and competitor_identity is not None
+    assert installed_identity != competitor_identity
+    assert refused == {
+        "accepted": False,
+        "preflight": {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]},
+    }
+    assert (current.st_dev, current.st_ino) == competitor_identity
+    assert _tree_bytes(run) == {**before, "run-manifest.json": competitor_bytes}
+    assert not portable.verify_evaluation_run(run).valid
+
+
+@pytest.mark.skipif(os.name != "posix", reason="inode ownership is POSIX-specific")
+def test_protocol_21_transition_preserves_different_byte_manifest_inode_swap_before_fsync_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    portable = _load_protocol_21_portable()
+    run = tmp_path / "portable-v21-transition-different-manifest-inode-swap"
+    portable.initialize_evaluation(_case_payload(), run, seed_hex="1" * 64)
+    request = portable.next_judge_request(run)
+    assert request is not None
+    response = _protocol_21_test_response(request)
+    before = _tree_bytes(run)
+    original_replace = portable.os.replace
+    original_fsync = portable.os.fsync
+    competitor_bytes = b'{"external":"different"}\n'
+    competitor_identity: tuple[int, int] | None = None
+    swapped = False
+    failed = False
+
+    def install_then_swap(
+        source: object,
+        destination: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal competitor_identity, swapped
+        original_replace(source, destination, *args, **kwargs)
+        if destination != "run-manifest.json" or swapped:
+            return
+        competitor_path = run / "external-manifest.json"
+        competitor_path.write_bytes(competitor_bytes)
+        competitor = os.stat(competitor_path, follow_symlinks=False)
+        competitor_identity = (competitor.st_dev, competitor.st_ino)
+        original_replace(competitor_path, run / "run-manifest.json")
+        swapped = True
+
+    def fail_post_swap_directory_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if swapped and not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            failed = True
+            raise OSError("injected post-swap directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(portable.os, "replace", install_then_swap)
+    monkeypatch.setattr(portable.os, "fsync", fail_post_swap_directory_fsync)
+    refused = portable.guarded_submit_judge_response(run, response)
+
+    current = os.stat(run / "run-manifest.json", follow_symlinks=False)
+    assert swapped and failed and competitor_identity is not None
+    assert refused == {
+        "accepted": False,
+        "preflight": {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]},
+    }
+    assert (current.st_dev, current.st_ino) == competitor_identity
+    assert _tree_bytes(run) == {**before, "run-manifest.json": competitor_bytes}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="inode ownership is POSIX-specific")
+def test_protocol_21_transition_preserves_owned_manifest_when_rollback_identity_read_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    portable = _load_protocol_21_portable()
+    run = tmp_path / "portable-v21-transition-manifest-identity-read-failure"
+    portable.initialize_evaluation(_case_payload(), run, seed_hex="0" * 64)
+    request = portable.next_judge_request(run)
+    assert request is not None
+    response = _protocol_21_test_response(request)
+    before = _tree_bytes(run)
+    original_replace = portable.os.replace
+    original_fsync = portable.os.fsync
+    original_stat = portable.os.stat
+    installed_identity: tuple[int, int] | None = None
+    replaced = False
+    failed = False
+    identity_failed = False
+
+    def record_manifest_replace(
+        source: object,
+        destination: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal installed_identity, replaced
+        original_replace(source, destination, *args, **kwargs)
+        if destination == "run-manifest.json" and not replaced:
+            current = original_stat(
+                run / "run-manifest.json", follow_symlinks=False
+            )
+            installed_identity = (current.st_dev, current.st_ino)
+            replaced = True
+
+    def fail_post_replace_directory_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if replaced and not failed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            failed = True
+            raise OSError("injected post-replace directory fsync failure")
+        original_fsync(descriptor)
+
+    def fail_rollback_identity_read(
+        path: object, *args: object, **kwargs: object
+    ) -> os.stat_result:
+        nonlocal identity_failed
+        if failed and path == "run-manifest.json" and not identity_failed:
+            identity_failed = True
+            raise OSError("injected rollback identity read failure")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(portable.os, "replace", record_manifest_replace)
+    monkeypatch.setattr(portable.os, "fsync", fail_post_replace_directory_fsync)
+    monkeypatch.setattr(portable.os, "stat", fail_rollback_identity_read)
+    refused = portable.guarded_submit_judge_response(run, response)
+
+    current = original_stat(run / "run-manifest.json", follow_symlinks=False)
+    assert replaced and failed and identity_failed and installed_identity is not None
+    assert refused == {
+        "accepted": False,
+        "preflight": {"valid": False, "diagnostics": ["MECHANICAL_RESPONSE_INVALID"]},
+    }
+    assert (current.st_dev, current.st_ino) == installed_identity
+    assert _tree_bytes(run)["run-manifest.json"] != before["run-manifest.json"]
+
+
+def test_protocol_21_post_replace_fsync_and_restore_failure_is_controlled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    portable = _load_protocol_21_portable()
+    run = tmp_path / "portable-v21-post-replace-cleanup-failure"
+    portable.initialize_evaluation(_case_payload(), run, seed_hex="4" * 64)
+    request = portable.next_judge_request(run)
+    assert request is not None
+    response = _protocol_21_test_response(request)
+    before = _tree_bytes(run)
+    original_replace = portable.os.replace
+    original_fsync = portable.os.fsync
+    manifest_replacements = 0
+    failures = 0
+
+    def record_manifest_replace(
+        source: object,
+        destination: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal manifest_replacements
+        original_replace(source, destination, *args, **kwargs)
+        if destination == "run-manifest.json":
+            manifest_replacements += 1
+
+    def fail_two_manifest_directory_fsyncs(descriptor: int) -> None:
+        nonlocal failures
+        if (
+            manifest_replacements > failures
+            and failures < 2
+            and stat.S_ISDIR(os.fstat(descriptor).st_mode)
+        ):
+            failures += 1
+            raise OSError(f"injected manifest directory fsync failure {failures}")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(portable.os, "replace", record_manifest_replace)
+    monkeypatch.setattr(portable.os, "fsync", fail_two_manifest_directory_fsyncs)
+
+    accepted_response = portable._v21_response(response, request)
+    with pytest.raises(
+        portable.EvaluationIntegrityError, match="EVALUATOR_V21_ROLLBACK_FAILED"
+    ):
+        portable._v21_commit_source_review(run, accepted_response)
+
+    assert manifest_replacements == 2
+    assert failures == 2
+    assert _tree_bytes(run) == before

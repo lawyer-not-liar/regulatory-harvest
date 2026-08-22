@@ -10,6 +10,7 @@ surfaces.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -22,11 +23,20 @@ from regulatory_harvest.evaluation import attorney_generation as generation
 from regulatory_harvest.evaluation.attorney_artifacts import (
     EvaluationIntegrityError,
     load_verified_evaluation_run,
+    read_evaluation_artifact,
     verify_evaluation_run,
 )
 from regulatory_harvest.evaluation.attorney_cli import (
     _case_and_capsules_from_fixture,
+    _probe_resumed_scripted_v22_run,
     _qualification_case_from_fixture,
+    _scripted_drafts_from_fixture,
+    _ScriptedDraftFixtureError,
+    _ScriptedFixtureDraftEvaluatorV22,
+    _v22_nonterminal_payload,
+    _v22_outcome_payload,
+    _v22_result_payload,
+    _verified_protocol_for_v22_initialization,
 )
 from regulatory_harvest.evaluation.attorney_models import (
     EvaluationPreflightIssue,
@@ -37,6 +47,7 @@ from regulatory_harvest.evaluation.attorney_models import (
     JudgeResponse,
     QualificationSubmissionResult,
 )
+from regulatory_harvest.evaluation.attorney_protocol import detect_evaluation_protocol
 from regulatory_harvest.evaluation.attorney_qualification import (
     guarded_submit_case_qualification,
     initialize_case_qualification,
@@ -44,10 +55,56 @@ from regulatory_harvest.evaluation.attorney_qualification import (
     resume_case_qualification,
     verify_case_qualification,
 )
+from regulatory_harvest.evaluation.attorney_v2_artifacts import (
+    V2ResponsePreflight,
+    load_verified_v2_run,
+    verify_v2_run,
+)
+from regulatory_harvest.evaluation.attorney_v2_models import EvaluationRunStateV2
+from regulatory_harvest.evaluation.attorney_v2_workflow import (
+    GuardedSubmissionResultV2,
+    guarded_submit_evaluator_response_v2,
+    next_evaluator_request_v2,
+    preflight_evaluator_response_v2,
+    resume_evaluation_v2,
+    stop_evaluation_v2_inconclusive,
+    submit_evaluator_response_v2,
+)
+from regulatory_harvest.evaluation.attorney_v21_artifacts import (
+    V21ResponsePreflight,
+    load_verified_v21_run,
+    verify_v21_run,
+)
+from regulatory_harvest.evaluation.attorney_v21_models import EvaluationRunStateV21
+from regulatory_harvest.evaluation.attorney_v21_workflow import (
+    GuardedSubmissionResultV21,
+    guarded_submit_evaluator_response_v21,
+    initialize_evaluation_v21,
+    next_evaluator_request_v21,
+    preflight_evaluator_response_v21,
+    resume_evaluation_v21,
+    stop_evaluation_v21_inconclusive,
+    submit_evaluator_response_v21,
+)
+from regulatory_harvest.evaluation.attorney_v22_artifacts import (
+    V22ResponsePreflight,
+    load_verified_v22_run,
+    verify_v22_run,
+)
+from regulatory_harvest.evaluation.attorney_v22_models import EvaluationRunStateV22
+from regulatory_harvest.evaluation.attorney_v22_workflow import (
+    GuardedSubmissionResultV22,
+    continue_evaluation_v22,
+    guarded_submit_evaluator_response_v22,
+    initialize_evaluation_v22,
+    next_evaluator_request_v22,
+    preflight_evaluator_response_v22,
+    resume_evaluation_v22,
+    submit_evaluator_response_v22,
+)
 from regulatory_harvest.evaluation.attorney_workflow import (
     EvaluationSourceParityUnprovenError,
     guarded_submit_judge_response,
-    initialize_evaluation,
     next_judge_request,
     preflight_judge_response,
     resume_evaluation,
@@ -60,6 +117,7 @@ EVAL_EXIT_INPUT = 2
 EVAL_EXIT_INCONCLUSIVE = 3
 EVAL_EXIT_FAIL = 4
 EVAL_EXIT_INTEGRITY = 5
+EVAL_EXIT_ENGINE_PAUSED = 6
 _EVAL_RESPONSE_MAX_BYTES = 1024 * 1024
 _EVAL_RESPONSE_MAX_DEPTH = 64
 EVALUATION_INTEGRITY_INVALID = "EVALUATION_INTEGRITY_INVALID"
@@ -110,21 +168,32 @@ def _parser() -> argparse.ArgumentParser:
     eval_init_parser.add_argument("--case", required=True)
     eval_init_parser.add_argument("--run", required=True)
     eval_init_parser.add_argument("--seed-hex", required=True)
+    eval_init_parser.add_argument("--protocol", choices=("2.1", "2.2"), default="2.1")
     eval_next_parser = subparsers.add_parser("eval-next")
     eval_next_parser.add_argument("--run", required=True)
     eval_preflight_parser = subparsers.add_parser("eval-preflight")
     eval_preflight_parser.add_argument("--run", required=True)
     eval_preflight_parser.add_argument("--response", required=True)
+    _add_payload_response_arguments(eval_preflight_parser)
     eval_submit_parser = subparsers.add_parser("eval-submit")
     eval_submit_parser.add_argument("--run", required=True)
     eval_submit_parser.add_argument("--response", required=True)
     eval_submit_safe_parser = subparsers.add_parser("eval-submit-safe")
     eval_submit_safe_parser.add_argument("--run", required=True)
     eval_submit_safe_parser.add_argument("--response", required=True)
+    _add_payload_response_arguments(eval_submit_safe_parser)
+    eval_stop_inconclusive_parser = subparsers.add_parser("eval-stop-inconclusive")
+    eval_stop_inconclusive_parser.add_argument("--run", required=True)
+    eval_stop_inconclusive_parser.add_argument(
+        "--reason", required=True, choices=("MECHANICAL_RESPONSE_INVALID",)
+    )
     eval_status_parser = subparsers.add_parser("eval-status")
     eval_status_parser.add_argument("--run", required=True)
     eval_verify_parser = subparsers.add_parser("eval-verify")
     eval_verify_parser.add_argument("--run", required=True)
+    eval_resume_parser = subparsers.add_parser("eval-resume")
+    eval_resume_parser.add_argument("--run", required=True)
+    eval_resume_parser.add_argument("--scripted-responses", required=True)
     eval_qualify_init_parser = subparsers.add_parser("eval-qualify-init")
     eval_qualify_init_parser.add_argument("--case", required=True)
     eval_qualify_init_parser.add_argument("--run", required=True)
@@ -154,6 +223,16 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_payload_response_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--provider-name", default=argparse.SUPPRESS)
+    parser.add_argument("--model-name", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--judge-isolation",
+        choices=("fresh_context", "scripted_fixture"),
+        default=argparse.SUPPRESS,
+    )
+
+
 def _eval_json(value: object) -> None:
     print(canonical_json_bytes(value).decode("utf-8"))
 
@@ -174,6 +253,33 @@ def _safe_evaluation_verification_issues(issues: tuple[str, ...]) -> list[str]:
     return normalized or [EVALUATION_INTEGRITY_INVALID]
 
 
+def _retained_protocol_verifier_nominee(run: Path) -> str | None:
+    """Use a bounded marker read only to nominate a canonical verifier."""
+    try:
+        data = read_evaluation_artifact(
+            run, "run-manifest.json", max_bytes=16 * 1024 * 1024
+        )
+        payload = json.loads(data.decode("utf-8"))
+    except (
+        EvaluationIntegrityError,
+        OSError,
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+    ):
+        return None
+    if type(payload) is not dict:
+        return None
+    protocol = payload.get("protocol_version")
+    if protocol in {"2.0", "2.1", "2.2"}:
+        return str(protocol)
+    if protocol is None and payload.get("schema_version") in {"1.0", "1.3", "2.0"}:
+        return "1.3"
+    return None
+
+
 def _state_payload(state: EvaluationRunState) -> dict[str, object]:
     return state.model_dump(mode="json")
 
@@ -188,6 +294,39 @@ def _eval_exit(state: EvaluationRunState, run: Path) -> int:
     return (
         EVAL_EXIT_FAIL
         if any(report.absolute_disposition.value == "FAIL" for report in result.reports)
+        else EVAL_EXIT_SUCCESS
+    )
+
+
+def _eval_exit_v2(state: EvaluationRunStateV2, run: Path) -> int:
+    if state.terminal_status is None:
+        return EVAL_EXIT_SUCCESS
+    if state.terminal_status.value == "inconclusive":
+        return EVAL_EXIT_INCONCLUSIVE
+    _, result = load_verified_v2_run(run)
+    if result is None:
+        raise EvaluationIntegrityError("EVALUATOR_V2_RESULT_REQUIRED")
+    return (
+        EVAL_EXIT_FAIL
+        if any(report.absolute_disposition.value == "FAIL" for report in result.reports)
+        else EVAL_EXIT_SUCCESS
+    )
+
+
+def _eval_exit_v21(state: EvaluationRunStateV21, run: Path) -> int:
+    if state.terminal_status is None:
+        return EVAL_EXIT_SUCCESS
+    if state.terminal_status.value in {"INCONCLUSIVE", "INCONCLUSIVE_MECHANICAL"}:
+        return EVAL_EXIT_INCONCLUSIVE
+    _, result = load_verified_v21_run(run)
+    if result is None:
+        raise EvaluationIntegrityError("EVALUATOR_V21_RESULT_REQUIRED")
+    return (
+        EVAL_EXIT_FAIL
+        if any(
+            report.reconciliation.absolute_disposition.value == "FAIL"
+            for report in result.reports
+        )
         else EVAL_EXIT_SUCCESS
     )
 
@@ -264,6 +403,68 @@ def _read_guarded_eval_object(path: Path) -> dict[str, object] | None:
         return None
 
 
+def _read_guarded_v2_response(
+    args: argparse.Namespace, run: Path
+) -> dict[str, object] | None:
+    """Read a full response or deterministically wrap one role-authored payload."""
+    value = _read_guarded_eval_object(Path(args.response))
+    if value is None:
+        return None
+    metadata = (
+        getattr(args, "provider_name", None),
+        getattr(args, "model_name", None),
+        getattr(args, "judge_isolation", None),
+    )
+    if not any(item is not None for item in metadata):
+        return value
+    if any(item is None for item in metadata):
+        return None
+    request = next_evaluator_request_v2(run)
+    if request is None:
+        return None
+    provider_name, model_name, judge_isolation = metadata
+    return {
+        "schema_version": "2.0",
+        "operation": request.operation.value,
+        "request_fingerprint": request.request_fingerprint,
+        "provider_name": provider_name,
+        "model_name": model_name,
+        "judge_isolation": judge_isolation,
+        "payload": value,
+    }
+
+
+def _read_guarded_v21_response(
+    args: argparse.Namespace, run: Path
+) -> dict[str, object] | None:
+    """Read a complete 2.1 response or bind one role payload to the pending call."""
+    value = _read_guarded_eval_object(Path(args.response))
+    if value is None:
+        return None
+    metadata = (
+        getattr(args, "provider_name", None),
+        getattr(args, "model_name", None),
+        getattr(args, "judge_isolation", None),
+    )
+    if not any(item is not None for item in metadata):
+        return value
+    if any(item is None for item in metadata):
+        return None
+    request = next_evaluator_request_v21(run)
+    if request is None:
+        return None
+    provider_name, model_name, judge_isolation = metadata
+    return {
+        "schema_version": "2.1",
+        "operation": request.operation.value,
+        "request_fingerprint": request.request_fingerprint,
+        "provider_name": provider_name,
+        "model_name": model_name,
+        "judge_isolation": judge_isolation,
+        "payload": value,
+    }
+
+
 def _schema_preflight_result(
     request: JudgeRequest | None,
 ) -> EvaluationPreflightResult:
@@ -306,22 +507,8 @@ def _no_pending_preflight_result() -> EvaluationPreflightResult:
     )
 
 
-def _run_eval_command(args: argparse.Namespace) -> int:
+def _run_v1_eval_command(args: argparse.Namespace, run: Path) -> int:
     try:
-        run = Path(args.run)
-        if args.command == "eval-init":
-            case_path = Path(args.case)
-            case, capsule_paths = _case_and_capsules_from_fixture(
-                case_path, root=case_path.parent
-            )
-            state = initialize_evaluation(
-                case,
-                run,
-                seed_hex=args.seed_hex,
-                generation_capsule_paths=capsule_paths,
-            )
-            _eval_json(_state_payload(state))
-            return EVAL_EXIT_SUCCESS
         if args.command == "eval-next":
             request = next_judge_request(run)
             if request is None:
@@ -407,6 +594,387 @@ def _run_eval_command(args: argparse.Namespace) -> int:
         raise
     except (TypeError, ValueError) as error:
         raise EvaluationCliInputError("EVALUATION_INPUT_INVALID", str(error)) from error
+
+
+def _v2_preflight_payload(preflight: V2ResponsePreflight) -> dict[str, object]:
+    return {"diagnostics": list(preflight.diagnostics), "valid": preflight.valid}
+
+
+def _v2_guarded_payload(result: GuardedSubmissionResultV2) -> dict[str, object]:
+    accepted = result.accepted
+    preflight = result.preflight
+    state = result.state
+    payload: dict[str, object] = {
+        "accepted": accepted,
+        "preflight": _v2_preflight_payload(preflight),
+    }
+    if state is not None:
+        payload["state"] = state.model_dump(mode="json")
+    return payload
+
+
+def _v21_preflight_payload(preflight: V21ResponsePreflight) -> dict[str, object]:
+    return {"diagnostics": list(preflight.diagnostics), "valid": preflight.valid}
+
+
+def _v21_guarded_payload(result: GuardedSubmissionResultV21) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "accepted": result.accepted,
+        "preflight": _v21_preflight_payload(result.preflight),
+    }
+    if result.state is not None:
+        payload["state"] = result.state.model_dump(mode="json")
+    return payload
+
+
+def _v22_preflight_payload(preflight: V22ResponsePreflight) -> dict[str, object]:
+    return {"diagnostics": list(preflight.diagnostics), "valid": preflight.valid}
+
+
+def _v22_guarded_payload(result: GuardedSubmissionResultV22) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "accepted": result.accepted,
+        "preflight": _v22_preflight_payload(result.preflight),
+    }
+    if result.state is not None:
+        payload["state"] = result.state.model_dump(mode="json")
+    return payload
+
+
+def _eval_exit_v22(state: EvaluationRunStateV22, run: Path) -> int:
+    if state.terminal_status is None:
+        return EVAL_EXIT_SUCCESS
+    _, result = load_verified_v22_run(run)
+    if result is None:
+        raise EvaluationIntegrityError("EVALUATOR_V22_RESULT_REQUIRED")
+    if result.terminal_status.value == "INCONCLUSIVE":
+        return EVAL_EXIT_INCONCLUSIVE
+    return (
+        EVAL_EXIT_FAIL
+        if any(
+            report.sensitivity.absolute_disposition.value == "FAIL"
+            for report in result.reports
+        )
+        else EVAL_EXIT_SUCCESS
+    )
+
+
+def _run_v2_eval_command(args: argparse.Namespace, run: Path) -> int:
+    try:
+        if args.command == "eval-next":
+            request = next_evaluator_request_v2(run)
+            if request is None:
+                state = resume_evaluation_v2(run)
+                _eval_json(None)
+                return _eval_exit_v2(state, run)
+            _eval_json(request.model_dump(mode="json"))
+            return EVAL_EXIT_SUCCESS
+        if args.command == "eval-preflight":
+            value = _read_guarded_v2_response(args, run)
+            preflight = preflight_evaluator_response_v2(run, value)
+            _eval_json(_v2_preflight_payload(preflight))
+            return EVAL_EXIT_SUCCESS if preflight.valid else EVAL_EXIT_INPUT
+        if args.command == "eval-submit":
+            response = _read_canonical_eval_object(Path(args.response))
+            state = submit_evaluator_response_v2(run, response)
+            _eval_json(state.model_dump(mode="json"))
+            return _eval_exit_v2(state, run)
+        if args.command == "eval-submit-safe":
+            value = _read_guarded_v2_response(args, run)
+            guarded = guarded_submit_evaluator_response_v2(run, value)
+            _eval_json(_v2_guarded_payload(guarded))
+            return EVAL_EXIT_SUCCESS if guarded.accepted else EVAL_EXIT_INPUT
+        if args.command == "eval-stop-inconclusive":
+            if next_evaluator_request_v2(run) is None:
+                raise EvaluationCliInputError(
+                    "EVALUATION_INPUT_INVALID", "The evaluation run has no pending request."
+                )
+            state = stop_evaluation_v2_inconclusive(run, args.reason)
+            _eval_json(state.model_dump(mode="json"))
+            return _eval_exit_v2(state, run)
+        if args.command == "eval-status":
+            state = resume_evaluation_v2(run)
+            _eval_json(state.model_dump(mode="json"))
+            return _eval_exit_v2(state, run)
+        verification = verify_v2_run(run)
+        if not verification.valid:
+            _eval_json(
+                {"ok": False, "issues": _safe_evaluation_verification_issues(verification.issues)}
+            )
+            return EVAL_EXIT_INTEGRITY
+        state = resume_evaluation_v2(run)
+        _eval_json(
+            {
+                "ok": True,
+                "manifest_root": verification.root_hash,
+                "state": state.model_dump(mode="json"),
+            }
+        )
+        return _eval_exit_v2(state, run)
+    except EvaluationIntegrityError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise EvaluationCliInputError("EVALUATION_INPUT_INVALID", str(error)) from error
+
+
+def _run_v21_eval_command(args: argparse.Namespace, run: Path) -> int:
+    try:
+        if args.command == "eval-next":
+            request = next_evaluator_request_v21(run)
+            if request is None:
+                state = resume_evaluation_v21(run)
+                _eval_json(None)
+                return _eval_exit_v21(state, run)
+            _eval_json(request.model_dump(mode="json"))
+            return EVAL_EXIT_SUCCESS
+        if args.command == "eval-preflight":
+            value = _read_guarded_v21_response(args, run)
+            preflight = preflight_evaluator_response_v21(run, value)
+            _eval_json(_v21_preflight_payload(preflight))
+            return EVAL_EXIT_SUCCESS if preflight.valid else EVAL_EXIT_INPUT
+        if args.command == "eval-submit":
+            response = _read_canonical_eval_object(Path(args.response))
+            state = submit_evaluator_response_v21(run, response)
+            _eval_json(state.model_dump(mode="json"))
+            return _eval_exit_v21(state, run)
+        if args.command == "eval-submit-safe":
+            value = _read_guarded_v21_response(args, run)
+            guarded = guarded_submit_evaluator_response_v21(run, value)
+            _eval_json(_v21_guarded_payload(guarded))
+            return EVAL_EXIT_SUCCESS if guarded.accepted else EVAL_EXIT_INPUT
+        if args.command == "eval-stop-inconclusive":
+            if next_evaluator_request_v21(run) is None:
+                raise EvaluationCliInputError(
+                    "EVALUATION_INPUT_INVALID", "The evaluation run has no pending request."
+                )
+            state = stop_evaluation_v21_inconclusive(run, args.reason)
+            _eval_json(state.model_dump(mode="json"))
+            return _eval_exit_v21(state, run)
+        if args.command == "eval-status":
+            state = resume_evaluation_v21(run)
+            _eval_json(state.model_dump(mode="json"))
+            return _eval_exit_v21(state, run)
+        verification = verify_v21_run(run)
+        if not verification.valid:
+            _eval_json(
+                {"ok": False, "issues": _safe_evaluation_verification_issues(verification.issues)}
+            )
+            return EVAL_EXIT_INTEGRITY
+        state = resume_evaluation_v21(run)
+        _eval_json(
+            {
+                "ok": True,
+                "manifest_root": verification.root_hash,
+                "state": state.model_dump(mode="json"),
+            }
+        )
+        return _eval_exit_v21(state, run)
+    except EvaluationIntegrityError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise EvaluationCliInputError("EVALUATION_INPUT_INVALID", str(error)) from error
+
+
+def _run_v22_eval_command(args: argparse.Namespace, run: Path) -> int:
+    try:
+        if args.command == "eval-next":
+            request = next_evaluator_request_v22(run)
+            if request is None:
+                state = resume_evaluation_v22(run)
+                _eval_json(None)
+                return _eval_exit_v22(state, run)
+            _eval_json(request.model_dump(mode="json"))
+            return EVAL_EXIT_SUCCESS
+        if args.command == "eval-preflight":
+            value = _read_guarded_eval_object(Path(args.response))
+            preflight = preflight_evaluator_response_v22(run, value)
+            _eval_json(_v22_preflight_payload(preflight))
+            return EVAL_EXIT_SUCCESS if preflight.valid else EVAL_EXIT_INPUT
+        if args.command == "eval-submit":
+            value = _read_guarded_eval_object(Path(args.response))
+            try:
+                state = submit_evaluator_response_v22(run, value)
+            except (TypeError, ValueError) as error:
+                raise EvaluationCliInputError(
+                    "EXTERNAL_RESPONSE_INVALID",
+                    "The strict response does not bind the pending request.",
+                ) from error
+            _eval_json(state.model_dump(mode="json"))
+            return _eval_exit_v22(state, run)
+        if args.command == "eval-submit-safe":
+            value = _read_guarded_eval_object(Path(args.response))
+            guarded = guarded_submit_evaluator_response_v22(run, value)
+            _eval_json(_v22_guarded_payload(guarded))
+            return EVAL_EXIT_SUCCESS if guarded.accepted else EVAL_EXIT_INPUT
+        if args.command == "eval-stop-inconclusive":
+            raise EvaluationCliInputError(
+                "EVALUATION_MUTATION_UNSUPPORTED",
+                "Protocol 2.2 has no mechanical terminalization command.",
+            )
+        if args.command == "eval-resume":
+            responses = _scripted_drafts_from_fixture(Path(args.scripted_responses))
+            _probe_resumed_scripted_v22_run(run, responses)
+            evaluator = _ScriptedFixtureDraftEvaluatorV22(responses)
+            try:
+                outcome = asyncio.run(continue_evaluation_v22(run, evaluator))
+            except (EvaluationIntegrityError, _ScriptedDraftFixtureError):
+                raise
+            except Exception:
+                resume_evaluation_v22(run)
+                _eval_json(
+                    {
+                        "error": "evaluation_engine_paused",
+                        "ok": False,
+                        "pending_call": _v22_nonterminal_payload(run)["pending_call"],
+                    }
+                )
+                return EVAL_EXIT_ENGINE_PAUSED
+            evaluator.assert_exhausted()
+            _eval_json(
+                _v22_outcome_payload(
+                    outcome,
+                    run,
+                    judge_mode="local-scripted-fixture",
+                )
+            )
+            return outcome.exit_code
+        if args.command == "eval-status":
+            state = resume_evaluation_v22(run)
+            if state.terminal_status is None:
+                _eval_json(_v22_nonterminal_payload(run))
+            else:
+                _, result = load_verified_v22_run(run)
+                if result is None:
+                    raise EvaluationIntegrityError("EVALUATOR_V22_RESULT_REQUIRED")
+                _eval_json(_v22_result_payload(result, run, judge_mode="status-only"))
+            return _eval_exit_v22(state, run)
+        verification = verify_v22_run(run)
+        if not verification.valid:
+            _eval_json(
+                {"ok": False, "issues": _safe_evaluation_verification_issues(verification.issues)}
+            )
+            return EVAL_EXIT_INTEGRITY
+        state = resume_evaluation_v22(run)
+        if state.terminal_status is None:
+            _eval_json(_v22_nonterminal_payload(run))
+        else:
+            _, result = load_verified_v22_run(run)
+            if result is None:
+                raise EvaluationIntegrityError("EVALUATOR_V22_RESULT_REQUIRED")
+            _eval_json(_v22_result_payload(result, run, judge_mode="verification-only"))
+        return _eval_exit_v22(state, run)
+    except EvaluationCliInputError:
+        raise
+    except EvaluationIntegrityError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise EvaluationCliInputError("EVALUATION_INPUT_INVALID", str(error)) from error
+
+
+def _run_eval_command(args: argparse.Namespace) -> int:
+    if args.command == "eval-init":
+        try:
+            run = _physical_run_path(args.run)
+            # Initialization normally owns a new empty directory. Explicit
+            # v2.2 verifies a detected retained root before refusing it. The
+            # default v2.1 path keeps its historical detection-only behavior.
+            if args.protocol == "2.2":
+                protocol = _verified_protocol_for_v22_initialization(run)
+                if protocol in {"1.3", "2.0", "2.1"}:
+                    raise EvaluationCliInputError(
+                        "EVALUATION_LEGACY_READ_ONLY",
+                        f"Protocol {protocol} evaluation runs are read-only.",
+                    )
+            elif run.exists():
+                try:
+                    protocol = detect_evaluation_protocol(run)
+                except (EvaluationIntegrityError, OSError, TypeError, ValueError):
+                    protocol = None
+                if protocol in {"1.3", "2.0", "2.1"}:
+                    raise EvaluationCliInputError(
+                        "EVALUATION_LEGACY_READ_ONLY",
+                        f"Protocol {protocol} evaluation runs are read-only.",
+                    )
+            case_path = Path(args.case)
+            case, capsule_paths = _case_and_capsules_from_fixture(
+                case_path, root=case_path.parent
+            )
+            if args.protocol == "2.2":
+                state_v22 = initialize_evaluation_v22(
+                    case,
+                    run,
+                    seed_hex=args.seed_hex,
+                    generation_capsule_paths=capsule_paths,
+                )
+                _eval_json(state_v22.model_dump(mode="json"))
+            else:
+                state_v21 = initialize_evaluation_v21(
+                    case,
+                    run,
+                    seed_hex=args.seed_hex,
+                    generation_capsule_paths=capsule_paths,
+                )
+                _eval_json(state_v21.model_dump(mode="json"))
+            return EVAL_EXIT_SUCCESS
+        except EvaluationCliInputError:
+            raise
+        except EvaluationIntegrityError as error:
+            if args.protocol == "2.2":
+                raise
+            raise EvaluationCliInputError("EVALUATION_INPUT_INVALID", str(error)) from error
+        except (TypeError, ValueError) as error:
+            raise EvaluationCliInputError("EVALUATION_INPUT_INVALID", str(error)) from error
+
+    run = _physical_run_path(args.run)
+    try:
+        protocol = detect_evaluation_protocol(run)
+    except (EvaluationIntegrityError, OSError, TypeError, ValueError) as error:
+        protocol = _retained_protocol_verifier_nominee(run)
+        if protocol is None:
+            raise EvaluationCliInputError(
+                "EVALUATION_PROTOCOL_UNSUPPORTED",
+                "The evaluation run protocol is unsupported.",
+            ) from error
+        if protocol == "1.3":
+            verification = verify_evaluation_run(run)
+        elif protocol == "2.0":
+            verification = verify_v2_run(run)
+        elif protocol == "2.1":
+            verification = verify_v21_run(run)
+        else:
+            verification = verify_v22_run(run)
+        if not verification.valid:
+            if args.command in {"eval-verify", "eval-resume"}:
+                _eval_json(
+                    {
+                        "ok": False,
+                        "issues": _safe_evaluation_verification_issues(
+                            verification.issues
+                        ),
+                    }
+                )
+                return EVAL_EXIT_INTEGRITY
+            raise EvaluationIntegrityError("EVALUATION_RETAINED_RUN_INVALID") from error
+    if protocol == "2.2":
+        return _run_v22_eval_command(args, run)
+    if protocol == "2.1":
+        if args.command == "eval-resume":
+            raise EvaluationCliInputError(
+                "EVALUATION_LEGACY_READ_ONLY",
+                "Protocol 2.1 evaluation runs cannot use Protocol 2.2 resume.",
+            )
+        return _run_v21_eval_command(args, run)
+    if protocol in {"1.3", "2.0"}:
+        if args.command not in {"eval-status", "eval-verify"}:
+            raise EvaluationCliInputError(
+                "EVALUATION_LEGACY_READ_ONLY", f"Protocol {protocol} evaluation runs are read-only."
+            )
+        if protocol == "2.0":
+            return _run_v2_eval_command(args, run)
+        return _run_v1_eval_command(args, run)
+    raise EvaluationCliInputError(
+        "EVALUATION_PROTOCOL_UNSUPPORTED", "The evaluation run protocol is unsupported."
+    )
 
 
 def _run_qualification_command(args: argparse.Namespace) -> int:

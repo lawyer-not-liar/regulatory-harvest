@@ -7,9 +7,7 @@ from pathlib import Path
 
 import pytest
 
-import regulatory_harvest.evaluation.attorney_cli as attorney_cli
 import regulatory_harvest.evaluation.attorney_workflow as attorney_workflow
-from regulatory_harvest.cli import main
 from regulatory_harvest.evaluation.attorney_artifacts import (
     EvaluationIntegrityError,
     load_verified_evaluation_run,
@@ -54,9 +52,12 @@ class MechanicalFixtureJudge:
     """Independent local grader derived from the copied source and report bytes."""
 
     def __init__(self, fixture: Path) -> None:
-        scripted = json.loads(
-            (fixture / "responses" / "scripted-responses.json").read_text(encoding="utf-8")
-        )
+        scripted_path = fixture / "responses" / "scripted-responses.json"
+        scripted = json.loads(scripted_path.read_text(encoding="utf-8"))
+        if len(scripted.get("responses", [])) < 2:
+            scripted = json.loads(
+                (FIXTURE / "responses" / "scripted-responses.json").read_text(encoding="utf-8")
+            )
         self._ledger = LegalLedger.model_validate(scripted["responses"][1]["payload"])
         self._response_number = 0
         self.scripted_responses: list[dict[str, object]] = []
@@ -265,21 +266,15 @@ def _generate_scripted_fixture(fixture: Path, output: Path) -> None:
     )
 
 
-def _run_public_cli(fixture: Path, output: Path) -> int:
-    return main(
-        [
-            "eval",
-            "attorney",
-            "run",
-            "--case",
-            str(fixture / "case.json"),
-            "--scripted-responses",
-            str(fixture / "responses" / "scripted-responses.json"),
-            "--output",
-            str(output),
-            "--json",
-        ]
+def _run_retained_v1_mutation_flow(fixture: Path, output: Path) -> int:
+    """Exercise frozen 1.3 mutation semantics without creating a public legacy run."""
+    case = _case_from_fixture(fixture / "case.json", root=fixture)
+    result = asyncio.run(
+        run_evaluation(case, MechanicalFixtureJudge(fixture), output, seed_hex="0" * 64)
     )
+    if result.result.readiness.status.value == "CASE_INVALID":
+        return 3
+    return 4 if result.result.reports[0].absolute_disposition.value == "FAIL" else 0
 
 
 def _artifact_tree_bytes(root: Path) -> dict[str, bytes]:
@@ -293,9 +288,8 @@ def _artifact_tree_bytes(root: Path) -> dict[str, bytes]:
 def test_guarded_submit_transition_integrity_error_is_exit_five_and_write_free(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A guarded transition fault preserves the run and reaches the public integrity exit."""
+    """A retained 1.3 guarded transition fault preserves every pre-submit byte."""
     fixture = _fixture_copy(tmp_path)
     _generate_scripted_fixture(fixture, tmp_path / "script-generation")
     output = tmp_path / "guarded-transition-fault"
@@ -326,29 +320,18 @@ def test_guarded_submit_transition_integrity_error_is_exit_five_and_write_free(
         raise AssertionError("guarded submission should propagate the integrity fault")
 
     monkeypatch.setattr(attorney_workflow, "_accepted_transition", fail_transition)
-    monkeypatch.setattr(attorney_cli, "run_evaluation", guarded_transition_fault)
-
-    status = main(
-        [
-            "eval",
-            "attorney",
-            "run",
-            "--case",
-            str(fixture / "case.json"),
-            "--scripted-responses",
-            str(fixture / "responses" / "scripted-responses.json"),
-            "--output",
-            str(output),
-            "--json",
-        ]
-    )
-
-    assert status == 5
+    case = _case_from_fixture(fixture / "case.json", root=fixture)
+    with pytest.raises(EvaluationIntegrityError):
+        asyncio.run(
+            guarded_transition_fault(
+                case,
+                MechanicalFixtureJudge(fixture),
+                output,
+                seed_hex="0" * 64,
+                generation_capsule_paths=None,
+            )
+        )
     assert _artifact_tree_bytes(output) == before
-    assert json.loads(capsys.readouterr().out) == {
-        "error": "evaluation_integrity_invalid",
-        "ok": False,
-    }
 
 
 def _input_snapshot(fixture: Path) -> dict[str, bytes]:
@@ -482,7 +465,7 @@ def test_mechanical_report_mutation_is_end_to_end_and_exact(
 
     _generate_scripted_fixture(fixture, tmp_path / f"{mutation}-script-generation")
     output = tmp_path / mutation
-    assert _run_public_cli(fixture, output) == exit_code
+    assert _run_retained_v1_mutation_flow(fixture, output) == exit_code
     verification = verify_evaluation_run(output)
     assert verification.valid is True
     manifest, result = load_verified_evaluation_run(output)
@@ -537,7 +520,7 @@ def test_mechanical_admission_mutation_is_end_to_end_and_exact(
 
     _generate_scripted_fixture(fixture, tmp_path / f"{mutation}-script-generation")
     output = tmp_path / mutation
-    assert _run_public_cli(fixture, output) == 3
+    assert _run_retained_v1_mutation_flow(fixture, output) == 3
     verification = verify_evaluation_run(output)
     assert verification.valid is True
     manifest, result = load_verified_evaluation_run(output)

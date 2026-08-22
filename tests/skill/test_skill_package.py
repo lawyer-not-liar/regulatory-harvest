@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 
 from regulatory_harvest.analysis import AnalysisDraft
+from regulatory_harvest.evaluation.attorney_v21_models import EvaluatorResponseV21
+from regulatory_harvest.evaluation.attorney_v22_models import EvaluatorResponseV22
 
 ROOT = Path(__file__).parents[2]
 RUNNERS = (
@@ -21,6 +23,20 @@ def _canonical_bytes(value: object) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _normalized_markdown_slice(
+    relative_path: str,
+    start_heading: str,
+    end_heading: str | None,
+) -> str:
+    text = (ROOT / relative_path).read_text(encoding="utf-8")
+    assert text.count(start_heading) == 1
+    section = text.split(start_heading, 1)[1]
+    if end_heading is not None:
+        assert section.count(end_heading) == 1
+        section = section.split(end_heading, 1)[0]
+    return " ".join(section.casefold().split())
 
 
 def _run_runner(runner: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -1073,7 +1089,8 @@ def test_evaluation_case_template_initializes_with_both_packaged_runners(
 
     assert outputs[0] == outputs[1]
     state = json.loads(outputs[0])
-    assert state["current_operation"] == "admit_case"
+    assert state["phase"] == "source_review"
+    assert state["current_call_id"] is not None
     assert state["terminal_status"] is None
 
 
@@ -1100,6 +1117,284 @@ def test_evaluation_response_template_is_only_the_public_wire_envelope() -> None
         sort_keys=True,
     ).encode("utf-8")
     assert raw == canonical
+
+
+def test_retained_protocol_2_response_template_and_docs_publish_only_bounded_contract() -> None:
+    """The v2 wire template remains byte-stable while the docs mark it replay-only."""
+    template_path = ROOT / "assets" / "attorney-evaluation-v2-response.template.json"
+    assert template_path.is_file()
+    raw = template_path.read_bytes()
+    response = json.loads(raw)
+    assert set(response) == {
+        "schema_version",
+        "operation",
+        "request_fingerprint",
+        "provider_name",
+        "model_name",
+        "judge_isolation",
+        "payload",
+    }
+    assert response["schema_version"] == "2.0"
+    assert response["payload"] == {}
+    assert raw == _canonical_bytes(response)
+
+    public_docs = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8")
+        for path in ("docs/evaluation.md", "references/attorney-evaluation.md")
+    )
+    for phrase in (
+        "PASS means the report satisfied this versioned evaluation rubric",
+        "It does not",
+        "establish legal correctness",
+        "at most one",
+        "fresh mechanical repair",
+        "Protocol 2.1 is the default for new evaluation runs",
+        "Protocol 1.3 is retained for replay and read-only verification",
+        "Protocol 2.0 is retained for replay and read-only verification",
+        "Requirement-level findings are the primary product",
+        "attorney review remains required",
+    ):
+        assert phrase in public_docs
+
+
+def test_protocol_21_response_template_and_docs_publish_fragmented_contract() -> None:
+    """New runs must expose only the gated Protocol 2.1 operator contract."""
+    template_path = ROOT / "assets" / "attorney-evaluation-v21-response.template.json"
+    raw = template_path.read_bytes()
+    response = json.loads(raw)
+    assert response == {
+        "judge_isolation": "fresh_context",
+        "model_name": "example-model",
+        "operation": "source_referee_fragment",
+        "payload": {},
+        "provider_name": "example-provider",
+        "request_fingerprint": "0" * 64,
+        "schema_version": "2.1",
+    }
+    assert raw == _canonical_bytes(response)
+    assert (
+        EvaluatorResponseV21.model_validate_json(raw).operation.value
+        == "source_referee_fragment"
+    )
+
+    public_doc_paths = (
+        "README.md",
+        "SKILL.md",
+        "docs/evaluation.md",
+        "references/attorney-evaluation.md",
+    )
+    public_docs = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8") for path in public_doc_paths
+    )
+    for phrase in (
+        "Protocol 2.1 is the default for new evaluation runs",
+        "experimental",
+        "public verification gate",
+        "one initial response and at most one fresh mechanical repair per fragment",
+        "source-only referee packets",
+        "at most five",
+        "contested requirements",
+        "outcome sensitivity",
+        "substantive unresolved",
+        "INCONCLUSIVE_MECHANICAL",
+        "Protocol 1.3 is retained for replay and read-only verification",
+        "Protocol 2.0 is retained for replay and read-only verification",
+        "attorney review remains required",
+    ):
+        assert phrase in public_docs
+    current_sections = {
+        "README.md": (
+            "### Automated evaluation operator contract",
+            "## Development and contribution status",
+        ),
+        "SKILL.md": ("## Choose the journey", "## Non-negotiable result"),
+        "docs/evaluation.md": (
+            "## Protocol 2.1 current evaluator contract",
+            "## Retained Protocol 1.3 reference",
+        ),
+        "references/attorney-evaluation.md": (
+            "## Protocol 2.1 new-run contract",
+            "## Retained Protocol 1.3 operator reference",
+        ),
+    }
+    for path, (start_heading, end_heading) in current_sections.items():
+        current_contract = _normalized_markdown_slice(
+            path, start_heading, end_heading
+        )
+        assert "one initial response" in current_contract
+        assert "at most one fresh mechanical repair" in current_contract
+        assert any(
+            fragment_scope in current_contract
+            for fragment_scope in (
+                "for every fragment",
+                "for each protocol 2.1 fragment",
+                "per fragment",
+            )
+        )
+        assert "second mechanical refusal" in current_contract
+        assert "inconclusive_mechanical" in current_contract
+        assert "one initial response and at most two mechanical repairs" not in current_contract
+        assert "never make a fourth attempt" not in current_contract
+
+    retained_sections = {
+        "docs/evaluation.md": ("## Retained Protocol 1.3 reference", None),
+        "references/attorney-evaluation.md": (
+            "## Retained Protocol 1.3 operator reference",
+            None,
+        ),
+    }
+    for path, (start_heading, end_heading) in retained_sections.items():
+        retained_contract = _normalized_markdown_slice(
+            path, start_heading, end_heading
+        )
+        assert "one initial response and at most two mechanical repairs" in retained_contract
+        assert "same diagnostic code occurs twice" in retained_contract
+        assert any(
+            repair_bound in retained_contract
+            for repair_bound in (
+                "stop after the second repair even if the diagnostic codes differ",
+                "never make a fourth attempt",
+            )
+        )
+        assert (
+            "one initial response and at most one fresh mechanical repair per fragment"
+            not in retained_contract
+        )
+
+
+def test_protocol_22_evaluator_response_template_is_strict_canonical_json() -> None:
+    """The v2.2 compatibility template is a strict seven-key envelope."""
+    raw = (ROOT / "assets" / "attorney-evaluation-v22-response.template.json").read_bytes()
+    response = json.loads(raw)
+    assert response == {
+        "judge_isolation": "fresh_context",
+        "model_name": "example-model",
+        "operation": "source_review_fragment",
+        "payload": {},
+        "provider_name": "example-provider",
+        "request_fingerprint": "0" * 64,
+        "schema_version": "2.2",
+    }
+    assert raw == _canonical_bytes(response)
+    assert not raw.endswith(b"\n")
+    assert (
+        EvaluatorResponseV22.model_validate_json(raw).operation.value
+        == "source_review_fragment"
+    )
+
+
+def test_protocol_22_current_contract_is_section_scoped_in_every_public_document() -> None:
+    """Current v2.2 wording stays separate from retained protocol instructions."""
+    current_sections = {
+        "README.md": (
+            "#### Protocol 2.2 current evaluator contract",
+            "#### Retained Protocol 2.1 operator reference",
+        ),
+        "SKILL.md": (
+            "### Protocol 2.2 current evaluator contract",
+            "### Retained Protocol 2.1 operator reference",
+        ),
+        "docs/evaluation.md": (
+            "## Protocol 2.2 current evaluator contract",
+            "## Retained Protocol 2.1 reference",
+        ),
+        "references/attorney-evaluation.md": (
+            "## Protocol 2.2 new-run contract",
+            "## Retained Protocol 2.1 operator reference",
+        ),
+    }
+    required = (
+        "protocol 2.2",
+        "explicit experimental",
+        "protocol 2.1 remains the new-run default",
+        "semantic draft",
+        "strict compiled response",
+        "safe normalization",
+        "content quality",
+        "five",
+        "exit 6",
+        "pending",
+        "resume",
+        "completed",
+        "substantive inconclusive",
+        "qualified-attorney",
+        "no benchmark claim",
+    )
+    for path, (start_heading, end_heading) in current_sections.items():
+        current = _normalized_markdown_slice(path, start_heading, end_heading)
+        for phrase in required:
+            assert phrase in current, (path, phrase)
+        assert "inconclusive_mechanical" not in current
+
+    for path, (_, retained_heading) in current_sections.items():
+        retained = _normalized_markdown_slice(path, retained_heading, None)
+        assert "protocol 2.1" in retained
+        assert "inconclusive_mechanical" in retained
+        assert "one initial response" in retained
+        assert "at most one fresh mechanical repair" in retained
+        assert "protocol 2.2 remains the new-run default" not in retained
+
+
+def test_protocol_21_public_flow_and_surface_measurement_are_explicit() -> None:
+    """Public guidance names the fragmented 2.1 lifecycle without a benchmark claim."""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    normalized_readme = " ".join(readme.split())
+    for phrase in (
+        "source review",
+        "source audit",
+        "source-only referee packet",
+        "contested requirement",
+        "two independent grader lanes",
+        "outcome sensitivity",
+    ):
+        assert phrase in normalized_readme
+    assert "source-readiness" not in readme
+    assert "legal-ledger" not in readme
+    automatic_flow = " ".join(
+        readme.split("### Evaluate reports automatically", maxsplit=1)[1]
+        .split("## What you receive", maxsplit=1)[0]
+        .split()
+    )
+    for phrase in (
+        "source review",
+        "source audit",
+        "source-only referee",
+        "contested requirement",
+        "two independent grader lanes",
+        "outcome sensitivity",
+    ):
+        assert phrase in automatic_flow
+
+    full_modules = (
+        "src/regulatory_harvest/evaluation/attorney_v2_artifacts.py",
+        "src/regulatory_harvest/evaluation/attorney_v2_compiler.py",
+        "src/regulatory_harvest/evaluation/attorney_v2_models.py",
+        "src/regulatory_harvest/evaluation/attorney_v2_requests.py",
+        "src/regulatory_harvest/evaluation/attorney_v2_rubric.py",
+        "src/regulatory_harvest/evaluation/attorney_v2_workflow.py",
+    )
+    manifest_entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert set(full_modules) <= set(manifest_entries)
+    assert all((ROOT / module).is_file() for module in full_modules)
+
+    portable_lines = (ROOT / "scripts" / "attorney_eval_portable.py").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    portable_marker = (
+        "# Protocol 2.0 portable mirror "
+        "-------------------------------------------------"
+    )
+    assert portable_lines.count(portable_marker) == 1
+    section_start = portable_lines.index(portable_marker) + 1
+    v21_marker = "# Protocol 2.1 portable mirror"
+    assert portable_lines.count(v21_marker) == 1
+    v2_section = portable_lines[section_start : portable_lines.index(v21_marker)]
+    assert "def _v2_initialize_evaluation(" in v2_section
+    assert any(
+        line.startswith("def stop_evaluation_v2_inconclusive(") for line in v2_section
+    )
 
 
 def test_skill_requires_expansive_analysis_before_evidence_hardening() -> None:
