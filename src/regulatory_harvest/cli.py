@@ -102,6 +102,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     attorney_subparsers = attorney.add_subparsers(dest="attorney_command", required=True)
     attorney_run = attorney_subparsers.add_parser("run", help="run a local scripted fixture")
+    attorney_run.add_argument("--protocol", choices=("2.1", "2.2"), default="2.1")
     attorney_run.add_argument("--case", type=Path, required=True)
     attorney_run.add_argument("--scripted-responses", type=Path)
     attorney_run.add_argument("--output", type=Path, required=True)
@@ -109,6 +110,12 @@ def _parser() -> argparse.ArgumentParser:
     attorney_verify = attorney_subparsers.add_parser("verify", help="read-only run verification")
     attorney_verify.add_argument("--output", type=Path, required=True)
     _add_json_flag(attorney_verify)
+    attorney_resume = attorney_subparsers.add_parser(
+        "resume", help="resume an explicit Protocol 2.2 scripted run"
+    )
+    attorney_resume.add_argument("--output", type=Path, required=True)
+    attorney_resume.add_argument("--scripted-responses", type=Path, required=True)
+    _add_json_flag(attorney_resume)
     return parser
 
 

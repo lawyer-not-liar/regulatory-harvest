@@ -4,6 +4,26 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 
 ## [Unreleased]
 
+## [0.1.0-beta.2] - 2026-08-22
+
+- Added the recoverable Protocol 2.2 attorney-report evaluator as an explicit
+  option. Protocol 2.2 remains opt-in and experimental; Protocol 2.1 remains
+  the new-run default.
+- Passed the public test, type, lint, package, reproducibility, and privacy
+  gates for the reviewed Protocol 2.2 candidate.
+- A separately authorized private readiness evaluation verified package and
+  input binding, live role execution, safe pause, and exact recovery, but
+  evidence references could not be resolved before any role response was
+  accepted or grading began. Private readiness is therefore incomplete.
+- Made no performance, benchmark, report-quality, legal-correctness,
+  completeness, currency, or applicability claim. Attorney validation remains
+  required.
+- After the reviewed candidate, hardened POSIX rollback ownership against
+  immediate inode-number reuse and made development-only AST policy inventories
+  stable across Python 3.11 through 3.14. This CI portability work does not
+  loosen evidence binding or policy checks, and it gives the release ZIP a new
+  archive hash.
+
 ## [0.1.0-beta.1] - 2026-08-17
 
 - Added one self-contained Agent Skill package for Codex and Claude Desktop, with supplied-source and current-web research modes.
@@ -48,5 +68,6 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 - The GitHub prerelease packages the unchanged `0.1.0` engine. No PyPI
   distribution is published.
 
-[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.1...HEAD
+[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.2...HEAD
+[0.1.0-beta.2]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.1...v0.1.0-beta.2
 [0.1.0-beta.1]: https://github.com/lawyer-not-liar/regulatory-harvest/releases/tag/v0.1.0-beta.1

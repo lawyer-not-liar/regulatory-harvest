@@ -27,13 +27,31 @@ the path to the evidence-level requirement matrix.
 Keep evaluation a fully automated, one-request journey. Internally run the
 attorney-hidden controller described by the evaluation reference.
 
+### Protocol 2.2 current evaluator contract
+
+Protocol 2.2 is explicit experimental behavior; Protocol 2.1 remains the new-run
+default. Ask internal evaluator roles only for bounded semantic drafts. Deterministic
+code may apply safe normalization solely to mechanically provable equivalents and
+must construct the strict compiled response itself; content quality is assessed by
+the independent audit, referee, and grader roles. Source-review and source-audit
+fragments contain at most five new items. Two invalid internal drafts return exit 6
+with the exact request pending. Resume the same verified run later without repeating
+accepted work. Only `COMPLETED` and substantive INCONCLUSIVE are terminal Protocol
+2.2 outcomes. Protocols 1.3, 2.0, and 2.1 remain retained and must not be relabeled or
+resumed as 2.2. Make no benchmark claim, and require qualified-attorney validation.
+
+### Retained Protocol 2.1 operator reference
+
 - Qualify every locked case before generating a candidate.
 - Qualification readiness is not a report-quality PASS, and changing any source byte creates a new versioned case.
 - Use eval-submit-safe for every evaluator response.
-- For each role, allow one initial response and at most two mechanical repairs.
+- Protocol 2.1 is the experimental default for new evaluation runs only after its
+  public verification gate passes; Protocols 1.3 and 2.0 are replay-only.
+- For each Protocol 2.1 fragment, allow one initial response and at most one fresh mechanical repair per fragment.
 - Start every mechanical repair in a genuinely fresh role context.
 - If a genuinely fresh repair context is unavailable, stop rather than repair in the same role context.
-- Stop when the same diagnostic code occurs twice.
+- Stop as `INCONCLUSIVE_MECHANICAL` after a second mechanical refusal; do not relabel
+  it as substantive uncertainty.
 - Never retry an unfavorable substantive judgment.
 - Accept an unfavorable substantive result without retry.
 - Verify terminal evaluation artifacts before delivery.
@@ -45,6 +63,15 @@ never relabel a reused context as fresh. Verify every terminal qualification,
 generation, and evaluation artifact before delivery. Do not expose JSON,
 commands, role packets, retry mechanics, or the role queue to the attorney
 unless asked.
+
+Protocol 2.1 keeps source review and independent source audit, then sends each
+material dispute in a source-only referee packet. A valid referee `unresolved` is a
+substantive judgment: preserve both alternatives as a contested requirement and
+continue. Two isolated grader lanes assess ordinary requirements in batches of at
+most five and assess each contested requirement individually. Deterministic outcome
+sensitivity decides whether a contested baseline changes the report disposition.
+`PASS`, `FAIL`, and substantive `INCONCLUSIVE` are limited rubric outcomes, not legal
+advice; qualified-attorney review remains required.
 
 For every newly generated report, complete the reference's generation capsule
 workflow before evaluation initialization. For a historical or external report,

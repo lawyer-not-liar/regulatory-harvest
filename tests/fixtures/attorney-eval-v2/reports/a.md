@@ -1,0 +1,5 @@
+# Fictional Report A
+
+A covered operator must file a notice by 10 June. The duty does not apply during a declared exercise. The fictional bureau may issue an order and a violation may result in a civil penalty.
+
+The source does not establish any filing fee.

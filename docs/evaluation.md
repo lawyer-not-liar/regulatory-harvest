@@ -100,6 +100,64 @@ candidate report against the supplied authority record and a sealed requirement
 ledger; it is not LegalBench-RAG retrieval evaluation and does not fetch legal
 sources.
 
+## Protocol 2.2 current evaluator contract
+
+Protocol 2.2 is explicit experimental behavior; Protocol 2.1 remains the new-run
+default. Internal evaluator roles provide bounded semantic drafts rather than
+persisted envelopes. Deterministic code performs safe normalization only for
+mechanically provable equivalents, constructs the strict compiled response, and
+submits that response through the ordinary strict preflight and atomic commit path.
+Content quality is not a mechanical acceptance gate: independent audit, refereeing,
+two-lane grading, and reconciliation evaluate the substance.
+
+Source-review and source-audit fragments contain at most five new items. One driver
+invocation permits an initial draft and one fresh clarification. If both drafts are
+invalid, it returns exit 6 with the exact request pending and no accepted-response
+write. A compatible driver can resume that same verified run without repeating an
+accepted fragment. Protocol 2.2 ends only as `COMPLETED` or substantive
+INCONCLUSIVE; an engine pause is nonterminal. Protocols 1.3, 2.0, and 2.1 retain
+their existing replay/read-only meanings and are never upgraded in place. This
+experimental evaluator makes no benchmark claim. Results still require
+qualified-attorney validation before use in legal advice.
+
+## Retained Protocol 2.1 reference
+
+## Protocol 2.1 current evaluator contract
+
+Protocol 2.1 is the default for new evaluation runs after the public verification
+gate passes; it remains experimental pending the complete public release gate.
+Protocol 1.3 is retained for replay and read-only verification. Protocol 2.0 is retained for replay and read-only verification. Neither supports migration or new
+work. Protocol 2.1 keeps independent
+`source_review` and `source_audit`. It uses source-only referee packets
+(`source_referee_fragment`), one for each material dispute. A referee may accept the reviewer,
+accept the auditor, or make a substantive unresolved judgment; unresolved preserves
+both alternatives as a contested requirement instead of forcing a legal choice.
+
+Two isolated grader lanes assess each report. Ordinary requirements are sent in
+deterministic batches of at most five; contested requirements are assessed
+individually. Deterministic reconciliation and outcome sensitivity then determine
+whether a contested baseline is outcome-stable or changes the final disposition.
+
+The evaluator role returns only the operation-specific object governed by the pending
+request's `json_schema`. The controller supplies truthful provider/model/isolation
+labels to `eval-submit-safe`; deterministic code copies the pending operation and
+fingerprint and constructs the canonical seven-key envelope. The public response
+template remains only a compatibility reference for full-envelope callers.
+
+A refusal writes no run byte. Each fragment has one initial response and at most one fresh mechanical repair per fragment; a second mechanical refusal stops as
+`INCONCLUSIVE_MECHANICAL` and is never relabeled substantive unresolved. `PASS`,
+`FAIL`, and `INCONCLUSIVE` are
+limited results under this versioned evaluation rubric. They do not establish legal
+correctness, completeness, currency, applicability, or suitability for legal advice.
+Requirement-level findings are the primary product, and attorney review remains
+required.
+
+## Retained Protocol 1.3 reference
+
+The remaining ledger-repair material in this section documents retained Protocol
+1.3 artifacts. It is not the contract for new runs and must not be used to mutate
+or upgrade a retained run.
+
 ## Source qualification and case admission
 
 Qualify every locked case before generating a candidate. Qualification is a

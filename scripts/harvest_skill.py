@@ -55,9 +55,10 @@ def _full_evaluation_runner() -> Any:
     return evaluation_module
 
 
-# Evaluation has a deliberately narrower dependency surface than research.
-# Dispatch it before probing or importing the research/briefing stack so a
-# clean evaluation installation cannot be broken by unrelated optional models.
+# Evaluation, including recoverable full-runtime resume, has a deliberately
+# narrower dependency surface than research. Dispatch it before probing or
+# importing the research/briefing stack so a clean evaluation installation
+# cannot be broken by unrelated optional models.
 _IS_EVALUATION_COMMAND = (
     __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1].startswith("eval-")
 )
@@ -457,6 +458,8 @@ def finalize(
     stored_draft = matter / "analysis-draft.json"
     _write_json(stored_draft, draft)
 
+    coverage_review: dict[str, Any]
+    proposition_coverage_valid: bool | None
     if contract_version == PROPOSITION_COVERAGE_V2:
         assert isinstance(raw_units, dict)
         coverage_review = evaluate_atomic_coverage(
@@ -467,7 +470,7 @@ def finalize(
         )
         proposition_coverage_valid = coverage_review["valid"] is True
         provision_recall_valid = coverage_review["valid"] is True
-        coverage_issue_count = len(coverage_review["issues"])
+        coverage_issue_count = len(cast(list[object], coverage_review["issues"]))
     elif contract_version == PROPOSITION_COVERAGE_V1:
         assert isinstance(raw_units, dict)
         coverage_draft = draft
@@ -481,9 +484,7 @@ def finalize(
             coverage_draft,
             prepared_sources,
         )
-        proposition_coverage_valid: bool | None = (
-            coverage_review["proposition_coverage"]["valid"] is True
-        )
+        proposition_coverage_valid = coverage_review["proposition_coverage"]["valid"] is True
         provision_recall_valid = coverage_review["valid"] is True
         coverage_issue_count = len(coverage_review["lead_recall"]["issues"]) + len(
             coverage_review["proposition_coverage"]["issues"]

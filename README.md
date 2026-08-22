@@ -1,22 +1,60 @@
 # Regulatory Harvest
 
-> **Experimental beta (`v0.1.0-beta.1`).** The public test, type, lint,
-> package, reproducibility, and privacy gates passed. A final private
-> end-to-end evaluation did not complete because its source-ledger audit
-> exhausted a bounded mechanical retry rule before report grading. No
-> performance, benchmark, or report-quality claim is made. Results are AI
-> Generated and may contain errors. Output must be validated by an attorney
-> before the attorney delivers legal advice.
+> **Experimental beta (`v0.1.0-beta.2`).** The public test, type, lint,
+> package, reproducibility, and privacy gates passed. A separately authorized
+> private readiness evaluation verified package and input binding, live role
+> execution, safe pause, and exact recovery, but evidence references could not
+> be resolved before any role response was accepted or grading began.
+> Private readiness is therefore incomplete. No performance, benchmark, or
+> report-quality claim is made. Results are AI Generated and may contain
+> errors. Output must be validated by an attorney before the attorney delivers
+> legal advice.
 
-The GitHub prerelease label `v0.1.0-beta.1` packages the unchanged `0.1.0`
-engine used for the bounded private evaluation. The beta suffix describes the
-release channel; it does not relabel or alter the evaluated runtime bytes.
+The GitHub prerelease label `v0.1.0-beta.2` packages project version `0.1.0`.
+The beta suffix describes the release channel. This release-preparation commit
+builds on reviewed candidate `bdebfecc1e39812844c77f0a895d563e8f786e80` and
+adds two CI portability corrections: POSIX rollback now confirms complete
+installed-leaf identity and bytes before cleanup, and the development-only AST
+policy inventory canonicalizes empty syntax fields across Python 3.11 through
+3.14. The ZIP therefore has a new archive hash. Neither correction loosens
+evidence binding or policy checks. Protocol 2.2 remains opt-in and experimental;
+Protocol 2.1 remains the new-run default.
 
 Regulatory Harvest is an installable research skill for attorneys. Ask a legal question in ordinary language, attach your sources or authorize current web research, and receive a cited Markdown briefing plus a machine-verifiable evidence bundle.
 
 The same skill package is designed for Codex and Claude Desktop. It uses the host agent for research and legal analysis, then passes the work through a deterministic Python engine that normalizes sources, resolves exact quotations, validates citations, records gaps, and seals the result.
 
-For new matters, the skill also performs an internal fail-closed provision sweep that dispositions every required source unit and provision lead before delivery. This adds no user setup: the skill operates the ledger and repair loop itself while preserving the natural-language attorney briefing.
+For new matters, the skill also performs an internal fail-closed provision sweep that dispositions every required source unit and provision lead before delivery. This adds no user setup while preserving the natural-language attorney briefing.
+
+### Protocol 2.2 current evaluation behavior
+
+Protocol 2.2 is explicit experimental behavior; Protocol 2.1 remains the new-run
+default. Internal evaluator roles return bounded semantic drafts, and deterministic
+code applies safe normalization only to mechanically provable equivalents before it
+constructs a strict compiled response. Content quality remains a downstream question
+for independent audit, refereeing, and grading. Source-review and source-audit
+fragments add at most five items. After two invalid internal drafts, the driver
+returns exit 6 with the exact request pending; a later compatible invocation can
+resume it. Only `COMPLETED` and substantive INCONCLUSIVE are terminal Protocol 2.2
+outcomes. This experimental path makes no benchmark claim, and qualified-attorney
+validation remains required.
+
+### Retained Protocol 2.1 evaluation behavior
+
+New attorney-report evaluations use experimental Protocol 2.1, the new-run default
+only while its public verification gate remains satisfied. It separately reviews and
+audits the source record, sends each material dispute to a source-only referee packet,
+and preserves a substantive unresolved dispute as a contested requirement. Two
+independent grader lanes assess ordinary requirements in batches of at most five and
+each contested requirement individually. Deterministic code compiles and seals the
+baseline, reconciles both lanes, and evaluates outcome sensitivity: a disputed
+baseline is `INCONCLUSIVE` only when it changes the outcome or cannot be meaningfully
+graded. A mechanical refusal remains a separate `INCONCLUSIVE_MECHANICAL` stop after
+one initial response and one fresh repair for that fragment. Protocols 1.3 and 2.0
+are retained only for replay and read-only verification. `PASS`, `FAIL`, and
+`INCONCLUSIVE` state only the result under this versioned evaluation rubric; they do
+not establish legal correctness, completeness, currency, or applicability. Attorney
+review remains required.
 
 Regulatory Harvest assists research. It does not provide legal advice or replace source review, currentness checks, applicability analysis, professional judgment, or approval by a qualified attorney.
 
@@ -83,7 +121,14 @@ Attach the authority packet and the report or reports, then say:
 
 > Evaluate these two anonymous regulatory reports against the supplied authority and give me the automatic result.
 
-That one plain-language request starts and completes the automated journey. The skill runs source-readiness, legal-ledger, independent grading, response validation, and integrity checks without opening a browser reviewer or asking you to score either report. Each report receives an absolute `PASS` or `FAIL`, or the matter terminates as `CASE_INVALID` or `INCONCLUSIVE` when the evidence cannot support a sound evaluation. The resulting requirement matrix walks the authority provision by provision and shows what each report covered, misstated, or omitted.
+That one plain-language request starts and completes the automated journey. The
+skill runs source review and source audit, then uses source-only referee packets for
+material disputes. A substantive unresolved decision becomes a contested requirement
+rather than a forced legal choice. The workflow uses two independent grader lanes to assess ordinary
+requirements in bounded batches and contested requirements individually; deterministic
+outcome sensitivity determines whether an unresolved baseline changes the result. It validates responses and integrity without opening a browser reviewer or asking you to score either report. `PASS`, `FAIL`, and `INCONCLUSIVE` are limited rubric outcomes,
+not legal advice. The resulting requirement matrix walks the authority provision by
+provision and shows what each report covered, misstated, or omitted.
 
 Existing reports are treated as external artifacts and graded independently. Their matrices can be viewed side by side, but Regulatory Harvest does not manufacture a winner or tie from reports whose generating builds were not captured. A formal two-build comparison requires each report to be created through its own verified generation capsule against the same source and client-fact bytes.
 
@@ -248,13 +293,30 @@ Reference OpenAI Responses API and Tavily Search adapters remain available for d
 
 ### Automated evaluation operator contract
 
-The universal skill keeps the role loop internal. Before every `eval-submit`, it
-runs the read-only `eval-preflight` command, which applies the same semantic
-validation without changing run bytes. A failed preflight is repaired in a fresh
-isolated role context and checked again; an invalid response is never submitted.
-Initial ledger-audit findings may identify precise defects without supplying a
-complete executable edit. After repair, every unresolved `remaining_audit`
-dispute must be transaction-ready before the ledger can be sealed.
+#### Protocol 2.2 current evaluator contract
+
+Protocol 2.2 is explicit experimental behavior; Protocol 2.1 remains the new-run
+default. An internal role supplies only a bounded semantic draft. Deterministic code
+performs safe normalization only when equivalence is mechanically provable, creates
+the strict compiled response, and leaves content quality to source audit, refereeing,
+and grading. Source-review and source-audit fragments contain at most five new items.
+Two invalid internal drafts return exit 6 with the exact request pending and
+resumable; resume continues the same verified run without repeating accepted work.
+Protocol 2.2 terminal outcomes are `COMPLETED` or substantive INCONCLUSIVE.
+Protocols 1.3, 2.0, and 2.1 remain retained behavior, not mutable Protocol 2.2 runs.
+There is no benchmark claim, and qualified-attorney validation remains required.
+
+#### Retained Protocol 2.1 operator reference
+
+The universal skill keeps the Protocol 2.1 fragmented role loop internal. A refused
+response is write-free and discarded; for every fragment there is one initial
+response and at most one fresh mechanical repair. A second mechanical refusal stops
+as `INCONCLUSIVE_MECHANICAL`, never as substantive uncertainty. Accepted `FAIL` and
+`INCONCLUSIVE` results are substantive outcomes, not retry triggers. The current
+request supplies the role-specific inner schema. The evaluator returns only that
+inner payload; the controller supplies truthful provider/model/isolation metadata
+and the runner constructs the canonical outer envelope. The public v2.1 response
+template is a compatibility reference for full-envelope callers.
 
 ## Development and contribution status
 

@@ -99,6 +99,12 @@ from .attorney_scoring import (
 )
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+STORAGE_DIRECTORY_NAMESPACE_CONTRACT = (
+    "cooperative-exclusive-directory-namespace-per-operation-v1",
+    "during each evaluator storage operation",
+    "does not defend against arbitrary same-UID directory rename or replacement "
+    "between syscalls",
+)
 _MANIFEST_PATH = "run-manifest.json"
 _CASE_ENVELOPE_PATH = "case-envelope.json"
 _RUBRIC_PATH = "evaluation-rubric.json"
@@ -244,6 +250,30 @@ def _audit_action_contract() -> dict[str, object]:
 
 class EvaluationIntegrityError(ValueError):
     """Raised when an evaluation run cannot be trusted or safely mutated."""
+
+
+class _AtomicWriteOwnershipError(EvaluationIntegrityError):
+    """An immutable target became visible before its write reported success."""
+
+    def __init__(
+        self,
+        artifact_path: str,
+        error: BaseException,
+        *,
+        created: bool = True,
+        replaced: bool = False,
+        identity: _NodeIdentity | None = None,
+    ) -> None:
+        message = (
+            str(error)
+            if isinstance(error, EvaluationIntegrityError)
+            else f"evaluation storage artifact write ({artifact_path}) failed"
+        )
+        super().__init__(message)
+        self.artifact_path = artifact_path
+        self.created = created
+        self.replaced = replaced
+        self.identity = identity
 
 
 def _ledger_referee_payload(
@@ -579,22 +609,69 @@ class _NodeIdentity:
 
 
 @dataclass(frozen=True)
+class _AtomicWriteReceipt:
+    created: bool
+    replaced: bool
+    identity: _NodeIdentity | None
+
+
+@dataclass(frozen=True)
+class _ArtifactRecoveryReceipt:
+    artifact_path: str
+    operation: Literal["remove", "restore"]
+    recovery_directory: str
+    recovery_name: str
+    expected_identity: _NodeIdentity
+    expected_sha256: str
+    claimed_identity: _NodeIdentity | None = None
+    claimed_sha256: str | None = None
+
+
+@dataclass(frozen=True)
 class _PosixAnchor:
     name: str | None
     descriptor: int
     identity: _NodeIdentity
 
 
+@dataclass(frozen=True)
+class _OwnedDirectory:
+    artifact_path: str
+    identity: _NodeIdentity
+
+
+@dataclass(frozen=True)
+class _PosixOwnedArtifact:
+    identity: _NodeIdentity
+    created_directories: tuple[_OwnedDirectory, ...]
+
+
 class _RunStorage:
-    """One retained, race-resistant filesystem view of an evaluation run."""
+    """One retained, race-resistant filesystem view of an evaluation run.
+
+    Every evaluator component must honor ``STORAGE_DIRECTORY_NAMESPACE_CONTRACT``:
+    evaluator-controlled directory names are cooperatively exclusive for each
+    storage operation. Checks still reject every identity or symlink change they
+    observe, but they do not promise stability against an arbitrary same-UID
+    renamer between every pair of syscalls.
+    """
 
     root_path: Path
     failure_stage: str
 
-    def read_artifact(self, artifact_path: str) -> bytes:
+    def read_artifact(
+        self, artifact_path: str, *, max_bytes: int | None = None
+    ) -> bytes:
         raise NotImplementedError
 
-    def read_optional_artifact(self, artifact_path: str) -> bytes | None:
+    def read_optional_artifact(
+        self, artifact_path: str, *, max_bytes: int | None = None
+    ) -> bytes | None:
+        raise NotImplementedError
+
+    def read_optional_artifact_with_identity(
+        self, artifact_path: str, *, max_bytes: int | None = None
+    ) -> tuple[bytes, _NodeIdentity] | None:
         raise NotImplementedError
 
     def atomic_write(
@@ -603,7 +680,32 @@ class _RunStorage:
         data: bytes,
         *,
         mutable: bool,
+    ) -> bool:
+        raise NotImplementedError
+
+    def atomic_write_receipt(self, artifact_path: str) -> _AtomicWriteReceipt | None:
+        raise NotImplementedError
+
+    def replace_artifact_if_owned(
+        self,
+        artifact_path: str,
+        data: bytes,
+        *,
+        owned_identity: _NodeIdentity,
+        owned_data: bytes,
     ) -> None:
+        raise NotImplementedError
+
+    def remove_artifact(
+        self,
+        artifact_path: str,
+        *,
+        expected_identity: _NodeIdentity | None = None,
+        expected_data: bytes | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    def recovery_receipts(self) -> tuple[_ArtifactRecoveryReceipt, ...]:
         raise NotImplementedError
 
     def scan_inventory(self) -> dict[str, _NodeIdentity]:
@@ -639,6 +741,49 @@ def _new_posix_anchor(name: str | None, descriptor: int) -> _PosixAnchor:
         raise
 
 
+def _create_posix_directory_checked(parent: int, name: str) -> int:
+    """Create under a trusted parent and bind the first observable identity.
+
+    POSIX ``mkdirat`` returns no descriptor or creation identity.  The parent
+    must therefore remain non-mutating for the complete directory-binding
+    operation. EEXIST is always a collision, and every swap that the practical
+    stat/open/fchmod/stat defense observes is rejected before return or ownership
+    recording. The cooperative contract does not claim that portable POSIX can
+    defeat arbitrary same-UID namespace mutation between every syscall.
+    """
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent)
+    except FileExistsError as error:
+        raise EvaluationIntegrityError("directory creation collision") from error
+    created = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if not stat.S_ISDIR(created.st_mode):
+        raise EvaluationIntegrityError("directory creation race")
+    descriptor = _open_posix_directory(parent, name)
+    try:
+        opened = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (
+            not _same_filesystem_object(opened, _node_identity(created))
+            or not _same_filesystem_object(named, _node_identity(created))
+        ):
+            raise EvaluationIntegrityError("directory creation race")
+        os.fchmod(descriptor, 0o700)
+        opened_after_chmod = os.fstat(descriptor)
+        named_after_chmod = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (
+            not _same_filesystem_object(opened_after_chmod, _node_identity(created))
+            or not _same_filesystem_object(
+                named_after_chmod,
+                _node_identity(created),
+            )
+        ):
+            raise EvaluationIntegrityError("directory creation race")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _same_filesystem_object(left: os.stat_result | _NodeIdentity, right: _NodeIdentity) -> bool:
     left_device = left.st_dev if isinstance(left, os.stat_result) else left.device
     left_inode = left.st_ino if isinstance(left, os.stat_result) else left.inode
@@ -664,6 +809,63 @@ def _require_posix_capabilities() -> None:
         raise EvaluationIntegrityError(
             f"secure POSIX storage capabilities are unavailable: {detail}"
         )
+
+
+def _rename_posix_noreplace(
+    source: str,
+    destination: str,
+    *,
+    source_directory: int,
+    destination_directory: int,
+) -> None:
+    """Atomically move one relative POSIX name without replacing a destination."""
+    library = ctypes.CDLL(None, use_errno=True)
+    encoded_source = os.fsencode(source)
+    encoded_destination = os.fsencode(destination)
+    renameatx = getattr(library, "renameatx_np", None)
+    if renameatx is not None:
+        renameatx.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx.restype = ctypes.c_int
+        result = renameatx(
+            source_directory,
+            encoded_source,
+            destination_directory,
+            encoded_destination,
+            0x00000004,
+        )
+    else:
+        renameat2 = getattr(library, "renameat2", None)
+        if renameat2 is None:
+            raise NotImplementedError("atomic no-replace rename is unavailable")
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            source_directory,
+            encoded_source,
+            destination_directory,
+            encoded_destination,
+            0x00000001,
+        )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number), destination)
+    if error_number == errno.ENOENT:
+        raise FileNotFoundError(error_number, os.strerror(error_number), source)
+    raise OSError(error_number, os.strerror(error_number), source)
 
 
 def _posix_directory_flags() -> int:
@@ -705,12 +907,21 @@ def _write_all(descriptor: int, data: bytes) -> None:
         offset += written
 
 
-def _read_all(descriptor: int) -> bytes:
+def _read_all(descriptor: int, *, max_bytes: int | None = None) -> bytes:
+    if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+        raise EvaluationIntegrityError("artifact maximum size is invalid")
     chunks: list[bytes] = []
+    total = 0
     while True:
-        chunk = os.read(descriptor, 1024 * 1024)
+        read_size = 1024 * 1024
+        if max_bytes is not None:
+            read_size = min(read_size, max_bytes + 1 - total)
+        chunk = os.read(descriptor, read_size)
         if not chunk:
             return b"".join(chunks)
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise EvaluationIntegrityError("artifact exceeds maximum size")
         chunks.append(chunk)
 
 
@@ -744,15 +955,34 @@ def _probe_posix_capabilities(directory_descriptor: int) -> None:
             with os.scandir(child_descriptor) as entries:
                 if {entry.name for entry in entries} != {"before"}:
                     raise EvaluationIntegrityError("descriptor inventory probe failed")
-            os.replace(
+            collision = os.open(
+                "collision",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=child_descriptor,
+            )
+            os.close(collision)
+            try:
+                _rename_posix_noreplace(
+                    "before",
+                    "collision",
+                    source_directory=child_descriptor,
+                    destination_directory=child_descriptor,
+                )
+            except FileExistsError:
+                pass
+            else:
+                raise EvaluationIntegrityError("no-replace rename probe clobbered")
+            _rename_posix_noreplace(
                 "before",
                 "after",
-                src_dir_fd=child_descriptor,
-                dst_dir_fd=child_descriptor,
+                source_directory=child_descriptor,
+                destination_directory=child_descriptor,
             )
             metadata = os.stat("after", dir_fd=child_descriptor, follow_symlinks=False)
             _validate_regular_metadata(metadata, "storage capability probe")
             os.unlink("after", dir_fd=child_descriptor)
+            os.unlink("collision", dir_fd=child_descriptor)
             os.fsync(child_descriptor)
             os.fsync(root_descriptor)
         except (NotImplementedError, OSError, TypeError) as error:
@@ -774,9 +1004,13 @@ class _PosixRunStorage(_RunStorage):
         self._anchors = anchors
         self._root_descriptor = anchors[-1].descriptor
         self._closed = False
+        self._last_atomic_write: tuple[str, _AtomicWriteReceipt] | None = None
+        self._recovery_receipts: list[_ArtifactRecoveryReceipt] = []
+        self._owned_artifacts: dict[str, _PosixOwnedArtifact] = {}
 
     @classmethod
     def open(cls, run_dir: Path, *, initialize: bool) -> _PosixRunStorage:
+        """Open a run; initialization requires trusted creation-path parents."""
         _require_posix_capabilities()
         root_path = _lexical_absolute_path(run_dir)
         anchors: list[_PosixAnchor] = []
@@ -804,13 +1038,13 @@ class _PosixRunStorage(_RunStorage):
                 _probe_posix_capabilities(anchors[-1].descriptor)
                 for segment in parts[missing_at:] if missing_at is not None else ():
                     parent_descriptor = anchors[-1].descriptor
-                    with suppress(FileExistsError):
-                        os.mkdir(segment, mode=0o700, dir_fd=parent_descriptor)
-                    descriptor = _open_posix_directory(parent_descriptor, segment)
+                    descriptor = _create_posix_directory_checked(
+                        parent_descriptor, segment
+                    )
                     anchors.append(_new_posix_anchor(segment, descriptor))
-                    os.fchmod(descriptor, 0o700)
                     os.fsync(parent_descriptor)
-                os.fchmod(anchors[-1].descriptor, 0o700)
+                if missing_at is None:
+                    os.fchmod(anchors[-1].descriptor, 0o700)
                 if missing_at is not None:
                     with os.scandir(anchors[-1].descriptor) as entries:
                         if next(entries, None) is not None:
@@ -859,9 +1093,11 @@ class _PosixRunStorage(_RunStorage):
         artifact_path: str,
         *,
         create: bool,
-    ) -> Iterator[tuple[int, str]]:
+    ) -> Iterator[tuple[int, str, tuple[_OwnedDirectory, ...]]]:
+        """Bind a parent under the cooperative per-operation namespace contract."""
         relative = _validate_relative_path(artifact_path)
         descriptors: list[int] = []
+        created_directories: list[_OwnedDirectory] = []
         current = self._root_descriptor
         try:
             for segment in relative.parts[:-1]:
@@ -871,21 +1107,46 @@ class _PosixRunStorage(_RunStorage):
                 except FileNotFoundError:
                     if not create:
                         raise
-                    with suppress(FileExistsError):
-                        os.mkdir(segment, mode=0o700, dir_fd=current)
-                    descriptor = _open_posix_directory(current, segment)
+                    descriptor = _create_posix_directory_checked(current, segment)
                     created = True
                 descriptors.append(descriptor)
                 if created:
-                    os.fchmod(descriptor, 0o700)
                     os.fsync(current)
+                    created_directories.append(
+                        _OwnedDirectory(
+                            PurePosixPath(*relative.parts[: len(descriptors)]).as_posix(),
+                            _node_identity(os.fstat(descriptor)),
+                        )
+                    )
                 current = descriptor
-            yield current, relative.name
+            yield current, relative.name, tuple(created_directories)
         finally:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
 
-    def _read_leaf(self, parent_descriptor: int, name: str, artifact_path: str) -> bytes:
+    def _read_leaf(
+        self,
+        parent_descriptor: int,
+        name: str,
+        artifact_path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        return self._read_leaf_with_identity(
+            parent_descriptor,
+            name,
+            artifact_path,
+            max_bytes=max_bytes,
+        )[0]
+
+    def _read_leaf_with_identity(
+        self,
+        parent_descriptor: int,
+        name: str,
+        artifact_path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> tuple[bytes, _NodeIdentity]:
         try:
             descriptor = os.open(
                 name,
@@ -901,39 +1162,74 @@ class _PosixRunStorage(_RunStorage):
         try:
             before = os.fstat(descriptor)
             _validate_regular_metadata(before, artifact_path)
-            data = _read_all(descriptor)
+            if max_bytes is not None and before.st_size > max_bytes:
+                raise EvaluationIntegrityError(
+                    f"artifact exceeds maximum size: {artifact_path}"
+                )
+            data = (
+                _read_all(descriptor)
+                if max_bytes is None
+                else _read_all(descriptor, max_bytes=max_bytes)
+            )
             after = os.fstat(descriptor)
+            if max_bytes is not None and after.st_size > max_bytes:
+                raise EvaluationIntegrityError(
+                    f"artifact exceeds maximum size: {artifact_path}"
+                )
             named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
             if _node_identity(before) != _node_identity(after) or (
                 before.st_dev,
                 before.st_ino,
             ) != (named.st_dev, named.st_ino):
                 raise EvaluationIntegrityError(f"artifact changed while reading: {artifact_path}")
-            return data
+            return data, _node_identity(after)
         finally:
             os.close(descriptor)
 
-    def read_artifact(self, artifact_path: str) -> bytes:
+    def read_artifact(
+        self, artifact_path: str, *, max_bytes: int | None = None
+    ) -> bytes:
         self.failure_stage = f"artifact read ({artifact_path})"
         self.assert_root_identity()
         try:
-            with self._artifact_parent(artifact_path, create=False) as (parent, name):
-                data = self._read_leaf(parent, name, artifact_path)
+            with self._artifact_parent(artifact_path, create=False) as (parent, name, _):
+                data = self._read_leaf(
+                    parent, name, artifact_path, max_bytes=max_bytes
+                )
         except FileNotFoundError as error:
             raise EvaluationIntegrityError(f"artifact is missing: {artifact_path}") from error
         self.assert_root_identity()
         return data
 
-    def read_optional_artifact(self, artifact_path: str) -> bytes | None:
+    def read_optional_artifact(
+        self, artifact_path: str, *, max_bytes: int | None = None
+    ) -> bytes | None:
         self.failure_stage = f"optional artifact read ({artifact_path})"
         self.assert_root_identity()
         try:
-            with self._artifact_parent(artifact_path, create=False) as (parent, name):
-                data = self._read_leaf(parent, name, artifact_path)
+            with self._artifact_parent(artifact_path, create=False) as (parent, name, _):
+                data = self._read_leaf(
+                    parent, name, artifact_path, max_bytes=max_bytes
+                )
         except FileNotFoundError:
             data = None
         self.assert_root_identity()
         return data
+
+    def read_optional_artifact_with_identity(
+        self, artifact_path: str, *, max_bytes: int | None = None
+    ) -> tuple[bytes, _NodeIdentity] | None:
+        self.failure_stage = f"optional artifact identity read ({artifact_path})"
+        self.assert_root_identity()
+        try:
+            with self._artifact_parent(artifact_path, create=False) as (parent, name, _):
+                result = self._read_leaf_with_identity(
+                    parent, name, artifact_path, max_bytes=max_bytes
+                )
+        except FileNotFoundError:
+            result = None
+        self.assert_root_identity()
+        return result
 
     def atomic_write(
         self,
@@ -941,23 +1237,323 @@ class _PosixRunStorage(_RunStorage):
         data: bytes,
         *,
         mutable: bool,
+    ) -> bool:
+        return self._atomic_write(artifact_path, data, mutable=mutable)
+
+    def atomic_write_receipt(self, artifact_path: str) -> _AtomicWriteReceipt | None:
+        if self._last_atomic_write is None:
+            return None
+        path, receipt = self._last_atomic_write
+        return receipt if path == artifact_path else None
+
+    def replace_artifact_if_owned(
+        self,
+        artifact_path: str,
+        data: bytes,
+        *,
+        owned_identity: _NodeIdentity,
+        owned_data: bytes,
     ) -> None:
+        self._replace_owned_artifact(
+            artifact_path, data, owned_identity=owned_identity, owned_data=owned_data
+        )
+
+    @staticmethod
+    def _identity_payload(identity: _NodeIdentity) -> dict[str, int]:
+        return {
+            "device": identity.device,
+            "inode": identity.inode,
+            "mode": identity.mode,
+            "link_count": identity.link_count,
+            "size": identity.size,
+            "modified_ns": identity.modified_ns,
+            "changed_ns": identity.changed_ns,
+        }
+
+    def _recovery_parent(self) -> tuple[int, Path]:
+        if len(self._anchors) < 2:
+            raise EvaluationIntegrityError("run has no safe recovery parent")
+        self.assert_root_identity()
+        return self._anchors[-2].descriptor, self.root_path.parent
+
+    def _write_recovery_record(
+        self,
+        recovery_parent: int,
+        name: str,
+        payload: dict[str, object],
+    ) -> None:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=recovery_parent,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            _write_all(descriptor, canonical_json_bytes(payload))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(recovery_parent)
+
+    def _claim_leaf(
+        self,
+        parent: int,
+        name: str,
+        artifact_path: str,
+        *,
+        operation: Literal["remove", "restore"],
+        expected_identity: _NodeIdentity,
+        expected_data: bytes,
+    ) -> str:
+        recovery_parent, recovery_path = self._recovery_parent()
+        for _ in range(16):
+            token = uuid.uuid4().hex
+            claim_name = f".regulatory-harvest-recovery-{token}.claim"
+            record_name = f".regulatory-harvest-recovery-{token}.json"
+            receipt = _ArtifactRecoveryReceipt(
+                artifact_path=artifact_path,
+                operation=operation,
+                recovery_directory=os.fspath(recovery_path),
+                recovery_name=claim_name,
+                expected_identity=expected_identity,
+                expected_sha256=sha256_digest(expected_data),
+            )
+            try:
+                self._write_recovery_record(
+                    recovery_parent,
+                    record_name,
+                    {
+                        "artifact_path": artifact_path,
+                        "claim_name": claim_name,
+                        "expected_identity": self._identity_payload(expected_identity),
+                        "expected_sha256": receipt.expected_sha256,
+                        "operation": operation,
+                        "recovery_schema_version": "1.1",
+                        "run_directory_name": self.root_path.name,
+                    },
+                )
+            except FileExistsError:
+                continue
+            try:
+                _rename_posix_noreplace(
+                    name,
+                    claim_name,
+                    source_directory=parent,
+                    destination_directory=recovery_parent,
+                )
+            except FileExistsError:
+                continue
+            self._recovery_receipts.append(receipt)
+            break
+        else:
+            raise EvaluationIntegrityError("unable to allocate private artifact claim")
+        try:
+            os.fsync(parent)
+            os.fsync(recovery_parent)
+            self.assert_root_identity()
+            return claim_name
+        except BaseException as error:
+            try:
+                observed, observed_identity = self._read_leaf_with_identity(
+                    recovery_parent, claim_name, artifact_path
+                )
+                self._record_claimed_leaf(claim_name, observed, observed_identity)
+                self._install_recovery_bytes_no_clobber(
+                    parent, name, observed
+                )
+            except BaseException as restore_error:
+                raise EvaluationIntegrityError(
+                    "claim durability failed; recovery bytes retained"
+                ) from restore_error
+            raise error
+
+    def _record_claimed_leaf(
+        self,
+        claim_name: str,
+        observed: bytes,
+        observed_identity: _NodeIdentity,
+    ) -> None:
+        recovery_parent, _ = self._recovery_parent()
+        self._write_recovery_record(
+            recovery_parent,
+            f"{claim_name}.verified.json",
+            {
+                "claimed_identity": self._identity_payload(observed_identity),
+                "claimed_sha256": sha256_digest(observed),
+                "claimed_size": len(observed),
+                "status": "VERIFIED_CLAIM",
+            },
+        )
+        previous = self._recovery_receipts[-1]
+        self._recovery_receipts[-1] = _ArtifactRecoveryReceipt(
+            artifact_path=previous.artifact_path,
+            operation=previous.operation,
+            recovery_directory=previous.recovery_directory,
+            recovery_name=previous.recovery_name,
+            expected_identity=previous.expected_identity,
+            expected_sha256=previous.expected_sha256,
+            claimed_identity=observed_identity,
+            claimed_sha256=sha256_digest(observed),
+        )
+        self.assert_root_identity()
+
+    def _install_recovery_bytes_no_clobber(
+        self,
+        parent: int,
+        name: str,
+        data: bytes,
+    ) -> _NodeIdentity:
+        recovery_parent, recovery_path = self._recovery_parent()
+        temporary_name = f".regulatory-harvest-recovery-{uuid.uuid4().hex}.restore"
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=recovery_parent,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            _write_all(descriptor, data)
+            os.fsync(descriptor)
+            restored_identity = _node_identity(os.fstat(descriptor))
+        finally:
+            os.close(descriptor)
+        try:
+            _rename_posix_noreplace(
+                temporary_name,
+                name,
+                source_directory=recovery_parent,
+                destination_directory=parent,
+            )
+        except FileExistsError as error:
+            raise EvaluationIntegrityError(
+                "artifact restore collision; recovery bytes retained at "
+                f"{recovery_path / temporary_name}"
+            ) from error
+        except BaseException as error:
+            raise EvaluationIntegrityError(
+                "artifact restore failed; recovery bytes retained at "
+                f"{recovery_path / temporary_name}"
+            ) from error
+        os.fsync(parent)
+        os.fsync(recovery_parent)
+        self.assert_root_identity()
+        return restored_identity
+
+    def _replace_owned_artifact(
+        self,
+        artifact_path: str,
+        data: bytes,
+        *,
+        owned_identity: _NodeIdentity,
+        owned_data: bytes,
+    ) -> None:
+        self._last_atomic_write = None
+        self.failure_stage = f"owned artifact replace ({artifact_path})"
+        self.assert_root_identity()
+        with self._artifact_parent(artifact_path, create=False) as (parent, name, _):
+            try:
+                current, current_identity = self._read_leaf_with_identity(
+                    parent, name, artifact_path
+                )
+                if current_identity != owned_identity or current != owned_data:
+                    raise EvaluationIntegrityError(
+                        "transaction-owned artifact changed"
+                    )
+                claim_name = self._claim_leaf(
+                    parent,
+                    name,
+                    artifact_path,
+                    operation="restore",
+                    expected_identity=owned_identity,
+                    expected_data=owned_data,
+                )
+            except FileNotFoundError as error:
+                raise EvaluationIntegrityError(
+                    "transaction-owned artifact changed"
+                ) from error
+            try:
+                recovery_parent, _ = self._recovery_parent()
+                observed, observed_identity = self._read_leaf_with_identity(
+                    recovery_parent, claim_name, artifact_path
+                )
+            except BaseException:
+                raise
+            self._record_claimed_leaf(claim_name, observed, observed_identity)
+            if (
+                not _same_filesystem_object(observed_identity, owned_identity)
+                or observed != owned_data
+            ):
+                self._install_recovery_bytes_no_clobber(
+                    parent, name, observed
+                )
+                raise EvaluationIntegrityError("transaction-owned artifact changed")
+            try:
+                restored_identity = self._install_recovery_bytes_no_clobber(
+                    parent, name, data
+                )
+            except BaseException as error:
+                raise EvaluationIntegrityError(
+                    "transaction-owned artifact restore failed"
+                ) from error
+            self._last_atomic_write = (
+                artifact_path,
+                _AtomicWriteReceipt(False, True, restored_identity),
+            )
+        self.assert_root_identity()
+
+    def recovery_receipts(self) -> tuple[_ArtifactRecoveryReceipt, ...]:
+        return tuple(self._recovery_receipts)
+
+    def _atomic_write(
+        self,
+        artifact_path: str,
+        data: bytes,
+        *,
+        mutable: bool,
+    ) -> bool:
+        self._last_atomic_write = None
         self.failure_stage = f"artifact write ({artifact_path})"
         self.assert_root_identity()
-        with self._artifact_parent(artifact_path, create=True) as (parent, name):
+        with self._artifact_parent(artifact_path, create=True) as (
+            parent,
+            name,
+            created_directories,
+        ):
             try:
-                existing = self._read_leaf(parent, name, artifact_path)
+                existing, _ = self._read_leaf_with_identity(
+                    parent, name, artifact_path
+                )
             except FileNotFoundError:
                 existing = None
             self.assert_root_identity()
             if existing is not None:
                 if existing == data:
-                    return
+                    self._last_atomic_write = (
+                        artifact_path,
+                        _AtomicWriteReceipt(False, False, None),
+                    )
+                    return False
                 if not mutable:
                     raise EvaluationIntegrityError(f"immutable artifact differs: {artifact_path}")
 
             temporary_name = f".{name}.{uuid.uuid4().hex}.tmp"
             descriptor: int | None = None
+            temporary_exists = False
+            immutable_collision = False
+            immutable_visible = False
+            mutable_visible = False
+            installed_identity: _NodeIdentity | None = None
+            write_error: BaseException | None = None
             try:
                 descriptor = os.open(
                     temporary_name,
@@ -969,23 +1565,326 @@ class _PosixRunStorage(_RunStorage):
                     0o600,
                     dir_fd=parent,
                 )
+                temporary_exists = True
                 os.fchmod(descriptor, 0o600)
                 _write_all(descriptor, data)
                 os.fsync(descriptor)
+                installed_identity = _node_identity(os.fstat(descriptor))
                 self.assert_root_identity()
-                os.replace(
-                    temporary_name,
-                    name,
-                    src_dir_fd=parent,
-                    dst_dir_fd=parent,
-                )
-                os.fsync(parent)
+                if mutable:
+                    os.replace(
+                        temporary_name,
+                        name,
+                        src_dir_fd=parent,
+                        dst_dir_fd=parent,
+                    )
+                    temporary_exists = False
+                    mutable_visible = True
+                else:
+                    try:
+                        os.link(
+                            temporary_name,
+                            name,
+                            src_dir_fd=parent,
+                            dst_dir_fd=parent,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError:
+                        immutable_collision = True
+                    else:
+                        immutable_visible = True
+                        os.unlink(temporary_name, dir_fd=parent)
+                        temporary_exists = False
+                if not immutable_collision:
+                    os.fsync(parent)
                 self.assert_root_identity()
+                if immutable_visible or mutable_visible:
+                    installed = os.stat(
+                        name, dir_fd=parent, follow_symlinks=False
+                    )
+                    _validate_regular_metadata(installed, artifact_path)
+                    assert descriptor is not None
+                    opened = os.fstat(descriptor)
+                    if (installed.st_dev, installed.st_ino) != (
+                        opened.st_dev,
+                        opened.st_ino,
+                    ):
+                        raise EvaluationIntegrityError(
+                            "installed artifact identity changed"
+                        )
+                    installed_identity = _node_identity(installed)
+            except BaseException as error:
+                write_error = error
             finally:
                 if descriptor is not None:
-                    os.close(descriptor)
-                with suppress(FileNotFoundError):
-                    os.unlink(temporary_name, dir_fd=parent)
+                    try:
+                        os.close(descriptor)
+                    except BaseException as error:
+                        write_error = error
+                if temporary_exists:
+                    try:
+                        os.unlink(temporary_name, dir_fd=parent)
+                    except FileNotFoundError:
+                        pass
+                    except BaseException as error:
+                        write_error = error
+            if write_error is not None:
+                if immutable_visible:
+                    assert installed_identity is not None
+                    self._owned_artifacts[artifact_path] = _PosixOwnedArtifact(
+                        installed_identity, created_directories
+                    )
+                    self._last_atomic_write = (
+                        artifact_path,
+                        _AtomicWriteReceipt(True, False, installed_identity),
+                    )
+                    raise _AtomicWriteOwnershipError(
+                        artifact_path, write_error, identity=installed_identity
+                    ) from write_error
+                if mutable_visible:
+                    assert installed_identity is not None
+                    self._owned_artifacts[artifact_path] = _PosixOwnedArtifact(
+                        installed_identity, created_directories
+                    )
+                    receipt = _AtomicWriteReceipt(
+                        existing is None,
+                        existing is not None,
+                        installed_identity,
+                    )
+                    self._last_atomic_write = (artifact_path, receipt)
+                    raise _AtomicWriteOwnershipError(
+                        artifact_path,
+                        write_error,
+                        created=receipt.created,
+                        replaced=receipt.replaced,
+                        identity=installed_identity,
+                    ) from write_error
+                raise write_error
+            if immutable_collision:
+                competing = self._read_leaf(parent, name, artifact_path)
+                if competing == data:
+                    self._last_atomic_write = (
+                        artifact_path,
+                        _AtomicWriteReceipt(False, False, None),
+                    )
+                    return False
+                raise EvaluationIntegrityError(
+                    f"immutable artifact differs: {artifact_path}"
+                )
+        assert installed_identity is not None
+        self._owned_artifacts[artifact_path] = _PosixOwnedArtifact(
+            installed_identity, created_directories
+        )
+        self._last_atomic_write = (
+            artifact_path,
+            _AtomicWriteReceipt(
+                created=existing is None,
+                replaced=mutable and existing is not None,
+                identity=installed_identity,
+            ),
+        )
+        return True
+
+    def remove_artifact(
+        self,
+        artifact_path: str,
+        *,
+        expected_identity: _NodeIdentity | None = None,
+        expected_data: bytes | None = None,
+    ) -> None:
+        """Unlink one verified relative regular file without following links."""
+        if (expected_identity is None) != (expected_data is None):
+            raise ValueError("owned artifact identity and bytes must be supplied together")
+        if expected_identity is not None:
+            assert expected_data is not None
+            self._remove_owned_artifact(
+                artifact_path,
+                expected_identity=expected_identity,
+                expected_data=expected_data,
+            )
+            return
+        self.failure_stage = f"artifact remove ({artifact_path})"
+        self.assert_root_identity()
+        relative = _validate_relative_path(artifact_path)
+        parents: list[tuple[int, str, int]] = []
+        current = self._root_descriptor
+        try:
+            for segment in relative.parts[:-1]:
+                child = _open_posix_directory(current, segment)
+                parents.append((current, segment, child))
+                current = child
+            self._read_leaf_with_identity(current, relative.name, artifact_path)
+            os.unlink(relative.name, dir_fd=current)
+            os.fsync(current)
+            # Prune only parents made empty by this explicit leaf removal.  Each
+            # descriptor was opened with O_NOFOLLOW, and nonempty pre-existing
+            # directories are left intact.
+            for parent, name, child in reversed(parents):
+                try:
+                    os.rmdir(name, dir_fd=parent)
+                    os.fsync(parent)
+                except OSError as error:
+                    if error.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                        raise
+                finally:
+                    os.close(child)
+            parents.clear()
+        finally:
+            for _, _, child in reversed(parents):
+                os.close(child)
+        self.assert_root_identity()
+
+    def _remove_owned_artifact(
+        self,
+        artifact_path: str,
+        *,
+        expected_identity: _NodeIdentity,
+        expected_data: bytes,
+    ) -> None:
+        self.failure_stage = f"owned artifact remove ({artifact_path})"
+        self.assert_root_identity()
+        relative = _validate_relative_path(artifact_path)
+        parents: list[tuple[int, str, int]] = []
+        current = self._root_descriptor
+        try:
+            for segment in relative.parts[:-1]:
+                child = _open_posix_directory(current, segment)
+                parents.append((current, segment, child))
+                current = child
+            try:
+                observed_before_claim, identity_before_claim = (
+                    self._read_leaf_with_identity(
+                        current, relative.name, artifact_path
+                    )
+                )
+                if (
+                    identity_before_claim != expected_identity
+                    or observed_before_claim != expected_data
+                ):
+                    raise EvaluationIntegrityError(
+                        "transaction-owned artifact changed"
+                    )
+                claim_name = self._claim_leaf(
+                    current,
+                    relative.name,
+                    artifact_path,
+                    operation="remove",
+                    expected_identity=expected_identity,
+                    expected_data=expected_data,
+                )
+            except FileNotFoundError as error:
+                raise EvaluationIntegrityError(
+                    "transaction-owned artifact changed"
+                ) from error
+            try:
+                recovery_parent, _ = self._recovery_parent()
+                observed, observed_identity = self._read_leaf_with_identity(
+                    recovery_parent, claim_name, artifact_path
+                )
+            except BaseException:
+                raise
+            self._record_claimed_leaf(claim_name, observed, observed_identity)
+            if (
+                not _same_filesystem_object(observed_identity, expected_identity)
+                or observed != expected_data
+            ):
+                self._install_recovery_bytes_no_clobber(
+                    current,
+                    relative.name,
+                    observed,
+                )
+                raise EvaluationIntegrityError("transaction-owned artifact changed")
+        finally:
+            for _, _, child in reversed(parents):
+                os.close(child)
+        owned = self._owned_artifacts.pop(artifact_path, None)
+        if owned is not None and _same_filesystem_object(
+            owned.identity, expected_identity
+        ):
+            for directory in reversed(owned.created_directories):
+                self._claim_owned_empty_directory(directory)
+        self.assert_root_identity()
+
+    def _claim_owned_empty_directory(self, owned: _OwnedDirectory) -> None:
+        relative = _validate_relative_path(owned.artifact_path)
+        descriptors: list[int] = []
+        current = self._root_descriptor
+        try:
+            for segment in relative.parts[:-1]:
+                descriptor = _open_posix_directory(current, segment)
+                descriptors.append(descriptor)
+                current = descriptor
+            target = _open_posix_directory(current, relative.name)
+            descriptors.append(target)
+            target_identity = _node_identity(os.fstat(target))
+            recovery_parent, recovery_path = self._recovery_parent()
+            for _ in range(16):
+                token = uuid.uuid4().hex
+                claim_name = f".regulatory-harvest-recovery-{token}.dirclaim"
+                record_name = f".regulatory-harvest-recovery-{token}.dir.json"
+                try:
+                    self._write_recovery_record(
+                        recovery_parent,
+                        record_name,
+                        {
+                            "artifact_path": owned.artifact_path,
+                            "claim_name": claim_name,
+                            "expected_identity": self._identity_payload(owned.identity),
+                            "operation": "remove_empty_directory",
+                            "recovery_schema_version": "1.1",
+                            "run_directory_name": self.root_path.name,
+                        },
+                    )
+                except FileExistsError:
+                    continue
+                try:
+                    _rename_posix_noreplace(
+                        relative.name,
+                        claim_name,
+                        source_directory=current,
+                        destination_directory=recovery_parent,
+                    )
+                except FileExistsError:
+                    continue
+                break
+            else:
+                raise EvaluationIntegrityError(
+                    "unable to allocate private directory claim"
+                )
+            os.fsync(current)
+            os.fsync(recovery_parent)
+            claimed = os.stat(
+                claim_name, dir_fd=recovery_parent, follow_symlinks=False
+            )
+            claimed_matches_open = _same_filesystem_object(claimed, target_identity)
+            owned_matches_open = _same_filesystem_object(target_identity, owned.identity)
+            with os.scandir(target) as entries:
+                empty = next(entries, None) is None
+            if claimed_matches_open and owned_matches_open and empty:
+                return
+            try:
+                _rename_posix_noreplace(
+                    claim_name,
+                    relative.name,
+                    source_directory=recovery_parent,
+                    destination_directory=current,
+                )
+            except FileExistsError as error:
+                raise EvaluationIntegrityError(
+                    "directory restore collision; recovery entry retained at "
+                    f"{recovery_path / claim_name}"
+                ) from error
+            if not owned_matches_open:
+                raise EvaluationIntegrityError(
+                    "transaction-owned directory identity changed"
+                )
+            if not claimed_matches_open:
+                raise EvaluationIntegrityError(
+                    "directory recovery claim identity changed"
+                )
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
     def _scan_directory(
         self,
@@ -1132,7 +2031,7 @@ class _Win32API:
     def query_names(self, directory_handle: int) -> list[str]:
         raise NotImplementedError
 
-    def read_file(self, handle: int) -> bytes:
+    def read_file(self, handle: int, *, max_bytes: int | None = None) -> bytes:
         raise NotImplementedError
 
     def write_file(self, handle: int, data: bytes) -> None:
@@ -1626,10 +2525,16 @@ class _CtypesWin32API(_Win32API):
                 if offset >= used:
                     raise EvaluationIntegrityError("native directory offset is out of range")
 
-    def read_file(self, handle: int) -> bytes:
+    def read_file(self, handle: int, *, max_bytes: int | None = None) -> bytes:
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+            raise ValueError("max_bytes must be a non-negative integer")
         chunks: list[bytes] = []
+        total = 0
         while True:
-            buffer = ctypes.create_string_buffer(1024 * 1024)
+            read_size = 1024 * 1024
+            if max_bytes is not None:
+                read_size = min(read_size, max_bytes + 1 - total)
+            buffer = ctypes.create_string_buffer(read_size)
             read_count = _WinDword()
             if not self._read_file(
                 self._as_handle(handle),
@@ -1641,6 +2546,11 @@ class _CtypesWin32API(_Win32API):
                 raise self._last_error("open handle")
             if read_count.value == 0:
                 return b"".join(chunks)
+            if read_count.value > read_size:
+                raise EvaluationIntegrityError("native read returned an invalid byte count")
+            total += read_count.value
+            if max_bytes is not None and total > max_bytes:
+                raise EvaluationIntegrityError("artifact exceeds maximum size")
             chunks.append(buffer.raw[: read_count.value])
 
     def write_file(self, handle: int, data: bytes) -> None:
@@ -1930,6 +2840,19 @@ class _WindowsAnchor:
     identity: _NodeIdentity
 
 
+@dataclass(frozen=True)
+class _WindowsOwnedDirectory:
+    artifact_path: str
+    identity: _NodeIdentity
+
+
+@dataclass(frozen=True)
+class _WindowsOwnedArtifact:
+    identity: _NodeIdentity
+    created_directories: tuple[_WindowsOwnedDirectory, ...]
+    retained_handle: int | None
+
+
 def _windows_node_identity(info: _WinNodeInfo) -> _NodeIdentity:
     mode = stat.S_IFDIR if info.attributes & _WIN_FILE_ATTRIBUTE_DIRECTORY else stat.S_IFREG
     return _NodeIdentity(
@@ -2133,6 +3056,10 @@ def _windows_writable_file_access() -> int:
     )
 
 
+def _windows_deletable_file_access() -> int:
+    return _WIN_FILE_READ_ATTRIBUTES | _WIN_DELETE | _WIN_SYNCHRONIZE
+
+
 def _windows_root_flags() -> int:
     return _WIN_FILE_FLAG_BACKUP_SEMANTICS | _WIN_FILE_FLAG_OPEN_REPARSE_POINT
 
@@ -2169,17 +3096,18 @@ def _windows_node_options() -> int:
     )
 
 
-def _open_windows_directory(
+def _open_windows_directory_with_disposition(
     api: _Win32API,
     parent_handle: int,
     name: str,
     display_path: str,
     *,
     create: bool,
-) -> _WindowsAnchor:
+) -> tuple[_WindowsAnchor, bool]:
     disposition = _WIN_FILE_CREATE if create else _WIN_FILE_OPEN
     options = _windows_directory_create_options() if create else _windows_directory_options()
     parent_path = ntpath.dirname(display_path)
+    created = create
     try:
         handle = _open_windows_child_checked(
             api,
@@ -2195,30 +3123,44 @@ def _open_windows_directory(
     except FileExistsError:
         if not create:
             raise
-        handle = _open_windows_child_checked(
-            api,
-            parent_handle,
-            parent_path,
-            name,
-            _windows_directory_access(),
-            _windows_directory_share(),
-            _WIN_FILE_OPEN,
-            _windows_directory_options(),
-            0,
-        )
+        raise
     try:
         info = api.file_info(handle)
         _validate_windows_directory(info, display_path)
-        return _WindowsAnchor(
-            name=name,
-            display_path=display_path,
-            parent_handle=parent_handle,
-            handle=handle,
-            identity=_windows_node_identity(info),
+        return (
+            _WindowsAnchor(
+                name=name,
+                display_path=display_path,
+                parent_handle=parent_handle,
+                handle=handle,
+                identity=_windows_node_identity(info),
+            ),
+            created,
         )
     except BaseException:
         api.close_handle(handle)
         raise
+
+
+def _open_windows_directory(
+    api: _Win32API,
+    parent_handle: int,
+    name: str,
+    display_path: str,
+    *,
+    create: bool,
+) -> _WindowsAnchor:
+    try:
+        anchor, _ = _open_windows_directory_with_disposition(
+            api,
+            parent_handle,
+            name,
+            display_path,
+            create=create,
+        )
+    except FileExistsError as error:
+        raise EvaluationIntegrityError("directory creation collision") from error
+    return anchor
 
 
 class _WindowsRunStorage(_RunStorage):
@@ -2236,6 +3178,14 @@ class _WindowsRunStorage(_RunStorage):
         self._root_handle = anchors[-1].handle
         self._api = api
         self._closed = False
+        self._close_started = False
+        self._pending_close_handles: dict[int, str] | None = None
+        self._owned_artifacts: dict[str, _WindowsOwnedArtifact] = {}
+        self._last_atomic_write: tuple[str, _AtomicWriteReceipt] | None = None
+        self._recovery_anchor: _WindowsAnchor | None = None
+        self._recovery_receipts: list[_ArtifactRecoveryReceipt] = []
+        self._deferred_recovery_handles: set[int] = set()
+        self._deferred_binding_handles: dict[int, str] = {}
 
     @classmethod
     def open(
@@ -2334,6 +3284,8 @@ class _WindowsRunStorage(_RunStorage):
     def _ensure_open(self) -> None:
         if self._closed:
             raise EvaluationIntegrityError("run storage is closed")
+        if self._close_started:
+            raise EvaluationIntegrityError("run storage close is incomplete")
 
     def assert_root_identity(self) -> None:
         self._ensure_open()
@@ -2364,6 +3316,7 @@ class _WindowsRunStorage(_RunStorage):
                     raise EvaluationIntegrityError("run directory path identity changed")
             finally:
                 self._api.close_handle(reopened)
+        self._assert_recovery_identity()
 
     def _assert_relative_bindings(self, bindings: tuple[_WindowsAnchor, ...]) -> None:
         for binding in bindings:
@@ -2399,13 +3352,23 @@ class _WindowsRunStorage(_RunStorage):
         artifact_path: str,
         *,
         create: bool,
-    ) -> Iterator[tuple[int, str, tuple[_WindowsAnchor, ...]]]:
+    ) -> Iterator[
+        tuple[
+            int,
+            str,
+            tuple[_WindowsAnchor, ...],
+            tuple[_WindowsOwnedDirectory, ...],
+        ]
+    ]:
+        """Bind a parent under the cooperative per-operation namespace contract."""
         relative = _validate_relative_path(artifact_path)
         bindings: list[_WindowsAnchor] = []
+        created_directories: list[_WindowsOwnedDirectory] = []
         current_handle = self._root_handle
         current_path = self._root_text
+        primary_error: BaseException | None = None
         try:
-            for segment in relative.parts[:-1]:
+            for index, segment in enumerate(relative.parts[:-1]):
                 current_path = ntpath.join(current_path, segment)
                 try:
                     binding = _open_windows_directory(
@@ -2418,22 +3381,79 @@ class _WindowsRunStorage(_RunStorage):
                 except FileNotFoundError:
                     if not create:
                         raise
-                    binding = _open_windows_directory(
-                        self._api,
-                        current_handle,
-                        segment,
-                        current_path,
-                        create=True,
+                    try:
+                        binding, created = _open_windows_directory_with_disposition(
+                            self._api,
+                            current_handle,
+                            segment,
+                            current_path,
+                            create=True,
+                        )
+                    except FileExistsError as error:
+                        raise EvaluationIntegrityError(
+                            "directory creation collision"
+                        ) from error
+                    assert created
+                    created_directories.append(
+                        _WindowsOwnedDirectory(
+                            PurePosixPath(*relative.parts[: index + 1]).as_posix(),
+                            binding.identity,
+                        )
                     )
                 bindings.append(binding)
                 current_handle = binding.handle
             self._assert_relative_bindings(tuple(bindings))
-            yield current_handle, relative.name, tuple(bindings)
+            yield (
+                current_handle,
+                relative.name,
+                tuple(bindings),
+                tuple(created_directories),
+            )
+        except BaseException as error:
+            primary_error = error
         finally:
+            cleanup_errors: list[tuple[str, BaseException]] = []
             for binding in reversed(bindings):
-                self._api.close_handle(binding.handle)
+                stage = (
+                    f"close transient artifact-parent binding {binding.handle} "
+                    f"({binding.display_path})"
+                )
+                try:
+                    self._api.close_handle(binding.handle)
+                except BaseException as error:
+                    self._deferred_binding_handles.setdefault(binding.handle, stage)
+                    cleanup_errors.append((stage, error))
+                else:
+                    self._deferred_binding_handles.pop(binding.handle, None)
+            _raise_windows_operation_cleanup_errors(
+                primary_error,
+                cleanup_errors,
+                operation=f"Windows artifact parent ({artifact_path})",
+            )
 
-    def _read_leaf(self, parent_handle: int, name: str, artifact_path: str) -> bytes:
+    def _read_leaf(
+        self,
+        parent_handle: int,
+        name: str,
+        artifact_path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        return self._read_leaf_with_identity(
+            parent_handle,
+            name,
+            artifact_path,
+            max_bytes=max_bytes,
+        )[0]
+
+    def _read_leaf_with_identity(
+        self,
+        parent_handle: int,
+        name: str,
+        artifact_path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> tuple[bytes, _NodeIdentity]:
         parent_path = ntpath.dirname(
             ntpath.join(self._root_text, *PurePosixPath(artifact_path).parts)
         )
@@ -2451,8 +3471,25 @@ class _WindowsRunStorage(_RunStorage):
         try:
             before = self._api.file_info(handle)
             _validate_windows_regular(before, artifact_path)
-            data = self._api.read_file(handle)
+            if max_bytes is not None and before.size > max_bytes:
+                raise EvaluationIntegrityError(
+                    f"artifact exceeds maximum size: {artifact_path}"
+                )
+            try:
+                data = self._api.read_file(handle, max_bytes=max_bytes)
+            except EvaluationIntegrityError as error:
+                if str(error) == "artifact exceeds maximum size":
+                    raise EvaluationIntegrityError(
+                        f"artifact exceeds maximum size: {artifact_path}"
+                    ) from error
+                raise
             after = self._api.file_info(handle)
+            if max_bytes is not None and (
+                len(data) > max_bytes or after.size > max_bytes
+            ):
+                raise EvaluationIntegrityError(
+                    f"artifact exceeds maximum size: {artifact_path}"
+                )
             if _windows_node_identity(before) != _windows_node_identity(after):
                 raise EvaluationIntegrityError(f"artifact changed while reading: {artifact_path}")
             reopened = _open_windows_child_checked(
@@ -2477,11 +3514,13 @@ class _WindowsRunStorage(_RunStorage):
                     )
             finally:
                 self._api.close_handle(reopened)
-            return data
+            return data, _windows_node_identity(after)
         finally:
             self._api.close_handle(handle)
 
-    def read_artifact(self, artifact_path: str) -> bytes:
+    def read_artifact(
+        self, artifact_path: str, *, max_bytes: int | None = None
+    ) -> bytes:
         self.failure_stage = f"artifact read ({artifact_path})"
         self.assert_root_identity()
         try:
@@ -2489,15 +3528,20 @@ class _WindowsRunStorage(_RunStorage):
                 parent,
                 name,
                 bindings,
+                _,
             ):
-                data = self._read_leaf(parent, name, artifact_path)
+                data = self._read_leaf(
+                    parent, name, artifact_path, max_bytes=max_bytes
+                )
                 self._assert_relative_bindings(bindings)
         except FileNotFoundError as error:
             raise EvaluationIntegrityError(f"artifact is missing: {artifact_path}") from error
         self.assert_root_identity()
         return data
 
-    def read_optional_artifact(self, artifact_path: str) -> bytes | None:
+    def read_optional_artifact(
+        self, artifact_path: str, *, max_bytes: int | None = None
+    ) -> bytes | None:
         self.failure_stage = f"optional artifact read ({artifact_path})"
         self.assert_root_identity()
         try:
@@ -2505,13 +3549,37 @@ class _WindowsRunStorage(_RunStorage):
                 parent,
                 name,
                 bindings,
+                _,
             ):
-                data = self._read_leaf(parent, name, artifact_path)
+                data = self._read_leaf(
+                    parent, name, artifact_path, max_bytes=max_bytes
+                )
                 self._assert_relative_bindings(bindings)
         except FileNotFoundError:
             data = None
         self.assert_root_identity()
         return data
+
+    def read_optional_artifact_with_identity(
+        self, artifact_path: str, *, max_bytes: int | None = None
+    ) -> tuple[bytes, _NodeIdentity] | None:
+        self.failure_stage = f"optional artifact identity read ({artifact_path})"
+        self.assert_root_identity()
+        try:
+            with self._artifact_parent(artifact_path, create=False) as (
+                parent,
+                name,
+                bindings,
+                _,
+            ):
+                result = self._read_leaf_with_identity(
+                    parent, name, artifact_path, max_bytes=max_bytes
+                )
+                self._assert_relative_bindings(bindings)
+        except FileNotFoundError:
+            result = None
+        self.assert_root_identity()
+        return result
 
     def atomic_write(
         self,
@@ -2519,16 +3587,443 @@ class _WindowsRunStorage(_RunStorage):
         data: bytes,
         *,
         mutable: bool,
+    ) -> bool:
+        return self._atomic_write(artifact_path, data, mutable=mutable)
+
+    def atomic_write_receipt(self, artifact_path: str) -> _AtomicWriteReceipt | None:
+        if self._last_atomic_write is None:
+            return None
+        path, receipt = self._last_atomic_write
+        return receipt if path == artifact_path else None
+
+    def replace_artifact_if_owned(
+        self,
+        artifact_path: str,
+        data: bytes,
+        *,
+        owned_identity: _NodeIdentity,
+        owned_data: bytes,
     ) -> None:
+        self._replace_owned_artifact(
+            artifact_path, data, owned_identity=owned_identity, owned_data=owned_data
+        )
+
+    def _assert_recovery_identity(self) -> None:
+        anchor = self._recovery_anchor
+        if anchor is None:
+            return
+        info = self._api.file_info(anchor.handle)
+        _validate_windows_directory(info, anchor.display_path)
+        if not _same_filesystem_object(_windows_node_identity(info), anchor.identity):
+            raise EvaluationIntegrityError("recovery boundary identity changed")
+        assert anchor.name is not None and anchor.parent_handle is not None
+        reopened = _open_windows_child_checked(
+            self._api,
+            anchor.parent_handle,
+            ntpath.dirname(anchor.display_path),
+            anchor.name,
+            _windows_directory_access(),
+            _windows_directory_share(),
+            _WIN_FILE_OPEN,
+            _windows_directory_options(),
+            0,
+        )
+        try:
+            reopened_info = self._api.file_info(reopened)
+            _validate_windows_directory(reopened_info, anchor.display_path)
+            if not _same_filesystem_object(
+                _windows_node_identity(reopened_info), anchor.identity
+            ):
+                raise EvaluationIntegrityError("recovery boundary path changed")
+        finally:
+            self._api.close_handle(reopened)
+
+    def _ensure_recovery_root(self) -> _WindowsAnchor:
+        if self._recovery_anchor is not None:
+            self._assert_recovery_identity()
+            return self._recovery_anchor
+        if len(self._anchors) < 2:
+            raise EvaluationIntegrityError("run has no safe recovery parent")
+        parent = self._anchors[-2]
+        for _ in range(16):
+            name = f".regulatory-harvest-recovery-{uuid.uuid4().hex}"
+            display_path = ntpath.join(parent.display_path, name)
+            try:
+                anchor, created = _open_windows_directory_with_disposition(
+                    self._api,
+                    parent.handle,
+                    name,
+                    display_path,
+                    create=True,
+                )
+            except FileExistsError:
+                continue
+            if created:
+                self._recovery_anchor = anchor
+                self._assert_recovery_identity()
+                return anchor
+            self._api.close_handle(anchor.handle)
+        raise EvaluationIntegrityError("unable to allocate recovery boundary")
+
+    def _write_recovery_record(
+        self,
+        recovery: _WindowsAnchor,
+        name: str,
+        payload: dict[str, object],
+    ) -> None:
+        handle = _open_windows_child_checked(
+            self._api,
+            recovery.handle,
+            recovery.display_path,
+            name,
+            _windows_writable_file_access(),
+            0,
+            _WIN_FILE_CREATE,
+            _windows_file_options(),
+            _WIN_FILE_ATTRIBUTE_NORMAL,
+        )
+        try:
+            self._api.write_file(handle, canonical_json_bytes(payload))
+            self._api.flush_file(handle)
+        finally:
+            self._api.close_handle(handle)
+        self._assert_recovery_identity()
+
+    def _close_recovery_handle(self, handle: int) -> None:
+        try:
+            self._api.close_handle(handle)
+        except BaseException:
+            self._deferred_recovery_handles.add(handle)
+            raise
+        self._deferred_recovery_handles.discard(handle)
+
+    def _claim_leaf(
+        self,
+        parent_handle: int,
+        name: str,
+        artifact_path: str,
+        *,
+        operation: Literal["remove", "restore"],
+        expected_identity: _NodeIdentity,
+        expected_data: bytes,
+    ) -> tuple[int, str, str]:
+        parent_path = ntpath.dirname(
+            ntpath.join(self._root_text, *PurePosixPath(artifact_path).parts)
+        )
+        try:
+            handle = _open_windows_child_checked(
+                self._api,
+                parent_handle,
+                parent_path,
+                name,
+                _windows_readable_file_access() | _WIN_DELETE,
+                _WIN_FILE_SHARE_READ,
+                _WIN_FILE_OPEN,
+                _windows_file_options(),
+                0,
+            )
+        except FileNotFoundError as error:
+            raise EvaluationIntegrityError(
+                "transaction-owned artifact changed"
+            ) from error
+        self._deferred_recovery_handles.add(handle)
+        handle_owned_by_caller = False
+        try:
+            recovery = self._ensure_recovery_root()
+            for _ in range(16):
+                claim_name = f".rh-{uuid.uuid4().hex}.claim"
+                record_name = f"{claim_name}.json"
+                receipt = _ArtifactRecoveryReceipt(
+                    artifact_path=artifact_path,
+                    operation=operation,
+                    recovery_directory=recovery.display_path,
+                    recovery_name=claim_name,
+                    expected_identity=expected_identity,
+                    expected_sha256=sha256_digest(expected_data),
+                )
+                try:
+                    self._write_recovery_record(
+                        recovery,
+                        record_name,
+                        {
+                            "artifact_path": artifact_path,
+                            "claim_name": claim_name,
+                            "expected_identity": _PosixRunStorage._identity_payload(
+                                expected_identity
+                            ),
+                            "expected_sha256": receipt.expected_sha256,
+                            "operation": operation,
+                            "recovery_schema_version": "1.1",
+                            "run_directory_name": ntpath.basename(self._root_text),
+                        },
+                    )
+                except FileExistsError:
+                    continue
+                try:
+                    _rename_windows_file_checked(
+                        self._api,
+                        handle,
+                        root_directory=recovery.handle,
+                        root_path=recovery.display_path,
+                        new_name=claim_name,
+                        replace=False,
+                    )
+                except FileExistsError:
+                    continue
+                except BaseException:
+                    with suppress(Exception):
+                        _rename_windows_file_checked(
+                            self._api,
+                            handle,
+                            root_directory=parent_handle,
+                            root_path=parent_path,
+                            new_name=name,
+                            replace=False,
+                        )
+                    raise
+                self._recovery_receipts.append(receipt)
+                handle_owned_by_caller = True
+                return handle, claim_name, parent_path
+            raise EvaluationIntegrityError("unable to allocate private artifact claim")
+        finally:
+            if not handle_owned_by_caller:
+                self._close_recovery_handle(handle)
+
+    def _record_claimed_leaf(
+        self,
+        claim_name: str,
+        observed: bytes,
+        observed_identity: _NodeIdentity,
+    ) -> None:
+        recovery = self._ensure_recovery_root()
+        self._write_recovery_record(
+            recovery,
+            f"{claim_name}.verified.json",
+            {
+                "claimed_identity": _PosixRunStorage._identity_payload(
+                    observed_identity
+                ),
+                "claimed_sha256": sha256_digest(observed),
+                "claimed_size": len(observed),
+                "status": "VERIFIED_CLAIM",
+            },
+        )
+        previous = self._recovery_receipts[-1]
+        self._recovery_receipts[-1] = _ArtifactRecoveryReceipt(
+            artifact_path=previous.artifact_path,
+            operation=previous.operation,
+            recovery_directory=previous.recovery_directory,
+            recovery_name=previous.recovery_name,
+            expected_identity=previous.expected_identity,
+            expected_sha256=previous.expected_sha256,
+            claimed_identity=observed_identity,
+            claimed_sha256=sha256_digest(observed),
+        )
+
+    def recovery_receipts(self) -> tuple[_ArtifactRecoveryReceipt, ...]:
+        return tuple(self._recovery_receipts)
+
+    def _read_claimed_leaf(
+        self,
+        handle: int,
+        artifact_path: str,
+    ) -> tuple[bytes, _NodeIdentity]:
+        before = self._api.file_info(handle)
+        _validate_windows_regular(before, artifact_path)
+        observed = self._api.read_file(handle)
+        after = self._api.file_info(handle)
+        _validate_windows_regular(after, artifact_path)
+        if _windows_node_identity(before) != _windows_node_identity(after):
+            raise EvaluationIntegrityError("transaction-owned artifact changed")
+        return observed, _windows_node_identity(after)
+
+    def _restore_claim_no_clobber(
+        self,
+        handle: int,
+        parent_handle: int,
+        parent_path: str,
+        name: str,
+        claim_name: str,
+    ) -> None:
+        try:
+            _rename_windows_file_checked(
+                self._api,
+                handle,
+                root_directory=parent_handle,
+                root_path=parent_path,
+                new_name=name,
+                replace=False,
+            )
+        except FileExistsError as error:
+            raise EvaluationIntegrityError(
+                f"claimed artifact retained after restore collision: {claim_name}"
+            ) from error
+
+    def _replace_owned_artifact(
+        self,
+        artifact_path: str,
+        data: bytes,
+        *,
+        owned_identity: _NodeIdentity,
+        owned_data: bytes,
+    ) -> None:
+        self._last_atomic_write = None
+        self.failure_stage = f"owned artifact replace ({artifact_path})"
+        self.assert_root_identity()
+        with self._artifact_parent(artifact_path, create=False) as (
+            parent_handle,
+            name,
+            bindings,
+            _,
+        ):
+            claim, claim_name, parent_path = self._claim_leaf(
+                parent_handle,
+                name,
+                artifact_path,
+                operation="restore",
+                expected_identity=owned_identity,
+                expected_data=owned_data,
+            )
+            claim_closed = False
+            try:
+                try:
+                    observed, observed_identity = self._read_claimed_leaf(
+                        claim, artifact_path
+                    )
+                except BaseException:
+                    self._restore_claim_no_clobber(
+                        claim,
+                        parent_handle,
+                        parent_path,
+                        name,
+                        claim_name,
+                    )
+                    raise
+                self._record_claimed_leaf(
+                    claim_name, observed, observed_identity
+                )
+                if (
+                    not _same_filesystem_object(observed_identity, owned_identity)
+                    or observed != owned_data
+                ):
+                    self._restore_claim_no_clobber(
+                        claim,
+                        parent_handle,
+                        parent_path,
+                        name,
+                        claim_name,
+                    )
+                    raise EvaluationIntegrityError(
+                        "transaction-owned artifact changed"
+                    )
+                recovery = self._ensure_recovery_root()
+                temporary_name = f".rh-{uuid.uuid4().hex}.restore"
+                temporary: int | None = None
+                installed = False
+                try:
+                    temporary = _open_windows_child_checked(
+                        self._api,
+                        recovery.handle,
+                        recovery.display_path,
+                        temporary_name,
+                        _windows_writable_file_access(),
+                        0,
+                        _WIN_FILE_CREATE,
+                        _windows_file_options(),
+                        _WIN_FILE_ATTRIBUTE_NORMAL,
+                    )
+                    _validate_windows_regular(
+                        self._api.file_info(temporary), artifact_path
+                    )
+                    self._api.write_file(temporary, data)
+                    self._api.flush_file(temporary)
+                    restored_info = self._api.file_info(temporary)
+                    _validate_windows_regular(restored_info, artifact_path)
+                    restored_identity = _windows_node_identity(restored_info)
+                    self._assert_relative_bindings(bindings)
+                    self.assert_root_identity()
+                    try:
+                        self._close_recovery_handle(claim)
+                        claim_closed = True
+                    except BaseException as error:
+                        with suppress(Exception):
+                            self._restore_claim_no_clobber(
+                                claim,
+                                parent_handle,
+                                parent_path,
+                                name,
+                                claim_name,
+                            )
+                        with suppress(Exception):
+                            self._close_recovery_handle(claim)
+                            claim_closed = True
+                        raise EvaluationIntegrityError(
+                            "transaction-owned claim close failed; recovery bytes "
+                            "retained"
+                        ) from error
+                    _rename_windows_file_checked(
+                        self._api,
+                        temporary,
+                        root_directory=parent_handle,
+                        root_path=parent_path,
+                        new_name=name,
+                        replace=False,
+                    )
+                    installed = True
+                except BaseException as error:
+                    if not installed and not claim_closed:
+                        try:
+                            self._restore_claim_no_clobber(
+                                claim,
+                                parent_handle,
+                                parent_path,
+                                name,
+                                claim_name,
+                            )
+                        except BaseException as restore_error:
+                            raise EvaluationIntegrityError(
+                                "transaction-owned artifact restore failed and "
+                                "claimed artifact was retained"
+                            ) from restore_error
+                    raise EvaluationIntegrityError(
+                        "transaction-owned artifact restore failed; recovery "
+                        "bytes retained"
+                    ) from error
+                finally:
+                    if temporary is not None:
+                        self._api.close_handle(temporary)
+            finally:
+                if not claim_closed:
+                    with suppress(Exception):
+                        self._close_recovery_handle(claim)
+            self._assert_relative_bindings(bindings)
+        self._owned_artifacts.pop(artifact_path, None)
+        self._last_atomic_write = (
+            artifact_path,
+            _AtomicWriteReceipt(False, True, restored_identity),
+        )
+        self.assert_root_identity()
+
+    def _atomic_write(
+        self,
+        artifact_path: str,
+        data: bytes,
+        *,
+        mutable: bool,
+    ) -> bool:
+        self._last_atomic_write = None
         self.failure_stage = f"artifact write ({artifact_path})"
         self.assert_root_identity()
         with self._artifact_parent(artifact_path, create=True) as (
             parent_handle,
             name,
             bindings,
+            created_directories,
         ):
             try:
-                existing = self._read_leaf(parent_handle, name, artifact_path)
+                existing, _ = self._read_leaf_with_identity(
+                    parent_handle, name, artifact_path
+                )
             except FileNotFoundError:
                 existing = None
             self._assert_relative_bindings(bindings)
@@ -2537,13 +4032,19 @@ class _WindowsRunStorage(_RunStorage):
                 if existing == data:
                     self._assert_relative_bindings(bindings)
                     self.assert_root_identity()
-                    return
+                    self._last_atomic_write = (
+                        artifact_path,
+                        _AtomicWriteReceipt(False, False, None),
+                    )
+                    return False
                 if not mutable:
                     raise EvaluationIntegrityError(f"immutable artifact differs: {artifact_path}")
 
             temporary_name = f".rh-{uuid.uuid4().hex}.tmp"
             handle: int | None = None
             renamed = False
+            renamed_identity: _NodeIdentity | None = None
+            close_failed = False
             primary_error: BaseException | None = None
             cleanup_errors: list[tuple[str, BaseException]] = []
             try:
@@ -2578,6 +4079,7 @@ class _WindowsRunStorage(_RunStorage):
                 renamed = True
                 renamed_info = self._api.file_info(handle)
                 _validate_windows_regular(renamed_info, artifact_path)
+                renamed_identity = _windows_node_identity(renamed_info)
                 self._assert_relative_bindings(bindings)
                 self.assert_root_identity()
             except BaseException as error:
@@ -2592,15 +4094,374 @@ class _WindowsRunStorage(_RunStorage):
                     try:
                         self._api.close_handle(handle)
                     except BaseException as error:
+                        close_failed = True
                         cleanup_stage = (
                             "close renamed artifact" if renamed else "close temporary artifact"
                         )
                         cleanup_errors.append((cleanup_stage, error))
+            if renamed and not mutable:
+                assert renamed_identity is not None
+                self._owned_artifacts[artifact_path] = _WindowsOwnedArtifact(
+                    identity=renamed_identity,
+                    created_directories=created_directories,
+                    retained_handle=handle if close_failed else None,
+                )
+            elif renamed:
+                self._owned_artifacts.pop(artifact_path, None)
+            if renamed and renamed_identity is not None:
+                receipt = _AtomicWriteReceipt(
+                    created=existing is None,
+                    replaced=existing is not None,
+                    identity=renamed_identity,
+                )
+                self._last_atomic_write = (artifact_path, receipt)
+            if (
+                isinstance(primary_error, FileExistsError)
+                and not mutable
+                and existing is None
+                and not cleanup_errors
+            ):
+                competing = self._read_leaf(parent_handle, name, artifact_path)
+                if competing == data:
+                    self._last_atomic_write = (
+                        artifact_path,
+                        _AtomicWriteReceipt(False, False, None),
+                    )
+                    return False
+                raise EvaluationIntegrityError(
+                    f"immutable artifact differs: {artifact_path}"
+                ) from primary_error
+            try:
+                _raise_windows_operation_cleanup_errors(
+                    primary_error,
+                    cleanup_errors,
+                    operation=f"Windows artifact write ({artifact_path})",
+                )
+            except BaseException as error:
+                if renamed and not mutable:
+                    raise _AtomicWriteOwnershipError(
+                        artifact_path,
+                        error,
+                        identity=renamed_identity,
+                    ) from error
+                if renamed:
+                    raise _AtomicWriteOwnershipError(
+                        artifact_path,
+                        error,
+                        created=existing is None,
+                        replaced=existing is not None,
+                        identity=renamed_identity,
+                    ) from error
+                raise
+        return True
+
+    def remove_artifact(
+        self,
+        artifact_path: str,
+        *,
+        expected_identity: _NodeIdentity | None = None,
+        expected_data: bytes | None = None,
+    ) -> None:
+        """Remove one exact leaf installed by this storage instance."""
+        if (expected_identity is None) != (expected_data is None):
+            raise ValueError("owned artifact identity and bytes must be supplied together")
+        if expected_identity is not None:
+            assert expected_data is not None
+            self._remove_owned_artifact(
+                artifact_path,
+                expected_identity=expected_identity,
+                expected_data=expected_data,
+            )
+            return
+        owned = self._owned_artifacts.get(artifact_path)
+        if owned is None and expected_identity is None:
+            raise EvaluationIntegrityError(
+                "secure Windows artifact removal is unavailable"
+            )
+        identity = owned.identity
+        self.failure_stage = f"artifact remove ({artifact_path})"
+        self.assert_root_identity()
+        with self._artifact_parent(artifact_path, create=False) as (
+            parent_handle,
+            name,
+            bindings,
+            _,
+        ):
+            handle = owned.retained_handle
+            if handle is None:
+                parent_path = ntpath.dirname(
+                    ntpath.join(
+                        self._root_text,
+                        *PurePosixPath(artifact_path).parts,
+                    )
+                )
+                handle = _open_windows_child_checked(
+                    self._api,
+                    parent_handle,
+                    parent_path,
+                    name,
+                    _windows_readable_file_access() | _WIN_DELETE,
+                    _WIN_FILE_SHARE_READ
+                    | _WIN_FILE_SHARE_WRITE
+                    | _WIN_FILE_SHARE_DELETE,
+                    _WIN_FILE_OPEN,
+                    _windows_file_options(),
+                    0,
+                )
+            primary_error: BaseException | None = None
+            cleanup_errors: list[tuple[str, BaseException]] = []
+            handle_closed = False
+            try:
+                before = self._api.file_info(handle)
+                _validate_windows_regular(before, artifact_path)
+                self._api.read_file(handle)
+                info = self._api.file_info(handle)
+                _validate_windows_regular(info, artifact_path)
+                if not _same_filesystem_object(
+                    _windows_node_identity(info), identity
+                ):
+                    raise EvaluationIntegrityError(
+                        "transaction-owned artifact changed"
+                    )
+                if (
+                    _windows_node_identity(before) != _windows_node_identity(info)
+                ):
+                    raise EvaluationIntegrityError("transaction-owned artifact changed")
+                self._assert_relative_bindings(bindings)
+                self.assert_root_identity()
+                self._api.delete_handle(handle)
+            except BaseException as error:
+                primary_error = error
+            finally:
+                try:
+                    self._api.close_handle(handle)
+                except BaseException as error:
+                    cleanup_errors.append(("close owned artifact", error))
+                else:
+                    handle_closed = True
+            if handle_closed and owned.retained_handle == handle:
+                self._owned_artifacts[artifact_path] = _WindowsOwnedArtifact(
+                    owned.identity,
+                    owned.created_directories,
+                    None,
+                )
             _raise_windows_operation_cleanup_errors(
                 primary_error,
                 cleanup_errors,
-                operation=f"Windows artifact write ({artifact_path})",
+                operation=f"Windows owned artifact remove ({artifact_path})",
             )
+            self._assert_relative_bindings(bindings)
+        self.assert_root_identity()
+        removed_owned = self._owned_artifacts.pop(artifact_path, None)
+        if removed_owned is not None and _same_filesystem_object(
+            removed_owned.identity, identity
+        ):
+            for directory in reversed(removed_owned.created_directories):
+                self._remove_owned_empty_directory(directory)
+        self.assert_root_identity()
+
+    def _remove_owned_artifact(
+        self,
+        artifact_path: str,
+        *,
+        expected_identity: _NodeIdentity,
+        expected_data: bytes,
+    ) -> None:
+        self.failure_stage = f"owned artifact remove ({artifact_path})"
+        self.assert_root_identity()
+        with self._artifact_parent(artifact_path, create=False) as (
+            parent_handle,
+            name,
+            bindings,
+            _,
+        ):
+            claim, claim_name, parent_path = self._claim_leaf(
+                parent_handle,
+                name,
+                artifact_path,
+                operation="remove",
+                expected_identity=expected_identity,
+                expected_data=expected_data,
+            )
+            claim_closed = False
+            try:
+                try:
+                    observed, observed_identity = self._read_claimed_leaf(
+                        claim, artifact_path
+                    )
+                except BaseException:
+                    self._restore_claim_no_clobber(
+                        claim,
+                        parent_handle,
+                        parent_path,
+                        name,
+                        claim_name,
+                    )
+                    raise
+                self._record_claimed_leaf(
+                    claim_name, observed, observed_identity
+                )
+                if (
+                    not _same_filesystem_object(
+                        observed_identity, expected_identity
+                    )
+                    or observed != expected_data
+                ):
+                    self._restore_claim_no_clobber(
+                        claim,
+                        parent_handle,
+                        parent_path,
+                        name,
+                        claim_name,
+                    )
+                    raise EvaluationIntegrityError(
+                        "transaction-owned artifact changed"
+                    )
+                self._assert_relative_bindings(bindings)
+                self.assert_root_identity()
+                try:
+                    self._close_recovery_handle(claim)
+                    claim_closed = True
+                except BaseException as error:
+                    try:
+                        self._restore_claim_no_clobber(
+                            claim,
+                            parent_handle,
+                            parent_path,
+                            name,
+                            claim_name,
+                        )
+                    except BaseException as restore_error:
+                        raise EvaluationIntegrityError(
+                            "transaction-owned claim deletion failed; recovery "
+                            "bytes retained"
+                        ) from restore_error
+                    with suppress(Exception):
+                        self._close_recovery_handle(claim)
+                        claim_closed = True
+                    raise EvaluationIntegrityError(
+                        "transaction-owned claim close failed; run leaf restored"
+                    ) from error
+            finally:
+                if not claim_closed:
+                    with suppress(Exception):
+                        self._close_recovery_handle(claim)
+            self._assert_relative_bindings(bindings)
+        removed_owned = self._owned_artifacts.pop(artifact_path, None)
+        if removed_owned is not None and _same_filesystem_object(
+            removed_owned.identity, expected_identity
+        ):
+            for directory in reversed(removed_owned.created_directories):
+                self._remove_owned_empty_directory(directory)
+        self.assert_root_identity()
+
+    def _remove_owned_empty_directory(
+        self,
+        owned: _WindowsOwnedDirectory,
+    ) -> None:
+        relative = _validate_relative_path(owned.artifact_path)
+        bindings: list[_WindowsAnchor] = []
+        current_handle = self._root_handle
+        current_path = self._root_text
+        target_handle: int | None = None
+        try:
+            for index, segment in enumerate(relative.parts):
+                current_path = ntpath.join(current_path, segment)
+                if index != len(relative.parts) - 1:
+                    binding = _open_windows_directory(
+                        self._api,
+                        current_handle,
+                        segment,
+                        current_path,
+                        create=False,
+                    )
+                    bindings.append(binding)
+                    current_handle = binding.handle
+                    continue
+                target_handle = _open_windows_child_checked(
+                    self._api,
+                    current_handle,
+                    ntpath.dirname(current_path),
+                    segment,
+                    _windows_directory_access() | _WIN_DELETE,
+                    _WIN_FILE_SHARE_READ,
+                    _WIN_FILE_OPEN,
+                    _windows_directory_options(),
+                    0,
+                )
+            assert target_handle is not None
+            info = self._api.file_info(target_handle)
+            _validate_windows_directory(info, owned.artifact_path)
+            self._assert_relative_bindings(tuple(bindings))
+            self.assert_root_identity()
+            recovery = self._ensure_recovery_root()
+            claimed = False
+            for _ in range(16):
+                claim_name = f".rh-{uuid.uuid4().hex}.dirclaim"
+                try:
+                    self._write_recovery_record(
+                        recovery,
+                        f"{claim_name}.json",
+                        {
+                            "artifact_path": owned.artifact_path,
+                            "claim_name": claim_name,
+                            "expected_identity": _PosixRunStorage._identity_payload(
+                                owned.identity
+                            ),
+                            "operation": "remove_empty_directory",
+                            "recovery_schema_version": "1.1",
+                            "run_directory_name": ntpath.basename(self._root_text),
+                        },
+                    )
+                except FileExistsError:
+                    continue
+                try:
+                    _rename_windows_file_checked(
+                        self._api,
+                        target_handle,
+                        root_directory=recovery.handle,
+                        root_path=recovery.display_path,
+                        new_name=claim_name,
+                        replace=False,
+                    )
+                except FileExistsError:
+                    continue
+                claimed = True
+                break
+            if not claimed:
+                raise EvaluationIntegrityError(
+                    "unable to allocate private directory claim"
+                )
+            target_identity = _windows_node_identity(self._api.file_info(target_handle))
+            names = _query_windows_names_checked(
+                self._api,
+                target_handle,
+                ntpath.join(recovery.display_path, claim_name),
+            )
+            if _same_filesystem_object(target_identity, owned.identity) and not names:
+                return
+            try:
+                _rename_windows_file_checked(
+                    self._api,
+                    target_handle,
+                    root_directory=current_handle,
+                    root_path=ntpath.dirname(current_path),
+                    new_name=relative.name,
+                    replace=False,
+                )
+            except FileExistsError as error:
+                raise EvaluationIntegrityError(
+                    f"directory restore collision; recovery entry retained: {claim_name}"
+                ) from error
+            if not _same_filesystem_object(target_identity, owned.identity):
+                raise EvaluationIntegrityError(
+                    "transaction-owned directory identity changed"
+                )
+        finally:
+            if target_handle is not None:
+                self._api.close_handle(target_handle)
+            for binding in reversed(bindings):
+                self._api.close_handle(binding.handle)
 
     def scan_inventory(self) -> dict[str, _NodeIdentity]:
         self.failure_stage = "inventory scan"
@@ -2697,10 +4558,49 @@ class _WindowsRunStorage(_RunStorage):
     def close(self) -> None:
         if self._closed:
             return
+        self._close_started = True
+        if self._pending_close_handles is None:
+            targets: dict[int, str] = {}
+            for artifact_path, owned in self._owned_artifacts.items():
+                if owned.retained_handle is not None:
+                    targets.setdefault(
+                        owned.retained_handle,
+                        f"close retained ownership handle {owned.retained_handle} "
+                        f"({artifact_path})",
+                    )
+            for handle in self._deferred_recovery_handles:
+                targets.setdefault(handle, f"close deferred recovery handle {handle}")
+            for handle, stage in self._deferred_binding_handles.items():
+                targets.setdefault(handle, stage)
+            if self._recovery_anchor is not None:
+                targets.setdefault(
+                    self._recovery_anchor.handle,
+                    f"close recovery anchor {self._recovery_anchor.handle}",
+                )
+            for anchor in reversed(self._anchors):
+                targets.setdefault(
+                    anchor.handle,
+                    f"close run anchor {anchor.handle} ({anchor.display_path})",
+                )
+            self._pending_close_handles = targets
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        for handle, stage in tuple(self._pending_close_handles.items()):
+            try:
+                self._api.close_handle(handle)
+            except BaseException as error:
+                cleanup_errors.append((stage, error))
+                continue
+            self._pending_close_handles.pop(handle)
+            self._deferred_recovery_handles.discard(handle)
+            self._deferred_binding_handles.pop(handle, None)
+        if cleanup_errors:
+            _raise_windows_operation_cleanup_errors(
+                None,
+                cleanup_errors,
+                operation="Windows run storage close",
+            )
+        assert not self._pending_close_handles
         self._closed = True
-        for anchor in reversed(self._anchors):
-            with suppress(Exception):
-                self._api.close_handle(anchor.handle)
 
 
 def _storage_platform() -> str:
@@ -2917,19 +4817,31 @@ def _atomic_write(
     data: bytes,
     *,
     mutable: bool = False,
-) -> None:
+) -> bool:
     if isinstance(run_dir, _RunStorage):
-        run_dir.atomic_write(artifact_path, data, mutable=mutable)
-        return
+        return run_dir.atomic_write(artifact_path, data, mutable=mutable)
     with _open_run_storage(run_dir) as storage:
-        storage.atomic_write(artifact_path, data, mutable=mutable)
+        return storage.atomic_write(artifact_path, data, mutable=mutable)
 
 
-def _read_artifact(run_dir: Path | _RunStorage, artifact_path: str) -> bytes:
+def _read_artifact(
+    run_dir: Path | _RunStorage,
+    artifact_path: str,
+    *,
+    max_bytes: int | None = None,
+) -> bytes:
     if isinstance(run_dir, _RunStorage):
-        return run_dir.read_artifact(artifact_path)
+        return run_dir.read_artifact(artifact_path, max_bytes=max_bytes)
     with _open_run_storage(run_dir) as storage:
-        return storage.read_artifact(artifact_path)
+        return storage.read_artifact(artifact_path, max_bytes=max_bytes)
+
+
+# Narrow internal-package aliases for protocol 2.0.  Keep the retained 1.3
+# implementations above as the single source of no-follow storage behavior.
+RunStorage = _RunStorage
+open_evaluation_storage = _open_run_storage
+atomic_write_evaluation_artifact = _atomic_write
+read_evaluation_artifact = _read_artifact
 
 
 def _artifact_record(artifact_path: str, data: bytes) -> ArtifactRecord:
