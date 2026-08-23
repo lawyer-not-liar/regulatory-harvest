@@ -136,9 +136,19 @@ Each `rule_relationships` row contains a unique `relationship_id`, `relation_typ
 
 An exception, deadline, enforcement trigger, route, remedy, penalty, or appeal requires an appropriate relationship family. Bind each relationship to exact evidence from both endpoint source contexts. A cross-source relationship therefore needs evidence from both sources; evidence from only one endpoint is insufficient.
 
+### Materiality challenge
+
+A citation quote is not coverage. Before assigning `not_material` or drafting prose, compare each responsive source unit, provision lead, and exact citation quote against the claim and atomic graph. If an actor, duty, right, qualification, independence condition, location condition, threshold, deadline, enforcement authority, route, remedy, or consequence survives only in the quotation, map it to an atom or preserve a source-bound gap. A nearby claim or atom about the same topic is not a substitute for the independently operative element.
+
+A concrete `not_material` rationale must identify one of these ordinary reasons in prose: navigation or publication metadata; exact duplication of a named mapped atom; outside the scoped question; nonoperative or superseded text; or evidentiary context that states no independent legal proposition. These reasons are authoring guidance, not a parsed enum or a schema change.
+
 ### Visible brief binding
 
 Bind critical and material atoms and relationships to visible `legal_analysis` paragraphs, list items, or table rows using `claim_ids`, `atom_ids`, and `relationship_ids`. A visible relationship binding must include both endpoint atom IDs and a relationship claim. Related atoms may share natural prose when the unit preserves every operative actor, trigger, threshold, exception, timing rule, route, and consequence. Internal IDs never appear in rendered prose.
+
+### Final graph-to-report omission pass
+
+Trace (1) each responsive unit or lead to an atom or source-bound gap; (2) each citation quote to a narrowly stated source-supported claim; (3) each claim to the atom elements and relationships it states; (4) every critical or material atom to one visible legal-analysis binding; and (5) each visible binding into rendered report prose without losing material actors, conditions, authorities, or consequences during compression. Deterministic `completed` status proves schema, evidence, and binding consistency, but it does not excuse a substantively false `not_material` decision.
 
 After authoring, challenge exceptions, thresholds, triggers, consequences, cross-references, status changes, dates, defenses, and source limitations. Finalization writes `coverage-review.json`; repair every finite diagnostic and rerun. Do not delete gaps or dismiss responsive targets to obtain a green result.
 
