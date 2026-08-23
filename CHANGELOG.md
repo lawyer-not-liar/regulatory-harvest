@@ -4,6 +4,23 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 
 ## [Unreleased]
 
+## [0.1.0-beta.3] - 2026-08-23
+
+- Changed Protocol 2.2 grader reconciliation to score both lanes
+  independently. A common `PASS` or `FAIL` is preserved when evidence details
+  differ without changing the rubric outcome; outcome-changing disagreement
+  remains `INCONCLUSIVE` with `GRADER_DISAGREEMENT`.
+- Both raw grader aggregates remain sealed with their evidence choices so
+  requirement-level and passage-level variance remains available for later
+  calibration analysis.
+- The beta.2 private end-to-end run completed every evaluator role and grading.
+  Both lanes independently reached `FAIL`, but the prior exact-detail rule made
+  the result `INCONCLUSIVE`; beta.3 corrects that outcome-stability defect.
+- Public tests passed on Python 3.11 through 3.14. The beta.3 release has not yet
+  been privately rerun, so this prerelease makes no new private-readiness,
+  report-quality, or performance claim. Protocol 2.2 remains opt-in and
+  experimental; Protocol 2.1 remains the default.
+
 ## [0.1.0-beta.2] - 2026-08-22
 
 - Added the recoverable Protocol 2.2 attorney-report evaluator as an explicit
@@ -68,6 +85,7 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 - The GitHub prerelease packages the unchanged `0.1.0` engine. No PyPI
   distribution is published.
 
-[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.2...HEAD
+[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.3...HEAD
+[0.1.0-beta.3]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.2...v0.1.0-beta.3
 [0.1.0-beta.2]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.1...v0.1.0-beta.2
 [0.1.0-beta.1]: https://github.com/lawyer-not-liar/regulatory-harvest/releases/tag/v0.1.0-beta.1
