@@ -47,19 +47,20 @@ def test_experimental_beta_release_surfaces_are_coherent() -> None:
     changelog_words = " ".join(changelog.split())
     roadmap_words = " ".join(roadmap.split())
 
-    assert "v0.1.0-beta.2" in readme
+    assert "v0.1.0-beta.3" in readme
     assert "packages project version `0.1.0`" in readme_words
     assert "Protocol 2.1 remains the new-run default" in readme_words
-    assert "before any role response was accepted or grading began" in readme_words
-    assert "Private readiness is therefore incomplete" in readme_words
-    assert "adds two CI portability corrections" in readme_words
-    assert "complete installed-leaf identity and bytes before cleanup" in readme_words
-    assert "empty syntax fields across Python 3.11 through 3.14" in readme_words
-    assert "executable and evaluator runtime bytes remain unchanged" not in readme_words.lower()
-    assert "## [0.1.0-beta.2] - 2026-08-22" in changelog
+    assert "completed every evaluator role and grading" in readme_words
+    assert "Both grader lanes independently reached `FAIL`" in readme_words
+    assert "outcome-stable reconciliation" in readme_words
+    assert "Raw lane aggregates remain preserved" in readme_words
+    assert "beta.3 release has not yet been privately rerun" in readme_words
+    assert "## [0.1.0-beta.3] - 2026-08-23" in changelog
     assert "Protocol 2.2 remains opt-in and experimental" in changelog
-    assert "immediate inode-number reuse" in changelog
-    assert "does not loosen evidence binding or policy checks" in changelog_words
+    assert "Both lanes independently reached `FAIL`" in changelog
+    assert "outcome-changing disagreement remains `INCONCLUSIVE`" in changelog_words
+    assert "raw grader aggregates remain sealed" in changelog_words
+    assert "beta.3 release has not yet been privately rerun" in changelog_words
     assert "LLM supplies substantive judgments" in roadmap_words
     assert "deterministic code constructs canonical artifacts" in roadmap_words
 

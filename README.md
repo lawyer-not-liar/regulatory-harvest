@@ -1,23 +1,25 @@
 # Regulatory Harvest
 
-> **Experimental beta (`v0.1.0-beta.2`).** The public test, type, lint,
-> package, reproducibility, and privacy gates passed. A separately authorized
-> private readiness evaluation verified package and input binding, live role
-> execution, safe pause, and exact recovery, but evidence references could not
-> be resolved before any role response was accepted or grading began.
-> Private readiness is therefore incomplete. No performance, benchmark, or
+> **Experimental beta (`v0.1.0-beta.3`).** The public test, type, lint,
+> package, reproducibility, and privacy gates passed.
+> The beta.2 private run completed every evaluator role and grading.
+> Both grader lanes independently reached `FAIL`, but exact detail equality
+> made the run `INCONCLUSIVE`.
+> Beta.3 adds outcome-stable reconciliation.
+> Raw lane aggregates remain preserved for audit.
+> The beta.3 release has not yet been privately rerun, so private readiness
+> remains incomplete. No performance, benchmark, or
 > report-quality claim is made. Results are AI Generated and may contain
 > errors. Output must be validated by an attorney before the attorney delivers
 > legal advice.
 
-The GitHub prerelease label `v0.1.0-beta.2` packages project version `0.1.0`.
-The beta suffix describes the release channel. This release-preparation commit
-builds on reviewed candidate `bdebfecc1e39812844c77f0a895d563e8f786e80` and
-adds two CI portability corrections: POSIX rollback now confirms complete
-installed-leaf identity and bytes before cleanup, and the development-only AST
-policy inventory canonicalizes empty syntax fields across Python 3.11 through
-3.14. The ZIP therefore has a new archive hash. Neither correction loosens
-evidence binding or policy checks. Protocol 2.2 remains opt-in and experimental;
+The GitHub prerelease label `v0.1.0-beta.3` packages project version `0.1.0`.
+The beta suffix describes the release channel. This release builds on exact
+merge commit `bba4e5957375d8f73d6832f78f11a3041e4517fd`. Protocol 2.2 now
+scores both grader lanes independently and preserves their common `PASS` or
+`FAIL`; a lane-level outcome difference remains substantive
+`INCONCLUSIVE`. Evidence validation, rubric thresholds, and immutable prior-run
+verification are unchanged. Protocol 2.2 remains opt-in and experimental;
 Protocol 2.1 remains the new-run default.
 
 Regulatory Harvest is an installable research skill for attorneys. Ask a legal question in ordinary language, attach your sources or authorize current web research, and receive a cited Markdown briefing plus a machine-verifiable evidence bundle.
@@ -36,8 +38,10 @@ for independent audit, refereeing, and grading. Source-review and source-audit
 fragments add at most five items. After two invalid internal drafts, the driver
 returns exit 6 with the exact request pending; a later compatible invocation can
 resume it. Only `COMPLETED` and substantive INCONCLUSIVE are terminal Protocol 2.2
-outcomes. This experimental path makes no benchmark claim, and qualified-attorney
-validation remains required.
+outcomes. Grader lanes are scored independently: differences in cited passages or
+requirement-level grades remain visible in the sealed aggregates, while only a
+difference in the scored outcome produces `GRADER_DISAGREEMENT`. This experimental
+path makes no benchmark claim, and qualified-attorney validation remains required.
 
 ### Retained Protocol 2.1 evaluation behavior
 
