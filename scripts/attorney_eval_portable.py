@@ -14432,6 +14432,93 @@ def _v22_score(observations: list[tuple[str, str]]) -> tuple[str, list[str]]:
     return ("FAIL" if reasons else "PASS"), reasons
 
 
+def _v22_merge_grader_outcomes(
+    first: tuple[str, list[str]], second: tuple[str, list[str]]
+) -> tuple[str, list[str]]:
+    # Preserve raw lane evidence while reconciling only the independently
+    # scored outcome, matching the full Protocol 2.2 implementation.
+    if first[0] != second[0]:
+        return "INCONCLUSIVE", ["GRADER_DISAGREEMENT"]
+    return first[0], list(dict.fromkeys(first[1] + second[1]))
+
+
+def _v22_ordinary_observations(
+    baseline: JsonObject, aggregate: JsonObject
+) -> list[tuple[str, str]]:
+    grades = {
+        grade["requirement_id"]: grade
+        for fragment in cast(list[JsonObject], aggregate["ordinary_fragments"])
+        for grade in cast(list[JsonObject], fragment["requirement_grades"])
+    }
+    return [
+        (
+            cast(str, requirement["importance"]),
+            cast(str, grades[requirement["requirement_id"]]["disposition"]),
+        )
+        for requirement in cast(list[JsonObject], baseline["requirements"])
+    ]
+
+
+def _v22_lane_sensitivity_outcome(
+    baseline: JsonObject, aggregate: JsonObject
+) -> tuple[str, list[str], list[str]]:
+    ordinary = _v22_ordinary_observations(baseline, aggregate)
+    contested = {
+        fragment["contested_requirement_id"]: fragment
+        for fragment in cast(list[JsonObject], aggregate["contested_fragments"])
+    }
+    reviewer_world = list(ordinary)
+    auditor_world = list(ordinary)
+    differing: list[str] = []
+    for item in cast(list[JsonObject], baseline["contested_requirements"]):
+        contested_id = cast(str, item["contested_requirement_id"])
+        fragment = contested[contested_id]
+        reviewer = cast(JsonObject | None, item["reviewer_alternative"])
+        auditor = cast(JsonObject | None, item["auditor_alternative"])
+        reviewer_observation = (
+            None
+            if reviewer is None
+            else (
+                cast(str, reviewer["importance"]),
+                cast(
+                    str,
+                    cast(JsonObject, fragment["reviewer_alternative_grade"])[
+                        "disposition"
+                    ],
+                ),
+            )
+        )
+        auditor_observation = (
+            None
+            if auditor is None
+            else (
+                cast(str, auditor["importance"]),
+                cast(
+                    str,
+                    cast(JsonObject, fragment["auditor_alternative_grade"])[
+                        "disposition"
+                    ],
+                ),
+            )
+        )
+        if reviewer_observation is not None:
+            reviewer_world.append(reviewer_observation)
+        if auditor_observation is not None:
+            auditor_world.append(auditor_observation)
+        if reviewer_observation != auditor_observation:
+            differing.append(contested_id)
+    reviewer_outcome = _v22_score(reviewer_world)
+    auditor_outcome = _v22_score(auditor_world)
+    if "INCONCLUSIVE" in {reviewer_outcome[0], auditor_outcome[0]}:
+        return "INCONCLUSIVE", ["BASELINE_EVIDENCE_INSUFFICIENT"], []
+    if reviewer_outcome[0] != auditor_outcome[0]:
+        return "INCONCLUSIVE", ["OUTCOME_SENSITIVE_BASELINE_DISPUTE"], differing
+    disposition, reasons = _v22_merge_grader_outcomes(
+        reviewer_outcome, auditor_outcome
+    )
+    return disposition, reasons, []
+
+
 def _v22_grade_artifacts(
     calls: list[JsonObject], files: dict[str, bytes], baseline: JsonObject,
     envelope: JsonObject, batches: list[JsonObject],
@@ -14471,23 +14558,10 @@ def _v22_grade_artifacts(
         if (label, 1) not in by_coordinate or (label, 2) not in by_coordinate:
             continue
         first, second = by_coordinate[(label, 1)], by_coordinate[(label, 2)]
-        def view(aggregate: JsonObject) -> object:
-            return (
-                [[(grade["requirement_id"], grade["disposition"], grade["report_passages"]) for grade in cast(list[JsonObject], fragment["requirement_grades"])] for fragment in cast(list[JsonObject], aggregate["ordinary_fragments"])],
-                [[fragment["contested_requirement_id"], cast(JsonObject, fragment["reviewer_alternative_grade"])["disposition"], cast(JsonObject, fragment["auditor_alternative_grade"])["disposition"], fragment["ambiguity_disposition"]] for fragment in cast(list[JsonObject], aggregate["contested_fragments"])],
-            )
-        grades = {
-            grade["requirement_id"]: grade
-            for fragment in cast(list[JsonObject], first["ordinary_fragments"])
-            for grade in cast(list[JsonObject], fragment["requirement_grades"])
-        }
-        ordinary_observations = [
-            (cast(str, requirement["importance"]), cast(str, grades[requirement["requirement_id"]]["disposition"]))
-            for requirement in cast(list[JsonObject], baseline["requirements"])
-        ]
-        disposition, reasons = _v22_score(ordinary_observations)
-        if view(first) != view(second):
-            disposition, reasons = "INCONCLUSIVE", ["GRADER_DISAGREEMENT"]
+        disposition, reasons = _v22_merge_grader_outcomes(
+            _v22_score(_v22_ordinary_observations(baseline, first)),
+            _v22_score(_v22_ordinary_observations(baseline, second)),
+        )
         reconciliation_body: JsonObject = {
             "anonymous_label": label, "absolute_disposition": disposition,
             "reason_codes": reasons, "grader_aggregates": [first, second],
@@ -14498,32 +14572,16 @@ def _v22_grade_artifacts(
         if not baseline["requirements"] and not baseline["contested_requirements"]:
             sensitivity_disposition, sensitivity_reasons = "INCONCLUSIVE", ["BASELINE_EVIDENCE_INSUFFICIENT"]
         elif disposition != "INCONCLUSIVE":
-            contested_by_id = {item["contested_requirement_id"]: item for item in cast(list[JsonObject], baseline["contested_requirements"])}
-            reviewer_world = list(ordinary_observations)
-            auditor_world = list(ordinary_observations)
-            differing: list[str] = []
-            for fragment in cast(list[JsonObject], first["contested_fragments"]):
-                item = contested_by_id[fragment["contested_requirement_id"]]
-                reviewer = cast(JsonObject | None, item["reviewer_alternative"])
-                auditor = cast(JsonObject | None, item["auditor_alternative"])
-                reviewer_observation = None if reviewer is None else (cast(str, reviewer["importance"]), cast(str, cast(JsonObject, fragment["reviewer_alternative_grade"])["disposition"]))
-                auditor_observation = None if auditor is None else (cast(str, auditor["importance"]), cast(str, cast(JsonObject, fragment["auditor_alternative_grade"])["disposition"]))
-                if reviewer_observation is not None:
-                    reviewer_world.append(reviewer_observation)
-                if auditor_observation is not None:
-                    auditor_world.append(auditor_observation)
-                if reviewer_observation != auditor_observation:
-                    differing.append(cast(str, fragment["contested_requirement_id"]))
-            reviewer_result, reviewer_reasons = _v22_score(reviewer_world)
-            auditor_result, auditor_reasons = _v22_score(auditor_world)
-            if "INCONCLUSIVE" in {reviewer_result, auditor_result}:
-                sensitivity_disposition, sensitivity_reasons = "INCONCLUSIVE", ["BASELINE_EVIDENCE_INSUFFICIENT"]
-            elif reviewer_result != auditor_result:
-                changing = differing
-                sensitivity_disposition, sensitivity_reasons = "INCONCLUSIVE", ["OUTCOME_SENSITIVE_BASELINE_DISPUTE"]
-            else:
-                sensitivity_disposition = reviewer_result
-                sensitivity_reasons = sorted(set(reviewer_reasons + auditor_reasons))
+            first_sensitivity = _v22_lane_sensitivity_outcome(baseline, first)
+            second_sensitivity = _v22_lane_sensitivity_outcome(baseline, second)
+            sensitivity_disposition, sensitivity_reasons = (
+                _v22_merge_grader_outcomes(
+                    first_sensitivity[:2], second_sensitivity[:2]
+                )
+            )
+            changing = list(
+                dict.fromkeys(first_sensitivity[2] + second_sensitivity[2])
+            )
         sensitivity_body: JsonObject = {
             "anonymous_label": label, "baseline_fingerprint": baseline["baseline_fingerprint"],
             "reconciliation_fingerprint": reconciliation["reconciliation_fingerprint"],

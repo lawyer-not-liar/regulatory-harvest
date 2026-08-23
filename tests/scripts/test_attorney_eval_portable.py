@@ -7231,6 +7231,95 @@ def _protocol_22_storage_response(
     return cast(dict[str, Any], response)
 
 
+def _protocol_22_outcome_stable_variance_response(
+    portable: ModuleType, request: dict[str, Any]
+) -> dict[str, Any]:
+    if request["operation"] != "ordinary_grade_fragment":
+        return _protocol_22_storage_response(portable, request, disputed=False)
+    payload = request["payload"]
+    lane = payload["grader_lane"]
+    dispositions = (
+        ("partially_met", "met")
+        if lane == 1
+        else ("partially_met", "partially_met")
+    )
+    passages = ("First grading passage.", "Second grading passage.")
+    draft = {
+        "requirement_grades": [
+            {
+                "requirement_ordinal": ordinal,
+                "disposition": disposition,
+                "report_passages": [passages[ordinal - 1]],
+                "rationale": "The requirement was independently graded.",
+                "omission": None
+                if disposition == "met"
+                else "The report does not fully state the requirement.",
+            }
+            for ordinal, disposition in enumerate(dispositions, 1)
+        ],
+        "rationale": "The issued ordinary batch was independently graded.",
+    }
+    response, reasons = portable._v22_compile_draft(
+        request,
+        draft,
+        {
+            "provider_name": "local-scripted-fixture",
+            "model_name": "no-provider",
+            "judge_isolation": "scripted_fixture",
+        },
+    )
+    assert response is not None, reasons
+    return cast(dict[str, Any], response)
+
+
+def test_protocol_22_outcome_stable_grader_variance_has_full_portable_parity(
+    tmp_path: Path,
+) -> None:
+    portable = _load_protocol_22_portable()
+    case_payload = _case_payload_with_report(
+        "First grading passage. Second grading passage."
+    )
+    full_run = tmp_path / "full-outcome-stable-variance"
+    portable_run = tmp_path / "portable-outcome-stable-variance"
+    initialize_v22_core(
+        _core_case_from_payload(case_payload), full_run, seed_hex="8" * 64
+    )
+    portable.initialize_evaluation_v22(
+        case_payload, portable_run, seed_hex="8" * 64
+    )
+
+    for _ in range(20):
+        full_request = next_v22_core(full_run)
+        portable_request = portable.next_evaluator_request_v22(portable_run)
+        assert (full_request is None) == (portable_request is None)
+        if full_request is None:
+            break
+        assert portable_request is not None
+        assert canonical_json_bytes(full_request.model_dump(mode="json")) == (
+            portable.canonical_json_bytes(portable_request)
+        )
+        response = _protocol_22_outcome_stable_variance_response(
+            portable, portable_request
+        )
+        full_submitted = guarded_submit_v22_core(full_run, response)
+        portable_submitted = portable.guarded_submit_evaluator_response_v22(
+            portable_run, response
+        )
+        assert full_submitted.accepted and portable_submitted["accepted"]
+        assert _tree_bytes(full_run) == _tree_bytes(portable_run)
+    else:
+        pytest.fail("Protocol 2.2 variance lifecycle did not terminate")
+
+    result = json.loads((full_run / "result.json").read_text(encoding="utf-8"))
+    assert result["terminal_status"] == "COMPLETED"
+    assert result["reports"][0]["reconciliation"]["absolute_disposition"] == "FAIL"
+    assert result["reports"][0]["sensitivity"]["absolute_disposition"] == "FAIL"
+    assert result["reports"][0]["reconciliation"]["reason_codes"] == [
+        "CRITICAL_RECALL_BELOW_FLOOR",
+        "WEIGHTED_COVERAGE_BELOW_FLOOR",
+    ]
+
+
 def _protocol_22_prepare_response_pair(
     portable: ModuleType,
     tmp_path: Path,
