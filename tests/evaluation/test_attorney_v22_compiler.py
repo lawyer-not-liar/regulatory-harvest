@@ -190,6 +190,51 @@ def _alternative_world_aggregate(
     )
 
 
+def _ordinary_outcome_aggregate(
+    baseline: CanonicalBaselineV22,
+    lane: int,
+    *,
+    dispositions: tuple[str, ...],
+    passages: tuple[str, ...],
+) -> GraderAggregateV22:
+    report = "First grading passage. Second grading passage."
+    requirement_ids = [item.requirement_id for item in baseline.requirements]
+    assert len(requirement_ids) == len(dispositions) == len(passages)
+    grade_by_id = dict(zip(requirement_ids, zip(dispositions, passages, strict=True), strict=True))
+    fragments = []
+    for batch in ordinary_grade_batches_v22(baseline, "A", lane):
+        fragments.append(
+            validate_grade_fragment_v22(
+                baseline,
+                {
+                    "schema_version": "2.2",
+                    "anonymous_label": "A",
+                    "grader_lane": lane,
+                    "batch_ref": batch.batch_ref,
+                    "baseline_fingerprint": baseline.baseline_fingerprint,
+                    "report_fingerprint": hashlib.sha256(report.encode()).hexdigest(),
+                    "requirement_grades": [
+                        {
+                            "requirement_id": requirement_id,
+                            "disposition": grade_by_id[requirement_id][0],
+                            "report_passages": []
+                            if grade_by_id[requirement_id][0] in {"not_met", "uncertain"}
+                            else [grade_by_id[requirement_id][1]],
+                            "rationale": "The requirement was independently graded.",
+                            "omission": None
+                            if grade_by_id[requirement_id][0] == "met"
+                            else "The report does not fully state the requirement.",
+                        }
+                        for requirement_id in batch.requirement_ids
+                    ],
+                    "rationale": "The issued ordinary batch was independently graded.",
+                },
+                report,
+            )
+        )
+    return aggregate_grader_lane_v22(baseline, "A", lane, tuple(fragments), ())
+
+
 def _alternative_world_sensitivity(
     baseline: CanonicalBaselineV22,
     *,
@@ -588,6 +633,95 @@ def test_v22_grade_conversion_reconciles_two_lanes_and_preserves_sensitivity() -
     )
     with pytest.raises(RubricValidationError, match="RECONCILIATION_INVALID"):
         evaluate_outcome_sensitivity_v22(baseline, resealed)
+
+
+def test_v22_reconciliation_preserves_common_pass_despite_passage_variance() -> None:
+    baseline = _alternative_world_baseline(ordinary_count=1, contested_count=0)
+    first = _ordinary_outcome_aggregate(
+        baseline,
+        1,
+        dispositions=("met",),
+        passages=("First grading passage.",),
+    )
+    second = _ordinary_outcome_aggregate(
+        baseline,
+        2,
+        dispositions=("met",),
+        passages=("Second grading passage.",),
+    )
+
+    reconciliation = reconcile_grader_lanes_v22(baseline, first, second)
+
+    assert reconciliation.absolute_disposition == "PASS"
+    assert reconciliation.reason_codes == ()
+
+
+def test_v22_reconciliation_preserves_common_fail_despite_grade_variance() -> None:
+    baseline = _alternative_world_baseline(ordinary_count=2, contested_count=0)
+    first = _ordinary_outcome_aggregate(
+        baseline,
+        1,
+        dispositions=("partially_met", "met"),
+        passages=("First grading passage.", "Second grading passage."),
+    )
+    second = _ordinary_outcome_aggregate(
+        baseline,
+        2,
+        dispositions=("partially_met", "partially_met"),
+        passages=("First grading passage.", "Second grading passage."),
+    )
+
+    reconciliation = reconcile_grader_lanes_v22(baseline, first, second)
+
+    assert reconciliation.absolute_disposition == "FAIL"
+    assert reconciliation.reason_codes == (
+        "CRITICAL_RECALL_BELOW_FLOOR",
+        "WEIGHTED_COVERAGE_BELOW_FLOOR",
+    )
+
+
+def test_v22_reconciliation_keeps_outcome_changing_lane_variance_inconclusive() -> None:
+    baseline = _alternative_world_baseline(ordinary_count=1, contested_count=0)
+    first = _ordinary_outcome_aggregate(
+        baseline,
+        1,
+        dispositions=("met",),
+        passages=("First grading passage.",),
+    )
+    second = _ordinary_outcome_aggregate(
+        baseline,
+        2,
+        dispositions=("partially_met",),
+        passages=("Second grading passage.",),
+    )
+
+    reconciliation = reconcile_grader_lanes_v22(baseline, first, second)
+
+    assert reconciliation.absolute_disposition == "INCONCLUSIVE"
+    assert reconciliation.reason_codes == ("GRADER_DISAGREEMENT",)
+
+
+def test_v22_reconciliation_defers_contested_variance_to_sensitivity() -> None:
+    baseline = _alternative_world_baseline(ordinary_count=1, contested_count=1)
+    first = _alternative_world_aggregate(
+        baseline,
+        1,
+        contested=(("met", "met"),),
+    )
+    second = _alternative_world_aggregate(
+        baseline,
+        2,
+        contested=(("met", "not_met"),),
+    )
+
+    reconciliation = reconcile_grader_lanes_v22(baseline, first, second)
+    sensitivity = evaluate_outcome_sensitivity_v22(baseline, reconciliation)
+
+    assert reconciliation.absolute_disposition == "PASS"
+    assert reconciliation.reason_codes == ()
+    assert sensitivity.absolute_disposition == "INCONCLUSIVE"
+    assert sensitivity.reason_codes == ("GRADER_DISAGREEMENT",)
+    assert sensitivity.outcome_determinative_contested_ids == ("CONT-0001",)
 
 
 @pytest.mark.parametrize(
@@ -2011,11 +2145,8 @@ _EXPECTED_TASK3_ALL_CALLS: Counter[_Task3Call] = Counter(
         ('attorney_v22_compiler.py', '<module>#1::_review_fragments#1', 'tuple', (), '0c6490f9b751e5840d3394855715e37ce30dcd7c9c8a1b5243fb8697850f4c92'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::_review_fragments#1::<GeneratorExp>#1', '_strict_rehydrate_v22', ('validation',), '4d5434639885551f39cfb368b002c5899f5782e503c3f875ec8efdbc12487f41'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::_review_fragments#1::<GeneratorExp>#3', 'len', (), '9027a46d044cc32d0632daa8de371833e56cac88d8f5e38c6075319e934b47f2'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::_same_observations_v22#1', 'view', (), '33b604f4774aab5649ec3e5eab85d85806ac3fe3844c48226015fefe4879a142'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::_same_observations_v22#1', 'view', (), '50bb0d5127db07cf2833614071ec1a0b7d24d77d17974bbe42cebc831d148fe8'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::_same_observations_v22#1::view#1', 'tuple', (), '2858f9c5f238802cb32bbf4c4828d89529eafef9d2481f0eb916969c1330a965'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::_same_observations_v22#1::view#1', 'tuple', (), 'd1c84ff7b3c1f11ce3fadc1d0c40511a841c091413e14dbe487602d7d54e2a2f'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::_same_observations_v22#1::view#1::<GeneratorExp>#1', 'tuple', (), 'eb9a4f83c801bb62b0192362517603e631fe07b2ffc242b1861c67f9ec8a9b18'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::_merge_grader_outcomes_v22#1', 'dict.fromkeys', (), 'd982331af4e17ca05d24403db64c2856204968afdd15aee361b06d82b80dac61'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::_merge_grader_outcomes_v22#1', 'tuple', (), '59115d76c4e4383dcc773cc4213b7344f14249367af4af4abc46e1d94975d981'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::_score_v22#1', 'any', (), '96432c0b1ee80c2413d0854aa6ab4219b36549b86cb4d4bd6994082a498cb56d'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::_score_v22#1', 'len', (), 'bc1ca01a8cb3093be160eeae49561ee18e20b201432bef6740290601a3ef35dd'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::_score_v22#1', 'reasons.append', (), '25c310f4329b3a33e7adb7598af673f8c5292e8193000116c75173953163379a'): 1,  # noqa: E501
@@ -2177,27 +2308,29 @@ _EXPECTED_TASK3_ALL_CALLS: Counter[_Task3Call] = Counter(
         ('attorney_v22_compiler.py', '<module>#1::compile_baseline_v22#1::<GeneratorExp>#1', 'item.decision.model_dump', ('serialization',), '51058ed9ea844df54ea15396754e7f16f3c0d09a71fd4549900e48bee322acd5'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::compile_baseline_v22#1::<GeneratorExp>#1', 'zip', (), '639944494e554faaee7b39a7aa2741a2a809adb50c357fcbeb9c103adc209547'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::compile_baseline_v22#1::<ListComp>#1', 'item.model_dump', ('serialization',), 'a2ff83926a3385245f4eae5f7cc3326871d49f19646d0f24db6ff98d49ce4812'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'ReconciledGradeV22.validate_for_baseline', (), '82609182ab303aea3ec6e0fc64e645b5e71c8ebd8bd0d73402898107412db905'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'RubricValidationError', (), '1eaa84d72af6ba0d0ae3fbe3f6c638407a8de5f75a4241df346aeeb9d880cae8'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'RubricValidationError', (), 'f18861edf04c5a28396306d649182d39ba1ea0caa8908e423c8187600c828de7'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'SensitivityRecordV22.model_validate', ('validation',), '6a97d9bbf4fec6914efb447d389dfb5c30df2016ee525db54394c29872ad9f5c'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', '_hash', (), 'be1a46d500b7e5cdc3be63fb664fdc02361f91682f7ea86a3719575088418d35'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', '_ordinary_observations_v22', (), 'b55ad4d5c1f318ab53960161f036931519ba6d25467c341c44b4df2399f57a01'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', '_score_v22', (), '1b7676a082252fccaa68222d7f521e56c66af3b9b8df830c697ddf0bd53ec5a9'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', '_score_v22', (), '7c86e47ca56233b7f6940dd31fe31fe29c8e54619a0ea0e498a6fdfb57998b1d'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', '_strict_rubric', ('validation',), '49888a51ed99832f28dbb28f58ee2679778c3127a187abd908945ebcd7e3d76d'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', '_verified_grader_aggregate', (), 'b8b553afdfb731f265d85090c0332cfb7f7f100075cadb36c6ce1bc466de1bc8'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'auditor_world.append', (), '7653ae69350a7c71f993ae0496ca89e98f215cac8a1c963d2ef8e971a296563a'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'differing_alternatives.append', (), '3d3b2c2b317aac48792ea59a963e639ef23b1e8d337cd2b3c8e5a5fb4acd1626'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'list', (), '99eac0140f90120e295c9f0d393edc2ec7cf5f079d403c65c11a9f06b2ea8c72'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'list', (), 'bb788abdd24ee776973e0a0b07848bd88a5f09208ce4922ccaec4f889ac1a6c7'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'reconcile_grader_lanes_v22', (), '193cca145ababc1c69d11b0c26b8ff157f5c8add6620331fb4dd056e59c7e6c7'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'reviewer_world.append', (), '41e7db0b4c7aba4273a418553f84547c04fdd199f5c16436ad9867fee6f1b579'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'set', (), '237ee594cb4d7455e727a2934f07d100d5022314717cbac861af43d2d64c93a3'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'sorted', (), '50a7a4b8dc3717ea8bd715ea4a4ad37d73886f316c1a69267c66e1d4b27df177'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'tuple', (), '1aa2209dee3404e7b7291442af1d877cceb7245e8e45a6670c9b7a72e5bb1fb3'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'tuple', (), 'fafc343dbebd29da3dc8b48977ea183dee3f67ae47b699b947043d434fd44077'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'verify_canonical_baseline_v22', ('validation',), '00b5b7d6a22adfc5bd478fe0be4a77810211074909beb0abb54508051fc36457'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'ReconciledGradeV22.validate_for_baseline', (), '34b596012509e523921a56087a2fca0e4cc6844b46b87dcb4125f5e62ae8d4ab'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'RubricValidationError', (), '312bffae2c8513cd7918453679739c5a288fe3010f56a0290d2058cb88000e23'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'RubricValidationError', (), '55250adb6e44ee85e29da80f2acefc0934544655d3565145050a315f43d97c35'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'SensitivityRecordV22.model_validate', ('validation',), '4699983cf9c19d41b8e5ab6b620d124b939904d40123a054b35ab6797b24e2c5'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', '_hash', (), 'ae9c13190600e12c81ced69b221eae4188d32142bc34f22942711fff585a0225'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', '_merge_grader_outcomes_v22', (), '34a64218c34a831eb532dc18c933405c6a1afa61aa5be49a0b79c4fc931411b4'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', '_strict_rubric', ('validation',), '6e69eebaef5c5002c629df0b9953a9896f70de85c0683f3fd439fdc7a533d421'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', '_verified_grader_aggregate', (), 'a09f2633de77e980c37b32e495c3a7a488b7406636d1bf681f1a89cce13ac6f4'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'dict.fromkeys', (), '9317d41e4b1c8514fab3b4593fc246b97b12a331b5856902f17d6b6346ab0571'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'reconcile_grader_lanes_v22', (), 'a3b4380a29160cd5819b2215bbd8ae3b0a7c9abc32622d8ad5a15f199aafccc8'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'tuple', (), 'bf18e4b1e6f79dba5884f1b534bf29461935956cdeddae449e07baa4ec4966b8'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'verify_canonical_baseline_v22', ('validation',), '4677b286f7b12c6c62c289dd0f9743452cd5456e4fc89f783f6a6d6e2582a617'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::<ListComp>#1', 'lane_outcome', (), 'f7dc2d10155fe952dbd83e864d1e4a05a61896ecfb5af046978afeb8f64eac67'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::lane_outcome#1', '_merge_grader_outcomes_v22', (), 'e268eb71edffd52490642d80c66c6ab18e130164d8da822afb2ed25bbc608365'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::lane_outcome#1', '_ordinary_observations_v22', (), 'f070136d77812a08853d49a748d2e4e4b270a8ec528d7723b8560312cefcc751'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::lane_outcome#1', '_score_v22', (), '2579b1ca4ced0005f519b9b81109873cf7252c7b4c9b4458519a8e6cb0dc0ee8'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::lane_outcome#1', '_score_v22', (), 'bd1a3d58b9a935992ac21ab0b500e3e875465847116b5291c6f1e79455ea3991'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::lane_outcome#1', 'auditor_world.append', (), '081c64da08f2ccb111882fb2b275f2380b7272ab6feedf59a2a6401fe4a9c87a'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::lane_outcome#1', 'differing_alternatives.append', (), '1398a8c338c7b71cdb0066d3917633fbe2291af30301f24b3181a846e0b8c710'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::lane_outcome#1', 'list', (), '98298fada240e4964ae33fcf0aa734911e0cbc13a2e300a55710cb8a91b588e3'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::lane_outcome#1', 'list', (), 'f04d71114630815a3545496ee98144502d83a5300e4d3cc60e1d6d24dc23aa63'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::lane_outcome#1', 'reviewer_world.append', (), '6959d8a01b3e1cbcaddfe2573b2f764bdad8e2812d4c4639ae326cd63fcdad52'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::lane_outcome#1', 'tuple', (), '4316e3dc4203ac060319695a9a142a4c3e3c90e9c6f86b9dd0de9772abc2c731'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::ordinary_grade_batches_v22#1', 'RubricValidationError', (), '54d2ae4d0cdc04a95d1c3e382fae874db37093f43a6253481515b138f5b062ad'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::ordinary_grade_batches_v22#1', '_strict_grade_coordinate_v22', ('validation',), 'e60afb37a863efdb58d538633ac494f9d0f6a074f4c51e224182c293ace29f27'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::ordinary_grade_batches_v22#1', 'len', (), '78ea68ec2879db2d516c6278db5122518928502310e1aa1b3a0469248c2523a8'): 1,  # noqa: E501
@@ -2207,18 +2340,20 @@ _EXPECTED_TASK3_ALL_CALLS: Counter[_Task3Call] = Counter(
         ('attorney_v22_compiler.py', '<module>#1::ordinary_grade_batches_v22#1::<GeneratorExp>#1', 'len', (), 'e3237cef979e8501a4e0696f4098a42207cfce0f9c61c73b2e89967b32885f7f'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::ordinary_grade_batches_v22#1::<GeneratorExp>#1', 'range', (), '98ef04841c83b469ce774f56b9708ed5508ad6386dcc3bac393a20eb06f2c356'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::ordinary_grade_batches_v22#1::<GeneratorExp>#1', 'tuple', (), '48fa1bebca11e98e13d550308071473cd3d27937f2b323aa17b91e206dd5488e'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', 'ReconciledGradeV22.validate_for_baseline', (), '3f8ef2f99710453550bbc888dc9c162d321e96c343482cddf5d6b541a0a4babb'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', 'ReconciledGradeV22.validate_for_baseline', (), '6ed2bb5f4caeab6448e26f1683543e9afe7cef34482547a3038af606aa8b7a5c'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', 'RubricValidationError', (), '56afb3c160c677f9484be7674f5c973a5232594da51f981facef5a1bea728eb0'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', 'ValueError', (), 'b76a8116ca28c7a32c1da11c87f0b14bbfd984b9b07510d2f576dbd5cc135ec7'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', '_hash', (), 'f3b3b7cc86ae71f35ceec4b45de8a3f5481c21ea464dbbc648214e7fe32c100f'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', '_hash', (), '29eefa3c34b1ca4c1c7c540225f4434b2873d66c18f54ebeaabd074008b2a24d'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', '_merge_grader_outcomes_v22', (), 'a98441faca6523f5211bb88177389eaf51f8beb627c49a484a0472dcd7983162'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', '_ordinary_observations_v22', (), '93eb6c7c477e36dd4a976810807a13dcca6e3ebda9fd41673a380531c4b61bca'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', '_ordinary_observations_v22', (), 'c38f33b4d7c0236c05098213bf9d231a65869d73e3370b7877a3d0e87ff0ef5c'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', '_same_observations_v22', (), '3da3f4f89411b480f5bf707ebdce71bdf53c043105294ff91df64123c7fe5830'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', '_score_v22', (), '61bded88776a3613aa5bbb03887d6a58a9dc8fef775072e78d999398daee8f52'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', '_score_v22', (), 'c45f6761b5c7472935efc8ef2ddc889fc8dbe7f0281158ff1786eb9cc18ca97c'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', '_strict_rubric', ('validation',), '0c5a9a5eb082c077ed2f3eafa7741792e13580c8d4ac5958c490ed1e14da8de4'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', '_verified_grader_aggregate', (), '1eeb01d7610c4d30d28fde5383debb491f9054869fd461f618d517ddae909e51'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', '_verified_grader_aggregate', (), '67f268e535ccc0c7f5f3c3cd7a324f4f90801355888b85b838a80091a3123ca0'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', 'first.model_dump', ('serialization',), 'a18f74cd7445cf72c8cd9ccd6d15f6463edd40ec12aed3141d696fc82406e49c'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', 'second.model_dump', ('serialization',), 'db06178b9a1e04be670ce62bc60c6bbe5e2e1fe5ee1bfa743de6d73576b18630'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', 'first.model_dump', ('serialization',), '65e0e071055bdbba2d0788721b4bb43bb7e90b2274be91e66885b5662f057eae'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', 'second.model_dump', ('serialization',), '4fb512cb681871ff047ed8943e6e6fa8f335c0a343e0b35a94accae2eb140c40'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', 'verify_canonical_baseline_v22', ('validation',), 'e8a8532236387765c2082e72d735fd6ae98af9d5ea3393df9bd42691bf9b6ee1'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::referee_dispute_fingerprint_v22#1', '_referee_dispute_fingerprint_from_validated_v22', (), '869282c639376045a495549f676b124766c997cfde86d32cd8a0466d48ac4939'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::referee_dispute_fingerprint_v22#1', '_validated_referee_dispute_v22', (), '4e79ea62e7d1df809df2e63baa6a72b0ab9ecc4ca91d25cbfd94ca389a75e2c5'): 1,  # noqa: E501
@@ -2567,8 +2702,7 @@ _EXPECTED_TASK3_DEFINITIONS: Counter[_Task3Definition] = Counter(
         ('attorney_v22_compiler.py', '<module>#1::_referee_dispute_fingerprint_from_validated_v22#1', 'FunctionDef', 'f45f2f6cda88727156a10a6622e75d7b7428140a6cea892ebfce09e5a1524417'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::_referee_disputes_from_verified_sources_v22#1', 'FunctionDef', '893d52005cc41c985cacba3f4bb208b589bbe4ad448e707c6b377736df61ea93'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::_review_fragments#1', 'FunctionDef', 'fca8ce283eab4f978d704a64dca96d4921f745ae7fb861c2cec2aa9e83c18df8'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::_same_observations_v22#1', 'FunctionDef', '1198331158ca1d55cbb44c9bcb16f0d162ca9231a946c2734ea2d4ab3a6c6b22'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::_same_observations_v22#1::view#1', 'FunctionDef', '46cdbb6ece1ca5d0cf9f754f268e0c10f71bedca02fb7962244322769c3f29c3'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::_merge_grader_outcomes_v22#1', 'FunctionDef', 'f8cb1ac5378940500194ae724deade5889a34f797e9a271244f852f4c873ac09'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::_score_v22#1', 'FunctionDef', 'a26bebe44a85e45b5587c00d5d490582ef266bbcd8ddfab7acdf9407d402c48a'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::_semantic_identity#1', 'FunctionDef', 'd95544c0c85396205078552479f9c42f0f5bc9f555baf529fe53b94840d6d6c2'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::_SourceFragmentSemanticResponseErrorV22#1', 'ClassDef', 'bd1e064ac1f92b7d4af4ee10b85af6dd7dc85839d6ca03da8888d605a558c314'): 1,  # noqa: E501
@@ -2588,9 +2722,10 @@ _EXPECTED_TASK3_DEFINITIONS: Counter[_Task3Definition] = Counter(
         ('attorney_v22_compiler.py', '<module>#1::build_referee_disputes_v22#1', 'FunctionDef', '87d269d026607c335c1889b775d0dd45036d64ee4fedf405465009a4cf49d883'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::canonical_referee_disputes_v22#1', 'FunctionDef', '90f399afe29f12febba948ae3ac0e03540e87b9d0bfc8b6b4f7e363d74b5f923'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::compile_baseline_v22#1', 'FunctionDef', '573e72c161d84e2595042bd3cdcdc2c90d5614e34ae463829b3168ba02ca3c5f'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'FunctionDef', '5f7ad14aa11afbae6c11b1f5a9ff0873e1ad1c7179e063643bbfa8ea3b1abe45'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1', 'FunctionDef', 'b4e921b5b84d59c6e2bc69ac3f1d3b220bcb6a4c0030e9ff41bfc05e11945da2'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::evaluate_outcome_sensitivity_v22#1::lane_outcome#1', 'FunctionDef', 'e431e25c6fb6f50a1b22c96213218104c460aad0e39a2028624afd8ed6e426d0'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::ordinary_grade_batches_v22#1', 'FunctionDef', 'cf09d956de18974492485632c53fb3a6e208a0f268255f00f165e90d45f54246'): 1,  # noqa: E501
-        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', 'FunctionDef', 'adff33a23ad9c039a6a1025a75fbe2745e19863a312ed218f66f06f45adaeb92'): 1,  # noqa: E501
+        ('attorney_v22_compiler.py', '<module>#1::reconcile_grader_lanes_v22#1', 'FunctionDef', 'a910e37bb34a8c1b19f9591fd994d1fc1181667eabd9a22bcfb18db34fea5312'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::referee_dispute_fingerprint_v22#1', 'FunctionDef', '0e9554dff934846b8270466c2889d1565160b41490a7fbf58daa21ff8920a747'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::validate_grade_fragment_v22#1', 'FunctionDef', 'ccaad64028709671383d18c53acdb5152620ba3f2168614818ac4f1c59b6556d'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::validate_referee_fragment_v22#1', 'FunctionDef', '223557feaebbd5f58daa959e94eb4b3a04797502995356695e7bb913445cd0d6'): 1,  # noqa: E501
@@ -2671,13 +2806,13 @@ _EXPECTED_TASK3_SIMPLE_SUBSCRIPTS: Counter[_Task3SimpleSubscript] = Counter(
             "attorney_v22_compiler.py",
             "<module>#1::reconcile_grader_lanes_v22#1",
             "raw['reconciliation_fingerprint']",
-            "0252ddb7ca40eef6c9949c3d6ad1bda0d41fe26a5694d70a789a2e1948d5c8e1",
+            "863412839320dbc119420a83a47a515d043e0885de24b9f18c8de6d7ab2de658",
         ): 1,
         (
             "attorney_v22_compiler.py",
             "<module>#1::evaluate_outcome_sensitivity_v22#1",
             "raw['sensitivity_fingerprint']",
-            "0bfed9d0669c59095ec318cd9507d4bac350b6f91eb2723db41f3b1992e35a42",
+            "0fba8d14593fd33cc0bc29de76b621c7fe8a82af6d68d82ac5161b8941909176",
         ): 1,
     }
 )
@@ -2749,7 +2884,7 @@ def test_task3_development_policy_review_inventories_are_exact() -> None:
     assert observed.imports == _EXPECTED_TASK3_ORIGINAL_CALLABLE_IMPORTS
     assert observed.definitions == _EXPECTED_TASK3_DEFINITIONS
     assert observed.simple_subscripts == _EXPECTED_TASK3_SIMPLE_SUBSCRIPTS
-    assert sum(observed.calls.values()) == 498
+    assert sum(observed.calls.values()) == 499
     assert sum(observed.imports.values()) == 93
     assert sum(observed.definitions.values()) == 59
     assert sum(observed.simple_subscripts.values()) == 9

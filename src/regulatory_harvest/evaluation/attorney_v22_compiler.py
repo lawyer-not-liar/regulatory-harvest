@@ -880,25 +880,15 @@ def _ordinary_observations_v22(
     ]
 
 
-def _same_observations_v22(first: GraderAggregateV22, second: GraderAggregateV22) -> bool:
-    def view(aggregate: GraderAggregateV22) -> tuple[object, ...]:
-        return tuple(
-            tuple(
-                (grade.requirement_id, grade.disposition, grade.report_passages)
-                for grade in fragment.requirement_grades
-            )
-            for fragment in aggregate.ordinary_fragments
-        ) + tuple(
-            (
-                fragment.contested_requirement_id,
-                fragment.reviewer_alternative_grade.disposition,
-                fragment.auditor_alternative_grade.disposition,
-                fragment.ambiguity_disposition,
-            )
-            for fragment in aggregate.contested_fragments
-        )
-
-    return view(first) == view(second)
+def _merge_grader_outcomes_v22(
+    first: tuple[AbsoluteDispositionV2, tuple[str, ...]],
+    second: tuple[AbsoluteDispositionV2, tuple[str, ...]],
+) -> tuple[AbsoluteDispositionV2, tuple[str, ...]]:
+    # Independent evidence choices remain visible in both aggregates. They
+    # become terminal disagreement only when they change the scored outcome.
+    if first[0] is not second[0]:
+        return AbsoluteDispositionV2.INCONCLUSIVE, ("GRADER_DISAGREEMENT",)
+    return first[0], tuple(dict.fromkeys((*first[1], *second[1])))
 
 
 def reconcile_grader_lanes_v22(
@@ -920,9 +910,11 @@ def reconcile_grader_lanes_v22(
             or first.report_fingerprint != second.report_fingerprint
         ):
             raise ValueError("grader aggregates do not bind the same canonical context")
-        disposition, reasons = _score_v22(_ordinary_observations_v22(baseline, first), rubric)
-        if not _same_observations_v22(first, second):
-            disposition, reasons = AbsoluteDispositionV2.INCONCLUSIVE, ("GRADER_DISAGREEMENT",)
+        first_outcome = _score_v22(_ordinary_observations_v22(baseline, first), rubric)
+        second_outcome = _score_v22(_ordinary_observations_v22(baseline, second), rubric)
+        disposition, reasons = _merge_grader_outcomes_v22(
+            first_outcome, second_outcome
+        )
         # Legitimate post-validation conversion: both aggregates are strict and
         # serialized only to build their controller-owned reconciliation.
         raw: dict[str, object] = {
@@ -942,30 +934,17 @@ def evaluate_outcome_sensitivity_v22(
     reconciliation: ReconciledGradeV22,
     rubric: RubricV22 = RUBRIC_V22,
 ) -> SensitivityRecordV22:
-    try:
-        rubric = _strict_rubric(rubric)
-        baseline = verify_canonical_baseline_v22(baseline)
-        reconciliation = ReconciledGradeV22.validate_for_baseline(reconciliation, baseline)
-        for aggregate in reconciliation.grader_aggregates:
-            _verified_grader_aggregate(baseline, aggregate)
-        expected = reconcile_grader_lanes_v22(
-            baseline,
-            reconciliation.grader_aggregates[0],
-            reconciliation.grader_aggregates[1],
-            rubric,
-        )
-        if reconciliation != expected:
-            raise RubricValidationError("RECONCILIATION_INVALID")
-        first = reconciliation.grader_aggregates[0]
-        ordinary = _ordinary_observations_v22(baseline, first)
+    def lane_outcome(
+        aggregate: GraderAggregateV22,
+    ) -> tuple[AbsoluteDispositionV2, tuple[str, ...], tuple[str, ...]]:
+        ordinary = _ordinary_observations_v22(baseline, aggregate)
         contested = {
-            item.contested_requirement_id: item for item in first.contested_fragments
+            item.contested_requirement_id: item
+            for item in aggregate.contested_fragments
         }
         reviewer_world = list(ordinary)
         auditor_world = list(ordinary)
         differing_alternatives: list[str] = []
-        disposition: AbsoluteDispositionV2
-        reasons: tuple[str, ...]
         for item in baseline.contested_requirements:
             grade = contested[item.contested_requirement_id]
             reviewer_observation = (
@@ -990,28 +969,58 @@ def evaluate_outcome_sensitivity_v22(
                 auditor_world.append(auditor_observation)
             if reviewer_observation != auditor_observation:
                 differing_alternatives.append(item.contested_requirement_id)
-        reviewer_disposition, reviewer_reasons = _score_v22(reviewer_world, rubric)
-        auditor_disposition, auditor_reasons = _score_v22(auditor_world, rubric)
+        reviewer_outcome = _score_v22(reviewer_world, rubric)
+        auditor_outcome = _score_v22(auditor_world, rubric)
+        if (
+            reviewer_outcome[0] is AbsoluteDispositionV2.INCONCLUSIVE
+            or auditor_outcome[0] is AbsoluteDispositionV2.INCONCLUSIVE
+        ):
+            return (
+                AbsoluteDispositionV2.INCONCLUSIVE,
+                ("BASELINE_EVIDENCE_INSUFFICIENT",),
+                (),
+            )
+        if reviewer_outcome[0] is not auditor_outcome[0]:
+            return (
+                AbsoluteDispositionV2.INCONCLUSIVE,
+                ("OUTCOME_SENSITIVE_BASELINE_DISPUTE",),
+                tuple(differing_alternatives),
+            )
+        disposition, reasons = _merge_grader_outcomes_v22(
+            reviewer_outcome, auditor_outcome
+        )
+        return disposition, reasons, ()
+
+    try:
+        rubric = _strict_rubric(rubric)
+        baseline = verify_canonical_baseline_v22(baseline)
+        reconciliation = ReconciledGradeV22.validate_for_baseline(reconciliation, baseline)
+        for aggregate in reconciliation.grader_aggregates:
+            _verified_grader_aggregate(baseline, aggregate)
+        expected = reconcile_grader_lanes_v22(
+            baseline,
+            reconciliation.grader_aggregates[0],
+            reconciliation.grader_aggregates[1],
+            rubric,
+        )
+        if reconciliation != expected:
+            raise RubricValidationError("RECONCILIATION_INVALID")
+        disposition: AbsoluteDispositionV2
+        reasons: tuple[str, ...]
         changing: tuple[str, ...] = ()
         if reconciliation.absolute_disposition is AbsoluteDispositionV2.INCONCLUSIVE:
             disposition, reasons = reconciliation.absolute_disposition, reconciliation.reason_codes
-        elif (
-            reviewer_disposition is AbsoluteDispositionV2.INCONCLUSIVE
-            or auditor_disposition is AbsoluteDispositionV2.INCONCLUSIVE
-        ):
-            disposition, reasons = (
-                AbsoluteDispositionV2.INCONCLUSIVE,
-                ("BASELINE_EVIDENCE_INSUFFICIENT",),
-            )
-        elif reviewer_disposition is not auditor_disposition:
-            changing = tuple(differing_alternatives)
-            disposition, reasons = (
-                AbsoluteDispositionV2.INCONCLUSIVE,
-                ("OUTCOME_SENSITIVE_BASELINE_DISPUTE",),
-            )
         else:
-            disposition = reviewer_disposition
-            reasons = tuple(sorted(set((*reviewer_reasons, *auditor_reasons))))
+            lane_outcomes = [
+                lane_outcome(aggregate)
+                for aggregate in reconciliation.grader_aggregates
+            ]
+            disposition, reasons = _merge_grader_outcomes_v22(
+                lane_outcomes[0][:2], lane_outcomes[1][:2]
+            )
+            changing = tuple(
+                dict.fromkeys((*lane_outcomes[0][2], *lane_outcomes[1][2]))
+            )
         raw: dict[str, object] = {
             "anonymous_label": reconciliation.anonymous_label,
             "baseline_fingerprint": baseline.baseline_fingerprint,
