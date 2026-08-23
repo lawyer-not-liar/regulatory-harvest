@@ -497,9 +497,13 @@ artifacts
   Give one fresh context only:
 
   - the exact installed skill instructions;
-  - the new generation request;
-  - the unchanged prepared dossier and normalized sources; and
+  - the sealed generation request; and
   - no beta.3 report, evaluator response, grader rationale, or desired sentence.
+
+  The sealed generation request is the sole matter-evidence input. The role must
+  derive any dossier and normalized sources inside the packet-only public
+  workflow from that request; the controller must not inject them as separate
+  context.
 
   The role produces a complete `analysis-draft.json` through the normal public
   schema. It must not receive the provenance matrix's private substantive
@@ -508,11 +512,14 @@ artifacts
 
 - [ ] **Step 3: Run one fresh isolated omission review before finalization**
 
-  A separate fresh context receives the candidate draft, dossier, and packaged
-  materiality-challenge instructions. It returns a private structured challenge
-  limited to target IDs, boundary categories, and whether each cited operative
-  element reaches atom/claim/visible binding. It does not grade the report or
-  receive the prior evaluator result.
+  A separate fresh context receives the candidate draft, packaged
+  materiality-challenge instructions, and the verified dossier produced inside
+  the same packet-only public workflow from the sealed generation request. The
+  dossier and normalized text must be request- and capsule-bound outputs of that
+  workflow, not separately injected matter evidence. The role returns a private
+  structured challenge limited to target IDs, boundary categories, and whether
+  each cited operative element reaches atom/claim/visible binding. It does not
+  grade the report or receive the prior evaluator result.
 
   If the challenge identifies a real omission, one fresh repair context may
   revise the draft once. Preserve the pre-repair draft and content-free receipt;

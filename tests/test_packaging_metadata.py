@@ -54,13 +54,20 @@ def test_experimental_beta_release_surfaces_are_coherent() -> None:
     assert "Both grader lanes independently reached `FAIL`" in readme_words
     assert "outcome-stable reconciliation" in readme_words
     assert "Raw lane aggregates remain preserved" in readme_words
-    assert "beta.3 release has not yet been privately rerun" in readme_words
     assert "## [0.1.0-beta.3] - 2026-08-23" in changelog
     assert "Protocol 2.2 remains opt-in and experimental" in changelog
     assert "Both lanes independently reached `FAIL`" in changelog
     assert "outcome-changing disagreement remains `INCONCLUSIVE`" in changelog_words
     assert "raw grader aggregates remain sealed" in changelog_words
-    assert "beta.3 release has not yet been privately rerun" in changelog_words
+    for release_surface in (readme_words.casefold(), changelog_words.casefold()):
+        assert "beta.3 post-release private run completed end to end" in release_surface
+        assert "both grader lanes independently reached `fail`" in release_surface
+        assert "locked content floors" in release_surface
+        assert "technical operability" in release_surface
+        assert "not private content readiness" in release_surface
+        assert "no performance" in release_surface
+        assert "report-quality claim" in release_surface
+        assert "beta.3 release has not yet been privately rerun" not in release_surface
     assert "LLM supplies substantive judgments" in roadmap_words
     assert "deterministic code constructs canonical artifacts" in roadmap_words
 
