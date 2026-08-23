@@ -46,28 +46,31 @@ def test_experimental_beta_release_surfaces_are_coherent() -> None:
     readme_words = " ".join(readme.split())
     changelog_words = " ".join(changelog.split())
     roadmap_words = " ".join(roadmap.split())
+    release_surfaces = (
+        readme_words.replace("> ", "").casefold(),
+        changelog_words.casefold(),
+    )
 
-    assert "v0.1.0-beta.3" in readme
+    assert "v0.1.0-beta.4" in readme
     assert "packages project version `0.1.0`" in readme_words
     assert "Protocol 2.1 remains the new-run default" in readme_words
-    assert "completed every evaluator role and grading" in readme_words
-    assert "Both grader lanes independently reached `FAIL`" in readme_words
-    assert "outcome-stable reconciliation" in readme_words
-    assert "Raw lane aggregates remain preserved" in readme_words
-    assert "## [0.1.0-beta.3] - 2026-08-23" in changelog
-    assert "Protocol 2.2 remains opt-in and experimental" in changelog
-    assert "Both lanes independently reached `FAIL`" in changelog
-    assert "outcome-changing disagreement remains `INCONCLUSIVE`" in changelog_words
-    assert "raw grader aggregates remain sealed" in changelog_words
-    for release_surface in (readme_words.casefold(), changelog_words.casefold()):
+    assert "## [0.1.0-beta.4] - 2026-08-23" in changelog
+    for release_surface in release_surfaces:
+        assert "protocol 2.2 remains opt-in and experimental" in release_surface
+        assert "general materiality" in release_surface
+        assert "graph-to-report omission safeguards" in release_surface
+        assert "pr #7" in release_surface
         assert "beta.3 post-release private run completed end to end" in release_surface
         assert "both grader lanes independently reached `fail`" in release_surface
-        assert "locked content floors" in release_surface
+        assert "locked recall and coverage floors" in release_surface
         assert "technical operability" in release_surface
         assert "not private content readiness" in release_surface
-        assert "no performance" in release_surface
-        assert "report-quality claim" in release_surface
-        assert "beta.3 release has not yet been privately rerun" not in release_surface
+        assert "beta.4 has not yet earned a private `pass`" in release_surface
+        assert (
+            "no performance, benchmark, or report-quality claim is made"
+            in release_surface
+        )
+        assert "no pypi distribution is published" in release_surface
     assert "LLM supplies substantive judgments" in roadmap_words
     assert "deterministic code constructs canonical artifacts" in roadmap_words
 

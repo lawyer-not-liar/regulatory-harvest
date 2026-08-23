@@ -4,6 +4,23 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 
 ## [Unreleased]
 
+## [0.1.0-beta.4] - 2026-08-23
+
+- Added general materiality safeguards from merged PR #7 that treat
+  `not_material` dispositions as provisional until responsive units, leads,
+  and citation quotes are challenged against the atomic rule graph.
+- Added graph-to-report omission safeguards that trace responsive source
+  material through claims and material graph elements into rendered report
+  prose without losing independently operative qualifications.
+- The beta.3 post-release private run completed end to end. Both grader lanes
+  independently reached `FAIL` on the locked recall and coverage floors. That
+  result proves technical operability, not private content readiness. Beta.4
+  has not yet earned a private `PASS`.
+- No performance, benchmark, or report-quality claim is made. No PyPI
+  distribution is published.
+- Protocol 2.2 remains opt-in and experimental; Protocol 2.1 remains the
+  default.
+
 ## [0.1.0-beta.3] - 2026-08-23
 
 - Changed Protocol 2.2 grader reconciliation to score both lanes
@@ -88,7 +105,8 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 - The GitHub prerelease packages the unchanged `0.1.0` engine. No PyPI
   distribution is published.
 
-[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.3...HEAD
+[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.4...HEAD
+[0.1.0-beta.4]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.3...v0.1.0-beta.4
 [0.1.0-beta.3]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.2...v0.1.0-beta.3
 [0.1.0-beta.2]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.1...v0.1.0-beta.2
 [0.1.0-beta.1]: https://github.com/lawyer-not-liar/regulatory-harvest/releases/tag/v0.1.0-beta.1
