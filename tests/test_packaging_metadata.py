@@ -43,18 +43,23 @@ def test_experimental_beta_release_surfaces_are_coherent() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs" / "roadmap.md").read_text(encoding="utf-8")
+    beta4_heading = "## [0.1.0-beta.4] - 2026-08-23"
+    beta3_heading = "## [0.1.0-beta.3] - 2026-08-23"
+    _, found_beta4_heading, beta4_and_history = changelog.partition(beta4_heading)
+    beta4_section, found_beta3_heading, _ = beta4_and_history.partition(beta3_heading)
     readme_words = " ".join(readme.split())
-    changelog_words = " ".join(changelog.split())
+    beta4_changelog_words = " ".join(beta4_section.split())
     roadmap_words = " ".join(roadmap.split())
     release_surfaces = (
         readme_words.replace("> ", "").casefold(),
-        changelog_words.casefold(),
+        beta4_changelog_words.casefold(),
     )
 
     assert "v0.1.0-beta.4" in readme
     assert "packages project version `0.1.0`" in readme_words
     assert "Protocol 2.1 remains the new-run default" in readme_words
-    assert "## [0.1.0-beta.4] - 2026-08-23" in changelog
+    assert found_beta4_heading == beta4_heading
+    assert found_beta3_heading == beta3_heading
     for release_surface in release_surfaces:
         assert "protocol 2.2 remains opt-in and experimental" in release_surface
         assert "general materiality" in release_surface
