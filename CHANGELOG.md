@@ -16,10 +16,13 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 - The beta.2 private end-to-end run completed every evaluator role and grading.
   Both lanes independently reached `FAIL`, but the prior exact-detail rule made
   the result `INCONCLUSIVE`; beta.3 corrects that outcome-stability defect.
-- Public tests passed on Python 3.11 through 3.14. The beta.3 release has not yet
-  been privately rerun, so this prerelease makes no new private-readiness,
-  report-quality, or performance claim. Protocol 2.2 remains opt-in and
-  experimental; Protocol 2.1 remains the default.
+- Public tests passed on Python 3.11 through 3.14.
+- The beta.3 post-release private run completed end to end. Both grader lanes
+  independently reached `FAIL` on the locked content floors. That result proves
+  technical operability, not private content readiness. No performance,
+  benchmark, or report-quality claim is made.
+- Protocol 2.2 remains opt-in and experimental; Protocol 2.1 remains the
+  default.
 
 ## [0.1.0-beta.2] - 2026-08-22
 

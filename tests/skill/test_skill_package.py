@@ -1471,6 +1471,112 @@ def test_skill_requires_an_atomic_rule_graph_before_prose_drafting() -> None:
     assert "narrower or broader colloquial label" in combined
 
 
+def test_skill_requires_quote_to_atom_materiality_challenge() -> None:
+    paths = (
+        "SKILL.md",
+        "references/research-protocol.md",
+        "references/draft-schema.md",
+        "src/regulatory_harvest/analysis/prompts/build-v1.md",
+    )
+    documents = {
+        path: (ROOT / path).read_text(encoding="utf-8") for path in paths
+    }
+    contract_groups = (
+        (
+            "provisional disposition sequencing",
+            (
+                "before retaining or finalizing",
+                "target review",
+                "provisional",
+                "revisit",
+            ),
+        ),
+        (
+            "navigation or publication metadata reason",
+            ("navigation", "publication metadata"),
+        ),
+        (
+            "exact mapped-atom duplication reason",
+            ("exact duplication", "named mapped atom"),
+        ),
+        ("outside-scope reason", ("outside the scoped question",)),
+        (
+            "nonoperative or superseded reason",
+            ("nonoperative", "superseded text"),
+        ),
+        (
+            "nonpropositional evidentiary-context reason",
+            ("evidentiary context", "no independent legal proposition"),
+        ),
+        (
+            "responsive-target link",
+            ("responsive unit or lead", "atom or source-bound gap"),
+        ),
+        (
+            "quote-to-claim link",
+            ("citation quote", "narrowly stated source-supported claim"),
+        ),
+        (
+            "claim-to-graph link",
+            ("each claim", "atom elements", "relationships it states"),
+        ),
+        (
+            "material-atom-to-visible-binding link",
+            ("critical or material atom", "visible legal-analysis binding"),
+        ),
+        (
+            "visible-binding-to-rendered-report link",
+            (
+                "visible binding",
+                "rendered report prose",
+                "material actors",
+                "conditions",
+                "authorities",
+                "consequences",
+                "compression",
+            ),
+        ),
+        (
+            "deterministic-completion caveat",
+            (
+                "deterministic `completed` status",
+                "schema, evidence, and binding consistency",
+                "does not excuse",
+                "substantively false `not_material` decision",
+            ),
+        ),
+    )
+
+    def missing_contract_groups(folded: str) -> list[str]:
+        return [
+            label
+            for label, fragments in contract_groups
+            if any(fragment not in folded for fragment in fragments)
+        ]
+
+    for path, document in documents.items():
+        folded = document.casefold()
+        assert "materiality challenge" in folded, path
+        assert "a citation quote is not coverage" in folded, path
+        assert "survives only in the quotation" in folded, path
+        assert "independently operative" in folded, path
+        assert "map it to an atom or preserve a source-bound gap" in folded, path
+        assert not missing_contract_groups(folded), path
+
+        for label, fragments in contract_groups:
+            mutated = folded.replace(fragments[0], "")
+            assert label in missing_contract_groups(mutated), (path, label)
+
+    combined = "\n".join(documents.values()).casefold()
+    for forbidden in (
+        "regional compliance steward",
+        "third-party assurance reviewer",
+        "rapid corrective direction",
+        "jurisdiction-local officer",
+    ):
+        assert forbidden not in combined
+
+
 def test_skill_requires_strict_atomic_coverage_and_finite_repair() -> None:
     """The host must close every prepared target before delivery."""
     instruction_paths = (

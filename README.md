@@ -7,9 +7,11 @@
 > made the run `INCONCLUSIVE`.
 > Beta.3 adds outcome-stable reconciliation.
 > Raw lane aggregates remain preserved for audit.
-> The beta.3 release has not yet been privately rerun, so private readiness
-> remains incomplete. No performance, benchmark, or
-> report-quality claim is made. Results are AI Generated and may contain
+> The beta.3 post-release private run completed end to end.
+> Both grader lanes independently reached `FAIL` on the locked content floors.
+> That result proves technical operability, not private content readiness.
+> No performance, benchmark, or report-quality claim is made.
+> Results are AI Generated and may contain
 > errors. Output must be validated by an attorney before the attorney delivers
 > legal advice.
 
