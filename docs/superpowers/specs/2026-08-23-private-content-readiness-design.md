@@ -3,7 +3,7 @@
 **Author:** Earl Mah
 **Created:** 2026-08-23
 **Last updated:** 2026-08-23
-**Status:** Draft for owner review
+**Status:** Approved for implementation planning
 **Applies to:** Work after the published `v0.1.0-beta.3` prerelease
 **Compatibility:** Protocol 2.2 evaluation semantics and the published beta.3 artifact remain unchanged
 
