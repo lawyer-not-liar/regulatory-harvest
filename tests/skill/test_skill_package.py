@@ -1471,6 +1471,34 @@ def test_skill_requires_an_atomic_rule_graph_before_prose_drafting() -> None:
     assert "narrower or broader colloquial label" in combined
 
 
+def test_skill_requires_quote_to_atom_materiality_challenge() -> None:
+    paths = (
+        "SKILL.md",
+        "references/research-protocol.md",
+        "references/draft-schema.md",
+        "src/regulatory_harvest/analysis/prompts/build-v1.md",
+    )
+    documents = {
+        path: (ROOT / path).read_text(encoding="utf-8") for path in paths
+    }
+    for path, document in documents.items():
+        folded = document.casefold()
+        assert "materiality challenge" in folded, path
+        assert "a citation quote is not coverage" in folded, path
+        assert "survives only in the quotation" in folded, path
+        assert "independently operative" in folded, path
+        assert "map it to an atom or preserve a source-bound gap" in folded, path
+
+    combined = "\n".join(documents.values()).casefold()
+    for forbidden in (
+        "regional compliance steward",
+        "third-party assurance reviewer",
+        "rapid corrective direction",
+        "jurisdiction-local officer",
+    ):
+        assert forbidden not in combined
+
+
 def test_skill_requires_strict_atomic_coverage_and_finite_repair() -> None:
     """The host must close every prepared target before delivery."""
     instruction_paths = (

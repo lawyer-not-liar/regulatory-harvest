@@ -79,6 +79,13 @@ def test_model_requests_use_the_versioned_attorney_briefing_prompts() -> None:
         "audit.md",
     ):
         assert term in build_request.system_instructions.lower()
+    for term in (
+        "materiality challenge",
+        "a citation quote is not coverage",
+        "survives only in the quotation",
+        "map it to an atom or preserve a source-bound gap",
+    ):
+        assert term in build_request.system_instructions.casefold()
     assert "index, not a substitute" in build_request.system_instructions.lower()
     assert "before attaching exact quotations" in build_request.system_instructions.lower()
     assert (
