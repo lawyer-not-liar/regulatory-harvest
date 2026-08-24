@@ -4,6 +4,21 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 
 ## [Unreleased]
 
+## [0.1.0-beta.8] - 2026-08-24
+
+- Added a controller-issued report-passage allowlist to every Protocol 2.2
+  ordinary and contested grade request. Each value is an exact unique substring
+  of the supplied report, and the issued schema accepts only those values.
+- Added a whole-report fallback when no narrower allowed passage accurately
+  supports the grade; strict grade validation remains unchanged.
+- The beta.7 private evaluation accepted all source-stage calls before pausing
+  at a hidden report-passage interface defect. Beta.8 addresses that interface
+  defect, but beta.8 has not yet earned a private `PASS`.
+- No performance, benchmark, or report-quality claim is made. No PyPI
+  distribution is published.
+- Protocol 2.2 remains opt-in and experimental; Protocol 2.1 remains the
+  default.
+
 ## [0.1.0-beta.7] - 2026-08-24
 
 - Made Protocol 2.2 ordinary-grade requests self-describing: each issued schema
@@ -151,7 +166,8 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 - The GitHub prerelease packages the unchanged `0.1.0` engine. No PyPI
   distribution is published.
 
-[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.7...HEAD
+[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.8...HEAD
+[0.1.0-beta.8]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.7...v0.1.0-beta.8
 [0.1.0-beta.7]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.6...v0.1.0-beta.7
 [0.1.0-beta.6]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.5...v0.1.0-beta.6
 [0.1.0-beta.5]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.4...v0.1.0-beta.5
