@@ -43,34 +43,37 @@ def test_experimental_beta_release_surfaces_are_coherent() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs" / "roadmap.md").read_text(encoding="utf-8")
+    beta5_heading = "## [0.1.0-beta.5] - 2026-08-24"
     beta4_heading = "## [0.1.0-beta.4] - 2026-08-23"
-    beta3_heading = "## [0.1.0-beta.3] - 2026-08-23"
-    _, found_beta4_heading, beta4_and_history = changelog.partition(beta4_heading)
-    beta4_section, found_beta3_heading, _ = beta4_and_history.partition(beta3_heading)
+    _, found_beta5_heading, beta5_and_history = changelog.partition(beta5_heading)
+    beta5_section, found_beta4_heading, _ = beta5_and_history.partition(beta4_heading)
     readme_words = " ".join(readme.split())
-    beta4_changelog_words = " ".join(beta4_section.split())
+    beta5_changelog_words = " ".join(beta5_section.split())
     roadmap_words = " ".join(roadmap.split())
     release_surfaces = (
         readme_words.replace("> ", "").casefold(),
-        beta4_changelog_words.casefold(),
+        beta5_changelog_words.casefold(),
     )
 
-    assert "v0.1.0-beta.4" in readme
+    assert "v0.1.0-beta.5" in readme
     assert "packages project version `0.1.0`" in readme_words
     assert "Protocol 2.1 remains the new-run default" in readme_words
+    assert found_beta5_heading == beta5_heading
     assert found_beta4_heading == beta4_heading
-    assert found_beta3_heading == beta3_heading
     for release_surface in release_surfaces:
         assert "protocol 2.2 remains opt-in and experimental" in release_surface
-        assert "general materiality" in release_surface
-        assert "graph-to-report omission safeguards" in release_surface
-        assert "pr #7" in release_surface
-        assert "beta.3 post-release private run completed end to end" in release_surface
-        assert "both grader lanes independently reached `fail`" in release_surface
-        assert "locked recall and coverage floors" in release_surface
-        assert "technical operability" in release_surface
-        assert "not private content readiness" in release_surface
-        assert "beta.4 has not yet earned a private `pass`" in release_surface
+        assert "source-review and source-audit requests self-describing" in release_surface
+        assert "allowed source ids" in release_surface
+        assert "exact contiguous quotation" in release_surface
+        assert "controller-owned ordinal bounds" in release_surface
+        assert "audit concern shape matrix" in release_surface
+        assert "compiler validation remains fail-closed and unchanged" in release_surface
+        assert (
+            "beta.4 private evaluation paused before any evaluator response was accepted"
+            in release_surface
+        )
+        assert "under-specified request contract" in release_surface
+        assert "beta.5 has not yet earned a private `pass`" in release_surface
         assert (
             "no performance, benchmark, or report-quality claim is made"
             in release_surface

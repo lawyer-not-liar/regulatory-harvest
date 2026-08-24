@@ -4,10 +4,19 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 
 ## [Unreleased]
 
+## [0.1.0-beta.5] - 2026-08-24
+
 - Made Protocol 2.2 source-review and source-audit requests self-describing:
-  issued schemas now enumerate valid source IDs, expose the compiler's quote
-  matching rule, bound controller-owned ordinals, and state the audit concern
-  shape matrix. Compiler validation remains fail-closed and unchanged.
+  issued schemas now enumerate allowed source IDs, state the exact contiguous
+  quotation rule, expose controller-owned ordinal bounds, and state the audit
+  concern shape matrix. Compiler validation remains fail-closed and unchanged.
+- The beta.4 private evaluation paused before any evaluator response was
+  accepted because of an under-specified request contract. Beta.5 addresses
+  that interface defect. Beta.5 has not yet earned a private `PASS`.
+- No performance, benchmark, or report-quality claim is made. No PyPI
+  distribution is published.
+- Protocol 2.2 remains opt-in and experimental; Protocol 2.1 remains the
+  default.
 
 ## [0.1.0-beta.4] - 2026-08-23
 
@@ -110,7 +119,8 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 - The GitHub prerelease packages the unchanged `0.1.0` engine. No PyPI
   distribution is published.
 
-[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.4...HEAD
+[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.5...HEAD
+[0.1.0-beta.5]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.4...v0.1.0-beta.5
 [0.1.0-beta.4]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.3...v0.1.0-beta.4
 [0.1.0-beta.3]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.2...v0.1.0-beta.3
 [0.1.0-beta.2]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.1...v0.1.0-beta.2
