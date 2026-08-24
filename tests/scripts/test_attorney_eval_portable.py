@@ -6141,6 +6141,9 @@ def test_protocol_22_portable_ordinary_request_exposes_exact_ordinal_allowlist()
             "baseline_fingerprint": "a" * 64,
             "report_text": "The report addresses the issued requirements.",
             "report_fingerprint": "b" * 64,
+            "report_passage_allowlist": [
+                "The report addresses the issued requirements."
+            ],
             "source_context": {"rule-1": "The frozen source context."},
             "rubric": copy.deepcopy(portable._V22_RUBRIC),
             "requirements": requirements,
@@ -6173,6 +6176,56 @@ def test_protocol_22_portable_ordinary_request_exposes_exact_ordinal_allowlist()
         match="request schema is invalid",
     ):
         portable._v22_validate_request(tampered)
+
+
+def test_protocol_22_portable_grade_requests_issue_exact_report_passages() -> None:
+    portable = _load_protocol_22_portable()
+    report = "Repeated support.\nRepeated support.\nUnique controlling passage."
+    payload = {
+        "anonymous_label": "A",
+        "grader_lane": 1,
+        "batch_ref": "GB-A-1-0001",
+        "baseline_fingerprint": "a" * 64,
+        "report_text": report,
+        "report_fingerprint": hashlib.sha256(report.encode()).hexdigest(),
+        "source_context": {"rule-1": "The frozen source context."},
+        "rubric": copy.deepcopy(portable._V22_RUBRIC),
+        "requirements": [{"requirement_id": "REQ-0001"}],
+        "report_passage_allowlist": ["Unique controlling passage.", report],
+    }
+    request = portable._v22_new_request(
+        "ordinary_grade_fragment",
+        payload,
+        {
+            "record_scope": "one-ordinary-grade-batch",
+            "baseline_fingerprint": "a" * 64,
+            "batch_ref": "GB-A-1-0001",
+        },
+    )
+
+    items = request["json_schema"]["$defs"]["_RequirementGradeDraftV22"][
+        "properties"
+    ]["report_passages"]["items"]
+    assert items["enum"] == ["Unique controlling passage.", report]
+    assert "controller-issued report_passage_allowlist" in request[
+        "system_instructions"
+    ]
+
+    missing_inventory = copy.deepcopy(payload)
+    missing_inventory.pop("report_passage_allowlist")
+    with pytest.raises(
+        portable.PortableEvaluationInputError,
+        match="report passage allowlist is invalid",
+    ):
+        portable._v22_new_request(
+            "ordinary_grade_fragment",
+            missing_inventory,
+            {
+                "record_scope": "one-ordinary-grade-batch",
+                "baseline_fingerprint": "a" * 64,
+                "batch_ref": "GB-A-1-0001",
+            },
+        )
 
 
 def test_protocol_22_source_evidence_handles_have_full_portable_byte_parity() -> None:

@@ -13196,7 +13196,7 @@ _V22_PROTOCOL = "2.2"
 _V22_MAX_JSON_BYTES = 16 * 1024 * 1024
 _V22_COMPILER_VERSION = "semantic-compiler-v2.2"
 _V22_COMPILER_CONTRACT_FINGERPRINT = (
-    "8a0c00613432b32fa92eb492586db0880d1f273031230b1370a1b447518ba879"
+    "315703abc8372ee643f39c9b1860bc22308c7c55e717e85411904a188a88a5ae"
 )
 _V22_STORAGE_CONCURRENCY_CONTRACT = (
     "cooperative-exclusive-directory-namespace-per-operation-v1"
@@ -13233,6 +13233,12 @@ _V22_AUDIT_SHAPE_RULE = (
 _V22_GRADE_ORDINAL_RULE = (
     " Return exactly one grade for each allowed ordinal. The ordinal is the "
     "1-based position of the requirement in the supplied requirements array."
+)
+_V22_REPORT_PASSAGE_RULE = (
+    " Select report_passages only from the controller-issued "
+    "report_passage_allowlist values. Each allowed value is an exact unique "
+    "substring of the supplied report. Prefer the narrowest accurate passage; the "
+    "whole-report fallback exists only when no narrower allowed passage suffices."
 )
 _V22_INSTRUCTIONS = {
     "source_review_fragment": "Review the supplied frozen source record and accepted inventory. Identify only new source-grounded semantic proposals.",
@@ -13905,10 +13911,45 @@ def _v22_request_fingerprint(request: JsonObject) -> str:
     return _sha256(canonical_json_bytes(body))
 
 
+def _v22_report_passage_allowlist(report: object) -> list[str]:
+    if type(report) is not str or not report.strip():
+        raise PortableEvaluationInputError("report passage allowlist is invalid")
+    passages: list[str] = []
+    for raw_line in report.splitlines():
+        passage = raw_line.strip()
+        if passage and passage not in passages and report.count(passage) == 1:
+            passages.append(passage)
+            if len(passages) == 639:
+                break
+    if report not in passages:
+        passages.append(report)
+    return passages
+
+
 def _v22_request_contract(
     operation: str, payload: JsonObject
 ) -> tuple[JsonObject, str]:
     schema = cast(JsonObject, _copy_json(_V22_DRAFT_SCHEMAS[operation]))
+    if operation in {"ordinary_grade_fragment", "contested_grade_fragment"}:
+        expected_passages = _v22_report_passage_allowlist(payload.get("report_text"))
+        if payload.get("report_passage_allowlist") != expected_passages:
+            raise PortableEvaluationInputError("report passage allowlist is invalid")
+        definitions = _object(schema.get("$defs"), location="grade draft definitions")
+        grade_name = (
+            "_RequirementGradeDraftV22"
+            if operation == "ordinary_grade_fragment"
+            else "ContestedAlternativeGradeV22"
+        )
+        grade = _object(definitions[grade_name], location="grade schema")
+        grade_properties = _object(
+            grade.get("properties"), location="grade properties"
+        )
+        passages = _object(
+            grade_properties["report_passages"], location="report passages schema"
+        )
+        _object(passages["items"], location="report passage item schema")[
+            "enum"
+        ] = expected_passages
     if operation == "ordinary_grade_fragment":
         requirements = _v2_list(payload.get("requirements"), location="requirements")
         if not 1 <= len(requirements) <= 5:
@@ -13928,9 +13969,7 @@ def _v22_request_contract(
             raise PortableEvaluationInputError(
                 "ordinary-grade requirement inventory is invalid"
             )
-        definitions = _object(
-            schema.get("$defs"), location="ordinary-grade draft definitions"
-        )
+        definitions = _object(schema.get("$defs"), location="grade draft definitions")
         grade = _object(
             definitions["_RequirementGradeDraftV22"],
             location="requirement grade schema",
@@ -13958,6 +13997,14 @@ def _v22_request_contract(
             _V22_INSTRUCTIONS[operation]
             + f" Allowed requirement_ordinal values: {encoded}."
             + _V22_GRADE_ORDINAL_RULE
+            + _V22_REPORT_PASSAGE_RULE
+            + _V22_INNER,
+        )
+    if operation == "contested_grade_fragment":
+        return (
+            schema,
+            _V22_INSTRUCTIONS[operation]
+            + _V22_REPORT_PASSAGE_RULE
             + _V22_INNER,
         )
     if operation not in {"source_review_fragment", "source_audit_fragment"}:
@@ -14426,6 +14473,7 @@ def _v22_grade_request(
         "baseline_fingerprint": baseline["baseline_fingerprint"],
         "report_text": report_text,
         "report_fingerprint": _sha256(report_text.encode("utf-8")),
+        "report_passage_allowlist": _v22_report_passage_allowlist(report_text),
         "source_context": _v22_source_context(envelope), "rubric": _copy_json(_V22_RUBRIC),
     }
     if operation == "ordinary_grade_fragment":
