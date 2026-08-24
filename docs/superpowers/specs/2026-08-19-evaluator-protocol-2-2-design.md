@@ -255,16 +255,19 @@ Protocol 2.2 replaces it with ordered `source_review_fragment` calls.
 Each request contains:
 
 - the same frozen source-only record;
+- one immutable controller-issued evidence handle for each frozen source;
 - the ordered controller-compiled proposal inventory accepted so far;
 - a controller-issued fragment ordinal;
 - `max_new_proposals`, initially five; and
 - a requirement to declare whether the review is complete.
 
-The issued JSON Schema enumerates the exact `source_id` allowlist from the
-frozen record. It also states that each quote must resolve as an exact or
-whitespace-normalized unique contiguous substring of that source's normalized
-text. When no proposals have been accepted, dependencies are schema-limited to
-`null`; otherwise, dependency ordinals are bounded to the supplied inventory.
+The issued JSON Schema enumerates only the controller's evidence handles. Each
+handle resolves to the complete exact `normalized_text` of one source in the
+frozen record; the role selects a handle and never reconstructs a source ID or
+quote. The compiler rejects unknown or rebound handles and emits the existing
+strict `source_id` plus exact quote in an accepted fragment. When no proposals
+have been accepted, dependencies are schema-limited to `null`; otherwise,
+dependency ordinals are bounded to the supplied inventory.
 
 Each draft contains at most five new semantic proposals and one `review_complete`
 boolean. A nonfinal fragment must add at least one new proposal. A final fragment
@@ -296,11 +299,11 @@ Each request contains the full frozen source record, complete controller-indexed
 review inventory, accepted audit concerns so far, a fragment ordinal, and a
 maximum of five new concerns. The draft declares whether the audit is complete.
 
-The audit request carries the same exact source and quote rules, bounds target
-and correction-dependency ordinals to the controller inventory, and states the
-cross-field concern matrix: omission requires no target and a correction;
-ambiguity requires a target and no correction; each `incorrect_*` concern
-requires both.
+The audit request carries the same immutable evidence-handle inventory, bounds
+target and correction-dependency ordinals to the controller inventory, and
+states the cross-field concern matrix: omission requires no target and a
+correction; ambiguity requires a target and no correction; each `incorrect_*`
+concern requires both.
 
 Every concern is independently compiled and sealed. Omission concerns may supply a
 new semantic proposal draft, which the controller compiles under the same evidence

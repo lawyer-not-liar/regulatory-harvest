@@ -43,9 +43,10 @@ from .attorney_v22_models import (
 )
 
 _INNER = " Return only the inner payload as one canonical JSON object conforming exactly to json_schema. Do not author the outer response envelope; the controller supplies operation, request_fingerprint, provider_name, model_name, judge_isolation, and the outer schema_version."
-_QUOTE_RULE = (
-    "Each passage quote must be an exact or whitespace-normalized unique contiguous "
-    "substring of the normalized_text for its source_id."
+_EVIDENCE_HANDLE_RULE = (
+    "Select only controller-issued evidence_handle values from the evidence_handles "
+    "inventory. Each handle resolves immutably to the complete frozen normalized_text "
+    "of exactly one source."
 )
 _AUDIT_SHAPE_RULE = (
     " Concern shapes are fixed: omission requires no target and a correction; "
@@ -93,7 +94,7 @@ COMPILER_CONTRACT_V22: dict[str, object] = {
     "fragment_maximum": 5,
     "fragments_per_operation_maximum": 128,
     "items_per_operation_maximum": 640,
-    "request_contract_version": "source-evidence-and-ordinal-constraints-v1",
+    "request_contract_version": "immutable-source-evidence-handles-v1",
     "ordering_version": "controller-fragment-order-v1",
     "compiler_version": "semantic-compiler-v2.2",
     "aggregate_version": "fragment-aggregate-v2.2",
@@ -206,6 +207,15 @@ def _source_ids_v22(source_record: dict[str, object]) -> list[str]:
     return [cast(str, source["source_id"]) for source in sources]
 
 
+def _source_evidence_handles_v22(
+    source_record: dict[str, object],
+) -> list[dict[str, str]]:
+    return [
+        {"evidence_handle": f"SOURCE-{ordinal:06d}", "source_id": source_id}
+        for ordinal, source_id in enumerate(_source_ids_v22(source_record), 1)
+    ]
+
+
 def _source_fragment_contract_v22(
     operation: EvaluatorOperationV22,
     *,
@@ -219,18 +229,32 @@ def _source_fragment_contract_v22(
     else:  # pragma: no cover - private helper has two fixed call sites
         raise ValueError("source-fragment operation is invalid")
     definitions = cast(dict[str, dict[str, object]], schema["$defs"])
-    passage = cast(
-        dict[str, dict[str, object]], definitions["SemanticPassage"]["properties"]
+    handles = _source_evidence_handles_v22(source_record)
+    handle_values = [item["evidence_handle"] for item in handles]
+    handle = cast(
+        dict[str, dict[str, object]],
+        definitions["_EvidenceHandleDraftV22"]["properties"],
     )
-    source_ids = _source_ids_v22(source_record)
-    source_id_schema = passage["source_id"]
-    source_id_schema["enum"] = source_ids
-    quote_schema = passage["quote"]
-    quote_schema["description"] = _QUOTE_RULE
+    handle_field = handle["evidence_handle"]
+    handle_field["enum"] = handle_values
 
     proposal = cast(
         dict[str, dict[str, object]], definitions["_ProposalDraftV22"]["properties"]
     )
+    proposal_passages = proposal["passages"]
+    proposal_passages["items"] = {
+        "$ref": "#/$defs/_EvidenceHandleDraftV22"
+    }
+    concern: dict[str, dict[str, object]] | None = None
+    if "_AuditConcernDraftV22" in definitions:
+        concern = cast(
+            dict[str, dict[str, object]],
+            definitions["_AuditConcernDraftV22"]["properties"],
+        )
+        concern_passages = concern["passages"]
+        concern_passages["items"] = {
+            "$ref": "#/$defs/_EvidenceHandleDraftV22"
+        }
     if proposal_count == 0:
         proposal["dependency"] = {"default": None, "type": "null"}
     else:
@@ -241,10 +265,10 @@ def _source_fragment_contract_v22(
         dependency_target_schema = dependency["target_ordinal"]
         dependency_target_schema["maximum"] = proposal_count
 
-    source_list = json.dumps(source_ids, ensure_ascii=False, separators=(",", ":"))
+    handle_list = json.dumps(handle_values, ensure_ascii=False, separators=(",", ":"))
     instructions = (
         _INSTRUCTIONS[operation]
-        + f" Allowed source_id values: {source_list}. {_QUOTE_RULE}"
+        + f" Allowed evidence_handle values: {handle_list}. {_EVIDENCE_HANDLE_RULE}"
     )
     if operation is EvaluatorOperationV22.SOURCE_REVIEW_FRAGMENT:
         if proposal_count == 0:
@@ -257,10 +281,8 @@ def _source_fragment_contract_v22(
                 f"{proposal_count}."
             )
     else:
-        concern = cast(
-            dict[str, dict[str, object]],
-            definitions["_AuditConcernDraftV22"]["properties"],
-        )
+        if concern is None:  # pragma: no cover - schema provenance invariant
+            raise ValueError("source-audit schema is invalid")
         if proposal_count == 0:
             concern["target_proposal_ordinal"] = {"default": None, "type": "null"}
             instructions += (
@@ -314,6 +336,7 @@ def _source_review_request_from_context_v22(
         json_schema=schema,
         payload={
             "source_record": source_record,
+            "evidence_handles": _source_evidence_handles_v22(source_record),
             "accepted_proposals": accepted_proposals,
             "fragment_ordinal": fragment_ordinal,
             "max_new_proposals": 5,
@@ -340,6 +363,7 @@ def _source_audit_request_from_context_v22(
         json_schema=schema,
         payload={
             "source_record": source_record,
+            "evidence_handles": _source_evidence_handles_v22(source_record),
             "indexed_proposals": [
                 proposal.model_dump(mode="json") for proposal in review.proposals
             ],

@@ -126,6 +126,23 @@ class _DependencyDraftV22(V2StrictModel):
     target_ordinal: _LocalOrdinalV22
 
 
+class _EvidenceHandleDraftV22(V2StrictModel):
+    evidence_handle: str
+
+    _validate_handle = field_validator("evidence_handle")(_nonblank)
+
+
+_DraftPassageV22: TypeAlias = _EvidenceHandleDraftV22 | SemanticPassage
+
+
+def _parse_draft_passage_shape(value: object) -> _DraftPassageV22:
+    if isinstance(value, (_EvidenceHandleDraftV22, SemanticPassage)):
+        return value
+    if isinstance(value, dict) and "evidence_handle" in value:
+        return _EvidenceHandleDraftV22.model_validate(value)
+    return SemanticPassage.model_validate(value)
+
+
 class _ProposalDraftV22(V2StrictModel):
     statement: str
     kind: Literal[
@@ -139,18 +156,25 @@ class _ProposalDraftV22(V2StrictModel):
         "gap",
     ]
     importance: Literal["critical", "material", "supporting"]
-    passages: tuple[SemanticPassage, ...] = Field(min_length=1, max_length=5)
+    passages: tuple[_DraftPassageV22, ...] = Field(min_length=1, max_length=5)
     dependency: _DependencyDraftV22 | None = None
     confidence: Literal["clear", "ambiguous", "unresolved"]
     rationale: str
 
     _validate_text = field_validator("statement", "rationale")(_nonblank)
 
+    @field_validator("passages", mode="before")
+    @classmethod
+    def parse_passage_shapes(cls, values: object) -> object:
+        if isinstance(values, (list, tuple)):
+            return tuple(_parse_draft_passage_shape(value) for value in values)
+        return values
+
     @field_validator("passages")
     @classmethod
     def reject_duplicate_passages(
-        cls, values: tuple[SemanticPassage, ...]
-    ) -> tuple[SemanticPassage, ...]:
+        cls, values: tuple[_DraftPassageV22, ...]
+    ) -> tuple[_DraftPassageV22, ...]:
         if len(values) != len(set(values)):
             raise ValueError("draft proposal passages must be unique")
         return values
@@ -176,17 +200,24 @@ class _AuditConcernDraftV22(V2StrictModel):
         "incorrect_relationship",
         "ambiguity",
     ]
-    passages: tuple[SemanticPassage, ...] = Field(min_length=1, max_length=5)
+    passages: tuple[_DraftPassageV22, ...] = Field(min_length=1, max_length=5)
     explanation: str
     correction: _ProposalDraftV22 | None = None
 
     _validate_explanation = field_validator("explanation")(_nonblank)
 
+    @field_validator("passages", mode="before")
+    @classmethod
+    def parse_passage_shapes(cls, values: object) -> object:
+        if isinstance(values, (list, tuple)):
+            return tuple(_parse_draft_passage_shape(value) for value in values)
+        return values
+
     @field_validator("passages")
     @classmethod
     def reject_duplicate_passages(
-        cls, values: tuple[SemanticPassage, ...]
-    ) -> tuple[SemanticPassage, ...]:
+        cls, values: tuple[_DraftPassageV22, ...]
+    ) -> tuple[_DraftPassageV22, ...]:
         if len(values) != len(set(values)):
             raise ValueError("draft audit passages must be unique")
         return values
@@ -386,6 +417,28 @@ def _source_texts(request: EvaluatorRequestV22) -> dict[str, str]:
     return texts
 
 
+def _evidence_handle_inventory(
+    request: EvaluatorRequestV22, source_texts: dict[str, str]
+) -> dict[str, tuple[str, str]]:
+    raw = request.payload.get("evidence_handles")
+    if raw is None:
+        return {}
+    if not isinstance(raw, list) or len(raw) != len(source_texts):
+        raise _ControllerInvariantV22("source evidence-handle inventory is invalid")
+    result: dict[str, tuple[str, str]] = {}
+    source_ids = list(source_texts)
+    for ordinal, item in enumerate(raw, 1):
+        if not isinstance(item, dict) or set(item) != {"evidence_handle", "source_id"}:
+            raise _ControllerInvariantV22("source evidence-handle inventory is invalid")
+        expected_handle = f"SOURCE-{ordinal:06d}"
+        handle = item.get("evidence_handle")
+        source_id = item.get("source_id")
+        if handle != expected_handle or source_id != source_ids[ordinal - 1]:
+            raise _ControllerInvariantV22("source evidence-handle inventory is invalid")
+        result[expected_handle] = (source_id, source_texts[source_id])
+    return result
+
+
 def _resolve_quote(source_id: str, quote: str, source_texts: dict[str, str]) -> tuple[str, bool]:
     text = source_texts.get(source_id)
     if text is None:
@@ -409,7 +462,9 @@ def _resolve_quote(source_id: str, quote: str, source_texts: dict[str, str]) -> 
 
 
 def _resolve_passages(
-    values: tuple[SemanticPassage, ...], source_texts: dict[str, str]
+    values: tuple[_DraftPassageV22, ...],
+    source_texts: dict[str, str],
+    evidence_handles: dict[str, tuple[str, str]],
 ) -> tuple[list[dict[str, str]], bool, bool]:
     """Bind passages and remove only duplicates made byte-identical by binding."""
     passages: list[dict[str, str]] = []
@@ -417,14 +472,21 @@ def _resolve_passages(
     evidence_normalized = False
     duplicate_removed = False
     for passage in values:
-        quote, changed = _resolve_quote(passage.source_id, passage.quote, source_texts)
-        key = (passage.source_id, quote)
+        if isinstance(passage, _EvidenceHandleDraftV22):
+            bound = evidence_handles.get(passage.evidence_handle)
+            if bound is None:
+                raise _DraftNeedsClarificationV22(DraftReasonCodeV22.REFERENCE_UNKNOWN)
+            key = bound
+            changed = False
+        else:
+            quote, changed = _resolve_quote(passage.source_id, passage.quote, source_texts)
+            key = (passage.source_id, quote)
         evidence_normalized = evidence_normalized or changed
         if key in seen:
             duplicate_removed = True
             continue
         seen.add(key)
-        passages.append({"source_id": passage.source_id, "quote": quote})
+        passages.append({"source_id": key[0], "quote": key[1]})
     return passages, evidence_normalized, duplicate_removed
 
 
@@ -491,10 +553,13 @@ def _controller_proposal_inventory(
 def _resolved_proposal(
     proposal: _ProposalDraftV22,
     source_texts: dict[str, str],
+    evidence_handles: dict[str, tuple[str, str]],
     dependency_inventory: tuple[tuple[str, str], ...],
 ) -> tuple[dict[str, object], bool, bool]:
     raw = proposal.model_dump(mode="json")
-    passages, normalized, duplicate_removed = _resolve_passages(proposal.passages, source_texts)
+    passages, normalized, duplicate_removed = _resolve_passages(
+        proposal.passages, source_texts, evidence_handles
+    )
     raw["passages"] = passages
     if proposal.dependency is not None:
         ordinal = proposal.dependency.target_ordinal
@@ -511,6 +576,7 @@ def _compile_source_review(
     request: EvaluatorRequestV22, draft: _SourceReviewDraftV22
 ) -> tuple[dict[str, object], tuple[str, ...]]:
     source_texts = _source_texts(request)
+    evidence_handles = _evidence_handle_inventory(request, source_texts)
     dependencies = _controller_proposal_inventory(
         request.payload.get("accepted_proposals", []),
         location="source-review",
@@ -522,7 +588,7 @@ def _compile_source_review(
     duplicate_removed = False
     for proposal in draft.proposals:
         compiled, changed, passage_duplicates = _resolved_proposal(
-            proposal, source_texts, dependencies
+            proposal, source_texts, evidence_handles, dependencies
         )
         identity = str(compiled["statement"])
         encoded = canonical_json_bytes(compiled)
@@ -550,6 +616,7 @@ def _compile_source_audit(
     request: EvaluatorRequestV22, draft: _SourceAuditDraftV22
 ) -> tuple[dict[str, object], tuple[str, ...]]:
     source_texts = _source_texts(request)
+    evidence_handles = _evidence_handle_inventory(request, source_texts)
     inventory = request.payload.get("indexed_proposals")
     if not isinstance(inventory, list):
         raise _ControllerInvariantV22("source-audit proposal inventory is invalid")
@@ -580,13 +647,18 @@ def _compile_source_audit(
                 raise _DraftNeedsClarificationV22(DraftReasonCodeV22.SUBSTANCE_MISSING)
         elif target is None or concern.correction is None:
             raise _DraftNeedsClarificationV22(DraftReasonCodeV22.SUBSTANCE_MISSING)
-        passages, changed, passage_duplicates = _resolve_passages(concern.passages, source_texts)
+        passages, changed, passage_duplicates = _resolve_passages(
+            concern.passages, source_texts, evidence_handles
+        )
         evidence_normalized = evidence_normalized or changed
         duplicate_removed = duplicate_removed or passage_duplicates
         correction: dict[str, object] | None = None
         if concern.correction is not None:
             correction, changed, correction_duplicates = _resolved_proposal(
-                concern.correction, source_texts, dependency_inventory
+                concern.correction,
+                source_texts,
+                evidence_handles,
+                dependency_inventory,
             )
             evidence_normalized = evidence_normalized or changed
             duplicate_removed = duplicate_removed or correction_duplicates
