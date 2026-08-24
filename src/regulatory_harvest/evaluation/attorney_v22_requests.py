@@ -43,6 +43,16 @@ from .attorney_v22_models import (
 )
 
 _INNER = " Return only the inner payload as one canonical JSON object conforming exactly to json_schema. Do not author the outer response envelope; the controller supplies operation, request_fingerprint, provider_name, model_name, judge_isolation, and the outer schema_version."
+_QUOTE_RULE = (
+    "Each passage quote must be an exact or whitespace-normalized unique contiguous "
+    "substring of the normalized_text for its source_id."
+)
+_AUDIT_SHAPE_RULE = (
+    " Concern shapes are fixed: omission requires no target and a correction; "
+    "ambiguity requires a target and no correction; incorrect_statement, "
+    "incorrect_evidence, and incorrect_relationship each require both a target and "
+    "a correction."
+)
 _INSTRUCTIONS = {
     EvaluatorOperationV22.SOURCE_REVIEW_FRAGMENT: "Review the supplied frozen source record and accepted inventory. Identify only new source-grounded semantic proposals.",
     EvaluatorOperationV22.SOURCE_AUDIT_FRAGMENT: "Audit the supplied source record and controller-indexed proposal inventory. Identify only new source-grounded concerns.",
@@ -54,6 +64,10 @@ _INSTRUCTIONS = {
 
 def _schema_hash(value: object) -> str:
     return sha256_digest(canonical_json_bytes(value))
+
+
+_SOURCE_REVIEW_DRAFT_SCHEMA_V22 = _SourceReviewDraftV22.model_json_schema()
+_SOURCE_AUDIT_DRAFT_SCHEMA_V22 = _SourceAuditDraftV22.model_json_schema()
 
 
 COMPILER_CONTRACT_V22: dict[str, object] = {
@@ -68,8 +82,8 @@ COMPILER_CONTRACT_V22: dict[str, object] = {
         "rubric": _schema_hash(RubricV22.model_json_schema()),
     },
     "draft_schema_hashes": {
-        "source_review": _schema_hash(_SourceReviewDraftV22.model_json_schema()),
-        "source_audit": _schema_hash(_SourceAuditDraftV22.model_json_schema()),
+        "source_review": _schema_hash(_SOURCE_REVIEW_DRAFT_SCHEMA_V22),
+        "source_audit": _schema_hash(_SOURCE_AUDIT_DRAFT_SCHEMA_V22),
         "referee": _schema_hash(_RefereeDraftV22.model_json_schema()),
         "ordinary_grade": _schema_hash(_OrdinaryGradeDraftV22.model_json_schema()),
         "contested_grade": _schema_hash(_ContestedGradeDraftV22.model_json_schema()),
@@ -79,6 +93,7 @@ COMPILER_CONTRACT_V22: dict[str, object] = {
     "fragment_maximum": 5,
     "fragments_per_operation_maximum": 128,
     "items_per_operation_maximum": 640,
+    "request_contract_version": "source-evidence-and-ordinal-constraints-v1",
     "ordering_version": "controller-fragment-order-v1",
     "compiler_version": "semantic-compiler-v2.2",
     "aggregate_version": "fragment-aggregate-v2.2",
@@ -116,12 +131,13 @@ def _new_request_v22(
     json_schema: dict[str, object],
     payload: dict[str, object],
     safe_metadata: dict[str, str],
+    system_instructions: str | None = None,
 ) -> EvaluatorRequestV22:
     provisional = EvaluatorRequestV22(
         schema_version="2.2",
         operation=operation,
         request_fingerprint="0" * 64,
-        system_instructions=_INSTRUCTIONS[operation] + _INNER,
+        system_instructions=system_instructions or (_INSTRUCTIONS[operation] + _INNER),
         json_schema=_snapshot(json_schema, "schema"),
         payload=_snapshot(payload, "payload"),
         safe_metadata={
@@ -185,6 +201,87 @@ def _context_source_metadata_v22(
     return dict(context.safe_metadata)
 
 
+def _source_ids_v22(source_record: dict[str, object]) -> list[str]:
+    sources = cast(list[dict[str, object]], source_record["sources"])
+    return [cast(str, source["source_id"]) for source in sources]
+
+
+def _source_fragment_contract_v22(
+    operation: EvaluatorOperationV22,
+    *,
+    source_record: dict[str, object],
+    proposal_count: int,
+) -> tuple[dict[str, object], str]:
+    if operation is EvaluatorOperationV22.SOURCE_REVIEW_FRAGMENT:
+        schema = _snapshot(_SOURCE_REVIEW_DRAFT_SCHEMA_V22, "schema")
+    elif operation is EvaluatorOperationV22.SOURCE_AUDIT_FRAGMENT:
+        schema = _snapshot(_SOURCE_AUDIT_DRAFT_SCHEMA_V22, "schema")
+    else:  # pragma: no cover - private helper has two fixed call sites
+        raise ValueError("source-fragment operation is invalid")
+    definitions = cast(dict[str, dict[str, object]], schema["$defs"])
+    passage = cast(
+        dict[str, dict[str, object]], definitions["SemanticPassage"]["properties"]
+    )
+    source_ids = _source_ids_v22(source_record)
+    source_id_schema = passage["source_id"]
+    source_id_schema["enum"] = source_ids
+    quote_schema = passage["quote"]
+    quote_schema["description"] = _QUOTE_RULE
+
+    proposal = cast(
+        dict[str, dict[str, object]], definitions["_ProposalDraftV22"]["properties"]
+    )
+    if proposal_count == 0:
+        proposal["dependency"] = {"default": None, "type": "null"}
+    else:
+        dependency = cast(
+            dict[str, dict[str, object]],
+            definitions["_DependencyDraftV22"]["properties"],
+        )
+        dependency_target_schema = dependency["target_ordinal"]
+        dependency_target_schema["maximum"] = proposal_count
+
+    source_list = json.dumps(source_ids, ensure_ascii=False, separators=(",", ":"))
+    instructions = (
+        _INSTRUCTIONS[operation]
+        + f" Allowed source_id values: {source_list}. {_QUOTE_RULE}"
+    )
+    if operation is EvaluatorOperationV22.SOURCE_REVIEW_FRAGMENT:
+        if proposal_count == 0:
+            instructions += (
+                " No accepted proposal ordinals exist; dependency must be null."
+            )
+        else:
+            instructions += (
+                " Allowed dependency target_ordinal values: 1 through "
+                f"{proposal_count}."
+            )
+    else:
+        concern = cast(
+            dict[str, dict[str, object]],
+            definitions["_AuditConcernDraftV22"]["properties"],
+        )
+        if proposal_count == 0:
+            concern["target_proposal_ordinal"] = {"default": None, "type": "null"}
+            instructions += (
+                " No target proposal ordinals exist; target_proposal_ordinal must be "
+                "null and correction dependencies must be null."
+            )
+        else:
+            target = cast(
+                list[dict[str, object]],
+                concern["target_proposal_ordinal"]["anyOf"],
+            )[0]
+            target["maximum"] = proposal_count
+            instructions += f" Allowed target proposal ordinals: 1 through {proposal_count}."
+            instructions += (
+                " Allowed correction dependency target_ordinal values: 1 through "
+                f"{proposal_count}."
+            )
+        instructions += _AUDIT_SHAPE_RULE
+    return schema, instructions + _INNER
+
+
 def _frozen_source_record_v22(envelope: CaseEnvelope) -> tuple[dict[str, object], str]:
     context = _verified_source_request_context_v22(envelope)
     return _context_source_record_v22(context), context.source_record_fingerprint
@@ -206,16 +303,23 @@ def _source_review_request_from_context_v22(
     accepted_proposals: list[dict[str, object]],
     fragment_ordinal: int,
 ) -> EvaluatorRequestV22:
+    source_record = _context_source_record_v22(context)
+    schema, instructions = _source_fragment_contract_v22(
+        EvaluatorOperationV22.SOURCE_REVIEW_FRAGMENT,
+        source_record=source_record,
+        proposal_count=len(accepted_proposals),
+    )
     return _new_request_v22(
         EvaluatorOperationV22.SOURCE_REVIEW_FRAGMENT,
-        json_schema=_SourceReviewDraftV22.model_json_schema(),
+        json_schema=schema,
         payload={
-            "source_record": _context_source_record_v22(context),
+            "source_record": source_record,
             "accepted_proposals": accepted_proposals,
             "fragment_ordinal": fragment_ordinal,
             "max_new_proposals": 5,
         },
         safe_metadata=_context_source_metadata_v22(context),
+        system_instructions=instructions,
     )
 
 
@@ -225,11 +329,17 @@ def _source_audit_request_from_context_v22(
     accepted_concerns: list[dict[str, object]],
     fragment_ordinal: int,
 ) -> EvaluatorRequestV22:
+    source_record = _context_source_record_v22(context)
+    schema, instructions = _source_fragment_contract_v22(
+        EvaluatorOperationV22.SOURCE_AUDIT_FRAGMENT,
+        source_record=source_record,
+        proposal_count=len(review.proposals),
+    )
     return _new_request_v22(
         EvaluatorOperationV22.SOURCE_AUDIT_FRAGMENT,
-        json_schema=_SourceAuditDraftV22.model_json_schema(),
+        json_schema=schema,
         payload={
-            "source_record": _context_source_record_v22(context),
+            "source_record": source_record,
             "indexed_proposals": [
                 proposal.model_dump(mode="json") for proposal in review.proposals
             ],
@@ -238,6 +348,7 @@ def _source_audit_request_from_context_v22(
             "max_new_concerns": 5,
         },
         safe_metadata=_context_source_metadata_v22(context),
+        system_instructions=instructions,
     )
 
 
