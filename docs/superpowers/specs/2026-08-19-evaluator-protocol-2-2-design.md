@@ -326,6 +326,14 @@ resolves each ordinal against the ordered frozen requirement subset and rejects
 missing, duplicate-conflicting, or unknown references; the request contract does
 not loosen grade validation or introduce a new substantive judgment.
 
+Every ordinary and contested grade request also issues a bounded
+`report_passage_allowlist`. The controller derives it from exact report lines
+that occur once and includes the complete report as a finishable fallback. The
+issued draft schema enumerates those exact strings, and the instructions require
+graders to select only from that inventory. The compiler retains its independent
+exact-unique-substring validation, so this makes an existing mechanical contract
+self-describing without weakening report binding or affecting the grade.
+
 ## Recovery and continuation
 
 ### Recoverable invariant

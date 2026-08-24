@@ -233,7 +233,7 @@ def test_compiler_contract_binds_every_wire_shaping_rule() -> None:
     assert COMPILER_CONTRACT_V22["fragments_per_operation_maximum"] == 128
     assert COMPILER_CONTRACT_V22["items_per_operation_maximum"] == 640
     assert COMPILER_CONTRACT_V22["request_contract_version"] == (
-        "self-describing-reference-constraints-v2"
+        "self-describing-reference-constraints-v3"
     )
     assert COMPILER_CONTRACT_V22["rubric_version"] == "attorney-eval-v2.2"
     assert len(COMPILER_CONTRACT_V22["strict_schema_hashes"]["rubric"]) == 64
@@ -324,6 +324,55 @@ def test_ordinary_grade_request_exposes_exact_requirement_ordinal_allowlist() ->
             f"Allowed requirement_ordinal values: {encoded}. "
             "Return exactly one grade for each allowed ordinal."
             in request.system_instructions
+        )
+
+
+def test_grade_requests_issue_exact_unique_report_passage_allowlists() -> None:
+    """Graders must select controller-issued passages instead of guessing substrings."""
+    from test_attorney_v22_compiler import canonical_baseline
+
+    from regulatory_harvest.evaluation.attorney_v22_compiler import (
+        ordinary_grade_batches_v22,
+    )
+
+    report = "Repeated support.\nRepeated support.\nUnique controlling passage."
+    expected = ["Unique controlling passage.", report]
+    baseline = canonical_baseline()
+    ordinary = build_ordinary_grade_request_v22(
+        baseline,
+        ordinary_grade_batches_v22(baseline, "A", 1)[0],
+        "A",
+        1,
+        report,
+        {"rule-1": "The frozen source context."},
+    )
+    contested_baseline, contested = _contested_baseline()
+    contested_request = build_contested_grade_request_v22(
+        contested_baseline,
+        contested,
+        "A",
+        1,
+        report,
+        {"rule-1": "The frozen source context."},
+    )
+
+    ordinary_items = ordinary.json_schema["$defs"]["_RequirementGradeDraftV22"][
+        "properties"
+    ]["report_passages"]["items"]
+    contested_items = contested_request.json_schema["$defs"][
+        "ContestedAlternativeGradeV22"
+    ]["properties"]["report_passages"]["items"]
+    for request, items in (
+        (ordinary, ordinary_items),
+        (contested_request, contested_items),
+    ):
+        assert request.payload["report_passage_allowlist"] == expected
+        assert items["enum"] == expected
+        assert "Select report_passages only from the controller-issued" in (
+            request.system_instructions
+        )
+        assert "Each allowed value is an exact unique substring" in (
+            request.system_instructions
         )
 
 
@@ -695,9 +744,9 @@ def test_linear_source_builders_preserve_current_request_contract_bytes() -> Non
     requests = (first_request, second_request, audit_request)
 
     assert tuple(item.request_fingerprint for item in requests) == (
-        "1a9139c2793f838bb0a22e37db2d2d7f69a19e3dc568b14a6e758d0c05420b2a",
-        "d12a09785a16c4f3f9608cb82f8d2b1010f21e7e59ffab7962a84a8d64417742",
-        "da93a947677fcceff63555285d929dc19644249a7f932c272a9214b5c2c10477",
+        "a78a16a14ac5d2f055d37a0d13d7ddc72847d9b3df3ecc9e8c779be8b8abf547",
+        "3ec7257af608d5a6f3a71e969fe2688b94df4bc3756004271060b7c6ec4ff820",
+        "6762b1ef2150aad99540f77579ed99ef451775acd4fd7e87e54bdbfed839fa66",
     )
     assert tuple(
         hashlib.sha256(
@@ -705,9 +754,9 @@ def test_linear_source_builders_preserve_current_request_contract_bytes() -> Non
         ).hexdigest()
         for item in requests
     ) == (
-        "75fd2e8fb3654a0a92ae8e2ff8d5103356b91261273aae96fb5386fbc4aff21c",
-        "93ffb7c98cd98926885f10a17768cd664208b481d03ff7e02d5f50c81f8fa2fe",
-        "aad8d9aba48662e53649ebac0f767c04e2622af66ea9003cd4aa03957e52e846",
+        "985f199cc3c22c4215a9689895357418e30f495e86ba17a1fd20209d325b3b53",
+        "ae87f23b8f73696cc0cc4c79b954abb08282eff71f75c37760518ca2789b82df",
+        "bfc279a4e743aeb465cf1946127394fcccaf1fbda9a5014b5d6c5ea35f0da55c",
     )
 
 

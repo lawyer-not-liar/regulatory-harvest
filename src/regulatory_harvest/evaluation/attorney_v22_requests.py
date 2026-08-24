@@ -58,6 +58,12 @@ _GRADE_ORDINAL_RULE = (
     " Return exactly one grade for each allowed ordinal. The ordinal is the "
     "1-based position of the requirement in the supplied requirements array."
 )
+_REPORT_PASSAGE_RULE = (
+    " Select report_passages only from the controller-issued "
+    "report_passage_allowlist values. Each allowed value is an exact unique "
+    "substring of the supplied report. Prefer the narrowest accurate passage; the "
+    "whole-report fallback exists only when no narrower allowed passage suffices."
+)
 _INSTRUCTIONS = {
     EvaluatorOperationV22.SOURCE_REVIEW_FRAGMENT: "Review the supplied frozen source record and accepted inventory. Identify only new source-grounded semantic proposals.",
     EvaluatorOperationV22.SOURCE_AUDIT_FRAGMENT: "Audit the supplied source record and controller-indexed proposal inventory. Identify only new source-grounded concerns.",
@@ -73,6 +79,7 @@ def _schema_hash(value: object) -> str:
 
 _SOURCE_REVIEW_DRAFT_SCHEMA_V22 = _SourceReviewDraftV22.model_json_schema()
 _SOURCE_AUDIT_DRAFT_SCHEMA_V22 = _SourceAuditDraftV22.model_json_schema()
+_CONTESTED_GRADE_DRAFT_SCHEMA_V22 = _ContestedGradeDraftV22.model_json_schema()
 
 
 COMPILER_CONTRACT_V22: dict[str, object] = {
@@ -91,14 +98,14 @@ COMPILER_CONTRACT_V22: dict[str, object] = {
         "source_audit": _schema_hash(_SOURCE_AUDIT_DRAFT_SCHEMA_V22),
         "referee": _schema_hash(_RefereeDraftV22.model_json_schema()),
         "ordinary_grade": _schema_hash(_OrdinaryGradeDraftV22.model_json_schema()),
-        "contested_grade": _schema_hash(_ContestedGradeDraftV22.model_json_schema()),
+        "contested_grade": _schema_hash(_CONTESTED_GRADE_DRAFT_SCHEMA_V22),
     },
     "enum_aliases": {key: sorted(values) for key, values in sorted(_ENUM_ALIASES.items())},
     "evidence_normalization_version": "source-whitespace-unique-v1",
     "fragment_maximum": 5,
     "fragments_per_operation_maximum": 128,
     "items_per_operation_maximum": 640,
-    "request_contract_version": "self-describing-reference-constraints-v2",
+    "request_contract_version": "self-describing-reference-constraints-v3",
     "ordering_version": "controller-fragment-order-v1",
     "compiler_version": "semantic-compiler-v2.2",
     "aggregate_version": "fragment-aggregate-v2.2",
@@ -163,6 +170,7 @@ def _new_request_v22(
 
 def _ordinary_grade_request_contract_v22(
     requirement_count: int,
+    report_passages: list[str],
 ) -> tuple[dict[str, object], str]:
     if not 1 <= requirement_count <= 5:
         raise ValueError("ordinary-grade requirement inventory is invalid")
@@ -173,6 +181,11 @@ def _ordinary_grade_request_contract_v22(
     grade = cast(dict[str, object], definitions["_RequirementGradeDraftV22"])
     grade_properties = cast(dict[str, object], grade["properties"])
     ordinal = cast(dict[str, object], grade_properties["requirement_ordinal"])
+    passage_schema = cast(
+        dict[str, object],
+        cast(dict[str, object], grade_properties["report_passages"])["items"],
+    )
+    passage_schema["enum"] = list(report_passages)
     allowed = list(range(1, requirement_count + 1))
     ordinal["enum"] = allowed
     properties = cast(dict[str, object], schema["properties"])
@@ -184,9 +197,32 @@ def _ordinary_grade_request_contract_v22(
         _INSTRUCTIONS[EvaluatorOperationV22.ORDINARY_GRADE_FRAGMENT]
         + f" Allowed requirement_ordinal values: {encoded}."
         + _GRADE_ORDINAL_RULE
+        + _REPORT_PASSAGE_RULE
         + _INNER
     )
     return schema, instructions
+
+
+def _contested_grade_request_contract_v22(
+    report_passages: list[str],
+) -> tuple[dict[str, object], str]:
+    schema = _snapshot(
+        _CONTESTED_GRADE_DRAFT_SCHEMA_V22, "contested-grade draft schema"
+    )
+    definitions = cast(dict[str, object], schema["$defs"])
+    alternative = cast(dict[str, object], definitions["ContestedAlternativeGradeV22"])
+    properties = cast(dict[str, object], alternative["properties"])
+    passage_schema = cast(
+        dict[str, object],
+        cast(dict[str, object], properties["report_passages"])["items"],
+    )
+    passage_schema["enum"] = list(report_passages)
+    return (
+        schema,
+        _INSTRUCTIONS[EvaluatorOperationV22.CONTESTED_GRADE_FRAGMENT]
+        + _REPORT_PASSAGE_RULE
+        + _INNER,
+    )
 
 
 @dataclass(frozen=True)
@@ -625,9 +661,30 @@ def _grade_context(
     return {
         "report_text": report_text,
         "report_fingerprint": report_digest.hexdigest(),
+        "report_passage_allowlist": _report_passage_allowlist_v22(report_text),
         "source_context": checked_source_context,
         "rubric": checked_rubric.model_dump(mode="json"),
     }
+
+
+def _report_passage_allowlist_v22(report_text: str) -> list[str]:
+    """Issue bounded exact-unique report passages plus one finishable fallback."""
+    if not isinstance(report_text, str) or not report_text.strip():
+        raise ValueError("report text is invalid")
+    passages: list[str] = []
+    for raw_line in report_text.splitlines():
+        passage = raw_line.strip()
+        if (
+            passage
+            and passage not in passages
+            and report_text.count(passage) == 1
+        ):
+            passages.append(passage)
+            if len(passages) == 639:
+                break
+    if report_text not in passages:
+        passages.append(report_text)
+    return passages
 
 
 def build_ordinary_grade_request_v22(
@@ -663,8 +720,10 @@ def build_ordinary_grade_request_v22(
     for requirement_id in checked.requirement_ids:
         requirement = requirements[requirement_id]
         serialized_requirements += [requirement.model_dump(mode="json")]
+    grade_context = _grade_context(report_text, source_context, rubric)
+    passage_allowlist = cast(list[str], grade_context["report_passage_allowlist"])
     schema, instructions = _ordinary_grade_request_contract_v22(
-        len(serialized_requirements)
+        len(serialized_requirements), passage_allowlist
     )
     return _new_request_v22(
         EvaluatorOperationV22.ORDINARY_GRADE_FRAGMENT,
@@ -675,7 +734,7 @@ def build_ordinary_grade_request_v22(
             "batch_ref": checked.batch_ref,
             "baseline_fingerprint": sealed.baseline_fingerprint,
             "requirements": serialized_requirements,
-            **_grade_context(report_text, source_context, rubric),
+            **grade_context,
         },
         safe_metadata={
             "record_scope": "one-ordinary-grade-batch",
@@ -714,19 +773,23 @@ def build_contested_grade_request_v22(
         raise ValueError("contested requirement is absent from inventory")
     if len(sealed.contested_requirements) > 128:
         raise ValueError("contested grade inventory exceeds 128 fragments")
+    grade_context = _grade_context(report_text, source_context, rubric)
+    passage_allowlist = cast(list[str], grade_context["report_passage_allowlist"])
+    schema, instructions = _contested_grade_request_contract_v22(passage_allowlist)
     return _new_request_v22(
         EvaluatorOperationV22.CONTESTED_GRADE_FRAGMENT,
-        json_schema=_ContestedGradeDraftV22.model_json_schema(),
+        json_schema=schema,
         payload={
             "anonymous_label": anonymous_label,
             "grader_lane": grader_lane,
             "baseline_fingerprint": sealed.baseline_fingerprint,
             "contested_requirement": checked.model_dump(mode="json"),
-            **_grade_context(report_text, source_context, rubric),
+            **grade_context,
         },
         safe_metadata={
             "record_scope": "one-contested-grade-requirement",
             "baseline_fingerprint": sealed.baseline_fingerprint,
             "contested_requirement_id": checked.contested_requirement_id,
         },
+        system_instructions=instructions,
     )
