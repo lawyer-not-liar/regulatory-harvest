@@ -1,22 +1,21 @@
 # Regulatory Harvest
 
-> **Experimental beta (`v0.1.0-beta.4`).** Beta.4 adds general materiality
-> safeguards and graph-to-report omission safeguards from merged PR #7.
-> A citation quote no longer counts as coverage by itself: provisional
-> `not_material` decisions must be challenged against the atomic rule graph,
-> and material graph elements must be traced into rendered report prose.
-> The beta.3 post-release private run completed end to end.
-> Both grader lanes independently reached `FAIL` on the locked recall and
-> coverage floors. That result proves technical operability, not private
-> content readiness. Beta.4 has not yet earned a private `PASS`.
+> **Experimental beta (`v0.1.0-beta.5`).** Beta.5 makes Protocol 2.2
+> source-review and source-audit requests self-describing: they enumerate
+> allowed source IDs, state the exact contiguous quotation rule, expose
+> controller-owned ordinal bounds, and state the audit concern shape matrix.
+> Compiler validation remains fail-closed and unchanged.
+> The beta.4 private evaluation paused before any evaluator response was
+> accepted because of an under-specified request contract. Beta.5 addresses
+> that interface defect. Beta.5 has not yet earned a private `PASS`.
 > No performance, benchmark, or report-quality claim is made.
 > Results are AI Generated and may contain
 > errors. Output must be validated by an attorney before the attorney delivers
 > legal advice.
 
-The GitHub prerelease label `v0.1.0-beta.4` packages project version `0.1.0`.
+The GitHub prerelease label `v0.1.0-beta.5` packages project version `0.1.0`.
 The beta suffix describes the release channel. This release builds on exact
-merge commit `5a4ad1c261aba4aafd294b1c37fac1bb4452c633`. Protocol 2.2 remains
+merge commit `e50f5c013ed8307e331ff96ab3cbd3b4bc2f0610`. Protocol 2.2 remains
 opt-in and experimental; Protocol 2.1 remains the new-run default. No PyPI
 distribution is published.
 
