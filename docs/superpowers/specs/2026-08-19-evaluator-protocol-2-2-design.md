@@ -318,6 +318,14 @@ referee fragments, ordinary grade fragments, and contested grade fragments remai
 bounded as in Protocol 2.1, but all use the new draft compiler before strict
 preflight.
 
+Each ordinary-grade request makes its batch-local references self-describing.
+The issued schema enumerates exactly the allowed 1-based
+`requirement_ordinal` values, fixes the draft array to the exact batch size, and
+the instructions require one grade for every issued ordinal. The compiler still
+resolves each ordinal against the ordered frozen requirement subset and rejects
+missing, duplicate-conflicting, or unknown references; the request contract does
+not loosen grade validation or introduce a new substantive judgment.
+
 ## Recovery and continuation
 
 ### Recoverable invariant

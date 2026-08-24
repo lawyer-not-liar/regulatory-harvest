@@ -6127,6 +6127,54 @@ def test_protocol_22_portable_source_requests_expose_compiler_constraints() -> N
     }
 
 
+def test_protocol_22_portable_ordinary_request_exposes_exact_ordinal_allowlist() -> None:
+    portable = _load_protocol_22_portable()
+    requirements = [
+        {"requirement_id": f"REQ-{ordinal:04d}"} for ordinal in range(1, 5)
+    ]
+    request = portable._v22_new_request(
+        "ordinary_grade_fragment",
+        {
+            "anonymous_label": "A",
+            "grader_lane": 1,
+            "batch_ref": "GB-A-1-0001",
+            "baseline_fingerprint": "a" * 64,
+            "report_text": "The report addresses the issued requirements.",
+            "report_fingerprint": "b" * 64,
+            "source_context": {"rule-1": "The frozen source context."},
+            "rubric": copy.deepcopy(portable._V22_RUBRIC),
+            "requirements": requirements,
+        },
+        {
+            "record_scope": "one-ordinary-grade-batch",
+            "baseline_fingerprint": "a" * 64,
+            "batch_ref": "GB-A-1-0001",
+        },
+    )
+    definitions = request["json_schema"]["$defs"]
+    ordinal = definitions["_RequirementGradeDraftV22"]["properties"][
+        "requirement_ordinal"
+    ]
+    grades = request["json_schema"]["properties"]["requirement_grades"]
+
+    assert ordinal["enum"] == [1, 2, 3, 4]
+    assert grades["minItems"] == grades["maxItems"] == 4
+    assert "Allowed requirement_ordinal values: [1,2,3,4]" in request[
+        "system_instructions"
+    ]
+
+    tampered = copy.deepcopy(request)
+    tampered["json_schema"]["$defs"]["_RequirementGradeDraftV22"][
+        "properties"
+    ]["requirement_ordinal"]["enum"] = [1, 2, 3]
+    tampered["request_fingerprint"] = portable._v22_request_fingerprint(tampered)
+    with pytest.raises(
+        portable.PortableEvaluationInputError,
+        match="request schema is invalid",
+    ):
+        portable._v22_validate_request(tampered)
+
+
 def test_protocol_22_source_evidence_handles_have_full_portable_byte_parity() -> None:
     """Dropping portable handle resolution must diverge from the full compiler bytes."""
     portable = _load_protocol_22_portable()

@@ -13196,7 +13196,7 @@ _V22_PROTOCOL = "2.2"
 _V22_MAX_JSON_BYTES = 16 * 1024 * 1024
 _V22_COMPILER_VERSION = "semantic-compiler-v2.2"
 _V22_COMPILER_CONTRACT_FINGERPRINT = (
-    "ec04d2f5956cb6388b1d46f5b2c8c74007f954decff6ada62b1eff6f1e6c55e3"
+    "8a0c00613432b32fa92eb492586db0880d1f273031230b1370a1b447518ba879"
 )
 _V22_STORAGE_CONCURRENCY_CONTRACT = (
     "cooperative-exclusive-directory-namespace-per-operation-v1"
@@ -13229,6 +13229,10 @@ _V22_AUDIT_SHAPE_RULE = (
     "ambiguity requires a target and no correction; incorrect_statement, "
     "incorrect_evidence, and incorrect_relationship each require both a target and "
     "a correction."
+)
+_V22_GRADE_ORDINAL_RULE = (
+    " Return exactly one grade for each allowed ordinal. The ordinal is the "
+    "1-based position of the requirement in the supplied requirements array."
 )
 _V22_INSTRUCTIONS = {
     "source_review_fragment": "Review the supplied frozen source record and accepted inventory. Identify only new source-grounded semantic proposals.",
@@ -13901,10 +13905,61 @@ def _v22_request_fingerprint(request: JsonObject) -> str:
     return _sha256(canonical_json_bytes(body))
 
 
-def _v22_source_fragment_contract(
+def _v22_request_contract(
     operation: str, payload: JsonObject
 ) -> tuple[JsonObject, str]:
     schema = cast(JsonObject, _copy_json(_V22_DRAFT_SCHEMAS[operation]))
+    if operation == "ordinary_grade_fragment":
+        requirements = _v2_list(payload.get("requirements"), location="requirements")
+        if not 1 <= len(requirements) <= 5:
+            raise PortableEvaluationInputError(
+                "ordinary-grade requirement inventory is invalid"
+            )
+        identifiers: list[str] = []
+        for value in requirements:
+            item = _object(value, location="requirement")
+            requirement_id = item.get("requirement_id")
+            if type(requirement_id) is not str or not requirement_id.strip():
+                raise PortableEvaluationInputError(
+                    "ordinary-grade requirement inventory is invalid"
+                )
+            identifiers.append(requirement_id)
+        if len(identifiers) != len(set(identifiers)):
+            raise PortableEvaluationInputError(
+                "ordinary-grade requirement inventory is invalid"
+            )
+        definitions = _object(
+            schema.get("$defs"), location="ordinary-grade draft definitions"
+        )
+        grade = _object(
+            definitions["_RequirementGradeDraftV22"],
+            location="requirement grade schema",
+        )
+        grade_properties = _object(
+            grade.get("properties"), location="requirement grade properties"
+        )
+        allowed = list(range(1, len(requirements) + 1))
+        _object(
+            grade_properties["requirement_ordinal"],
+            location="requirement ordinal schema",
+        )["enum"] = allowed
+        schema_properties = _object(
+            schema.get("properties"), location="ordinary-grade draft properties"
+        )
+        grades = _object(
+            schema_properties["requirement_grades"],
+            location="requirement grades schema",
+        )
+        grades["minItems"] = len(requirements)
+        grades["maxItems"] = len(requirements)
+        encoded = json.dumps(allowed, separators=(",", ":"))
+        return (
+            schema,
+            _V22_INSTRUCTIONS[operation]
+            + f" Allowed requirement_ordinal values: {encoded}."
+            + _V22_GRADE_ORDINAL_RULE
+            + _V22_INNER,
+        )
     if operation not in {"source_review_fragment", "source_audit_fragment"}:
         return schema, _V22_INSTRUCTIONS[operation] + _V22_INNER
     source_record = _object(payload.get("source_record"), location="source record")
@@ -14047,7 +14102,7 @@ def _v22_source_fragment_contract(
 
 
 def _v22_new_request(operation: str, payload: JsonObject, metadata: dict[str, str]) -> JsonObject:
-    schema, instructions = _v22_source_fragment_contract(operation, payload)
+    schema, instructions = _v22_request_contract(operation, payload)
     request: JsonObject = {
         "schema_version": "2.2", "operation": operation,
         "request_fingerprint": "0" * 64,
@@ -14069,7 +14124,7 @@ def _v22_validate_request(value: object) -> JsonObject:
         raise PortableEvaluationInputError("evaluator request is invalid")
     operation = cast(str, request["operation"])
     payload = _object(request["payload"], location="evaluator request payload")
-    expected, instructions = _v22_source_fragment_contract(operation, payload)
+    expected, instructions = _v22_request_contract(operation, payload)
     if request["json_schema"] != expected:
         raise PortableEvaluationInputError("evaluator request schema is invalid")
     if request["system_instructions"] != instructions:

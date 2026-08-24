@@ -233,7 +233,7 @@ def test_compiler_contract_binds_every_wire_shaping_rule() -> None:
     assert COMPILER_CONTRACT_V22["fragments_per_operation_maximum"] == 128
     assert COMPILER_CONTRACT_V22["items_per_operation_maximum"] == 640
     assert COMPILER_CONTRACT_V22["request_contract_version"] == (
-        "immutable-source-evidence-handles-v1"
+        "self-describing-reference-constraints-v2"
     )
     assert COMPILER_CONTRACT_V22["rubric_version"] == "attorney-eval-v2.2"
     assert len(COMPILER_CONTRACT_V22["strict_schema_hashes"]["rubric"]) == 64
@@ -290,6 +290,41 @@ def test_source_review_request_issues_immutable_source_evidence_handles() -> Non
     assert "Select only controller-issued evidence_handle values" in (
         request.system_instructions
     )
+
+
+def test_ordinary_grade_request_exposes_exact_requirement_ordinal_allowlist() -> None:
+    """Every issued batch must tell the grader exactly which local ordinals exist."""
+    from test_attorney_v22_compiler import canonical_baseline
+
+    from regulatory_harvest.evaluation.attorney_v22_compiler import (
+        ordinary_grade_batches_v22,
+    )
+
+    baseline = canonical_baseline(7)
+    first, second = ordinary_grade_batches_v22(baseline, "A", 1)
+
+    for batch, allowed in ((first, [1, 2, 3, 4, 5]), (second, [1, 2])):
+        request = build_ordinary_grade_request_v22(
+            baseline,
+            batch,
+            "A",
+            1,
+            "The report addresses the issued requirements.",
+            {"rule-1": "The frozen source context."},
+        )
+        definitions = request.json_schema["$defs"]
+        grade = definitions["_RequirementGradeDraftV22"]
+        ordinal = grade["properties"]["requirement_ordinal"]
+        grades = request.json_schema["properties"]["requirement_grades"]
+
+        assert ordinal["enum"] == allowed
+        assert grades["minItems"] == grades["maxItems"] == len(allowed)
+        encoded = json.dumps(allowed, separators=(",", ":"))
+        assert (
+            f"Allowed requirement_ordinal values: {encoded}. "
+            "Return exactly one grade for each allowed ordinal."
+            in request.system_instructions
+        )
 
 
 def test_source_review_handles_follow_frozen_multi_source_order() -> None:
@@ -660,9 +695,9 @@ def test_linear_source_builders_preserve_current_request_contract_bytes() -> Non
     requests = (first_request, second_request, audit_request)
 
     assert tuple(item.request_fingerprint for item in requests) == (
-        "e63a3112dfd576d86d5875e193edaa44857547048210b067a4b02947038c6832",
-        "c3fbdd510ccd9ed7e61571d9de17436e4c3dbdbd31f45cba1279d888258d8f44",
-        "ef8b9e9e88af1b1c10e36d869602d1554602c44bb37064458c54c54efd6167db",
+        "1a9139c2793f838bb0a22e37db2d2d7f69a19e3dc568b14a6e758d0c05420b2a",
+        "d12a09785a16c4f3f9608cb82f8d2b1010f21e7e59ffab7962a84a8d64417742",
+        "da93a947677fcceff63555285d929dc19644249a7f932c272a9214b5c2c10477",
     )
     assert tuple(
         hashlib.sha256(
@@ -670,9 +705,9 @@ def test_linear_source_builders_preserve_current_request_contract_bytes() -> Non
         ).hexdigest()
         for item in requests
     ) == (
-        "0a63544b734787313e5678a035587fbbe4805a7df0035e170594a3aebc7c4cd3",
-        "f2e96484b3e89a39dc0a860b1a16ac00ac340d612723e608f39d97a0400c244f",
-        "c4efa5b01748eb4393aa86778f0774547f064f2b6ab2386c29ea49fc2eb5fd65",
+        "75fd2e8fb3654a0a92ae8e2ff8d5103356b91261273aae96fb5386fbc4aff21c",
+        "93ffb7c98cd98926885f10a17768cd664208b481d03ff7e02d5f50c81f8fa2fe",
+        "aad8d9aba48662e53649ebac0f767c04e2622af66ea9003cd4aa03957e52e846",
     )
 
 

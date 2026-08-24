@@ -54,6 +54,10 @@ _AUDIT_SHAPE_RULE = (
     "incorrect_evidence, and incorrect_relationship each require both a target and "
     "a correction."
 )
+_GRADE_ORDINAL_RULE = (
+    " Return exactly one grade for each allowed ordinal. The ordinal is the "
+    "1-based position of the requirement in the supplied requirements array."
+)
 _INSTRUCTIONS = {
     EvaluatorOperationV22.SOURCE_REVIEW_FRAGMENT: "Review the supplied frozen source record and accepted inventory. Identify only new source-grounded semantic proposals.",
     EvaluatorOperationV22.SOURCE_AUDIT_FRAGMENT: "Audit the supplied source record and controller-indexed proposal inventory. Identify only new source-grounded concerns.",
@@ -94,7 +98,7 @@ COMPILER_CONTRACT_V22: dict[str, object] = {
     "fragment_maximum": 5,
     "fragments_per_operation_maximum": 128,
     "items_per_operation_maximum": 640,
-    "request_contract_version": "immutable-source-evidence-handles-v1",
+    "request_contract_version": "self-describing-reference-constraints-v2",
     "ordering_version": "controller-fragment-order-v1",
     "compiler_version": "semantic-compiler-v2.2",
     "aggregate_version": "fragment-aggregate-v2.2",
@@ -155,6 +159,34 @@ def _new_request_v22(
         raw,
         location="evaluator request",
     )
+
+
+def _ordinary_grade_request_contract_v22(
+    requirement_count: int,
+) -> tuple[dict[str, object], str]:
+    if not 1 <= requirement_count <= 5:
+        raise ValueError("ordinary-grade requirement inventory is invalid")
+    schema = _snapshot(
+        _OrdinaryGradeDraftV22.model_json_schema(), "ordinary-grade draft schema"
+    )
+    definitions = cast(dict[str, object], schema["$defs"])
+    grade = cast(dict[str, object], definitions["_RequirementGradeDraftV22"])
+    grade_properties = cast(dict[str, object], grade["properties"])
+    ordinal = cast(dict[str, object], grade_properties["requirement_ordinal"])
+    allowed = list(range(1, requirement_count + 1))
+    ordinal["enum"] = allowed
+    properties = cast(dict[str, object], schema["properties"])
+    grades = cast(dict[str, object], properties["requirement_grades"])
+    grades["minItems"] = requirement_count
+    grades["maxItems"] = requirement_count
+    encoded = json.dumps(allowed, separators=(",", ":"))
+    instructions = (
+        _INSTRUCTIONS[EvaluatorOperationV22.ORDINARY_GRADE_FRAGMENT]
+        + f" Allowed requirement_ordinal values: {encoded}."
+        + _GRADE_ORDINAL_RULE
+        + _INNER
+    )
+    return schema, instructions
 
 
 @dataclass(frozen=True)
@@ -631,9 +663,12 @@ def build_ordinary_grade_request_v22(
     for requirement_id in checked.requirement_ids:
         requirement = requirements[requirement_id]
         serialized_requirements += [requirement.model_dump(mode="json")]
+    schema, instructions = _ordinary_grade_request_contract_v22(
+        len(serialized_requirements)
+    )
     return _new_request_v22(
         EvaluatorOperationV22.ORDINARY_GRADE_FRAGMENT,
-        json_schema=_OrdinaryGradeDraftV22.model_json_schema(),
+        json_schema=schema,
         payload={
             "anonymous_label": anonymous_label,
             "grader_lane": grader_lane,
@@ -647,6 +682,7 @@ def build_ordinary_grade_request_v22(
             "baseline_fingerprint": sealed.baseline_fingerprint,
             "batch_ref": checked.batch_ref,
         },
+        system_instructions=instructions,
     )
 
 
