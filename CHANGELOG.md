@@ -4,6 +4,22 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 
 ## [Unreleased]
 
+## [0.1.0-beta.7] - 2026-08-24
+
+- Made Protocol 2.2 ordinary-grade requests self-describing: each issued schema
+  enumerates the exact allowed requirement ordinals, fixes the draft to one
+  grade for every issued ordinal, and explains that each ordinal is the 1-based
+  position of its requirement in the supplied batch.
+- Strict grade validation remains unchanged; missing, conflicting, and unknown
+  requirement references are still refused.
+- The beta.6 private evaluation accepted all source-stage calls before pausing
+  at an ordinary-grade requirement-reference interface defect. Beta.7 addresses
+  that interface defect, but beta.7 has not yet earned a private `PASS`.
+- No performance, benchmark, or report-quality claim is made. No PyPI
+  distribution is published.
+- Protocol 2.2 remains opt-in and experimental; Protocol 2.1 remains the
+  default.
+
 ## [0.1.0-beta.6] - 2026-08-24
 
 - Added controller-issued immutable evidence handles to Protocol 2.2 source
@@ -135,7 +151,8 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 - The GitHub prerelease packages the unchanged `0.1.0` engine. No PyPI
   distribution is published.
 
-[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.6...HEAD
+[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.7...HEAD
+[0.1.0-beta.7]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.6...v0.1.0-beta.7
 [0.1.0-beta.6]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.5...v0.1.0-beta.6
 [0.1.0-beta.5]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.4...v0.1.0-beta.5
 [0.1.0-beta.4]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.3...v0.1.0-beta.4
