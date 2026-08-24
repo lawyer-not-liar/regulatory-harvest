@@ -99,6 +99,9 @@ from regulatory_harvest.evaluation.attorney_v22_drafts import (
     compile_evaluator_draft_v22,
 )
 from regulatory_harvest.evaluation.attorney_v22_models import EvaluatorRequestV22
+from regulatory_harvest.evaluation.attorney_v22_requests import (
+    COMPILER_CONTRACT_FINGERPRINT_V22,
+)
 from regulatory_harvest.evaluation.attorney_v22_workflow import (
     guarded_submit_evaluator_response_v22 as guarded_submit_v22_core,
 )
@@ -6068,6 +6071,64 @@ def _portable_v22_review_request() -> dict[str, object]:
             "max_new_proposals": 5,
         },
         "safe_metadata": {},
+    }
+
+
+def test_protocol_22_portable_source_requests_expose_compiler_constraints() -> None:
+    portable = _load_protocol_22_portable()
+    assert (
+        portable._V22_COMPILER_CONTRACT_FINGERPRINT
+        == COMPILER_CONTRACT_FINGERPRINT_V22
+    )
+    envelope = portable.freeze_case(_case_payload(), seed_hex="0" * 64)
+    review_request = portable._v22_review_request(envelope, [])
+    review_definitions = review_request["json_schema"]["$defs"]
+    source_ids = [
+        source["source_id"]
+        for source in review_request["payload"]["source_record"]["sources"]
+    ]
+
+    assert review_definitions["SemanticPassage"]["properties"]["source_id"][
+        "enum"
+    ] == source_ids
+    assert review_definitions["_ProposalDraftV22"]["properties"]["dependency"] == {
+        "default": None,
+        "type": "null",
+    }
+    assert "unique contiguous substring" in review_request["system_instructions"]
+
+    proposal = copy.deepcopy(_portable_v22_review_draft()["proposals"][0])
+    audit_request = portable._v22_audit_request(
+        envelope,
+        {
+            "proposals": [{"proposal_ref": "P0001", "proposal": proposal}],
+            "aggregate_fingerprint": "a" * 64,
+        },
+        [],
+    )
+    audit_definitions = audit_request["json_schema"]["$defs"]
+    assert audit_definitions["_AuditConcernDraftV22"]["properties"][
+        "target_proposal_ordinal"
+    ]["anyOf"][0]["maximum"] == 1
+    assert audit_definitions["_DependencyDraftV22"]["properties"][
+        "target_ordinal"
+    ]["maximum"] == 1
+    assert "omission requires no target and a correction" in audit_request[
+        "system_instructions"
+    ]
+
+    empty_audit = portable._v22_audit_request(
+        envelope,
+        {"proposals": [], "aggregate_fingerprint": "b" * 64},
+        [],
+    )
+    empty_definitions = empty_audit["json_schema"]["$defs"]
+    assert empty_definitions["_AuditConcernDraftV22"]["properties"][
+        "target_proposal_ordinal"
+    ] == {"default": None, "type": "null"}
+    assert empty_definitions["_ProposalDraftV22"]["properties"]["dependency"] == {
+        "default": None,
+        "type": "null",
     }
 
 

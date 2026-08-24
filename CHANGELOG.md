@@ -4,6 +4,11 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 
 ## [Unreleased]
 
+- Made Protocol 2.2 source-review and source-audit requests self-describing:
+  issued schemas now enumerate valid source IDs, expose the compiler's quote
+  matching rule, bound controller-owned ordinals, and state the audit concern
+  shape matrix. Compiler validation remains fail-closed and unchanged.
+
 ## [0.1.0-beta.4] - 2026-08-23
 
 - Added general materiality safeguards from merged PR #7 that treat

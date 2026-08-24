@@ -13196,7 +13196,7 @@ _V22_PROTOCOL = "2.2"
 _V22_MAX_JSON_BYTES = 16 * 1024 * 1024
 _V22_COMPILER_VERSION = "semantic-compiler-v2.2"
 _V22_COMPILER_CONTRACT_FINGERPRINT = (
-    "46d582434e37f9b396c73a8c523c3b0666bb11ec8880c9fc2369bcc1fc854306"
+    "5e71246422c85022517d5941a24536fd8679d2aba907a0bee860db3eb9ff6100"
 )
 _V22_STORAGE_CONCURRENCY_CONTRACT = (
     "cooperative-exclusive-directory-namespace-per-operation-v1"
@@ -13218,6 +13218,16 @@ _V22_INNER = (
     "json_schema. Do not author the outer response envelope; the controller supplies "
     "operation, request_fingerprint, provider_name, model_name, judge_isolation, and the "
     "outer schema_version."
+)
+_V22_QUOTE_RULE = (
+    "Each passage quote must be an exact or whitespace-normalized unique contiguous "
+    "substring of the normalized_text for its source_id."
+)
+_V22_AUDIT_SHAPE_RULE = (
+    " Concern shapes are fixed: omission requires no target and a correction; "
+    "ambiguity requires a target and no correction; incorrect_statement, "
+    "incorrect_evidence, and incorrect_relationship each require both a target and "
+    "a correction."
 )
 _V22_INSTRUCTIONS = {
     "source_review_fragment": "Review the supplied frozen source record and accepted inventory. Identify only new source-grounded semantic proposals.",
@@ -13831,12 +13841,119 @@ def _v22_request_fingerprint(request: JsonObject) -> str:
     return _sha256(canonical_json_bytes(body))
 
 
+def _v22_source_fragment_contract(
+    operation: str, payload: JsonObject
+) -> tuple[JsonObject, str]:
+    schema = cast(JsonObject, _copy_json(_V22_DRAFT_SCHEMAS[operation]))
+    if operation not in {"source_review_fragment", "source_audit_fragment"}:
+        return schema, _V22_INSTRUCTIONS[operation] + _V22_INNER
+    source_record = _object(payload.get("source_record"), location="source record")
+    sources = source_record.get("sources")
+    if type(sources) is not list:
+        raise PortableEvaluationInputError("source record is invalid")
+    source_ids: list[str] = []
+    for item in sources:
+        source = _object(item, location="source record source")
+        source_id = source.get("source_id")
+        if type(source_id) is not str or not source_id.strip():
+            raise PortableEvaluationInputError("source record is invalid")
+        source_ids.append(source_id)
+
+    definitions = _object(schema.get("$defs"), location="draft schema definitions")
+    passage = _object(
+        _object(definitions["SemanticPassage"], location="passage schema").get(
+            "properties"
+        ),
+        location="passage properties",
+    )
+    _object(passage["source_id"], location="source-id schema")["enum"] = source_ids
+    _object(passage["quote"], location="quote schema")[
+        "description"
+    ] = _V22_QUOTE_RULE
+
+    proposals = _object(
+        _object(definitions["_ProposalDraftV22"], location="proposal schema").get(
+            "properties"
+        ),
+        location="proposal properties",
+    )
+    inventory_key = (
+        "accepted_proposals"
+        if operation == "source_review_fragment"
+        else "indexed_proposals"
+    )
+    inventory = payload.get(inventory_key)
+    if type(inventory) is not list:
+        raise PortableEvaluationInputError("proposal inventory is invalid")
+    proposal_count = len(inventory)
+    if proposal_count == 0:
+        proposals["dependency"] = {"default": None, "type": "null"}
+    else:
+        dependency = _object(
+            _object(
+                definitions["_DependencyDraftV22"], location="dependency schema"
+            ).get("properties"),
+            location="dependency properties",
+        )
+        _object(
+            dependency["target_ordinal"], location="dependency ordinal schema"
+        )["maximum"] = proposal_count
+
+    source_list = json.dumps(source_ids, ensure_ascii=False, separators=(",", ":"))
+    instructions = (
+        _V22_INSTRUCTIONS[operation]
+        + f" Allowed source_id values: {source_list}. {_V22_QUOTE_RULE}"
+    )
+    if operation == "source_review_fragment":
+        if proposal_count == 0:
+            instructions += (
+                " No accepted proposal ordinals exist; dependency must be null."
+            )
+        else:
+            instructions += (
+                " Allowed dependency target_ordinal values: 1 through "
+                f"{proposal_count}."
+            )
+    else:
+        concern = _object(
+            _object(
+                definitions["_AuditConcernDraftV22"], location="audit concern schema"
+            ).get("properties"),
+            location="audit concern properties",
+        )
+        if proposal_count == 0:
+            concern["target_proposal_ordinal"] = {"default": None, "type": "null"}
+            instructions += (
+                " No target proposal ordinals exist; target_proposal_ordinal must be "
+                "null and correction dependencies must be null."
+            )
+        else:
+            target_schema = _object(
+                concern["target_proposal_ordinal"], location="audit target schema"
+            ).get("anyOf")
+            if type(target_schema) is not list or not target_schema:
+                raise PortableEvaluationInputError("audit target schema is invalid")
+            _object(target_schema[0], location="audit target ordinal schema")[
+                "maximum"
+            ] = proposal_count
+            instructions += (
+                f" Allowed target proposal ordinals: 1 through {proposal_count}."
+            )
+            instructions += (
+                " Allowed correction dependency target_ordinal values: 1 through "
+                f"{proposal_count}."
+            )
+        instructions += _V22_AUDIT_SHAPE_RULE
+    return schema, instructions + _V22_INNER
+
+
 def _v22_new_request(operation: str, payload: JsonObject, metadata: dict[str, str]) -> JsonObject:
+    schema, instructions = _v22_source_fragment_contract(operation, payload)
     request: JsonObject = {
         "schema_version": "2.2", "operation": operation,
         "request_fingerprint": "0" * 64,
-        "system_instructions": _V22_INSTRUCTIONS[operation] + _V22_INNER,
-        "json_schema": _copy_json(_V22_DRAFT_SCHEMAS[operation]),
+        "system_instructions": instructions,
+        "json_schema": schema,
         "payload": _copy_json(payload),
         "safe_metadata": {
             **metadata,
@@ -13851,9 +13968,13 @@ def _v22_validate_request(value: object) -> JsonObject:
     request = _object(value, location="evaluator request")
     if set(request) != {"schema_version", "operation", "request_fingerprint", "system_instructions", "json_schema", "payload", "safe_metadata"} or request.get("schema_version") != "2.2" or request.get("operation") not in _V22_OPERATIONS or request.get("request_fingerprint") != _v22_request_fingerprint(request):
         raise PortableEvaluationInputError("evaluator request is invalid")
-    expected = _V22_DRAFT_SCHEMAS.get(cast(str, request["operation"]))
-    if expected is None or request["json_schema"] != expected:
+    operation = cast(str, request["operation"])
+    payload = _object(request["payload"], location="evaluator request payload")
+    expected, instructions = _v22_source_fragment_contract(operation, payload)
+    if request["json_schema"] != expected:
         raise PortableEvaluationInputError("evaluator request schema is invalid")
+    if request["system_instructions"] != instructions:
+        raise PortableEvaluationInputError("evaluator request instructions are invalid")
     return cast(JsonObject, _copy_json(request))
 
 

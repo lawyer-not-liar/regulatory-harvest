@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import date
 from enum import IntEnum, StrEnum
 from pathlib import Path
@@ -21,6 +22,12 @@ from regulatory_harvest.evaluation.attorney_models import (
 )
 from regulatory_harvest.evaluation.attorney_v2_compiler import resolve_exact_passage
 from regulatory_harvest.evaluation.attorney_v2_models import SemanticPassage
+from regulatory_harvest.evaluation.attorney_v22_drafts import (
+    CompiledDraftV22,
+    EvaluatorProvenanceV22,
+    NeedsClarificationV22,
+    compile_evaluator_draft_v22,
+)
 from regulatory_harvest.evaluation.attorney_v22_models import (
     AcceptedSourceAuditFragmentV22,
     AcceptedSourceReviewFragmentV22,
@@ -116,6 +123,13 @@ def proposal(statement: str = "Operators must file.") -> dict[str, object]:
         "confidence": "clear",
         "rationale": "The source is direct.",
     }
+
+
+_PROVENANCE = EvaluatorProvenanceV22(
+    provider_name="local-scripted-fixture",
+    model_name="no-provider",
+    judge_isolation="scripted_fixture",
+)
 
 
 def accepted_review(
@@ -217,12 +231,204 @@ def test_compiler_contract_binds_every_wire_shaping_rule() -> None:
     assert COMPILER_CONTRACT_V22["fragment_maximum"] == 5
     assert COMPILER_CONTRACT_V22["fragments_per_operation_maximum"] == 128
     assert COMPILER_CONTRACT_V22["items_per_operation_maximum"] == 640
+    assert COMPILER_CONTRACT_V22["request_contract_version"] == (
+        "source-evidence-and-ordinal-constraints-v1"
+    )
     assert COMPILER_CONTRACT_V22["rubric_version"] == "attorney-eval-v2.2"
     assert len(COMPILER_CONTRACT_V22["strict_schema_hashes"]["rubric"]) == 64
     assert (
         compiler_contract_fingerprint_v22({**COMPILER_CONTRACT_V22, "aggregate_version": "changed"})
         != COMPILER_CONTRACT_FINGERPRINT_V22
     )
+
+
+def test_source_review_request_exposes_compiler_reference_constraints() -> None:
+    initial = build_source_review_fragment_request_v22(
+        envelope(), (), fragment_ordinal=1
+    )
+    passage = initial.json_schema["$defs"]["SemanticPassage"]["properties"]
+    dependency = initial.json_schema["$defs"]["_ProposalDraftV22"][
+        "properties"
+    ]["dependency"]
+
+    assert passage["source_id"]["enum"] == ["rule-1"]
+    assert "exact or whitespace-normalized unique contiguous substring" in passage[
+        "quote"
+    ]["description"]
+    assert dependency == {"default": None, "type": "null"}
+    assert 'Allowed source_id values: ["rule-1"]' in initial.system_instructions
+    assert "No accepted proposal ordinals exist; dependency must be null" in (
+        initial.system_instructions
+    )
+
+    second = build_source_review_fragment_request_v22(
+        envelope(), (accepted_review(),), fragment_ordinal=2
+    )
+    second_dependency = second.json_schema["$defs"]["_DependencyDraftV22"][
+        "properties"
+    ]["target_ordinal"]
+    assert second_dependency["minimum"] == 1
+    assert second_dependency["maximum"] == 1
+    assert "Allowed dependency target_ordinal values: 1 through 1" in (
+        second.system_instructions
+    )
+
+
+def test_source_audit_request_exposes_compiler_reference_and_shape_constraints() -> None:
+    request = build_source_audit_fragment_request_v22(
+        envelope(), review_aggregate(), (), fragment_ordinal=1
+    )
+    definitions = request.json_schema["$defs"]
+    passage = definitions["SemanticPassage"]["properties"]
+    target = definitions["_AuditConcernDraftV22"]["properties"][
+        "target_proposal_ordinal"
+    ]["anyOf"][0]
+    dependency = definitions["_DependencyDraftV22"]["properties"][
+        "target_ordinal"
+    ]
+
+    assert passage["source_id"]["enum"] == ["rule-1"]
+    assert "exact or whitespace-normalized unique contiguous substring" in passage[
+        "quote"
+    ]["description"]
+    assert target == {"minimum": 1, "maximum": 1, "type": "integer"}
+    assert dependency["minimum"] == 1
+    assert dependency["maximum"] == 1
+    assert "Allowed target proposal ordinals: 1 through 1" in request.system_instructions
+    assert (
+        "omission requires no target and a correction; ambiguity requires a target "
+        "and no correction; incorrect_statement, incorrect_evidence, and "
+        "incorrect_relationship each require both a target and a correction"
+        in request.system_instructions
+    )
+
+
+def test_source_review_request_contract_matches_positive_and_refusal_compiler_paths() -> None:
+    request = build_source_review_fragment_request_v22(
+        envelope(), (), fragment_ordinal=1
+    )
+    valid = {
+        "proposals": [proposal()],
+        "review_complete": True,
+    }
+    compiled = compile_evaluator_draft_v22(request, valid, _PROVENANCE)
+    assert isinstance(compiled, CompiledDraftV22)
+
+    unknown_source = json.loads(canonical_json_bytes(valid))
+    unknown_source["proposals"][0]["passages"][0]["source_id"] = "not-allowed"
+    refused_source = compile_evaluator_draft_v22(
+        request, unknown_source, _PROVENANCE
+    )
+    assert isinstance(refused_source, NeedsClarificationV22)
+    assert [item.value for item in refused_source.reason_codes] == [
+        "REFERENCE_UNKNOWN"
+    ]
+
+    impossible_dependency = json.loads(canonical_json_bytes(valid))
+    impossible_dependency["proposals"][0]["dependency"] = {
+        "relationship": "depends_on",
+        "target_ordinal": 1,
+    }
+    refused_dependency = compile_evaluator_draft_v22(
+        request, impossible_dependency, _PROVENANCE
+    )
+    assert isinstance(refused_dependency, NeedsClarificationV22)
+    assert [item.value for item in refused_dependency.reason_codes] == [
+        "REFERENCE_UNKNOWN"
+    ]
+
+
+def test_source_audit_request_contract_matches_shape_and_ordinal_compiler_paths() -> None:
+    request = build_source_audit_fragment_request_v22(
+        envelope(), review_aggregate(), (), fragment_ordinal=1
+    )
+    valid = {
+        "concerns": [
+            {
+                "target_proposal_ordinal": 1,
+                "concern_type": "ambiguity",
+                "passages": [
+                    {"source_id": "rule-1", "quote": "operators must file"}
+                ],
+                "explanation": "The exclusion makes the duty ambiguous.",
+                "correction": None,
+            }
+        ],
+        "audit_complete": True,
+    }
+    compiled = compile_evaluator_draft_v22(request, valid, _PROVENANCE)
+    assert isinstance(compiled, CompiledDraftV22)
+
+    out_of_range = json.loads(canonical_json_bytes(valid))
+    out_of_range["concerns"][0]["target_proposal_ordinal"] = 2
+    refused_ordinal = compile_evaluator_draft_v22(
+        request, out_of_range, _PROVENANCE
+    )
+    assert isinstance(refused_ordinal, NeedsClarificationV22)
+    assert [item.value for item in refused_ordinal.reason_codes] == [
+        "REFERENCE_UNKNOWN"
+    ]
+
+    wrong_shape = json.loads(canonical_json_bytes(valid))
+    wrong_shape["concerns"][0]["concern_type"] = "omission"
+    refused_shape = compile_evaluator_draft_v22(request, wrong_shape, _PROVENANCE)
+    assert isinstance(refused_shape, NeedsClarificationV22)
+    assert [item.value for item in refused_shape.reason_codes] == [
+        "SUBSTANCE_MISSING"
+    ]
+
+
+def test_empty_review_audit_contract_remains_finishable_without_false_ordinals() -> None:
+    from regulatory_harvest.evaluation.attorney_v22_compiler import (
+        aggregate_source_review_fragments_v22,
+    )
+
+    review_request = build_source_review_fragment_request_v22(
+        envelope(), (), fragment_ordinal=1
+    )
+    empty_review = aggregate_source_review_fragments_v22(
+        (
+            AcceptedSourceReviewFragmentV22(
+                fragment_ordinal=1,
+                request_fingerprint=review_request.request_fingerprint,
+                response_fingerprint="9" * 64,
+                payload=SourceReviewFragmentV22(
+                    proposals=(), review_complete=True
+                ),
+            ),
+        )
+    )
+    audit_request = build_source_audit_fragment_request_v22(
+        envelope(), empty_review, (), fragment_ordinal=1
+    )
+    definitions = audit_request.json_schema["$defs"]
+    assert definitions["_AuditConcernDraftV22"]["properties"][
+        "target_proposal_ordinal"
+    ] == {"default": None, "type": "null"}
+    assert definitions["_ProposalDraftV22"]["properties"]["dependency"] == {
+        "default": None,
+        "type": "null",
+    }
+    assert "No target proposal ordinals exist" in audit_request.system_instructions
+
+    omission = {
+        "concerns": [
+            {
+                "target_proposal_ordinal": None,
+                "concern_type": "omission",
+                "passages": [
+                    {"source_id": "rule-1", "quote": "operators must file"}
+                ],
+                "explanation": "The review omitted the filing duty.",
+                "correction": proposal(),
+            }
+        ],
+        "audit_complete": True,
+    }
+    compiled = compile_evaluator_draft_v22(
+        audit_request, omission, _PROVENANCE
+    )
+    assert isinstance(compiled, CompiledDraftV22)
 
 
 def test_second_review_request_carries_only_compiled_accepted_inventory() -> None:
@@ -239,7 +445,7 @@ def test_second_review_request_carries_only_compiled_accepted_inventory() -> Non
     )
 
 
-def test_linear_source_builders_preserve_pre_refactor_request_bytes() -> None:
+def test_linear_source_builders_preserve_current_request_contract_bytes() -> None:
     from regulatory_harvest.evaluation.attorney_v22_compiler import (
         aggregate_source_review_fragments_v22,
     )
@@ -276,9 +482,9 @@ def test_linear_source_builders_preserve_pre_refactor_request_bytes() -> None:
     requests = (first_request, second_request, audit_request)
 
     assert tuple(item.request_fingerprint for item in requests) == (
-        "987ec550249548eb3e70ef566d8dc850b1b507818ae2929c36879afd807f49e9",
-        "cabeb291263f15fcea6f2aebbcf704e376edf5752ff6464bc1e5f303c14675b0",
-        "3bea380ea7d22f24af7616f70961fd9148878184e460aab3d70575f021aeb3cb",
+        "b63f2f49c5cde959ad17ded3940543b3bcad3c9b4401674143312587fbd543da",
+        "b0c280f6451c845d7ddb5f54de3403ae1fe5872e01151407f7adf4aabeb243a5",
+        "8620fdd33bf470362fec137260e941ba8e70ec89e08f01356d96e5e579862944",
     )
     assert tuple(
         hashlib.sha256(
@@ -286,9 +492,9 @@ def test_linear_source_builders_preserve_pre_refactor_request_bytes() -> None:
         ).hexdigest()
         for item in requests
     ) == (
-        "e8751d500471e7a566bcd9781461611f58af699d535fcb2abd7e056648e6f7a6",
-        "4eacbb5994711de5bcd513fbbd1b1f7c4f78d0ed42024d0d7ad5ff067ed5ea4b",
-        "c4b6288f6aebc979f8a75136284444ce15080272e48bf5bded134b04fa4f8487",
+        "24ec0365bc2037f8f2e1d1f5ae71849dd3cf21f0b8c84903c04f2fa740afa03c",
+        "ef2b51fd0b60fd542f3d0c79a3ffbfde1930c44c423e56a703bb6609fe837a28",
+        "1e92ffad3d8673cd06b910072cdc508c727c1908b196ea5b91d90f9516fc1f87",
     )
 
 

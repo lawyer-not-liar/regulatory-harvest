@@ -260,6 +260,12 @@ Each request contains:
 - `max_new_proposals`, initially five; and
 - a requirement to declare whether the review is complete.
 
+The issued JSON Schema enumerates the exact `source_id` allowlist from the
+frozen record. It also states that each quote must resolve as an exact or
+whitespace-normalized unique contiguous substring of that source's normalized
+text. When no proposals have been accepted, dependencies are schema-limited to
+`null`; otherwise, dependency ordinals are bounded to the supplied inventory.
+
 Each draft contains at most five new semantic proposals and one `review_complete`
 boolean. A nonfinal fragment must add at least one new proposal. A final fragment
 may add zero to five proposals. The controller compiles proposals, removes only
@@ -289,6 +295,12 @@ Protocol 2.2 also replaces the all-concerns source audit with ordered
 Each request contains the full frozen source record, complete controller-indexed
 review inventory, accepted audit concerns so far, a fragment ordinal, and a
 maximum of five new concerns. The draft declares whether the audit is complete.
+
+The audit request carries the same exact source and quote rules, bounds target
+and correction-dependency ordinals to the controller inventory, and states the
+cross-field concern matrix: omission requires no target and a correction;
+ambiguity requires a target and no correction; each `incorrect_*` concern
+requires both.
 
 Every concern is independently compiled and sealed. Omission concerns may supply a
 new semantic proposal draft, which the controller compiles under the same evidence
