@@ -2409,29 +2409,29 @@ _EXPECTED_TASK3_ALL_CALLS: Counter[_Task3Call] = Counter(
         ('attorney_v22_requests.py', '<module>#1::<DictComp>#1', 'sorted', (), '057db0383070fc0e6aebbe7e4f159c0750b63685209055c08121b99ca7536939'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::<DictComp>#1', 'sorted', (), 'bbb4d56aff382b6b9dcd5c4653fd14a8a0ae721c66b41d558fb3e84cba82fb8e'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_VerifiedSourceRequestContextV22#1', 'dataclass', (), 'c70200014f07c8cde19863a7636d39c23164272cd1f7c4f8baa3aa55f1c3acfd'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), '416ec90585cf7b749482d3a29293b803b5ad6c0245eafa1ece4dbd600d1ebd60'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), '57fee65e1eceab91be551fb6fdd258117a973feeb62c15b1112cfc45fd2b3a66'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), '71a518bdbdeb5d9455f99b5fd12e4dce04a25553865e5b2e546ab1bd39c1cdde'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), '7aba9d1315ac16855cdf813f6b0c257132fbe32fc598a249ae7a337d90f2d86f'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), '824751c1c9f318640bba3a8f2347951783d4b52177f3b4f2637b546d8b3db279'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), 'f2ac7f60464e57443dfff232c49f96b1d0f29c213d5224d25715468f166bdb55'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', '_source_audit_request_from_context_v22', (), 'dac129d4b67bd7d0753c81755b095c9122137a24e5ec7421382f5a06fb7daf29'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'accepted_concerns.extend', (), '12363246b46bd6918d0e1b13e91728f2ce8494c06bee5b01c1ebfc0810a138a0'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'any', (), '71b4236675d921021ed63213603dc0b75f1c8467803a3f194c30157bd40c6a94'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'any', (), '8ae178a6ba66efa1b652a425254bbc98c6b119b4d1baaa4d2528ae67132527c7'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'isinstance', (), 'e27f1a0453ef22f740b38c0b7f95de40d9c24174c1bcbecbff44e50b72d0b274'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'len', (), '47f1c65e5e85d58d026a86f1a3b1865431f14fc5dad5f8b243bc4832fc7b5748'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'len', (), '480287b0a0c349bf3c57ed91949524f9fd45d48c2feccdff0467ea7e882b4924'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'len', (), 'ce8dd31cf2b4f8ef09c45513c65b5fcf447322c51f9dea8ee5d1633054cfedba'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'len', (), 'fef440c3046dc70177edac72b146e0db60abac300c68c5ace0bb320bf1349408'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'list', (), '16fb3ae9806c62cb609080781576904847db4a246fb83f1f24b1b28ea344357c'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'range', (), '6d63c1850082d55563f442eded8fd1be9717ad73cd34550cf33e95b1b2218a73'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'sum', (), '4c044b25febc1ae63d1d3f4e9a5f45b8fbf4b0babe7e57db48a18fc57da9fe02'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'tuple', (), '9bc5d7b094f580c05be4a89dd71201f7afa89721a93c8d1a58736f6a1b7d822f'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1::<GeneratorExp>#1', '_strict_rehydrate_v22', ('validation',), '649ca935d9abb68aa2ba55d8dca9f7d2830ace95700dd4c43e801a14c6d5e5ad'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1::<GeneratorExp>#1', 'tuple.__iter__', (), '46ff398a835902df65dd4ad409d65c1e2323a5ea07d23e48b8a4ec1fe85dae7e'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1::<GeneratorExp>#4', 'len', (), 'e51650b87060bc9fa3aa7f85dfbf5aeb337e2d15018bc170061f47f1d6234f6c'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1::<GeneratorExp>#5', 'concern.model_dump', ('serialization',), '9ad490cc5433ce19e26f7b8ddd7159fbc19f1536d5f0cc9102024216f8928b7c'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), '5caf51c45d6c3f9bf05b2f509cac83b75a2dec4e9297562b22f4bd78f30eaf52'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), '6f17bc050f26cc09d596f3765304b6abba813f39c0c84b91f85934fdb0e35c8a'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), '9acc4b44bd864cdb334d87897f53bc5a0723b4589be87798670fe39690b0195c'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), 'a6a738d8fc97b701d773dec0af04cc5883578c691430d6eb9ca18d4db1b1535f'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), 'ba97ad9c543bec1913b7b821b2222a8c2170cddd2875c36fe4c284c265d2d710'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'ValueError', (), 'bdfb45d64c33ef2d65ce43ed3307898d15441d22f934152ee22e499279ba8b34'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', '_source_audit_request_from_context_v22', (), 'dbc76c40d98e289402d871a1e0aa21dcc53f4edd1db652b79e5642efdc438ff7'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'accepted_concerns.extend', (), '5a99e2e5e570da290024b9617b9c7fa2a0c5333e43867759ae614d770cd76cc3'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'any', (), 'a27b8c41c1c64a7b3d0ae4b9cc679b778aa0bf880794dbc09b9bf2b2bf5b9f43'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'any', (), 'f985cceaca4f5b45b799d0e6151db281f133b6200430695ce0d2e50c250494e5'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'isinstance', (), '466b20e2dd659f25cb2ff2a529034eb49a8e3d6887471bddaff62f74058de4ce'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'len', (), '209227182635b909d99c17d68361450eb3092a8035ee2e8a2c7fcd06ca3c0d0b'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'len', (), '8dd1a7a5a92fedbf4770c3c9d7be8390f6aa800ea3bfb84b3b269890afba46e0'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'len', (), '9f6240b95e8e6543ad42abe2cc45f5e222bddbed1ecdab295079b10a0e53e649'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'len', (), 'ac5e6e9e692f8ddb8211c22c045ac14eee6c04fbe651da2ce9f782a84b91bf01'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'list', (), '52e84e6a0f831c2379a842ed652610c1764f7f678c272fc5d99e8bc8562aa88b'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'range', (), '1a852983c33b1f8dfb1db1a5fa837c3f83cb3095913995f25ca5d56a093e6dc6'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'sum', (), '57ec5bb767c13fbb73f92bac0041ff01973eb213daa5d26046251624d80e93ff'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'tuple', (), '43ebb7817be0b3f0abdff50a9e7393c755817826782ea366d9f0e9c1370d27ab'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1::<GeneratorExp>#1', '_strict_rehydrate_v22', ('validation',), '5c0f5c80f62bfe4859d2f13188f313b34d4db70e4e7b21bba6d5018f82b6ff68'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1::<GeneratorExp>#1', 'tuple.__iter__', (), '59d30ae3315069b5ce2fdf90a5f3c7b0ee97bf57e8bfd824ffe11e5eac004ada'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1::<GeneratorExp>#4', 'len', (), 'f1032978e1bb70a56e7039f1bc8b2303f40bdf27fe738b89c94a38b78926cecc'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1::<GeneratorExp>#5', 'concern.model_dump', ('serialization',), '7c3e456e083bd1298bf7d0067e026eff661e04ccf3f0a51968c8e46e3c577800'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_context_source_metadata_v22#1', 'dict', (), 'b9be6844e8d46874762df1608f364d8be421cc85dcbd244bf14c26fbf4873b75'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_context_source_record_v22#1', 'cast', (), '6beb0f6f637e1d62bd2d51b4ad7d17a56ae8394c0dec36e96baa2a721b529be0'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_context_source_record_v22#1', 'json.loads', ('serialization',), '4c28df579ca5668959c7db63ce8fc9d6c445a882928bb1336ed483283f5c79c1'): 1,  # noqa: E501
@@ -2439,47 +2439,47 @@ _EXPECTED_TASK3_ALL_CALLS: Counter[_Task3Call] = Counter(
         ('attorney_v22_requests.py', '<module>#1::_fingerprint#1', 'digest.hexdigest', ('neutral',), '0ee53bbcf043fcef7b682581f232a8d610e60a04a736e9da22ed24c30a8ba43f'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_fingerprint#1', 'hashlib.sha256', ('neutral',), '740e8061776133a0524df8eedf13818dc24d8392bb9edb7aa1a9789786fb4e18'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_fingerprint#1', 'request.model_dump', ('serialization',), '23e622b66d45e6a059e95bf267b2fed054a4c56306038bf3dc78be414f323946'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_frozen_source_record_v22#1', '_context_source_record_v22', (), '9fb3c812fbd7320e4c868570a0627a557f8caf4645a010934e41c8e882e5ed22'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_frozen_source_record_v22#1', '_verified_source_request_context_v22', ('validation',), '8c021fba49181b94e5eea949acd881aaf7264b6ead622dd09e5f6475a2fd8e43'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'ValueError', (), '7c812e64d8308e0d7d1b4c904f2b2d7c31c0b3fff8372f2ccd923f3a848bb941'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'ValueError', (), '966d793e61359ed68076e462220cba6216ac7903aba35b72dcb56e7bcdacad81'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', '_strict_rubric', ('validation',), '7c4783c2c73004af380cdf9f2c04216ca4fb5bde9f5a2dfdcd4548fef48f8684'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', '_strict_source_context_v22', ('validation',), 'c40fdf6b763c95707e8db95864a8aca57ced3ea32480e3b2323fb2121583a5e3'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'checked_rubric.model_dump', ('serialization',), 'b7f927a00fd8a78126ab19dcb80e56011df46f1b678cfe769d0aa11d79544539'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'hashlib.sha256', ('neutral',), '0f726a5332c12dc306773b1834281acd1a0862504ea7b58ff1ab6a2c3ee0bff8'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'isinstance', (), 'db2bdf5edfac0c9eeef81a2462cab11bed212eae25c5fb1e214f4f6cd975a2df'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'report_digest.hexdigest', ('neutral',), '210a30688420f86f094617b02dea9d0db73bf36405d0e867b8c84a9a97ace9ec'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'report_text.encode', (), '730b575f25bca6d33dd90bb806a0958505c7ae0ffabf3b94afdd3b7b002ddebe'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'report_text.strip', (), '1dea94cee065885212f6364645850e33bb17d5414ca652383d6ce3792aba6cf2'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_frozen_source_record_v22#1', '_context_source_record_v22', (), '7282637a56f36ae7a0bcf8f36f09428da31ab2441f70737d268951cd96881ebf'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_frozen_source_record_v22#1', '_verified_source_request_context_v22', ('validation',), 'aa12619cde2e9d812eee8786f936c064fa500fcd5a3ca4510aa08cc1fa0d8d83'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'ValueError', (), '2d7575b5edbfbd2ca813551084dbca13ed479a1aa0808e6a3565ad5971dcb077'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'ValueError', (), 'abe7951bff3d74af56a4143f8dd3dc316716eda50cba99a363c88b92ec4fe935'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', '_strict_rubric', ('validation',), 'b864493357c20b7fc7d77cbcb2772a8c6f2407a32b043b8469a1c51b6fa46763'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', '_strict_source_context_v22', ('validation',), '22f4f8a748ecfa056e1c6b74e7531d0be07fd6b8cecc415cfada051837060e56'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'checked_rubric.model_dump', ('serialization',), '20ef865dff2f4162c012a7ebbb9648ab3b52f9b19ed3dec3d3d527fccc0855da'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'hashlib.sha256', ('neutral',), '8cf02609570b52c6a5bec4cf89afd0ee9ddb590101a037b93a120ed5c9f410a8'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'isinstance', (), '4de28e2748f364ffb2355b67197e4a02892c1969d6a1029f532c917f3564cfbe'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'report_digest.hexdigest', ('neutral',), 'c6d8105cbebf7bd96d029c5d90c43497bb9e83e0c1448c896d1a2189819dc799'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'report_text.encode', (), 'd9d10876e0e891d5b4fd8b33138df7390c0b67f0b04e0b237aa52546e6290075'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'report_text.strip', (), 'e9dbbb568e72ae6c3ca3c98ea7fd8194bded842d4a4fdf97e3703d52bdf5f882'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_new_request_v22#1', 'EvaluatorRequestV22', (), '561a17c955d6cc2f30a5619627296643daaaa815bbe50b993fa87481feb0de79'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_new_request_v22#1', '_fingerprint', (), '63de6f7a719033521756f535cc359472d91c466663c555b954a611863eef9b96'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_new_request_v22#1', '_snapshot', (), '454a7e823c650077670887f8c405316a89f8f0fc1af320c98de1e5ad59e306f5'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_new_request_v22#1', '_snapshot', (), '8f2cd62564d2cd5950dd8858add16bac5357977894643ebe26bb249ce02a87d7'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_new_request_v22#1', '_strict_rehydrate_v22', ('validation',), '298043823dbbb8afcb9a5fcd2b829893cb4a182b64ca6c75a774615f77c638d5'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_new_request_v22#1', 'provisional.model_dump', ('serialization',), '160aa3abb9a05065818f547cd92f98c8988bd1f02d49e71d218e195baa185ee2'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), '50d9d9acf31ba78dfe2fb9224fcd2dfab07df25e6f624c4187cc16886e0159f7'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), 'ab376776a77d01cb8a29ddd9aac63777f56ba0dacf9ac477e0f559446abeced0'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), 'af77e2c59ba06dc9a9e65e7d07e47acb151c5817eefaf6a87863fb1a3ea7f025'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), 'b0701fecd80fb7ed1512b3da32e08a99e7a55177d8d6fde75586a1c11051f826'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), 'd0f44c37f3e710129d4c84371aac992947e54e253b431bc5075c98be918ac064'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), 'ef12117ac54ba18995fa4d9abef915623ee0fa44e5bc9fcc14db27100839d40d'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', '_source_review_request_from_context_v22', (), '6671051dc0ae1b879a82c9b31fdd6ab584aee5b44a7e82d67a588986653139aa'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'accepted_proposals.extend', (), '9a81c37dddb55ce6e1f05e1b16ac755f9e7da5b3bf9814242d91529f439c363f'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'any', (), '1e6ca38ac658f28335df263e4509e1acc7dd407a68a9d0f3e44fcc3e44f53102'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'any', (), '9163975d4f5b8aedd6aa8fd9f3b7cbcec327324963016d8ab24fe022960f6855'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'isinstance', (), '4d1fd74e5b360ed60f1c637e304816b4a4e06125b888505c301ab97c0e32053f'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'len', (), '2dd641f7869d0b97bd30ade4dce49d34dd22c8c6ec6c6bcce9b7e3ee2c34690f'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'len', (), '89389d3c5255dbf98aabb173b30f58d0be29fe36cb5889b789d03ea0dea76bd5'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'len', (), 'bf775285ca37c5d26a9b6f7279ed46e0183a6196c0e061051e1ce2fa9e108a89'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'len', (), 'fc2612331b0b326977fb7c0750dd7f0fc03bdbe638c1cdc71f08026bbf52326a'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'list', (), '210b729e330233cf2819206df9953a5a0d9c36de9368604be8e81cb0ade55188'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'range', (), 'df8398a2b512f3ddfb9b7fbf507105fc357862dd88ddd1af298a18ea2b0df87a'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'sum', (), 'dd53d20e070b2e9311768177ac0c26c7d386c33a790fafe56913d0640405da51'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'tuple', (), 'c425900bad1a1b1cdb840796ffac3beba322a581cd6c8f985bd9dfcf4f34acf0'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1::<GeneratorExp>#1', '_strict_rehydrate_v22', ('validation',), '7dd29623e531e2c1c1babc1f5857cd7c20f8a1f3d521632f041e2f4a7fbd7146'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1::<GeneratorExp>#1', 'tuple.__iter__', (), 'f38cb76fa88e5098624947c298788c1a15c7950f581b12968f992b27da0ffae1'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1::<GeneratorExp>#4', 'len', (), 'faacff7364a93b2cc1523b12b38690da43958e2dc7790970f195f4bf804da907'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1::<GeneratorExp>#5', 'proposal.model_dump', ('serialization',), 'b1700d5273cf8f9598e5d1da1605ba4a0efe749581745729c4dd12055ea14475'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), '23c0355ffba8acafad1b3ec8f7c6cabe2ab2b405fa1ea90b934a7d076ba70e51'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), '38c4f730a73cf6bd150856213940115220a6758626cb62746fe52412362a9582'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), '5043f8c5e46272e6472ca0d49b9a84b473369891f4c0397953ff5582e7161e76'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), '6cb1415608f5b94250167f2d55f17989d849b31f9cc1dc4b6760fbdf7454cfc1'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), '88e232bb482d8fe1574ef4adcb850f9c29685943ad95e4270c52d1b0bfe90315'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'ValueError', (), 'eef12d720a2404301bc82bf40fc659d8a9e44339f4f95b047b1134ad45f7eee7'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', '_source_review_request_from_context_v22', (), '3691a85daf44809add1bcb677496489aa7d8f357ca80ae5b6e865835bef55491'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'accepted_proposals.extend', (), '6ce46e8d9958495879068fcddd0f625fa42ead17f595bdee04744001decaf71d'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'any', (), '8558a34e62f5f5dd0a50fa13e22d39ba0898b2a5ad420a5d90d5a7bf5cb18b46'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'any', (), 'c06b5e6c1c84a683d3de3f40323262b9450c91a00c29def5144bb24e643fa406'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'isinstance', (), '27bd7758275558f9ef9fd71f85a3defc8133fc7d1553ec0f5753ad5d9a3eda22'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'len', (), '3aae67617c2c0a57cbd02f4aaab1c1fe5d565477044336cbb6bf08a42147113c'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'len', (), '3f9f5541ffd64cc93c5f70ce1a7b632d02c35dd57d951adfaa2dd655d3c2b514'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'len', (), 'aeb84216811063d1810fef04fc88268a1938e4fe985309289ba7aa914bc7e548'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'len', (), 'deb733335feb541776c2d98fde09ba322e664861baddb9e2b4872ff71fcdbf25'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'list', (), '0d420157390b122d5aa9c3309d33246f5a2efa626aec862c770a9cafff4e1c45'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'range', (), '2e9d55e61c0c251c8e2ca23fd411d6c144a0f1a515934fa26d51864eab22b0ef'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'sum', (), 'dc759744675d57cf54bdf5af6f6b22ba74e60179a6d4f9fe567e64cd70048c4e'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'tuple', (), '7a27224e673462e802076317864bf7039cb0905169641266e3696e82ab8c2235'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1::<GeneratorExp>#1', '_strict_rehydrate_v22', ('validation',), '564b47752611649f4d21b9633467e9573802a8908d3467502d39df4895f713b3'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1::<GeneratorExp>#1', 'tuple.__iter__', (), '17b3d1523ac62f86d25d11520e6b21dee6461011b8f0fdc3ba34cde261822813'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1::<GeneratorExp>#4', 'len', (), 'd47b2ff2d26fcb9ace6043e5bb39a187602ab21be319ea120a8f91a6d3128cf0'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1::<GeneratorExp>#5', 'proposal.model_dump', ('serialization',), '223cfa84c2d9dad1bde10afe5659c226937f9520ba8323f5b56ccfa331f07f5b'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_schema_hash#1', 'canonical_json_bytes', ('serialization',), 'dac3df2b2731c565be18f8d08081fc38ab4ad5d38a0a0430d14c34b6d882f49b'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_schema_hash#1', 'sha256_digest', ('serialization',), '1cf230246cc2a97c7d9e2924dd729718c370992f4ae176b23e032c3454e0d9dd'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_snapshot#1', 'ValueError', (), '8a80279e16456d32f96c78c116278530dee47d980b9608405312aac6d62f3041'): 1,  # noqa: E501
@@ -2488,31 +2488,36 @@ _EXPECTED_TASK3_ALL_CALLS: Counter[_Task3Call] = Counter(
         ('attorney_v22_requests.py', '<module>#1::_snapshot#1', 'cast', (), 'b362348c1ef1868575150ffabceba7a452bca3d9cb596dfd4fca673dd4597e53'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_snapshot#1', 'json.loads', ('serialization',), 'e9c83a7a24c42244f9039c826af6d335258d6a9db48d471c72741521e1b87730'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_snapshot#1', 'type', (), '6382c76eebcee56cc3a3617700194b419c8de6beefc72c75229e4786248c1e8e'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', '_context_source_metadata_v22', (), '99b823e96935b515b039bb8965779460021923f789992be12151a18300f675c2'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', '_context_source_record_v22', (), '55c998877f294b758d5158542ebb24eebfb284c683c05e6af7ac9a9e152c5fd7'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', '_new_request_v22', (), '8f9309dcfafb8aa9b165118cb79e86b8c5d0749b8cffd552d7089310ab0b9b0c'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', '_source_fragment_contract_v22', (), 'c71e5b9fe42d3df75c1f41af87649007b0dfaedd15dd0992e0d3b5855d35861d'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', 'len', (), '76bbcd7e31477c8f223f96d5d474c42febb08e6c6ba76ba6a262b544a10ddb70'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1::<ListComp>#1', 'proposal.model_dump', ('serialization',), '7dbe9a6ab98c204d990bb04266a4938a676c5272864c54f46552aae19430b7a8'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'ValueError', (), '63726d251d821133ec0031fcae87dd746f0b691813595d265b17fbf8872e10e3'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', '_snapshot', (), '7ccbdad2fdb8c8f884cdaf7595cc752abccc2888ff1625c847a91901cafc11c4'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', '_snapshot', (), 'dee506edb2603d49424a9258f963e7b7dc95398f4c580bdc63d0cc3162a11a9b'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', '_source_ids_v22', (), '08bff25e88cd5d1c65f55cf5c199b54c9b2a0e4425280cb0d026d2e7e7fa4faa'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), '1895f4fe1e68d03c875ae7cdecfb4ceea9ea25f3addd0aa2301885faf88c1d25'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), '2a1e63a70526052e0b198b45a691b2bd184c75595998f1d167b046940669d024'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), '491dd0df715fd572345835dc5356b36197457a9bc07410b987c9b4d9cb5a2f7a'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), 'b4c963551e23aa002ddcdddc726cd3de07be3b8ef2f6ba40a312220b05924249'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), 'ba71970b8dc9a981fe9f5db514f842b8c5653dd9cf96fbddbd4dc3c362f467b2'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), 'e89378b8e8fd51cc84ae433ffb5ad49622339e3c2e998012134930932eb6ed21'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'json.dumps', (), '1c0de6a8fcd34e489a3563fe41178689d2dd7f53fce4fc2c9c693a5f9f192240'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', '_context_source_metadata_v22', (), '62a4bd5d13df7efab1689e2380f1400800996cf00fe75156dada9aeb1b4b0b7d'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', '_context_source_record_v22', (), '4e347e37d14685393752d546f5cd3e7da3e20e16fd49468d604dd68ecff467ce'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', '_new_request_v22', (), '3d6e4116345c33cf78f7c6e50597571a90a5de9e5ede9fb00e690a6207d884f3'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', '_source_evidence_handles_v22', (), '33d315f0f5b71572b091c12f8cf964149b72cfbe5eb90c37b303eeb306b19bc2'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', '_source_fragment_contract_v22', (), '5bef511c7598de398608eafbd9f616f16df988cd8fef521f2181607ff2a70de1'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', 'len', (), 'b31296334dc48b3f2d4b82129d783aa0b2751a35d288d0a7f9aa52ed0822a8ed'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1::<ListComp>#1', 'proposal.model_dump', ('serialization',), '5152d4ba69a0c94a6da99cdb9bc80340118954fcefe1bc422a7dcdd74ccea27a'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_evidence_handles_v22#1::<ListComp>#1', '_source_ids_v22', (), '50a8ab33e7a156647bbafb3bb9f82d14d63d37f10fae988f93d61492bda68ccb'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_evidence_handles_v22#1::<ListComp>#1', 'enumerate', (), 'fe745c33b81c165ed5a1b700f44a625968c4aa9fc131c0a0c3d44cd3ba4a640a'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'ValueError', (), '6ade83e0522d8cf30520b615fd97cd1ea28e5c35ea06deca1a8ef1c0e5b25ea1'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'ValueError', (), 'efa17e689ae6d6e207f59e17afb5d3d10093b2c3770a1c42ece72e2fa0952224'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', '_snapshot', (), 'd6ae217ac4b2d3e2717ec3586d44e1f6e32bfc56365344f6eeb0b0306e1f64eb'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', '_snapshot', (), 'e062c9a38650e0ab14006fb95578d1bdf3a2c7c30296ad8b1bc7365767acb4bd'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', '_source_evidence_handles_v22', (), '2113eb346cbd4d4ebf4b166f8e4938ad37be097dc07fc08d35a3f954849f6cd4'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), '482a7743a2cf5b5d396f31ca4bf3091bf083c7ac3b7e9e03bc73092e12f0c06e'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), '59047616c99d8481069c35686b2745d9450d4b26d6b508ad0624e78ef0c960bf'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), '883a3335471bfae4217bc23912e2a95dd42e3b1070748c61d7ddb6ab22d5ca89'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), 'a46b3f318e4a5e2595a7f229b5b77ed20bba2d38addba8166d97da318da5e934'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), 'b107cf84307ebcb235ea9605b740388cc1b489bb233e667f1ce7474f699b5dfc'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'cast', (), 'b41815ebf5e3b21121df218caa079492f1e2fa75d0b279d92d6b56c7a007d6a9'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'json.dumps', (), 'caf17a2c2e01e6f82528173ecef3b9302f46a6381ef362319f1973b19e9a174c'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_source_ids_v22#1', 'cast', (), '37081809d7a7dea62ef3e18c3f39a242ac5005497f194bd7c3b41c2b21b5ff7f'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_source_ids_v22#1::<ListComp>#1', 'cast', (), 'a0ce21d95875998506c4df308e8dffb4f375806846207c0bfbfafa7d3aea40ea'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_metadata#1', '_strict_rehydrate_v22', ('validation',), '13f4ae52ae3227f197775280de6cd630c316da71a524f4ce7322595afdcc221a'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', '_context_source_metadata_v22', (), 'edc46b193eba2dd95204bae4c94f7f0ee6a35e8b5981ef5dc2f19468f2755b9d'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', '_context_source_record_v22', (), 'e7142c03a7ce519390a9fdd627f1a23468eedb9eb93e8cd8b40ba265a4e02ca7'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', '_new_request_v22', (), '3f8b1a6838becce697965f523730efaff47984dd8706b881f5609254f716ea63'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', '_source_fragment_contract_v22', (), '0bfee2614d413538b786e7ca5eb474f7f36fae8fbeda46cdcb545cc8409c72dc'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', 'len', (), '1ee32436aee2fcbf398020ef63c3520dca8fcdd9b4716d0ba5d5fe148dd6856b'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_metadata#1', '_strict_rehydrate_v22', ('validation',), 'd3c3d96e776125084b0a894d99f2739329425fa763311bb35493b3909a681122'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', '_context_source_metadata_v22', (), 'ae18955276751bbeea9b843e7b21d14005b2391cdcd1da7b3b3e8133abcbfb3f'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', '_context_source_record_v22', (), '820301feb6cc095308457afc018ddbb4d5d132ceae0f412df2aecedc25d19e83'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', '_new_request_v22', (), 'c25b6a4c5b9bb9cadbb35e8da6892054d76167fd8a19a51d4513fa16a166b878'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', '_source_evidence_handles_v22', (), 'ec4c92fbf3b322f84fdf1470acb09dbec537b738f81a3ce325f9ced89a187638'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', '_source_fragment_contract_v22', (), '3d5e11e2ea4f59ada40a6cc152d5523a9f84ef76e5bcccdd762535f36badf60e'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', 'len', (), 'da72742faf3da695a05977b58481a4b42ab1acd25f7db0ca900c16b4a9f60fc8'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_verified_source_request_context_v22#1', 'ValueError', (), '8b33ca475c342ce0bbb9d9029b20d531d9ddb59a8dc32b7bc045ed9aa1fefe81'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_verified_source_request_context_v22#1', '_VerifiedSourceRequestContextV22', (), '6c35c558d9252d02591e8d2f3bf8c02e6d274b7c45c1e4cde4f8588227c11e0c'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_verified_source_request_context_v22#1', '_snapshot', (), '4d4c5cb03b72a5975c68dd450b1a96d0debca3c12341a7a1e6c169e51cac639c'): 1,  # noqa: E501
@@ -2521,61 +2526,61 @@ _EXPECTED_TASK3_ALL_CALLS: Counter[_Task3Call] = Counter(
         ('attorney_v22_requests.py', '<module>#1::_verified_source_request_context_v22#1', 'build_source_record', ('serialization',), '8a2fa92f1b6e5dfdccad512fe0693c43567d7910ddd2d0cadb741964967f7efa'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_verified_source_request_context_v22#1', 'canonical_json_bytes', ('serialization',), '067b5d24d2bf4d01eb28052faec6a8b4b1a35d61580338a9bd1ccd9d4e483f6b'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_verified_source_request_context_v22#1', 'sha256_digest', ('serialization',), '27810014de9fc01ce1d5d7e1344d0a5920788f8796658adaed35b4bf66c44487'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'ValueError', (), '26fdaedda966ba2bf7356c9caa224a53e1b58c3a9c0a75cbc3cbd1199cf163f3'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'ValueError', (), '408c7e8e4c012e0451ff7d7a05276e61449479bd49995d866296f8f6b6ce268b'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'ValueError', (), '4f749770748bcefe4603686f18a0bf6b9249b66aba28f4de523041593902f8df'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '_ContestedGradeDraftV22.model_json_schema', ('serialization',), '0a3cefcfb723e143c148ea005969e340835032b48fa68f202532d694ff445ce9'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '_grade_context', (), '8bb5d1a570b4509d58371747f06f81934f2b6049368c12e51d5b4d705b14e5c1'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '_new_request_v22', (), 'a3eb2a0eb4bd8f3ad268361f1e938436ee79cc162432089474b078682d5225ff'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '_strict_grade_coordinate_v22', ('validation',), '22a54cb8d738de7dc67044cd847d61ff2da1aefb17ce45b433a02cc64ec7c135'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '_strict_rehydrate_v22', ('validation',), '9179ebce584699b7b1f7dcebec3f7815a2a949a03a84d558c90090d8ae96faa8'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'checked.model_dump', ('serialization',), 'b34dd2a5b49b03382f9110e2f67d2b822fd597000540dafecb742d8c53ab85b7'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'len', (), '8ff733adabb85ef1b8482f58b040571baf92708a4fdd7f69fa45beb1d54985a2'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'sum', (), '731cabe3451b9aa904a999d5a417f209445d9cca8d5c03b4312cc0fea6660ec6'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'verify_canonical_baseline_v22', ('validation',), '548fd35640ba9067395371d386376a1d39d122e82b8ca7c4d7d6c53403acafef'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'ValueError', (), '3b25dbaca707e34d8c48fc7971e2d0c5508560aaf6d5b2214177580a5088740d'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'ValueError', (), '63fe4b1c1f0c9ee8a79a0595e02b9c53065c72432cc37dd0da02e46f95a11d60'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '_OrdinaryGradeDraftV22.model_json_schema', ('serialization',), 'a9aaeb697892ebd18b12663913bea227b6a6beb6e089c45f314edaa4c2874c90'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '_grade_context', (), '4774c99fe5c95a6a70bdbcf14a73368650e68ae90fc8130982cf399455a25eea'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '_new_request_v22', (), '9160dbe346f9c7b71e3e344f9639f878b183ad610d89ad8591f8de4947bdb5ad'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '_strict_grade_coordinate_v22', ('validation',), '8113754509a3ebe2fcb033a73ffdc43ad2cf423b2a919a80a63e6223d0193475'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '_strict_rehydrate_v22', ('validation',), 'ee20d5c5eb4d0aba416c313b34046d7e8423e5c5e56faed839a8542754e6dbd3'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'ordinary_grade_batches_v22', ('validation',), '4128ee2a7cf8f82cbfc29af0fac97c7463a7fb74b284304fdcead13a3f84d453'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'requirement.model_dump', ('serialization',), '50a36f3b4026c333e207d7c5357047acda6a01112c25f72008c4182dc08fdc78'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'verify_canonical_baseline_v22', ('validation',), 'cd70c2f6f7d51cba29f3f1706b6e815e94275d4e182f6b9339584ced5ea97857'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', 'ValueError', (), '343569d2f7fee48c34d8c20044598d470a8e3930f9e2e91acc94b318ae837bab'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', 'ValueError', (), '48a68829a48d7ca2a7d447bc66398aaaf1fabc8a486cc1b2b6800e7f1416c57a'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '_audit_history', ('validation',), '062a1c4de88dfe0505e915304a504f91e27d2fa880e55e7d0ff3b5c1f3fb37e5'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '_source_audit_request_from_context_v22', (), '6f35b0271eed97f0e5ef648e505c15440d8b826dbc541e39e96a2113f549e520'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '_strict_fragment_ordinal_v22', ('validation',), 'c861c6e58c690429dd43fce03448bb718c0285af532c432dfd653d4b6ce8ee90'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '_verified_source_request_context_v22', ('validation',), 'f1eac90ce4272d9afd640bd0925ec174f9749c9102dee92e67e67b60f358fb2b'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '_verify_source_review_aggregate_with_context_v22', ('validation',), '355a0e3a60e41acb2eca4a66491cea015c97838b4ee6acbc997e009454718b1d'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', 'len', (), '56d641bbbd2af029d2e0b7580a77b9e397266bab6bf9bef9f001f654046f8c1b'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1::<ListComp>#1', 'concern.model_dump', ('serialization',), '60f39274e0433048f84f991b3c52ca2575a8e2afb8fab76c9660389d7fbd31ac'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'ValueError', (), '44880a3d07a0c90c216d5b638310c696cffc25fdae7e6dc08ca40f1a5eb124c3'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'ValueError', (), '5357aefc3d303fa11b5d96523e9e0778943799bdc75320a6c5cbf1c6071b7792'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'ValueError', (), 'b59fe6a418ae749d2fa54dac4c6bf2e3a65a1b13c02e5d886dfa9605e2ab6538'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', '_RefereeDraftV22.model_json_schema', ('serialization',), '9f3a3b665df642b5ceff9966b5754cace406d29a19ee3c9443dd8982309c97a1'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', '_new_request_v22', (), '8d9c6b0143234e7654c8ba619353e0a1431cce69cf6a7456a8092a004c80a7c8'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', '_strict_rehydrate_v22', ('validation',), '82f95eeff5d4d0062a07cdc2b959d4b6c4e75380aadfa295ebdf0f2b7f8bb451'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', '_strict_rehydrate_v22', ('validation',), '8f409ee2ff51d4071d96b80d4501fa4426fe1fe07358b1193805a7c4b441bf6c'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'any', (), 'de11831c2c5d4e1f5fe143b0057f9fb6cb90def24bf57449e365a1c1642e32f4'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'canonical_referee_disputes_v22', ('validation',), 'd8156ea40825f785356579a188176ef499d0bea8894a611af8081c5a25e5c011'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'checked.model_dump', ('serialization',), 'eb1de7c81e1fb8fc9457c0cb4d291b3bc77155e5f062bf48f7ac9057cafa2745'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'len', (), '0865fa5b5b6c2f7f79e363ca1f36391fb61f50a92b302ff4ff482a050390237f'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'sum', (), '8a6782fa49cf087335244ff263681048ee7a4627b8d03d875b4806c6a4d92f45'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'tuple', (), '09e878701f6404f25467e550b52e737addbd919ebe55f4b8c25ad399b0a4f823'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'tuple', (), 'edde8f222ec9871d950bc1db14c21d1ec236906d64fe64e4a50947a885c131e2'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1::<GeneratorExp>#1', '_strict_rehydrate_v22', ('validation',), 'e094896c87d6a2fca15da7b37e48869d6219596ec5656c37f2d2989a00fda8d5'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1::<ListComp>#2', 'len', (), 'bd0e4ded9d88a1b13035712883594e6e49a2b0b828f4eba371f3741dece271f9'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1::<ListComp>#2', 'range', (), '539dc2de3f3710166508a05fcf59487c6269410373af87e094189721f85b4ca6'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', 'ValueError', (), '2e66e16550d4d26eaa13618eaaf757b09d404dd7037b5bbf008468f3840f0e90'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', '_review_history', ('validation',), '72ad26cc878697a858d7a9b96efc90956e2b9a9c060ad889145d2cc9936f59fb'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', '_source_review_request_from_context_v22', (), 'ef63331019b471b58926d5eeb6eb0d9e07f116335046560fbab38d28736c07e0'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', '_strict_fragment_ordinal_v22', ('validation',), '856a5e2a69a32253891bdd3254b3b85554708c99862922734abc10e2dd932036'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', '_verified_source_request_context_v22', ('validation',), '5cf26d12ff143f100731f31a9180a43c5b6c600823c5067cccb05db1f39fdc29'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', 'len', (), '7f27a5cdd8e6599cd8809aebcd2a5b5e010f85fed3ed847bbfaa5e87238e1370'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1::<ListComp>#1', 'proposal.model_dump', ('serialization',), 'e8cb73d695ff9b336ccd2c850dc9554aa81af70fe75ab87e5a2b005fdacbd429'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'ValueError', (), 'a357f37c1ce79b88299bfed28823f1960a95359a3d03ef6fe4d535437a4c30a9'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'ValueError', (), 'a8598df76498da89d052bd3afaac4456451332486d19b5313a2800dd7e3db4fd'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'ValueError', (), 'f5507ae5122b5a0a16df5e6a79e639dcef43a29d636f240778326f91055ad69b'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '_ContestedGradeDraftV22.model_json_schema', ('serialization',), 'f94f248d9374ac8d2ae6b4c58d91e6f01cce1ba6f2f11228f53db811888d6797'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '_grade_context', (), '56cc5f2ac9b1c1422d34db463ed85418b9c734cb2346e8ddc407b2c911796cf5'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '_new_request_v22', (), 'a57820c628a65d2ae2894ffe2bc6112e2f838680060f8d79043bbce1896d7acb'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '_strict_grade_coordinate_v22', ('validation',), '577165e088b6e8894309b374947d5f03987eab3aa16e67c02e5f2463bce82b08'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '_strict_rehydrate_v22', ('validation',), '10e439bb67edb133c87afca14ef80599646618afa7ee7cff0e5e8b0f4faa5fa0'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'checked.model_dump', ('serialization',), '5f4a1612d9e30686ec452c7fb093fe6fd349cdb6006fb7732db8a84947d2897d'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'len', (), 'f8ee1806a46d26d2d024e09bcc31b7c9b58c25efb46a8e1eaec44eb24f5f8ae5'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'sum', (), 'a965d013fd0828b8a08620188dc59349095719976d211c5b29118aeb3979943d'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'verify_canonical_baseline_v22', ('validation',), '3723375ce488177d4b46cf5c32ab1370a4c7fd2498f66b0613ac2f186d92749a'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'ValueError', (), '1ad947db7f5abb505734bf8f58358674c98924f45d6e0b94bc4400e74595a47b'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'ValueError', (), 'c6b2b607aaab31215f92adf54d91c061fca8b09bcf97882791f6b3396b1e1033'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '_OrdinaryGradeDraftV22.model_json_schema', ('serialization',), 'c324ccfd147179cffe59d28f9ff8113bf32515ddffa8eade709474a6e55b46d7'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '_grade_context', (), 'bcbb08e97845d2abe592b765f4a9ba3eebf9dd2dbc31ed6ad2a099e11d47803a'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '_new_request_v22', (), '2077fa12016adf5e22a8ef814763d8d3ee561e3fe9141649b32d0b396378e2c0'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '_strict_grade_coordinate_v22', ('validation',), 'ffbab76d29a9c641aed8751f5410ebc832040cbb3fc7aed8badadf99774129ce'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '_strict_rehydrate_v22', ('validation',), '9e5c3d8c2ff915d00a50291abff5e1a2a4487ac4c08a561fb6d98d773ce48ec8'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'ordinary_grade_batches_v22', ('validation',), 'afe2539ccbfc3a338b670570344410cbfd84ed05d31105d8765040aceb0d63de'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'requirement.model_dump', ('serialization',), 'cd167a28e2b2b585cdd340ff3434ff8d0aad66f2a2596ed4273afdf2992ce4ce'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'verify_canonical_baseline_v22', ('validation',), '133fed43ab72a8c660c2fe2ebb21de72b1edb11b8f4570ddb665f66c254c9333'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', 'ValueError', (), '3b40b645e6567b2fbef7fccfc5a355aed8625d55081365bb2c6756b78ef6c4b1'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', 'ValueError', (), '43ebbb9a596b59509630427d96fd2c1723fdfef6e41dd73e43a27dea52972d13'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '_audit_history', ('validation',), 'fab545cd86803b9816a172814cecebe8afeb41e819703775ad085573728e9dc8'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '_source_audit_request_from_context_v22', (), 'c11976583b82145620e1fae54f58c3406290f6cb2810f401cdebb2a10556bae8'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '_strict_fragment_ordinal_v22', ('validation',), '5d25e1a08102ea426974cb0310ec4fda79abae6ae6d1ce74895db2806a4d9186'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '_verified_source_request_context_v22', ('validation',), '16025ea73cebcf368672081a7a9ffc7e10a016b40e707e0422d923ffc8ca0456'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '_verify_source_review_aggregate_with_context_v22', ('validation',), '09e0210857a9825a18b79023c094a2cdf79f270fb61bcde8bf6ec555a7ff6264'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', 'len', (), '72108c09930d7cc8984161ee039c89637d8d891b44cf56f0471d7065f3c054d6'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1::<ListComp>#1', 'concern.model_dump', ('serialization',), 'abcd5716884fc5078894579f05d377332614d40d83dcf0aa0fc377d19fd185ac'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'ValueError', (), '4de3601908c7f753a814192d343666c069e4db9e82a89d23b8530c726d862b80'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'ValueError', (), '856553de6f0749ae6cc8ebb444e42eab3ff78035aa0f02e099915fc719e973b1'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'ValueError', (), 'ee8aa90f800eec92783596856221a8b445524025c083099570aab3147b37bea3'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', '_RefereeDraftV22.model_json_schema', ('serialization',), 'e926552cc3e1cce69690bcfd7370981d626ea5bb4e6b9ffbe3d788b24e07a4e5'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', '_new_request_v22', (), '49818f49a668d121da93e244684ec14d95064506c643b6fc4508fef765afb643'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', '_strict_rehydrate_v22', ('validation',), '35dcd3f4cdf924111a6987c7863c6d2cfa287bb846bc763d44f7339c8d73606e'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', '_strict_rehydrate_v22', ('validation',), '7c847493bdad7fd49979897c055489301017ba18bde67d2e57f16746b364558c'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'any', (), 'd88bedaf930d15369d4e3b3217d651a7a19d37a2dfad2534faec974dea2b81aa'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'canonical_referee_disputes_v22', ('validation',), 'a006d2bf1b1cdf5922cbbfacd5eb7965cd85e2907819a772d6c6ed1ab2c7734e'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'checked.model_dump', ('serialization',), '076bae1c4a5b2200ebc30870dcb7e585b991ea6a787f916395d58659b4646e5b'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'len', (), 'c1e674d3515f227b4d3ee2d4b44782f08b76402ca29060c5025e4ed0d6bf1373'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'sum', (), '5ba6d3b8a3be14a2a64486047e3d6f090f62a6a86de3ab61e091c663f6ee26e3'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'tuple', (), '1461c1817372dafac32597e594af136f023b23609abc8cc2ce6586c9812738d1'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'tuple', (), 'ada5410ba7bc7f62868738cd673bee9744797a135ae0f3138a07801240fb189a'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1::<GeneratorExp>#1', '_strict_rehydrate_v22', ('validation',), '6cf916f4742d94b66d13a7ab4c21c418dd34fc9bb79199887ad45eb03cd77a5c'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1::<ListComp>#2', 'len', (), '13a17d6160709c55fb2c48c46cafc993195f9c84ba3643965b683cf7dcdeb77c'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1::<ListComp>#2', 'range', (), 'eace46e9989cb78ffb7f2c5ae5c8dd6c974d9cfd24979da2b621a5ea55b02396'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', 'ValueError', (), '2756b0b368fae4d8a5f7940c2efc4dc467ad7a4859337c264999fa214d49725c'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', '_review_history', ('validation',), 'b8510ed50f348d8c993efe0a849daf6d94c6c123b8c54348dc1e96c87ec0323a'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', '_source_review_request_from_context_v22', (), '0bdd5115063ea18175b786748d3a39f055e243bfef89dbafd280b2d47083d4da'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', '_strict_fragment_ordinal_v22', ('validation',), 'de1d339d84158688cf381fd228e778b37cb9d2c9f50471d8035ca572d9336d58'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', '_verified_source_request_context_v22', ('validation',), 'a4387e373c4211f6c18b7f497128e1a612ae7826e61ef7720d2f4980e8439684'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', 'len', (), '319b18aebfa929462b5d649af305275fddbe15a91d6545c88aa5d8f084bf281d'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1::<ListComp>#1', 'proposal.model_dump', ('serialization',), '95ee189ebb68222d912e27aa2774705008ac4d1e63f65f482eba5034c51db3ce'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::compiler_contract_fingerprint_v22#1', 'canonical_json_bytes', ('serialization',), '415ef629bf80d151f8bacd3eee92092e88ebdfa6be70a83dd885024c8064c63d'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::compiler_contract_fingerprint_v22#1', 'sha256_digest', ('serialization',), '40211bc813940b1b745124ae6cefeedaa3f5843820a971f654baf805974cecb4'): 1,  # noqa: E501
     }
@@ -2668,14 +2673,14 @@ _EXPECTED_TASK3_ORIGINAL_CALLABLE_IMPORTS: Counter[_Task3Import] = Counter(
         ('attorney_v22_requests.py', '<module>#1', '<module>#1', 'from', 1, 'attorney_v22_models', '_strict_source_context_v22', '_strict_source_context_v22', ('validation',), '46731992fcf39fd417a13be5961c8a843cdab7dba4c4e0ea3f6c5e569bf8d24e'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1', '<module>#1', 'import', 0, 'hashlib', 'hashlib', 'hashlib', (), '3014986f794aec56edbf7380b110927a0083643a540f4723e0fa6d122106d28b'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1', '<module>#1', 'import', 0, 'json', 'json', 'json', (), '8425e52cf9b23c6be2fdfa3543812ab37457dee33bfdea71818d2ac5a81abf5e'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', '<module>#1::_grade_context#1', 'from', 1, 'attorney_v22_compiler', '_strict_rubric', '_strict_rubric', ('validation',), '129f802e91627945acdd172286165336954dde43282b9dddb224256ec4457ca3'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '<module>#1::build_contested_grade_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'RUBRIC_V22', 'RUBRIC_V22', (), '7c8674b88b9f5e804f1e24f6ce288df71a2b1ab9211229cf4540155a98f15b3b'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '<module>#1::build_contested_grade_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'verify_canonical_baseline_v22', 'verify_canonical_baseline_v22', ('validation',), '1737a464d95543a0c4188589e045d60e25095531cf921088506411a682e5fe64'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '<module>#1::build_ordinary_grade_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'RUBRIC_V22', 'RUBRIC_V22', (), 'd5cab8c4817775f47443a56731373516bca75dc2e20ffa47fabaed054f6b1c6d'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '<module>#1::build_ordinary_grade_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'ordinary_grade_batches_v22', 'ordinary_grade_batches_v22', ('validation',), 'd739475732bbc3dc6e1a8295a5f43b72ed5bec484ae6e989b2f3e9e4d6f4e758'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '<module>#1::build_ordinary_grade_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'verify_canonical_baseline_v22', 'verify_canonical_baseline_v22', ('validation',), '939e7fa0167e6eedff239ea4538852222d89c2c872ae2dba19379d5d58273101'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '<module>#1::build_source_audit_fragment_request_v22#1', 'from', 1, 'attorney_v22_compiler', '_verify_source_review_aggregate_with_context_v22', '_verify_source_review_aggregate_with_context_v22', ('validation',), '273dbe77e60cb0285749950821dd4da8898f79a50e75758f5188a2a82ee1e4e8'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', '<module>#1::build_source_referee_fragment_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'canonical_referee_disputes_v22', 'canonical_referee_disputes_v22', ('validation',), 'f7b870777b3c755c23417cc262109d08ea1bc48a157c12d9fca6fa319931ba84'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', '<module>#1::_grade_context#1', 'from', 1, 'attorney_v22_compiler', '_strict_rubric', '_strict_rubric', ('validation',), 'c9e335f37003068b21e4419b2e1b76d1ac6feaa7bd1febba7d8b06e53f863def'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '<module>#1::build_contested_grade_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'RUBRIC_V22', 'RUBRIC_V22', (), '7b53248136dcf3b1249d7e11292dff8a2325e6bbff602c77176fb549888261c2'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', '<module>#1::build_contested_grade_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'verify_canonical_baseline_v22', 'verify_canonical_baseline_v22', ('validation',), 'a42990735d6d282f532d2a325ab67e3399d57d29d9564a190a9aeaa48d709bf7'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '<module>#1::build_ordinary_grade_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'RUBRIC_V22', 'RUBRIC_V22', (), '5f2bc2bfae76b4f4905d73e46dd793bcb93c002a22e22be7802a9e221cafa363'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '<module>#1::build_ordinary_grade_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'ordinary_grade_batches_v22', 'ordinary_grade_batches_v22', ('validation',), '00c5fc4a9f70111a69b37f753f4867d63780605382fde0ed9c3bcc459387e5b8'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', '<module>#1::build_ordinary_grade_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'verify_canonical_baseline_v22', 'verify_canonical_baseline_v22', ('validation',), 'b24dee6d1bf5b8c71743c58d12a50c6703bc3533a48df98aa8f0caf91f68339e'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', '<module>#1::build_source_audit_fragment_request_v22#1', 'from', 1, 'attorney_v22_compiler', '_verify_source_review_aggregate_with_context_v22', '_verify_source_review_aggregate_with_context_v22', ('validation',), '3803d7aa8a2cb1f349be1e0b32a3820feb4682419aa35e2c058d4388ff053c0b'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', '<module>#1::build_source_referee_fragment_request_v22#1', 'from', 1, 'attorney_v22_compiler', 'canonical_referee_disputes_v22', 'canonical_referee_disputes_v22', ('validation',), '4a1d513c2028a89a3df6c7224fede2cd5a95bce2df333f4c16660155ad2a5121'): 1,  # noqa: E501
     }
 )
 
@@ -2720,27 +2725,28 @@ _EXPECTED_TASK3_DEFINITIONS: Counter[_Task3Definition] = Counter(
         ('attorney_v22_compiler.py', '<module>#1::verify_source_audit_aggregate_v22#1', 'FunctionDef', '3c25ba0bf134c2436ba7c7841d3fd4ae1380f5606d789e2b2774ec67707bfa38'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::verify_source_review_aggregate_v22#1', 'FunctionDef', '017a2acc5b4803a5dd83df6655bc0bec6c2783eaa3129ad3d4cf4b34bf043494'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_VerifiedSourceRequestContextV22#1', 'ClassDef', 'e14b7aa3cd380ad56aac06c6cf3c18d464b773286b5c9394765c25bdbaad2eaf'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'FunctionDef', '2e90edc01f8d9d7c94776350de8f7e16bfac0b974ab86a4e14188679ed051b40'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_audit_history#1', 'FunctionDef', '1432600fcf13a4879e7a69e85fac26856d7f14fcf3e18b02eee90ceb70bce2ac'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_context_source_metadata_v22#1', 'FunctionDef', 'ac0350cdd02a2e378b1462f3731e4baacd1c6f1857c5a88aa7ee3aa4c8164307'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_context_source_record_v22#1', 'FunctionDef', '6774cc03030d1d01b3be233d6fa5db0f69b10f5017ef6cc4c7b4b93911acc930'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_fingerprint#1', 'FunctionDef', 'af1cd746c8e26680790d026c43de1e329c5652c4512b09a4b07aa9f235b30674'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_frozen_source_record_v22#1', 'FunctionDef', '7f673af610fe1039d3ff0b3d693dfc63c75038387d62ff30169988d4fb04f6cb'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'FunctionDef', 'c7815122eac370ade5f762e433c04e1884457af5a26e6849860dfcf8f61cf22d'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_frozen_source_record_v22#1', 'FunctionDef', '005577d2751cf2475a2e57fb8e53ec4578074bdfdda8e87c26e8e6048449470a'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_grade_context#1', 'FunctionDef', '4b091a1eec13ce99bdb16ff917144a1013709a44fc3fc27863c46c87d7569ed3'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_new_request_v22#1', 'FunctionDef', '47192e172e11768dd272a8e51aaf4b9f1e6f6d181eb3636f26530248bd0083cb'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'FunctionDef', '8935decdc9845c8879e4d08459e0e74903eebe592f46c831d0dc7609706b3b40'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_review_history#1', 'FunctionDef', '7f6e0ef59bb4a7ef8acec3e378569aed4f95dc25b349924bb2d97b4439d34d5f'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_schema_hash#1', 'FunctionDef', '246a50d026b74926e0f8027009d830ef3ef0c1586342cebd4bf41786bbe6d720'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_snapshot#1', 'FunctionDef', '91486b15860c52ed819d2246bf1a94718470904bf90a758fbf5d9135331866db'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', 'FunctionDef', '7e1566b660f15262e6f6df21e67a12303b22962fef64bd16f2677f1524158042'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'FunctionDef', '5e9587b33cd50ac92beab4c35c98f8fd64b9a56aaa23ba6c3ceaefbf1fd9a3d1'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_audit_request_from_context_v22#1', 'FunctionDef', '0279548cdf26362410699c52114ffa76deccf4dd13d7a8799e444a77342ec428'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_evidence_handles_v22#1', 'FunctionDef', '6d03e59830b0e45cb4a544153d77f2b36e6e530de7ddc18e1f9bfb46d8f3c590'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', 'FunctionDef', '9ef2a9f1f25fea262d02beea92151351c6d46416c1ba3c0e3a155575ade393f5'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_source_ids_v22#1', 'FunctionDef', 'd0e6ee1f3aeb5e7ee535b8fd09484fba9bfa141751e6bdeb654be7ea697d9761'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_metadata#1', 'FunctionDef', 'fa6a94d527d65d2908a19ccab30809a5ea2bf3277d4659e55102ca4e63f30343'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', 'FunctionDef', '7721e919a4a2a86c0e0fdd27728625e03cf2b7dcc9fc19468b3c931badaf2f35'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_metadata#1', 'FunctionDef', 'd51aa34467a5d6ca8d188f6506e11bc9e5a45b1182005d400f869eed9cd85b19'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_review_request_from_context_v22#1', 'FunctionDef', 'b414212d659b973bfa0cecc83532c4dfbe7709e1260c37d4d9078fefdc54b86e'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_verified_source_request_context_v22#1', 'FunctionDef', '603a494bc8df33ada1951f141cfdf269b5d681999cf588a074e036c77f32eb05'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'FunctionDef', 'ff4699dc028bcb94418f2853fc5e675da1fdfefb14815bd1607a77a9875a0e4f'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'FunctionDef', 'b7d7dea170bf703556aab399a1db843cc8fa62d4cc0aab8e6bf27e83c73568be'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', 'FunctionDef', '4ae4884339533a2fe4c0e8165c161f0550862dfad7026cb516a3d28d0f9124e2'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'FunctionDef', '1a74e3b6f35b8a5d35118eacbeaaf4705a9dac2f88cff38f6a8f01f7396290eb'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', 'FunctionDef', 'c81fd5bd1b7aa1faa3bfaa5a556e824b5f828a8289d84553f0299b90442e3043'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_contested_grade_request_v22#1', 'FunctionDef', 'b324d92f284201702ece0616fe96e6b314859ab2b9294e46c26a9ef2803b4dcc'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_ordinary_grade_request_v22#1', 'FunctionDef', 'eb0165d91f977ee61bc24bde9bf9e21f7301585e820866f01ec405b6e9ade200'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_audit_fragment_request_v22#1', 'FunctionDef', '2fe53dafc11c176829c389db5fcc932584cf249ba579e7b1d9c412257c133503'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_referee_fragment_request_v22#1', 'FunctionDef', '2e8b464a3f678a885b9a041aea7cf5313a566432389a378d8cc960fc31c0728a'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::build_source_review_fragment_request_v22#1', 'FunctionDef', 'ec61552a7e2ec715a3e5705da1f55e90ab089957398fd25e3a53664a655f5b9f'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::compiler_contract_fingerprint_v22#1', 'FunctionDef', '096028d1996b0c9179f1803b6ce9804d2d0bb27779ebced4c6d8b090bab7cf8a'): 1,  # noqa: E501
     }
 )
@@ -2756,12 +2762,13 @@ _EXPECTED_TASK3_SIMPLE_SUBSCRIPTS: Counter[_Task3SimpleSubscript] = Counter(
         ('attorney_v22_compiler.py', '<module>#1::validate_referee_fragment_v22#1', "legacy_decision['schema_version']", '0ca3dcc0bcfb06380da614c154e89f7f7c7f36eba9d403d4cfac891ab5cbaad1'): 1,  # noqa: E501
         ('attorney_v22_compiler.py', '<module>#1::validate_referee_fragment_v22#1', "legacy_raw['dispute_fingerprint']", '48dc852b025e2ebdc12063841fe4b8091ebfa0a992aec5060786932aa9c264ef'): 1,  # noqa: E501
         ('attorney_v22_requests.py', '<module>#1::_new_request_v22#1', "raw['request_fingerprint']", 'ab391cf5c603c5291a00c3f501c81edc87e2bc581f1c701c792a6f75f087a1e1'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "concern['target_proposal_ordinal']", '900226785eeb404d9516f4b2e9dc84f044e9be2206a3e129ca709025b522c6a2'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "dependency_target_schema['maximum']", '1924833526268634ca52dd13de19fbf1ccf0f22574e77fc546cee66bc842aa93'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "proposal['dependency']", '5796f67423f26bf703491e49214a0ba03df8d6eb1ab7a2aadd3682810efba6c6'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "quote_schema['description']", '9ea756bd9d4570a59659e5a788386a2fe607e0305cfb2676d37ccc6eec26659e'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "source_id_schema['enum']", '61c437b554602733ef63aff9b1f061a939bc1c3474657c49c9b4bf6713170237'): 1,  # noqa: E501
-        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "target['maximum']", '7e8dcfd2a1f2066cec1e800263fd1c9fe353a7b2817389c9ac2b4eb805935f61'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "concern['target_proposal_ordinal']", '716058ae04e7e801a4842447407df4cd2fffaf793cbd204fce878e0f72c90421'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "concern_passages['items']", 'b41e36d5b03f50ee9661fd10c85dcf678b03854deb70caee7ac5bf6c64edc21b'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "dependency_target_schema['maximum']", 'a2830011750f99adaf2004dd6d5f16b3a4c021087f14abd5cfd489bb0c992b0a'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "handle_field['enum']", 'bb7df9facfe08964c84d4790c2e5ae1c375cbee533781897093f443c0a179de0'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "proposal['dependency']", '2e9b12af387b3583d7b3271f46eca469e4692fb6ed12ab05bdceca54d5d8a4c8'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "proposal_passages['items']", 'd1e1640d9bb16487ad5c7ceab650570ecf180b9080244024842beed4347403c7'): 1,  # noqa: E501
+        ('attorney_v22_requests.py', '<module>#1::_source_fragment_contract_v22#1', "target['maximum']", 'f1d9eb93dff56d8509cf5364d7fa776b046cba9b25f38dd5ce32d3d621252e63'): 1,  # noqa: E501
     }
 )
 
@@ -2831,10 +2838,10 @@ def test_task3_development_policy_review_inventories_are_exact() -> None:
     assert observed.imports == _EXPECTED_TASK3_ORIGINAL_CALLABLE_IMPORTS
     assert observed.definitions == _EXPECTED_TASK3_DEFINITIONS
     assert observed.simple_subscripts == _EXPECTED_TASK3_SIMPLE_SUBSCRIPTS
-    assert sum(observed.calls.values()) == 514
+    assert sum(observed.calls.values()) == 519
     assert sum(observed.imports.values()) == 93
-    assert sum(observed.definitions.values()) == 61
-    assert sum(observed.simple_subscripts.values()) == 15
+    assert sum(observed.definitions.values()) == 62
+    assert sum(observed.simple_subscripts.values()) == 16
     assert not observed.prohibited
 
 

@@ -13196,7 +13196,7 @@ _V22_PROTOCOL = "2.2"
 _V22_MAX_JSON_BYTES = 16 * 1024 * 1024
 _V22_COMPILER_VERSION = "semantic-compiler-v2.2"
 _V22_COMPILER_CONTRACT_FINGERPRINT = (
-    "5e71246422c85022517d5941a24536fd8679d2aba907a0bee860db3eb9ff6100"
+    "ec04d2f5956cb6388b1d46f5b2c8c74007f954decff6ada62b1eff6f1e6c55e3"
 )
 _V22_STORAGE_CONCURRENCY_CONTRACT = (
     "cooperative-exclusive-directory-namespace-per-operation-v1"
@@ -13219,9 +13219,10 @@ _V22_INNER = (
     "operation, request_fingerprint, provider_name, model_name, judge_isolation, and the "
     "outer schema_version."
 )
-_V22_QUOTE_RULE = (
-    "Each passage quote must be an exact or whitespace-normalized unique contiguous "
-    "substring of the normalized_text for its source_id."
+_V22_EVIDENCE_HANDLE_RULE = (
+    "Select only controller-issued evidence_handle values from the evidence_handles "
+    "inventory. Each handle resolves immutably to the complete frozen normalized_text "
+    "of exactly one source."
 )
 _V22_AUDIT_SHAPE_RULE = (
     " Concern shapes are fixed: omission requires no target and a correction; "
@@ -13237,8 +13238,8 @@ _V22_INSTRUCTIONS = {
     "contested_grade_fragment": "Grade both supplied alternatives for exactly one contested requirement against the supplied report and source context.",
 }
 _V22_DRAFT_SCHEMAS: dict[str, JsonObject] = {
-    'source_review_fragment': _v2_embedded_schema('c-oy+O>f&U4E-yC)}w)91$ybVy#zZnON(8G!jLW6<*Khra@Qcpe;*|$wqm;*x|=AI?~#wByk{2z8qaR_>;V+l0qYI-p0^OMxDXi7Xf8L-Sa1P>TpKPu6wGE<d-mFykYWM`NeA{lT@)<rY&3mvs9Sa@m^YoPp+u2;KcvgmTFfIT#KCKa4k+Sh7G4}lpNbJ?Qo{gds$WotNMGK81ua0=yF165@Z;+0lchS4Ji7X4w9y9LshF8az`it^c;USU8@<Y4$Rv?bQ#gIljiCZWS?%)7w>jv7YJs~JLTQ{p$}!R^)Tko!*AeA0d9Ch`UIPy504=zgm~O&)PLid!q}r0WQ9R?h{7-3XqZ^DYkPBN&;Ew3Hs<7=$7iH|U18?LT)sdxnJH{_)D25tRT6%Zi5d5B9IG_Xja+!AFa;ersu|MJIPD*xoN<HPB4D2S}5IibtT;S8>9Ti`vW+)!OVLJNGM(3DVmi~G~SV;c`waAf8C9zHIV@bzntng%kQ|LXOkK$<#aWJ@$G?wF3D$s$fmfJk7Z;^N*A=__R>Kq18=`ay<x{-${!~44TzAoYvAB}8`Hz(kMlsm_FG1&2bl+NCo?QpsD-UO086_&p@!{tBUo6Pg27XtG(*)i8TpT05Ce2r%NF<T;{|HQ)BBi>(oFlU{1VGw?RTTmX}5Pp}nQC7nFTfa@8R=1~5LvUpb?XI4QYBQcGZZ22<Tj=3Gmh2BNELi3', '566effc520f36e8b28efaab111d19ff0f209e68568d0a0b8836c04b469428faa'),
-    'source_audit_fragment': _v2_embedded_schema('c-qZYO>f&U4E-yC)?<L81$OCeXm<#9Xx0|H41=NAw98eNR7oxp1o`iy<S)r~+jXbiBw8XLA0H_n*;xUlWmiXb4>gw#^DVcQSKv*&DA1vjTx^ZfU>pJ+ExE9;W;!w**>j^@xZ}_XTCnfIux9R{{nk2zvSOz-v#K#UWLU(f?}Kr*Ddsomih<__4bY9B(e-r~^w)ZHGs$6argpy}cRqafrJ<y*mCV7&8^cTY<MQ%@$>#0ttaW~5Ae-7_Q#D#kE+{U_Tp2?#GwZm68l+3C@PY-9m&9m5a1X&gqNWeL-eJ|CJH#n=$X5?O_5!_~FOR|}B@eeHK|8WD1GHeD&O^b^GoPfgTnrSP*2mtPY=mGZ3Q9+LBOJT(7IF@IEx6>p_a4*N$h-hax77&LA#o8F6Fk$((Y2cIH|^=qv_aWzE=Df4z2hM$H-;blWyehgF4J9>nKA`ZX;V(fDb~Jp7lQ+o4k|G3voWH02%%Ozp{v_2)Ks~NY9dxrTBA}gOLa-pH=sd!Jstj0(TVaRMHj)b%|c;epM&<NGN)Le17(X}mWrCP$aaZT?@~F>bkWr)Dos+5l-{1zd8H;aPnu{FB&K(PwIy<Ao$}#fQFgr^5t|F(X6SL%cp4jNz$)=Vd87?r4zps$VKL<JcDpa+`Zo=awN}RQDR@K4=b;!i4L5^fX&dbidted#&FEnP{u9a~nV>s?RX<3G$4A^@zXLOl*FlQC4sqD<LXa#+Rd%Dd;yQ-)%?JKZW|iTsl#=)JZZIyrp~IUJzoF4X^UfO@oqTGEz_?7&Xv$;tjX>izn)S!5i75OB8ixC+m*uL~0@8nqFb`MP{g)xmPAO_9**<?^TE1Do<+(bo;^e`d7jAjH`*V{FVzSyFodDo<zWxAWKvW9', 'a30365d1413adf1eda94143e41b921cba15e3f52ac4a0efd9b8b284b630cfa04'),
+    'source_review_fragment': _v2_embedded_schema('c-oy+!EW0y4E>cr>(M~50=x9u4p^{5vvk;H2n^Yx9j>yZN^;jA$iI)06I-#J746NE$oHNeNqNt%1XPaQ?%5+WTzM>4+&NxD*y2K<N3FPAS#7|21PZOVbdWKVZ0*@|t9{Jz=p}uyA8{jNerLkcd5fxMhm1Mh+7faUY4l^<Tr9;jgHkL!w`hSfekbYKk#v&{Frz#4V7mANr4RJ^Js3~|RJpsiyz;+pZr*uS3zCOWw?z}ypxP!V6A{?uS`jb2mS93u?lmpRWK@(+2ddI^0g)HGRQWmuopH@`TZ7NF6-XKbZG#G%!2EeY`5B`Y567q;2bG5!?8HnvVm&8G<juJ@XYSV*3_<XXD<R>72E!2~-$s<QPfqxYj^NF18AGL4x}bILT0ydQTz>FErB+qPmG(<1fm@>EO@Vc*+t3}Yvf#9QA@zyWyCHw3HAG*UC`;`gDuUm$D+~0&K3&HVzn&}MA={tuR4XMrY+|eOR(f_Db_gCDqpjy-@s=)M#vW_92aEC3wI&1yVTt_ZfG{Kf36)5Zbs@2iUCE-4TP*Oj0^6W-cs^mL@xp$=g`{a4hOGhRX;pKR%K9FNX9St<@rac}4~_f3tryxTSUU<GzfOnEA-MOt>`1<3VWy9ZWT;msJ-t?LE#C#HmUkU^HY4kPbME!^RITVo`ug^pZ@#`s<WuJ#rqwlr)-r9{L1;RGld+o29?`#J&dd?-ymaG&O<2cO=#B5;W}K&&1^(uxZj6NUKi@hYE$&W7eR82Sjl7zeY7(9?ZfaNelkDIxTlNpJ%eM3', '8ef9bfe17717250df16887ddf4d007e3afe7ea0f66d09c471f948abc0ddfd394'),
+    'source_audit_fragment': _v2_embedded_schema('c-qxgOHbS|5dJGGm*YwZq+YmHfK=226i_b}ioD4rOmXaBJBZb4|9i*I%XY$Jd+RNpjAy?2=H(qbDxfs%Y{%}P=F(z*!;Rq;I1w)jw5TK(H(E8IEdr^QTo_ohCJ^n|bE~YsW6=uwU_ZTJ&Fr>uM`Jb0itX3Ts8;8YVG(NIdEx4+nBSl)8lGF!KsSB|*Vnz%hxKG8iD5LRHh&<u&VBZ+rJ&B0%t6Zw%}e|1^z^`B^X_)m8Q(FGZSAnB8jT?n<QHYGv?iaKvD`up(neBv!2-xiB-9|dgJ2%9p&z{7VAZ1Ch9UOISNG2M0=>O0hr$IVx7Q^>+p!}J^ufLy`-C57E=Xm#7%AAVcY`(A3c>c|lvH^uEIV@&G7hhe;F1s42TYfNcmYz=Wy4d4#D#eu*=0}7cP<M75xzt<P51tRyw&{ms&n#{4k-J>$wcAJfM>+YwdPv~)pA{d&6=K^Oz8rtB4WT~6l<69lhFW53l->(Nt{sJdsnL=53B3mRa)>-u?1wt*$66Rxx$xP;Q|_vj_d6|HbPXeK_e92u*rNqz-tbT)5@%3o(_~9epxE&<s#ce6@D9c!K|G690jR~5)#upusY9FLUYo4iIb4t1=g0xeWQ#IBX}4S*`v1-HC_K})j9ZZaHgihklw($6xM8R96UP9e)0wNk_+H^oOr5r)zL}~Mu`_fACJFsoSd`LD8|&hKVlYA_?hvCb)&T9DR@o6=f1{j8uc3er)e9f?0^OEuO<r%@Sji?(LUJ-tcI~lJU-$EhZE>&*^C`Fv=@#CUI^;8soDBPRPiQ+^}{*-zbCimT?Ixxaytr_9wOsn4j&@Hw*KHD5@<ek{9%~gU{L2_(M~|a4xF{stoO+M0e!~Z4#;v<Hv-~^ncohp^Wo3vXQLE#q3qrees{!aPm{g4WzsArua<e@mY1E=OCku#>RyW;z}tNN1yKLQO8', '70512eda0b7246d20518405f560fe75534a3db88b70769c0266340f6972429ee'),
     'source_referee_fragment': _v2_embedded_schema('c-n1|%TB{E5Ji8bnsqj<#3sAGD3PF!@<2ieMJAq9Mu`&~r%+Y-cg9T<SHR9bnz?i5&KbB6(#TrzGSqd0+DL4{FL>Fa2h9ySgTP$2RBGR-x(fVP;CYUX$uu4%exU|$B)lWt+Ja7LZ0quf0^U3@(v%23Y(_Ccr^b@jXsHg+dq83WRgPJ$g(PQ}>C#|zc~nx#%1)n8tx_30&~)mp_;)Z=-g&n4`kA}Q+pGGFjp~yQ*P5TKisnNmXa|ms(FFhT?6#yZcsr!T)rl1plgle+X|&#E%coVaOM~Qvq^@Yq_V<s$I&oyT4C%9C$wL;hI7kAvkF#_ir(wvVWV^Y<`OC+7B&sV*=&3?r!MoCcZ;4AGo&3(C!EbN(#?MY_x)fOz?m~YLavRajRkH{S)QB6+3-i2KxTNa$56lhpKOl$IMg', 'ef15eaa6fa7cb11ed8c34ed497c01f0420d47f5d0cef62b88aa8da790749a0bb'),
     'ordinary_grade_fragment': _v2_embedded_schema('c-oy)%WA_g5d4*}&Cw7V=*8zi=qVwGUP>|Bcx_bla91+anEZPsKV;|C(%z)iXl8dtYGIjEVIgfHJJ4q>m=tNZWz1>ASh$z<Ivir23nz?5xo1-mJ3;<Zfzna})vVM)E^K9NhYnlPwSx2&6gluv^f;8V$@;xEZdld&=s8emcuT+uCkay6%(#5DsY1~@7P^E}0!9gI2OZSSuJA(b6)aYCEhU^hy&oBC=^zc2No_aMd1}UfTngMH;1G*9nqjI8yR1TMvFxo7j#Rg}0xSG_?hl_P{X@sF*pCcR1evkvHDW}W;avD$0=*Jis9^KsoGd~Yy8#*rg?3aD!)fBoLrAyyle0vx=bU>ri|+n&id~rZ4?4Q8i9fur|0FX_Rfbm1!&x%<hXW6*?klYBH-4F$w|&^$@qOEiUFP_M>E(Fiwx@lN-27tbH{Z}%Is', '4972008ae8aa6d9a589a3680df797eecce21d43d8caf19b7a01f0fbd907ae364'),
     'contested_grade_fragment': _v2_embedded_schema('c-pN}!A`?44E+@pcC0k96WVQJ65=*-;DS))Ep8QPli;`;)wF*nNm;wCT_q4VJF)$q-}7EfBxX*`_u|25M#m@@1tV!-wZ%sQi7&HR_y;K!E2E)Uk+Ddu(D!9fI81~+dD;u9oHZ_1hjc=iiMhC)MyzQIwCu_P#vu^|4FZNXRvZHH+&(6PYa5;%lhS$YKx>Fo3(i5_pex2Q2EF1EzMh)TyV-rx0mK<MtK*Co28f^*hY0goDMBgcuV>r!37jtR)?tjQ+X9;PJ8n2oy(W@h3w2cn9woBxwBTijqNvj**M@(hN^iU+p!6V*i@7~%J%?X74&_?qmEt<R@cu{^HXqvT3Y57QF%f2q<QTX~O2thyNO^IbeX~4MzGp8~p0A-4I*HRfXgqd=Lw@}661NI>_#f~W2RAZ#Z0Y2RD_1TwZ8=3EOM;9CkMkREkAIc', '0f2fd52fe2b6e96686b777c79573b23812c79864ca9fcaa8a081a02bf2cb9d8c'),
@@ -13381,6 +13382,8 @@ def _v22_trim_aliases(value: object, *, quoted: bool = False) -> object:
 
 def _v22_passage(value: object) -> JsonObject:
     item = _v22_draft_object(value, location="draft passage")
+    if set(item) == {"evidence_handle"}:
+        return {"evidence_handle": _v22_required_nonblank(item, "evidence_handle")}
     if not {"source_id", "quote"} <= set(item):
         raise _V22Clarification("SUBSTANCE_MISSING")
     if set(item) != {"source_id", "quote"}:
@@ -13455,15 +13458,60 @@ def _v22_request_sources(request: JsonObject) -> dict[str, str]:
     return result
 
 
+def _v22_request_evidence_handles(
+    request: JsonObject, sources: dict[str, str]
+) -> dict[str, tuple[str, str]]:
+    payload = _object(request.get("payload"), location="request payload")
+    raw = payload.get("evidence_handles")
+    if raw is None:
+        return {}
+    values = _v2_list(raw, location="source evidence handles")
+    if len(values) != len(sources):
+        raise EvaluationIntegrityError("EVALUATOR_V22_REQUEST_CONTEXT")
+    result: dict[str, tuple[str, str]] = {}
+    source_ids = list(sources)
+    for ordinal, value in enumerate(values, 1):
+        item = _object(value, location="source evidence handle")
+        expected_handle = f"SOURCE-{ordinal:06d}"
+        if (
+            set(item) != {"evidence_handle", "source_id"}
+            or item.get("evidence_handle") != expected_handle
+            or item.get("source_id") != source_ids[ordinal - 1]
+        ):
+            raise EvaluationIntegrityError("EVALUATOR_V22_REQUEST_CONTEXT")
+        source_id = source_ids[ordinal - 1]
+        result[expected_handle] = (source_id, sources[source_id])
+    return result
+
+
+def _v22_resolve_draft_passage(
+    passage: JsonObject,
+    sources: dict[str, str],
+    handles: dict[str, tuple[str, str]],
+) -> tuple[tuple[str, str], bool]:
+    if "evidence_handle" in passage:
+        bound = handles.get(cast(str, passage["evidence_handle"]))
+        if bound is None:
+            raise _V22Clarification("REFERENCE_UNKNOWN")
+        return bound, False
+    source_id = cast(str, passage["source_id"])
+    quote, changed = _v22_resolve_quote(
+        source_id, cast(str, passage["quote"]), sources
+    )
+    return (source_id, quote), changed
+
+
 def _v22_resolved_proposal(
-    proposal: JsonObject, sources: dict[str, str], inventory: list[tuple[str, str]]
+    proposal: JsonObject,
+    sources: dict[str, str],
+    handles: dict[str, tuple[str, str]],
+    inventory: list[tuple[str, str]],
 ) -> tuple[JsonObject, bool, bool]:
     passages: list[JsonObject] = []
     seen: set[tuple[str, str]] = set()
     normalized = duplicate = False
     for raw in cast(list[JsonObject], proposal["passages"]):
-        quote, changed = _v22_resolve_quote(cast(str, raw["source_id"]), cast(str, raw["quote"]), sources)
-        key = (cast(str, raw["source_id"]), quote)
+        key, changed = _v22_resolve_draft_passage(raw, sources, handles)
         normalized = normalized or changed
         if key in seen:
             duplicate = True
@@ -13492,6 +13540,11 @@ def _v22_compile_draft(
         operation = request.get("operation")
         payload = _object(request.get("payload"), location="request payload")
         sources = _v22_request_sources(request) if operation in {"source_review_fragment", "source_audit_fragment"} else {}
+        handles = (
+            _v22_request_evidence_handles(request, sources)
+            if operation in {"source_review_fragment", "source_audit_fragment"}
+            else {}
+        )
         codes: list[str] = []
         strict: JsonObject
         if operation == "source_review_fragment":
@@ -13516,7 +13569,9 @@ def _v22_compile_draft(
             seen: dict[str, bytes] = {}
             normalized = duplicate = False
             for item in values:
-                proposal, changed, removed = _v22_resolved_proposal(_v22_proposal_draft(item), sources, inventory)
+                proposal, changed, removed = _v22_resolved_proposal(
+                    _v22_proposal_draft(item), sources, handles, inventory
+                )
                 identity = cast(str, proposal["statement"])
                 encoded = canonical_json_bytes(proposal)
                 if identity in seen and seen[identity] != encoded:
@@ -13534,7 +13589,7 @@ def _v22_compile_draft(
                 codes.append("DRAFT_NORMALIZED_DUPLICATES")
             strict = {"schema_version": "2.2", "proposals": compiled, "review_complete": raw["review_complete"]}
         elif operation == "source_audit_fragment":
-            strict, codes = _v22_compile_audit_draft(raw, payload, sources)
+            strict, codes = _v22_compile_audit_draft(raw, payload, sources, handles)
         elif operation == "source_referee_fragment":
             strict, codes = _v22_compile_referee_draft(raw, payload)
         elif operation == "ordinary_grade_fragment":
@@ -13587,7 +13642,10 @@ def _compile_evaluator_draft_v22_for_test(
 
 
 def _v22_compile_audit_draft(
-    raw: JsonObject, payload: JsonObject, sources: dict[str, str]
+    raw: JsonObject,
+    payload: JsonObject,
+    sources: dict[str, str],
+    handles: dict[str, tuple[str, str]],
 ) -> tuple[JsonObject, list[str]]:
     if not {"concerns", "audit_complete"} <= set(raw):
         raise _V22Clarification("SUBSTANCE_MISSING")
@@ -13641,8 +13699,7 @@ def _v22_compile_audit_draft(
         passage_seen: set[tuple[str, str]] = set()
         for passage_value in passages_raw:
             passage = _v22_passage(passage_value)
-            quote, changed = _v22_resolve_quote(cast(str, passage["source_id"]), cast(str, passage["quote"]), sources)
-            key = (cast(str, passage["source_id"]), quote)
+            key, changed = _v22_resolve_draft_passage(passage, sources, handles)
             evidence_normalized = evidence_normalized or changed
             if key in passage_seen:
                 duplicate = True
@@ -13652,7 +13709,10 @@ def _v22_compile_audit_draft(
         correction = None
         if correction_raw is not None:
             correction, changed, removed = _v22_resolved_proposal(
-                _v22_proposal_draft(correction_raw), sources, dependency_inventory
+                _v22_proposal_draft(correction_raw),
+                sources,
+                handles,
+                dependency_inventory,
             )
             evidence_normalized = evidence_normalized or changed
             duplicate = duplicate or removed
@@ -13859,17 +13919,41 @@ def _v22_source_fragment_contract(
             raise PortableEvaluationInputError("source record is invalid")
         source_ids.append(source_id)
 
+    handles = payload.get("evidence_handles")
+    if type(handles) is not list or len(handles) != len(source_ids):
+        raise PortableEvaluationInputError("source evidence handles are invalid")
+    handle_values: list[str] = []
+    for ordinal, value in enumerate(handles, 1):
+        item = _object(value, location="source evidence handle")
+        expected_handle = f"SOURCE-{ordinal:06d}"
+        if (
+            set(item) != {"evidence_handle", "source_id"}
+            or item.get("evidence_handle") != expected_handle
+            or item.get("source_id") != source_ids[ordinal - 1]
+        ):
+            raise PortableEvaluationInputError("source evidence handles are invalid")
+        handle_values.append(expected_handle)
+
     definitions = _object(schema.get("$defs"), location="draft schema definitions")
-    passage = _object(
-        _object(definitions["SemanticPassage"], location="passage schema").get(
-            "properties"
-        ),
-        location="passage properties",
+    if "_EvidenceHandleDraftV22" not in definitions:
+        definitions["_EvidenceHandleDraftV22"] = {
+            "additionalProperties": False,
+            "properties": {
+                "evidence_handle": {"title": "Evidence Handle", "type": "string"}
+            },
+            "required": ["evidence_handle"],
+            "title": "_EvidenceHandleDraftV22",
+            "type": "object",
+        }
+    handle_definition = _object(
+        definitions["_EvidenceHandleDraftV22"], location="evidence handle schema"
     )
-    _object(passage["source_id"], location="source-id schema")["enum"] = source_ids
-    _object(passage["quote"], location="quote schema")[
-        "description"
-    ] = _V22_QUOTE_RULE
+    handle_properties = _object(
+        handle_definition.get("properties"), location="evidence handle properties"
+    )
+    _object(handle_properties["evidence_handle"], location="evidence handle field")[
+        "enum"
+    ] = handle_values
 
     proposals = _object(
         _object(definitions["_ProposalDraftV22"], location="proposal schema").get(
@@ -13877,6 +13961,21 @@ def _v22_source_fragment_contract(
         ),
         location="proposal properties",
     )
+    _object(proposals["passages"], location="proposal passages schema")["items"] = {
+        "$ref": "#/$defs/_EvidenceHandleDraftV22"
+    }
+    if "_AuditConcernDraftV22" in definitions:
+        concern_passages = _object(
+            _object(
+                _object(
+                    definitions["_AuditConcernDraftV22"],
+                    location="audit concern schema",
+                ).get("properties"),
+                location="audit concern properties",
+            )["passages"],
+            location="audit concern passages schema",
+        )
+        concern_passages["items"] = {"$ref": "#/$defs/_EvidenceHandleDraftV22"}
     inventory_key = (
         "accepted_proposals"
         if operation == "source_review_fragment"
@@ -13899,10 +13998,10 @@ def _v22_source_fragment_contract(
             dependency["target_ordinal"], location="dependency ordinal schema"
         )["maximum"] = proposal_count
 
-    source_list = json.dumps(source_ids, ensure_ascii=False, separators=(",", ":"))
+    handle_list = json.dumps(handle_values, ensure_ascii=False, separators=(",", ":"))
     instructions = (
         _V22_INSTRUCTIONS[operation]
-        + f" Allowed source_id values: {source_list}. {_V22_QUOTE_RULE}"
+        + f" Allowed evidence_handle values: {handle_list}. {_V22_EVIDENCE_HANDLE_RULE}"
     )
     if operation == "source_review_fragment":
         if proposal_count == 0:
@@ -13994,6 +14093,23 @@ def _v22_source_metadata(envelope: JsonObject, record: JsonObject) -> dict[str, 
     }
 
 
+def _v22_source_evidence_handles(record: JsonObject) -> list[JsonObject]:
+    sources = _v2_list(record.get("sources"), location="source record sources")
+    result: list[JsonObject] = []
+    for ordinal, value in enumerate(sources, 1):
+        source = _object(value, location="source record source")
+        source_id = source.get("source_id")
+        if type(source_id) is not str or not source_id.strip():
+            raise PortableEvaluationInputError("source record is invalid")
+        result.append(
+            {
+                "evidence_handle": f"SOURCE-{ordinal:06d}",
+                "source_id": source_id,
+            }
+        )
+    return result
+
+
 def _v22_review_request(
     envelope: JsonObject, fragments: list[JsonObject]
 ) -> JsonObject:
@@ -14006,7 +14122,9 @@ def _v22_review_request(
     return _v22_new_request(
         "source_review_fragment",
         {
-            "source_record": record, "accepted_proposals": accepted,
+            "source_record": record,
+            "evidence_handles": _v22_source_evidence_handles(record),
+            "accepted_proposals": accepted,
             "fragment_ordinal": len(fragments) + 1, "max_new_proposals": 5,
         },
         _v22_source_metadata(envelope, record),
@@ -14107,6 +14225,7 @@ def _v22_audit_request(
         "source_audit_fragment",
         {
             "source_record": record,
+            "evidence_handles": _v22_source_evidence_handles(record),
             "indexed_proposals": _copy_json(review["proposals"]),
             "accepted_concerns": accepted,
             "fragment_ordinal": len(fragments) + 1, "max_new_concerns": 5,

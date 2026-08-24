@@ -24,6 +24,7 @@ from regulatory_harvest.evaluation.attorney_v2_compiler import resolve_exact_pas
 from regulatory_harvest.evaluation.attorney_v2_models import SemanticPassage
 from regulatory_harvest.evaluation.attorney_v22_drafts import (
     CompiledDraftV22,
+    EngineDefectV22,
     EvaluatorProvenanceV22,
     NeedsClarificationV22,
     compile_evaluator_draft_v22,
@@ -232,7 +233,7 @@ def test_compiler_contract_binds_every_wire_shaping_rule() -> None:
     assert COMPILER_CONTRACT_V22["fragments_per_operation_maximum"] == 128
     assert COMPILER_CONTRACT_V22["items_per_operation_maximum"] == 640
     assert COMPILER_CONTRACT_V22["request_contract_version"] == (
-        "source-evidence-and-ordinal-constraints-v1"
+        "immutable-source-evidence-handles-v1"
     )
     assert COMPILER_CONTRACT_V22["rubric_version"] == "attorney-eval-v2.2"
     assert len(COMPILER_CONTRACT_V22["strict_schema_hashes"]["rubric"]) == 64
@@ -246,17 +247,16 @@ def test_source_review_request_exposes_compiler_reference_constraints() -> None:
     initial = build_source_review_fragment_request_v22(
         envelope(), (), fragment_ordinal=1
     )
-    passage = initial.json_schema["$defs"]["SemanticPassage"]["properties"]
+    handle = initial.json_schema["$defs"]["_EvidenceHandleDraftV22"]["properties"]
     dependency = initial.json_schema["$defs"]["_ProposalDraftV22"][
         "properties"
     ]["dependency"]
 
-    assert passage["source_id"]["enum"] == ["rule-1"]
-    assert "exact or whitespace-normalized unique contiguous substring" in passage[
-        "quote"
-    ]["description"]
+    assert handle["evidence_handle"]["enum"] == ["SOURCE-000001"]
     assert dependency == {"default": None, "type": "null"}
-    assert 'Allowed source_id values: ["rule-1"]' in initial.system_instructions
+    assert 'Allowed evidence_handle values: ["SOURCE-000001"]' in (
+        initial.system_instructions
+    )
     assert "No accepted proposal ordinals exist; dependency must be null" in (
         initial.system_instructions
     )
@@ -274,12 +274,193 @@ def test_source_review_request_exposes_compiler_reference_constraints() -> None:
     )
 
 
+def test_source_review_request_issues_immutable_source_evidence_handles() -> None:
+    """Removing the controller handle inventory must make evidence binding impossible."""
+    request = build_source_review_fragment_request_v22(
+        envelope(), (), fragment_ordinal=1
+    )
+
+    assert request.payload["evidence_handles"] == [
+        {"evidence_handle": "SOURCE-000001", "source_id": "rule-1"}
+    ]
+    handle = request.json_schema["$defs"]["_EvidenceHandleDraftV22"][
+        "properties"
+    ]["evidence_handle"]
+    assert handle["enum"] == ["SOURCE-000001"]
+    assert "Select only controller-issued evidence_handle values" in (
+        request.system_instructions
+    )
+
+
+def test_source_review_handles_follow_frozen_multi_source_order() -> None:
+    """Reordering or coalescing sources must break the issued handle catalog."""
+    original = envelope().case
+    second_text = "Second rule: operators must retain the filing receipt."
+    second_source = EvaluationSource(
+        source_id="rule-2",
+        title="Second Rule",
+        normalized_text=second_text,
+        content_hash=_hash(second_text),
+        jurisdiction="Example State",
+        authority_type="regulation",
+        source_role=SourceRole.OFFICIAL_PRIMARY,
+        source_quality=SourceQuality.PRIMARY,
+        completeness="complete",
+        language="en",
+    )
+    authority = original.requested_authorities[0].model_copy(
+        update={"source_ids": ["rule-1", "rule-2"]}
+    )
+    case = original.model_copy(
+        update={
+            "requested_authorities": [authority],
+            "sources": [*original.sources, second_source],
+        }
+    )
+    request = build_source_review_fragment_request_v22(
+        freeze_case(case, seed_hex="0" * 64), (), fragment_ordinal=1
+    )
+
+    assert request.payload["evidence_handles"] == [
+        {"evidence_handle": "SOURCE-000001", "source_id": "rule-1"},
+        {"evidence_handle": "SOURCE-000002", "source_id": "rule-2"},
+    ]
+    assert request.json_schema["$defs"]["_EvidenceHandleDraftV22"]["properties"][
+        "evidence_handle"
+    ]["enum"] == ["SOURCE-000001", "SOURCE-000002"]
+
+
+def test_source_review_handle_compiles_to_exact_frozen_source() -> None:
+    """Rebinding a handle away from its frozen source must change this exact passage."""
+    request = build_source_review_fragment_request_v22(
+        envelope(), (), fragment_ordinal=1
+    )
+    draft = {
+        "proposals": [
+            {
+                "statement": "Operators must file.",
+                "kind": "obligation",
+                "importance": "critical",
+                "passages": [{"evidence_handle": "SOURCE-000001"}],
+                "dependency": None,
+                "confidence": "clear",
+                "rationale": "The frozen source states the filing duty.",
+            }
+        ],
+        "review_complete": True,
+    }
+
+    compiled = compile_evaluator_draft_v22(request, draft, _PROVENANCE)
+
+    assert isinstance(compiled, CompiledDraftV22)
+    assert compiled.response.payload["proposals"][0]["passages"] == [  # type: ignore[index]
+        {
+            "source_id": "rule-1",
+            "quote": "Rule: operators must file. Small operators are excluded.",
+        }
+    ]
+
+
+def test_source_review_unknown_evidence_handle_is_write_free_refusal() -> None:
+    """Accepting an unissued handle would let a draft forge controller evidence."""
+    request = build_source_review_fragment_request_v22(
+        envelope(), (), fragment_ordinal=1
+    )
+    draft = {
+        "proposals": [
+            {
+                "statement": "Operators must file.",
+                "kind": "obligation",
+                "importance": "critical",
+                "passages": [{"evidence_handle": "SOURCE-999999"}],
+                "dependency": None,
+                "confidence": "clear",
+                "rationale": "The frozen source states the filing duty.",
+            }
+        ],
+        "review_complete": True,
+    }
+
+    refused = compile_evaluator_draft_v22(request, draft, _PROVENANCE)
+
+    assert isinstance(refused, NeedsClarificationV22)
+    assert [item.value for item in refused.reason_codes] == ["REFERENCE_UNKNOWN"]
+
+
+def test_source_audit_handle_compiles_to_exact_frozen_source() -> None:
+    """Bypassing audit handle resolution must break the exact persisted passage."""
+    request = build_source_audit_fragment_request_v22(
+        envelope(), review_aggregate(), (), fragment_ordinal=1
+    )
+    draft = {
+        "concerns": [
+            {
+                "target_proposal_ordinal": 1,
+                "concern_type": "ambiguity",
+                "passages": [{"evidence_handle": "SOURCE-000001"}],
+                "explanation": "The exclusion makes the duty ambiguous.",
+                "correction": None,
+            }
+        ],
+        "audit_complete": True,
+    }
+
+    compiled = compile_evaluator_draft_v22(request, draft, _PROVENANCE)
+
+    assert isinstance(compiled, CompiledDraftV22)
+    assert compiled.response.payload["concerns"][0]["passages"] == [  # type: ignore[index]
+        {
+            "source_id": "rule-1",
+            "quote": "Rule: operators must file. Small operators are excluded.",
+        }
+    ]
+
+
+def test_tampered_source_evidence_handle_inventory_is_controller_defect() -> None:
+    """A catalog that rebinds an issued handle must never become draft refusal."""
+    request = build_source_review_fragment_request_v22(
+        envelope(), (), fragment_ordinal=1
+    )
+    tampered = request.model_copy(
+        update={
+            "payload": {
+                **request.payload,
+                "evidence_handles": [
+                    {
+                        "evidence_handle": "SOURCE-000001",
+                        "source_id": "other-source",
+                    }
+                ],
+            }
+        }
+    )
+    draft = {
+        "proposals": [
+            {
+                "statement": "Operators must file.",
+                "kind": "obligation",
+                "importance": "critical",
+                "passages": [{"evidence_handle": "SOURCE-000001"}],
+                "dependency": None,
+                "confidence": "clear",
+                "rationale": "The frozen source states the filing duty.",
+            }
+        ],
+        "review_complete": True,
+    }
+
+    outcome = compile_evaluator_draft_v22(tampered, draft, _PROVENANCE)
+
+    assert isinstance(outcome, EngineDefectV22)
+    assert outcome.reason_code == "COMPILER_INVARIANT"
+
+
 def test_source_audit_request_exposes_compiler_reference_and_shape_constraints() -> None:
     request = build_source_audit_fragment_request_v22(
         envelope(), review_aggregate(), (), fragment_ordinal=1
     )
     definitions = request.json_schema["$defs"]
-    passage = definitions["SemanticPassage"]["properties"]
+    handle = definitions["_EvidenceHandleDraftV22"]["properties"]
     target = definitions["_AuditConcernDraftV22"]["properties"][
         "target_proposal_ordinal"
     ]["anyOf"][0]
@@ -287,10 +468,7 @@ def test_source_audit_request_exposes_compiler_reference_and_shape_constraints()
         "target_ordinal"
     ]
 
-    assert passage["source_id"]["enum"] == ["rule-1"]
-    assert "exact or whitespace-normalized unique contiguous substring" in passage[
-        "quote"
-    ]["description"]
+    assert handle["evidence_handle"]["enum"] == ["SOURCE-000001"]
     assert target == {"minimum": 1, "maximum": 1, "type": "integer"}
     assert dependency["minimum"] == 1
     assert dependency["maximum"] == 1
@@ -482,9 +660,9 @@ def test_linear_source_builders_preserve_current_request_contract_bytes() -> Non
     requests = (first_request, second_request, audit_request)
 
     assert tuple(item.request_fingerprint for item in requests) == (
-        "b63f2f49c5cde959ad17ded3940543b3bcad3c9b4401674143312587fbd543da",
-        "b0c280f6451c845d7ddb5f54de3403ae1fe5872e01151407f7adf4aabeb243a5",
-        "8620fdd33bf470362fec137260e941ba8e70ec89e08f01356d96e5e579862944",
+        "e63a3112dfd576d86d5875e193edaa44857547048210b067a4b02947038c6832",
+        "c3fbdd510ccd9ed7e61571d9de17436e4c3dbdbd31f45cba1279d888258d8f44",
+        "ef8b9e9e88af1b1c10e36d869602d1554602c44bb37064458c54c54efd6167db",
     )
     assert tuple(
         hashlib.sha256(
@@ -492,9 +670,9 @@ def test_linear_source_builders_preserve_current_request_contract_bytes() -> Non
         ).hexdigest()
         for item in requests
     ) == (
-        "24ec0365bc2037f8f2e1d1f5ae71849dd3cf21f0b8c84903c04f2fa740afa03c",
-        "ef2b51fd0b60fd542f3d0c79a3ffbfde1930c44c423e56a703bb6609fe837a28",
-        "1e92ffad3d8673cd06b910072cdc508c727c1908b196ea5b91d90f9516fc1f87",
+        "0a63544b734787313e5678a035587fbbe4805a7df0035e170594a3aebc7c4cd3",
+        "f2e96484b3e89a39dc0a860b1a16ac00ac340d612723e608f39d97a0400c244f",
+        "c4efa5b01748eb4393aa86778f0774547f064f2b6ab2386c29ea49fc2eb5fd65",
     )
 
 

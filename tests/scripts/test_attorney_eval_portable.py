@@ -6083,19 +6083,14 @@ def test_protocol_22_portable_source_requests_expose_compiler_constraints() -> N
     envelope = portable.freeze_case(_case_payload(), seed_hex="0" * 64)
     review_request = portable._v22_review_request(envelope, [])
     review_definitions = review_request["json_schema"]["$defs"]
-    source_ids = [
-        source["source_id"]
-        for source in review_request["payload"]["source_record"]["sources"]
-    ]
-
-    assert review_definitions["SemanticPassage"]["properties"]["source_id"][
-        "enum"
-    ] == source_ids
+    assert review_definitions["_EvidenceHandleDraftV22"]["properties"][
+        "evidence_handle"
+    ]["enum"] == ["SOURCE-000001"]
     assert review_definitions["_ProposalDraftV22"]["properties"]["dependency"] == {
         "default": None,
         "type": "null",
     }
-    assert "unique contiguous substring" in review_request["system_instructions"]
+    assert "controller-issued evidence_handle" in review_request["system_instructions"]
 
     proposal = copy.deepcopy(_portable_v22_review_draft()["proposals"][0])
     audit_request = portable._v22_audit_request(
@@ -6130,6 +6125,62 @@ def test_protocol_22_portable_source_requests_expose_compiler_constraints() -> N
         "default": None,
         "type": "null",
     }
+
+
+def test_protocol_22_source_evidence_handles_have_full_portable_byte_parity() -> None:
+    """Dropping portable handle resolution must diverge from the full compiler bytes."""
+    portable = _load_protocol_22_portable()
+    envelope = portable.freeze_case(_case_payload(), seed_hex="0" * 64)
+    request = portable._v22_review_request(envelope, [])
+    draft = {
+        "proposals": [
+            {
+                "statement": "A controller must act.",
+                "kind": "obligation",
+                "importance": "critical",
+                "passages": [{"evidence_handle": "SOURCE-000001"}],
+                "dependency": None,
+                "confidence": "clear",
+                "rationale": "The controller-issued evidence supports the duty.",
+            }
+        ],
+        "review_complete": True,
+    }
+    provenance = {
+        "provider_name": "scripted",
+        "model_name": "fixture",
+        "judge_isolation": "scripted_fixture",
+    }
+    full = compile_evaluator_draft_v22(
+        EvaluatorRequestV22.model_validate(request),
+        draft,
+        EvaluatorProvenanceV22(**provenance),
+    )
+
+    assert isinstance(full, CompiledDraftV22)
+    assert request["payload"]["evidence_handles"] == [
+        {
+            "evidence_handle": "SOURCE-000001",
+            "source_id": "synthetic-rule-1-source",
+        }
+    ]
+    assert portable._compile_evaluator_draft_v22_for_test(
+        canonical_json_bytes(request), canonical_json_bytes(draft), provenance
+    ) == canonical_json_bytes(full.response.model_dump(mode="json"))
+
+    cast(list[dict[str, object]], draft["proposals"])[0]["passages"] = [
+        {"evidence_handle": "SOURCE-999999"}
+    ]
+    refused = compile_evaluator_draft_v22(
+        EvaluatorRequestV22.model_validate(request),
+        draft,
+        EvaluatorProvenanceV22(**provenance),
+    )
+    assert type(refused).__name__ == "NeedsClarificationV22"
+    assert tuple(code.value for code in refused.reason_codes) == ("REFERENCE_UNKNOWN",)
+    assert portable._compile_evaluator_draft_v22_for_test(
+        canonical_json_bytes(request), canonical_json_bytes(draft), provenance
+    ) == ("REFERENCE_UNKNOWN",)
 
 
 def _portable_v22_review_draft() -> dict[str, object]:
