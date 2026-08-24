@@ -1,21 +1,21 @@
 # Regulatory Harvest
 
-> **Experimental beta (`v0.1.0-beta.5`).** Beta.5 makes Protocol 2.2
-> source-review and source-audit requests self-describing: they enumerate
-> allowed source IDs, state the exact contiguous quotation rule, expose
-> controller-owned ordinal bounds, and state the audit concern shape matrix.
-> Compiler validation remains fail-closed and unchanged.
-> The beta.4 private evaluation paused before any evaluator response was
-> accepted because of an under-specified request contract. Beta.5 addresses
-> that interface defect. Beta.5 has not yet earned a private `PASS`.
+> **Experimental beta (`v0.1.0-beta.6`).** Beta.6 gives Protocol 2.2
+> source-review and source-audit roles controller-issued immutable evidence handles.
+> Roles select a handle without reconstructing source IDs or quotations; the
+> compiler resolves it to the exact frozen source text. Unknown handles are refused,
+> rebound handle catalogs are engine defects, and legacy exact quotations remain
+> compatible. The beta.5 private evaluation mechanically paused with zero accepted
+> responses at an evidence-reference interface defect. Beta.6 addresses that
+> interface defect, but beta.6 has not yet earned a private `PASS`.
 > No performance, benchmark, or report-quality claim is made.
 > Results are AI Generated and may contain
 > errors. Output must be validated by an attorney before the attorney delivers
 > legal advice.
 
-The GitHub prerelease label `v0.1.0-beta.5` packages project version `0.1.0`.
+The GitHub prerelease label `v0.1.0-beta.6` packages project version `0.1.0`.
 The beta suffix describes the release channel. This release builds on exact
-merge commit `e50f5c013ed8307e331ff96ab3cbd3b4bc2f0610`. Protocol 2.2 remains
+merge commit `dc9a890e0a7f5f26f9b7749c171af908c72e535a`. Protocol 2.2 remains
 opt-in and experimental; Protocol 2.1 remains the new-run default. No PyPI
 distribution is published.
 

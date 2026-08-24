@@ -4,6 +4,22 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 
 ## [Unreleased]
 
+## [0.1.0-beta.6] - 2026-08-24
+
+- Added controller-issued immutable evidence handles to Protocol 2.2 source
+  review and source audit. Evaluator roles select handles without reconstructing
+  source IDs or quotations, and the compiler resolves each handle to the exact
+  frozen source text.
+- Unknown handles are refused, rebound handle catalogs are engine defects, and
+  legacy exact quotations remain compatible.
+- The beta.5 private evaluation mechanically paused with zero accepted responses
+  at an evidence-reference interface defect. Beta.6 addresses that interface
+  defect, but beta.6 has not yet earned a private `PASS`.
+- No performance, benchmark, or report-quality claim is made. No PyPI
+  distribution is published.
+- Protocol 2.2 remains opt-in and experimental; Protocol 2.1 remains the
+  default.
+
 ## [0.1.0-beta.5] - 2026-08-24
 
 - Made Protocol 2.2 source-review and source-audit requests self-describing:
@@ -119,7 +135,8 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 - The GitHub prerelease packages the unchanged `0.1.0` engine. No PyPI
   distribution is published.
 
-[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.5...HEAD
+[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.6...HEAD
+[0.1.0-beta.6]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.5...v0.1.0-beta.6
 [0.1.0-beta.5]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.4...v0.1.0-beta.5
 [0.1.0-beta.4]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.3...v0.1.0-beta.4
 [0.1.0-beta.3]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.2...v0.1.0-beta.3
