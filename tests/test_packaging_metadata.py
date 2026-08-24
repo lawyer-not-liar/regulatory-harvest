@@ -43,36 +43,36 @@ def test_experimental_beta_release_surfaces_are_coherent() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs" / "roadmap.md").read_text(encoding="utf-8")
+    beta8_heading = "## [0.1.0-beta.8] - 2026-08-24"
     beta7_heading = "## [0.1.0-beta.7] - 2026-08-24"
-    beta6_heading = "## [0.1.0-beta.6] - 2026-08-24"
-    _, found_beta7_heading, beta7_and_history = changelog.partition(beta7_heading)
-    beta7_section, found_beta6_heading, _ = beta7_and_history.partition(beta6_heading)
+    _, found_beta8_heading, beta8_and_history = changelog.partition(beta8_heading)
+    beta8_section, found_beta7_heading, _ = beta8_and_history.partition(beta7_heading)
     readme_words = " ".join(readme.split())
-    beta7_changelog_words = " ".join(beta7_section.split())
+    beta8_changelog_words = " ".join(beta8_section.split())
     roadmap_words = " ".join(roadmap.split())
     release_surfaces = (
         readme_words.replace("> ", "").casefold(),
-        beta7_changelog_words.casefold(),
+        beta8_changelog_words.casefold(),
     )
 
-    assert "v0.1.0-beta.7" in readme
+    assert "v0.1.0-beta.8" in readme
     assert "TO_BE_BOUND" not in readme
     assert "packages project version `0.1.0`" in readme_words
     assert "Protocol 2.1 remains the new-run default" in readme_words
+    assert found_beta8_heading == beta8_heading
     assert found_beta7_heading == beta7_heading
-    assert found_beta6_heading == beta6_heading
     for release_surface in release_surfaces:
         assert "protocol 2.2 remains opt-in and experimental" in release_surface
-        assert "exact allowed requirement ordinals" in release_surface
-        assert "one grade for every issued ordinal" in release_surface
-        assert "1-based position" in release_surface
+        assert "controller-issued report-passage allowlist" in release_surface
+        assert "exact unique substring" in release_surface
+        assert "whole-report fallback" in release_surface
         assert "strict grade validation remains unchanged" in release_surface
         assert (
-            "beta.6 private evaluation accepted all source-stage calls"
+            "beta.7 private evaluation accepted all source-stage calls"
             in release_surface
         )
-        assert "ordinary-grade requirement-reference interface defect" in release_surface
-        assert "beta.7 has not yet earned a private `pass`" in release_surface
+        assert "report-passage interface defect" in release_surface
+        assert "beta.8 has not yet earned a private `pass`" in release_surface
         assert (
             "no performance, benchmark, or report-quality claim is made"
             in release_surface
