@@ -1,28 +1,24 @@
 # Regulatory Harvest
 
-> **Experimental beta (`v0.1.0-beta.3`).** The public test, type, lint,
-> package, reproducibility, and privacy gates passed.
-> The beta.2 private run completed every evaluator role and grading.
-> Both grader lanes independently reached `FAIL`, but exact detail equality
-> made the run `INCONCLUSIVE`.
-> Beta.3 adds outcome-stable reconciliation.
-> Raw lane aggregates remain preserved for audit.
+> **Experimental beta (`v0.1.0-beta.4`).** Beta.4 adds general materiality
+> safeguards and graph-to-report omission safeguards from merged PR #7.
+> A citation quote no longer counts as coverage by itself: provisional
+> `not_material` decisions must be challenged against the atomic rule graph,
+> and material graph elements must be traced into rendered report prose.
 > The beta.3 post-release private run completed end to end.
-> Both grader lanes independently reached `FAIL` on the locked content floors.
-> That result proves technical operability, not private content readiness.
+> Both grader lanes independently reached `FAIL` on the locked recall and
+> coverage floors. That result proves technical operability, not private
+> content readiness. Beta.4 has not yet earned a private `PASS`.
 > No performance, benchmark, or report-quality claim is made.
 > Results are AI Generated and may contain
 > errors. Output must be validated by an attorney before the attorney delivers
 > legal advice.
 
-The GitHub prerelease label `v0.1.0-beta.3` packages project version `0.1.0`.
+The GitHub prerelease label `v0.1.0-beta.4` packages project version `0.1.0`.
 The beta suffix describes the release channel. This release builds on exact
-merge commit `bba4e5957375d8f73d6832f78f11a3041e4517fd`. Protocol 2.2 now
-scores both grader lanes independently and preserves their common `PASS` or
-`FAIL`; a lane-level outcome difference remains substantive
-`INCONCLUSIVE`. Evidence validation, rubric thresholds, and immutable prior-run
-verification are unchanged. Protocol 2.2 remains opt-in and experimental;
-Protocol 2.1 remains the new-run default.
+merge commit `5a4ad1c261aba4aafd294b1c37fac1bb4452c633`. Protocol 2.2 remains
+opt-in and experimental; Protocol 2.1 remains the new-run default. No PyPI
+distribution is published.
 
 Regulatory Harvest is an installable research skill for attorneys. Ask a legal question in ordinary language, attach your sources or authorize current web research, and receive a cited Markdown briefing plus a machine-verifiable evidence bundle.
 
