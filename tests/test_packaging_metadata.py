@@ -43,38 +43,36 @@ def test_experimental_beta_release_surfaces_are_coherent() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs" / "roadmap.md").read_text(encoding="utf-8")
+    beta7_heading = "## [0.1.0-beta.7] - 2026-08-24"
     beta6_heading = "## [0.1.0-beta.6] - 2026-08-24"
-    beta5_heading = "## [0.1.0-beta.5] - 2026-08-24"
-    _, found_beta6_heading, beta6_and_history = changelog.partition(beta6_heading)
-    beta6_section, found_beta5_heading, _ = beta6_and_history.partition(beta5_heading)
+    _, found_beta7_heading, beta7_and_history = changelog.partition(beta7_heading)
+    beta7_section, found_beta6_heading, _ = beta7_and_history.partition(beta6_heading)
     readme_words = " ".join(readme.split())
-    beta6_changelog_words = " ".join(beta6_section.split())
+    beta7_changelog_words = " ".join(beta7_section.split())
     roadmap_words = " ".join(roadmap.split())
     release_surfaces = (
         readme_words.replace("> ", "").casefold(),
-        beta6_changelog_words.casefold(),
+        beta7_changelog_words.casefold(),
     )
 
-    assert "v0.1.0-beta.6" in readme
+    assert "v0.1.0-beta.7" in readme
     assert "TO_BE_BOUND" not in readme
     assert "packages project version `0.1.0`" in readme_words
     assert "Protocol 2.1 remains the new-run default" in readme_words
+    assert found_beta7_heading == beta7_heading
     assert found_beta6_heading == beta6_heading
-    assert found_beta5_heading == beta5_heading
     for release_surface in release_surfaces:
         assert "protocol 2.2 remains opt-in and experimental" in release_surface
-        assert "controller-issued immutable evidence handles" in release_surface
-        assert "without reconstructing source ids or quotations" in release_surface
-        assert "exact frozen source text" in release_surface
-        assert "unknown handles are refused" in release_surface
-        assert "rebound handle catalogs are engine defects" in release_surface
-        assert "legacy exact quotations remain compatible" in release_surface
+        assert "exact allowed requirement ordinals" in release_surface
+        assert "one grade for every issued ordinal" in release_surface
+        assert "1-based position" in release_surface
+        assert "strict grade validation remains unchanged" in release_surface
         assert (
-            "beta.5 private evaluation mechanically paused with zero accepted responses"
+            "beta.6 private evaluation accepted all source-stage calls"
             in release_surface
         )
-        assert "evidence-reference interface defect" in release_surface
-        assert "beta.6 has not yet earned a private `pass`" in release_surface
+        assert "ordinary-grade requirement-reference interface defect" in release_surface
+        assert "beta.7 has not yet earned a private `pass`" in release_surface
         assert (
             "no performance, benchmark, or report-quality claim is made"
             in release_surface
