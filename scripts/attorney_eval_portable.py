@@ -14333,7 +14333,9 @@ def _baseline_compile(
         for item in cast(list[JsonObject], review["proposals"])
     }
     additions: list[JsonObject] = []
-    contests: list[tuple[JsonObject | None, JsonObject | None, JsonObject, str, str]] = []
+    contests: list[
+        tuple[str | None, JsonObject | None, JsonObject | None, JsonObject, str, str]
+    ] = []
     semantic_targets: set[str] = set()
     for dispute in disputes:
         concern = cast(JsonObject | None, dispute["auditor_concern"])
@@ -14354,6 +14356,7 @@ def _baseline_compile(
             )
             contests.append(
                 (
+                    target,
                     cast(JsonObject | None, dispute["reviewer_proposal"]),
                     cast(JsonObject | None, concern["correction"]), decision,
                     cast(str, fragment["response_fingerprint"]), reason,
@@ -14400,8 +14403,10 @@ def _baseline_compile(
                 }
             )
             contests.append(
-                (reviewer, auditor, decision, cast(str, fragment["response_fingerprint"]),
-                 "SOURCE_AMBIGUITY")
+                (
+                    target, reviewer, auditor, decision,
+                    cast(str, fragment["response_fingerprint"]), "SOURCE_AMBIGUITY",
+                )
             )
         elif current is not None:
             current.update(
@@ -14420,7 +14425,45 @@ def _baseline_compile(
                 }
             )
         elif target in semantic_targets:
-            raise PortableEvaluationInputError("combined baseline disputes are unsupported")
+            updated: list[
+                tuple[
+                    str | None, JsonObject | None, JsonObject | None, JsonObject, str, str
+                ]
+            ] = []
+            matched = False
+            for contest in contests:
+                contest_target, reviewer, auditor, prior_decision, fingerprint, reason = contest
+                if contest_target != target or reviewer is None:
+                    updated.append(contest)
+                    continue
+                matched = True
+                reviewer_alternative = cast(JsonObject, _copy_json(reviewer))
+                reviewer_alternative.update(
+                    {
+                        "importance": (
+                            finding["reviewed_importance"]
+                            if decision["decision"] == "accept_auditor"
+                            else decision["importance"]
+                        ),
+                        "importance_basis": (
+                            finding["reviewed_importance_basis"]
+                            if decision["decision"] == "accept_auditor"
+                            else decision["importance_basis"]
+                        ),
+                        "importance_rationale": decision["importance_rationale"],
+                    }
+                )
+                updated.append(
+                    (
+                        contest_target, reviewer_alternative, auditor, prior_decision,
+                        fingerprint, reason,
+                    )
+                )
+            if not matched:
+                raise PortableEvaluationInputError(
+                    "combined baseline dispute reconciliation is invalid"
+                )
+            contests = updated
     proposals = [*ordinary.values(), *additions]
     proposals.sort(key=lambda item: _baseline_proposal_key(baseline_input, item))
     requirements = [
@@ -14432,13 +14475,13 @@ def _baseline_compile(
     ]
     contests.sort(
         key=lambda item: canonical_json_bytes(
-            {"reviewer": item[0], "auditor": item[1], "response_fingerprint": item[3]}
+            {"reviewer": item[1], "auditor": item[2], "response_fingerprint": item[4]}
         )
     )
     contested: list[JsonObject] = []
-    for index, (reviewer, auditor, decision, response_fingerprint, reason) in enumerate(
-        contests, 1
-    ):
+    for index, (
+        _, reviewer, auditor, decision, response_fingerprint, reason
+    ) in enumerate(contests, 1):
         order = len(requirements) + index - 1
         requirement_id = f"REQ-{order + 1:04d}"
         contested.append(
