@@ -49,6 +49,7 @@ from .attorney_baseline_models import (
     _gradeable_semantic_inventory_v1,
     strict_baseline_model_v1,
 )
+from .attorney_models import EvaluationSource, RequestedAuthority
 
 __all__ = [
     "project_gradeable_baseline_v1",
@@ -83,6 +84,14 @@ def _strict_verified_context_v1(
         if not isinstance(context.baseline, CanonicalBaselineV1):
             raise TypeError
         if not isinstance(context.verification, BaselineVerificationV1):
+            raise TypeError
+        if any(
+            not isinstance(item, EvaluationSource)
+            for item in context.baseline_input.sources
+        ) or any(
+            not isinstance(item, RequestedAuthority)
+            for item in context.baseline_input.requested_authorities
+        ):
             raise TypeError
         manifest = cast(
             BaselineManifestV1,
@@ -369,7 +378,7 @@ def _strict_projection_with_fingerprint_v1(
             mode="json", warnings="error"
         ),
     }
-    result = GradeableBaselineProjectionV1(
+    return GradeableBaselineProjectionV1(
         schema_version="baseline-gradeable-projection-v1",
         baseline_protocol_version="evaluation-baseline-v1",
         binding=binding,
@@ -380,7 +389,6 @@ def _strict_projection_with_fingerprint_v1(
         baseline_provenance=context.baseline.provenance,
         projection_fingerprint=sha256_digest(canonical_json_bytes(wire)),
     )
-    return result.model_copy(update={"baseline_input": context.baseline_input})
 
 
 def project_gradeable_baseline_v1(
@@ -397,10 +405,9 @@ def project_gradeable_baseline_v1(
     binding = _grade_target_binding_v1(
         checked.baseline_input, checked.baseline, semantic_fingerprint
     )
-    projection = _strict_projection_with_fingerprint_v1(
+    return _strict_projection_with_fingerprint_v1(
         checked, binding, requirements, contested
     )
-    return projection.model_copy(update={"baseline_input": context.baseline_input})
 
 
 def verify_gradeable_baseline_projection_v1(

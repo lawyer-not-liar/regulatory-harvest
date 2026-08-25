@@ -186,6 +186,16 @@ def _resealed_context(
     )
 
 
+def _ordinary_mutable_input(
+    context: VerifiedBaselineContextV1,
+) -> BaselineInputV1:
+    raw = context.baseline_input.model_dump(mode="python", warnings="error")
+    raw["compiler_contract"] = json.loads(
+        canonical_json_bytes(raw["compiler_contract"])
+    )
+    return BaselineInputV1.model_validate(raw)
+
+
 @pytest.fixture
 def verified_run(tmp_path: Path) -> tuple[Path, VerifiedBaselineContextV1]:
     _, files_by_path, manifest = _complete_graph()
@@ -618,6 +628,53 @@ def test_projection_rejects_invalid_or_forged_verified_context(
         )
     with pytest.raises(ValueError):
         project_gradeable_baseline_v1(cast(Any, object()))
+
+
+def test_projection_rejects_raw_nested_context_model_construct(
+    verified_context: VerifiedBaselineContextV1,
+) -> None:
+    raw = verified_context.baseline_input.model_dump(mode="python", warnings="error")
+    raw["compiler_contract"] = json.loads(
+        canonical_json_bytes(raw["compiler_contract"])
+    )
+    forged_input = BaselineInputV1.model_construct(**raw)
+    assert type(forged_input.sources[0]) is dict
+
+    with pytest.raises(ValueError):
+        project_gradeable_baseline_v1(
+            replace(verified_context, baseline_input=forged_input)
+        )
+
+
+def test_projection_never_reuses_caller_owned_baseline_input(
+    verified_context: VerifiedBaselineContextV1,
+) -> None:
+    mutable_input = _ordinary_mutable_input(verified_context)
+    context = replace(verified_context, baseline_input=mutable_input)
+
+    projected = project_gradeable_baseline_v1(context)
+
+    assert projected.baseline_input is not mutable_input
+    assert projected.baseline_input == mutable_input
+
+
+def test_returned_projection_rejects_nested_mutation_and_keeps_fingerprint_bytes(
+    verified_context: VerifiedBaselineContextV1,
+) -> None:
+    mutable_input = _ordinary_mutable_input(verified_context)
+    projected = project_gradeable_baseline_v1(
+        replace(verified_context, baseline_input=mutable_input)
+    )
+    before = canonical_json_bytes(projected.model_dump(mode="json", warnings="error"))
+    fingerprint = projected.projection_fingerprint
+
+    with pytest.raises((AttributeError, TypeError, ValueError)):
+        projected.baseline_input.sources[0].title = "mutated after projection"
+
+    assert canonical_json_bytes(
+        projected.model_dump(mode="json", warnings="error")
+    ) == before
+    assert projected.projection_fingerprint == fingerprint
 
 
 def test_projection_rejects_duplicate_ids_and_orders_from_raw_bypass(

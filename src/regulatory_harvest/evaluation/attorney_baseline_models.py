@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from enum import StrEnum
-from typing import TYPE_CHECKING, Annotated, Literal, Self
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -115,6 +115,43 @@ class _FrozenDict(dict[str, object]):
     popitem = _immutable  # type: ignore[assignment]
     setdefault = _immutable
     update = _immutable
+
+
+class _FrozenStringList(list[str]):
+    @staticmethod
+    def _immutable(*_: object, **__: object) -> None:
+        raise TypeError("evaluation-baseline-v1 values are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable  # type: ignore[assignment]
+    __imul__ = _immutable  # type: ignore[assignment]
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable  # type: ignore[assignment]
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+
+class _FrozenEvaluationSource(EvaluationSource):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", frozen=True)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, EvaluationSource) and self.model_dump(
+            mode="json"
+        ) == other.model_dump(mode="json")
+
+
+class _FrozenRequestedAuthority(RequestedAuthority):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", frozen=True)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, RequestedAuthority) and self.model_dump(
+            mode="json"
+        ) == other.model_dump(mode="json")
 
 
 def _deep_freeze(value: object) -> object:
@@ -395,6 +432,37 @@ class BaselineInputV1(BaselineStrictModel):
         ):
             raise ValueError("requested authorities must reference only baseline input sources")
         return self
+
+
+def _deep_frozen_baseline_input_v1(value: BaselineInputV1) -> BaselineInputV1:
+    sources: list[EvaluationSource] = []
+    for source_value in value.sources:
+        source = _FrozenEvaluationSource.model_validate(
+            source_value.model_dump(mode="python", warnings="error"), strict=True
+        )
+        object.__setattr__(
+            source,
+            "relationship_ids",
+            _FrozenStringList(source.relationship_ids),
+        )
+        sources.append(source)
+    authorities: list[RequestedAuthority] = []
+    for authority_value in value.requested_authorities:
+        authority = _FrozenRequestedAuthority.model_validate(
+            authority_value.model_dump(mode="python", warnings="error"), strict=True
+        )
+        object.__setattr__(
+            authority,
+            "source_ids",
+            _FrozenStringList(authority.source_ids),
+        )
+        authorities.append(authority)
+    return value.model_copy(
+        update={
+            "sources": tuple(sources),
+            "requested_authorities": tuple(authorities),
+        }
+    )
 
 
 class BaselineProposalV1(BaselineStrictModel):
@@ -956,6 +1024,11 @@ class GradeableBaselineProjectionV1(BaselineStrictModel):
         )
         if self.projection_fingerprint != sha256_digest(canonical_json_bytes(raw)):
             raise ValueError("projection fingerprint must match the exact projection")
+        object.__setattr__(
+            self,
+            "baseline_input",
+            _deep_frozen_baseline_input_v1(input_value),
+        )
         return self
 
 
