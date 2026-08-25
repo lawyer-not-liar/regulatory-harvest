@@ -1482,6 +1482,83 @@ def test_two_hop_correction_chain_requires_explicit_verified_ancestry(
     assert _snapshot(p1_dir) == p1_before
 
 
+def test_correction_ancestry_rejects_an_ordinary_terminal_reset(
+    tmp_path: Path,
+) -> None:
+    baseline_input, files_by_path, terminal_manifest = _complete_graph()
+    p0_dir = tmp_path / "p0"
+    initialize_baseline_storage_v1(p0_dir, terminal_manifest, files_by_path)
+    p0 = load_verified_baseline_run(p0_dir)
+    text = baseline_input.sources[0].normalized_text
+    quote = "must identify the operator"
+    start = text.find(quote)
+    added = BaselineRequirementV1(
+        requirement_id="REQ-9999",
+        canonical_order=999,
+        statement="The notice must identify the operator.",
+        kind="obligation",
+        importance="material",
+        importance_basis=("attorney_briefing",),
+        importance_rationale="The detail is necessary for a competent attorney briefing.",
+        passages=(
+            {
+                "source_id": "rule-1",
+                "quote": quote,
+                "start_char": start,
+                "end_char": start + len(quote),
+            },
+        ),
+        confidence="clear",
+        substantive_rationale="The source expressly identifies the required content.",
+    )
+    p1_dir = tmp_path / "p1"
+    baseline_artifacts.initialize_corrected_baseline_storage_v1(
+        p0_dir,
+        p1_dir,
+        _correction(
+            p0.manifest.root_hash,
+            p0.baseline.baseline_fingerprint,
+            added,
+        ),
+    )
+    p1 = load_verified_baseline_run(p1_dir, prior_run_dir=p0_dir)
+
+    q0_dir = tmp_path / "q0"
+    initialize_baseline_storage_v1(
+        q0_dir,
+        _manifest(
+            baseline_input,
+            BaselinePhaseV1.INCONCLUSIVE,
+            baseline_fingerprint=terminal_manifest.baseline_fingerprint,
+            terminal_status="INCONCLUSIVE",
+        ),
+        files_by_path,
+    )
+    q0 = load_verified_baseline_run(q0_dir)
+    prior_snapshots = {
+        p0_dir: _snapshot(p0_dir),
+        p1_dir: _snapshot(p1_dir),
+        q0_dir: _snapshot(q0_dir),
+    }
+    q1_dir = tmp_path / "q1"
+
+    with pytest.raises(EvaluationIntegrityError):
+        baseline_artifacts.initialize_corrected_baseline_storage_v1(
+            q0_dir,
+            q1_dir,
+            _correction(
+                q0.manifest.root_hash,
+                q0.baseline.baseline_fingerprint,
+                added,
+            ),
+            prior_ancestry=(p0_dir, p1_dir),
+        )
+
+    assert not q1_dir.exists()
+    assert p1.manifest.prior_baseline_root == p0.manifest.root_hash
+    assert all(_snapshot(run_dir) == before for run_dir, before in prior_snapshots.items())
+
+
 def test_unexpected_or_noncanonical_artifact_is_refused(tmp_path: Path) -> None:
     _, files_by_path, manifest = _complete_graph()
     run_dir = tmp_path / "unexpected"

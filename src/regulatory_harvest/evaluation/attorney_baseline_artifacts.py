@@ -1485,6 +1485,16 @@ def _terminal_replay_chain(run_dirs: tuple[Path, ...]) -> tuple[_Replay, ...]:
         with _open_locked_storage(run_dir, exclusive=False) as storage:
             replay = _verify_or_raise(storage, prior=prior)
             storage.assert_root_identity()
+        linked_to_prior = True
+        if prior is not None:
+            linked_to_prior = (
+                prior.baseline is not None
+                and replay.manifest.prior_baseline_root
+                == prior.manifest.root_hash
+                and replay.manifest.prior_baseline_fingerprint
+                == prior.baseline.baseline_fingerprint
+                and replay.manifest.correction_record_fingerprint is not None
+            )
         if (
             replay.baseline is None
             or replay.verification is None
@@ -1493,6 +1503,7 @@ def _terminal_replay_chain(run_dirs: tuple[Path, ...]) -> tuple[_Replay, ...]:
             not in {BaselinePhaseV1.COMPLETED, BaselinePhaseV1.INCONCLUSIVE}
             or replay.manifest.terminal_status not in {"COMPLETED", "INCONCLUSIVE"}
             or replay.manifest.root_hash in roots
+            or not linked_to_prior
         ):
             raise EvaluationIntegrityError("BASELINE_RESULT_REQUIRED")
         roots.add(replay.manifest.root_hash)
