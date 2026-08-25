@@ -899,6 +899,12 @@ def _strict_safety(value: object) -> ReconciledSafetyReviewV1:
     checked = _strict_model(ReconciledSafetyReviewV1, value, label="reconciled safety review")
     if checked.safety_review_fingerprint != _fingerprint(
         checked.model_dump(mode="json", exclude={"safety_review_fingerprint"})
+    ) or (
+        any(
+            decision.disposition in {"blocking", "unresolved"}
+            for decision in checked.referee_decisions
+        )
+        and not checked.blocking_codes
     ):
         raise ValueError("reconciled safety review is invalid")
     return checked
@@ -1309,10 +1315,22 @@ def _lane_fraction(
     inputs: VerifiedReadinessInputsV1,
     lane: BaselineLockedGraderAggregateV1,
 ) -> tuple[int, int, int, int]:
-    score = _score(
-        _ordinary_observations(inputs.gradeable_baseline, lane),
-        inputs.readiness_rubric,
-    )
+    observations = _ordinary_observations(inputs.gradeable_baseline, lane)
+    for item, grade in zip(
+        inputs.gradeable_baseline.contested_requirements,
+        lane.contested_grades,
+        strict=True,
+    ):
+        contest = item.contested_requirement
+        alternatives: list[RequirementDispositionV1] = []
+        if contest.reviewer_alternative is not None:
+            alternatives.append(grade.reviewer_alternative_disposition)
+        if contest.auditor_alternative is not None:
+            alternatives.append(grade.auditor_alternative_disposition)
+        if not alternatives:
+            raise ValueError("contested requirement has no gradeable alternative")
+        observations.append((contest.importance, _conservative(alternatives)))
+    score = _score(observations, inputs.readiness_rubric)
     return score[2], score[3], score[4], score[5]
 
 

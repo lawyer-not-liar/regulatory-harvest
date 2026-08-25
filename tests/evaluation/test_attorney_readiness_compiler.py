@@ -758,6 +758,32 @@ def test_exact_six_hundred_ninety_nine_thousandths_fails_rational_floor(
     assert safety.blocking_codes == ()
 
 
+def test_delivery_floor_counts_each_contested_requirement_once_conservatively(
+    inputs: VerifiedReadinessInputsV1,
+) -> None:
+    exact = _clean_qualification(
+        _with_requirements(
+            inputs,
+            count=7,
+            importance="supporting",
+            contested=True,
+        )
+    )
+    lanes = _lanes(
+        exact,
+        ("met",) * 6 + ("partially_met",),
+        contested_1=(("not_met", "not_met"),),
+    )
+
+    strict, _, _, _, result = _compile(exact, lanes)
+
+    assert strict.absolute_disposition == "FAIL"
+    assert result.lane_weighted_coverage == (0.65, 0.65)
+    assert result.lane_critical_recall == (0.0, 0.0)
+    assert result.delivery_readiness == "NOT_DELIVERABLE"
+    assert "MINIMUM_LANE_COVERAGE_BELOW_FLOOR" in result.blocking_codes
+
+
 def test_exact_ninety_percent_and_full_critical_recall_are_required_for_high_assurance(
     inputs: VerifiedReadinessInputsV1,
 ) -> None:
@@ -1093,6 +1119,76 @@ def test_resealed_fragment_provenance_attack_is_rejected(
             lane=1,
             ordinary_fragments=(forged, *ordinary[1:]),
             contested_grades=contested,
+        )
+
+
+def test_resealed_safety_cannot_delete_unresolved_referee_blocker(
+    inputs: VerifiedReadinessInputsV1,
+) -> None:
+    exact = _clean_qualification(_with_requirements(inputs, count=10, importance="supporting"))
+    lanes = _lanes(exact, ("met",) * 9 + ("not_met",))
+    strict = derive_baseline_locked_strict_equivalent_v1(
+        exact.gradeable_baseline,
+        lanes[0],
+        lanes[1],
+        exact.readiness_rubric,
+    )
+    requirement = compile_requirement_matrix_v1(exact, lanes)
+    candidates = build_gap_candidate_inventory_v1(exact, lanes)
+    first = tuple(_assessment(candidate) for candidate in candidates)
+    second_raw = first[0].model_dump(mode="json")
+    second_raw["owner_role"] = "outside_counsel"
+    second = (type(first[0]).model_validate(second_raw), *first[1:])
+    lane_1 = SafetyLaneResponseV1(
+        lane=1,
+        candidate_assessments=first,
+        finding_proposals=(),
+    )
+    lane_2 = SafetyLaneResponseV1(
+        lane=2,
+        candidate_assessments=second,
+        finding_proposals=(),
+    )
+    dispute = build_safety_disputes_v1(exact, lane_1, lane_2)[0]
+    unresolved = SafetyRefereeDecisionV1(
+        dispute_id=dispute.dispute_id,
+        disposition="unresolved",
+        rationale="The scoped evidence does not resolve the required owner.",
+        evidence_refs=dispute.evidence_refs[:1],
+    )
+    safety = reconcile_safety_lanes_v1(
+        exact,
+        candidates,
+        lane_1,
+        lane_2,
+        (unresolved,),
+    )
+    gap = compile_gap_follow_up_matrix_v1(exact, strict, candidates, safety)
+    original = derive_delivery_readiness_v1(
+        exact,
+        strict,
+        requirement,
+        gap,
+        safety,
+    )
+    assert original.delivery_readiness == "NOT_DELIVERABLE"
+    assert "CRITICAL_DISCLOSURE_INVALID" in original.blocking_codes
+
+    descriptor = safety.model_dump(mode="json", exclude={"safety_review_fingerprint"})
+    descriptor["blocking_codes"] = []
+    forged = ReconciledSafetyReviewV1.model_validate(
+        {
+            **descriptor,
+            "safety_review_fingerprint": sha256_digest(canonical_json_bytes(descriptor)),
+        }
+    )
+    with pytest.raises(ValueError, match="reconciled safety review is invalid"):
+        derive_delivery_readiness_v1(
+            exact,
+            strict,
+            requirement,
+            gap,
+            forged,
         )
 
 
