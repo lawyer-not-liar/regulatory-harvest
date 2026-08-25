@@ -3794,6 +3794,45 @@ def test_baseline_parity_public_policy_mutation_verification(
         assert portable._baseline_validate_input(portable_input) == portable_input
 
 
+@pytest.mark.parametrize(
+    "field",
+    (
+        "evaluation_rubric_bytes",
+        "evaluation_rubric_version",
+        "evaluation_rubric_fingerprint",
+        "importance_policy_bytes",
+        "importance_policy_version",
+        "importance_policy_fingerprint",
+        "compiler_contract",
+        "compiler_contract_fingerprint",
+    ),
+)
+def test_baseline_parity_public_binding_type_mutation_verification(
+    tmp_path: Path, field: str
+) -> None:
+    """Malformed binding types remain artifact-invalid before semantic comparison."""
+    control = _baseline_cli_control(tmp_path)
+    full_run = tmp_path / f"binding-type-full-{field}"
+    portable_run = tmp_path / f"binding-type-portable-{field}"
+    common = ("--input", str(control), "--nonce-hex", "2" * 64)
+    _assert_baseline_surface_parity(
+        ("eval-baseline-init", *common, "--run", str(full_run)),
+        ("eval-baseline-init", *common, "--run", str(portable_run)),
+    )
+    for run in (full_run, portable_run):
+        baseline_input = json.loads((run / "baseline-input.json").read_bytes())
+        baseline_input[field] = 7
+        _reseal_baseline_parity_run(
+            run,
+            {"baseline-input.json": _canonical_bytes(baseline_input)},
+        )
+    full, observed = _assert_baseline_surface_parity(
+        ("eval-baseline-verify", "--run", str(full_run)),
+        ("eval-baseline-verify", "--run", str(portable_run)),
+    )
+    assert full.returncode == observed.returncode == 5
+
+
 def test_baseline_full_runner_exposes_exact_commands_safe_status_and_exit_mapping(
     tmp_path: Path,
 ) -> None:

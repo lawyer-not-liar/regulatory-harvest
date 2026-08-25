@@ -13639,23 +13639,11 @@ def _baseline_validate_input(value: object) -> JsonObject:
         },
         location="baseline input",
     )
-    policy_bytes, policy, policy_fingerprint = _baseline_policy()
-    contract = _baseline_contract(policy_fingerprint)
-    if result["schema_version"] != "baseline-input-v1" or result[
-        "qualification_readiness"
-    ] != "ADMITTED":
-        raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
-    if (
-        result["compiler_contract"] != contract
-        or result["compiler_contract_fingerprint"] != _sha256(canonical_json_bytes(contract))
-        or result["evaluation_rubric_version"] != _BASELINE_RUBRIC["version"]
-        or result["evaluation_rubric_bytes"] != _BASELINE_RUBRIC_BYTES.decode()
-        or result["evaluation_rubric_fingerprint"] != _BASELINE_RUBRIC_FINGERPRINT
-        or result["importance_policy_version"] != policy["importance_policy_version"]
-        or result["importance_policy_bytes"] != policy_bytes.decode()
-        or result["importance_policy_fingerprint"] != policy_fingerprint
-    ):
-        raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+    _string(result["schema_version"], location="baseline input.schema_version")
+    _string(
+        result["qualification_readiness"],
+        location="baseline input.qualification_readiness",
+    )
     source_ids = _baseline_validate_sources(result["sources"])
     _baseline_validate_authorities(result["requested_authorities"], source_ids)
     _baseline_validate_json_tree(result["compiler_contract"])
@@ -13665,15 +13653,37 @@ def _baseline_validate_input(value: object) -> JsonObject:
         "importance_policy_fingerprint", "legal_input_fingerprint",
     ):
         _hash(result[key], location=f"baseline input.{key}")
-    for key in ("question", "jurisdiction", "as_of"):
+    for key in (
+        "question", "jurisdiction", "as_of", "evaluation_rubric_version",
+        "importance_policy_version",
+    ):
         _string(result[key], location=f"baseline input.{key}", nonblank=True)
+    for key in ("evaluation_rubric_bytes", "importance_policy_bytes"):
+        _string(result[key], location=f"baseline input.{key}")
+    _string(result["client_facts_binding"], location="baseline input.client_facts_binding")
     client_facts = result["client_facts"]
     if client_facts is None:
         expected_facts = "explicit-null"
     else:
         expected_facts = f"sha256:{_sha256(_string(client_facts, location='client facts').encode())}"
+    if result["schema_version"] != "baseline-input-v1" or result[
+        "qualification_readiness"
+    ] != "ADMITTED" or result["importance_policy_version"] != "importance-policy-v1":
+        raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
     if result["client_facts_binding"] != expected_facts:
         raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
+    policy_bytes, _policy, policy_fingerprint = _baseline_policy()
+    contract = _baseline_contract(policy_fingerprint)
+    if (
+        result["compiler_contract"] != contract
+        or result["compiler_contract_fingerprint"] != _sha256(canonical_json_bytes(contract))
+        or result["evaluation_rubric_version"] != _BASELINE_RUBRIC["version"]
+        or result["evaluation_rubric_bytes"] != _BASELINE_RUBRIC_BYTES.decode()
+        or result["evaluation_rubric_fingerprint"] != _BASELINE_RUBRIC_FINGERPRINT
+        or result["importance_policy_bytes"] != policy_bytes.decode()
+        or result["importance_policy_fingerprint"] != policy_fingerprint
+    ):
+        raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
     if result["legal_input_fingerprint"] != _sha256(
         canonical_json_bytes(_baseline_legal_projection(result))
     ):
