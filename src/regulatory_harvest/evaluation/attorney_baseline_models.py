@@ -497,6 +497,11 @@ class BaselineAuditConcernV1(BaselineStrictModel):
         return self
 
 
+class IndexedBaselineAuditConcernV1(BaselineStrictModel):
+    audit_ref: AuditRef
+    concern: BaselineAuditConcernV1
+
+
 class BaselineAuditFragmentV1(BaselineStrictModel):
     schema_version: Literal["evaluation-baseline-v1"] = BASELINE_PROTOCOL_V1
     concerns: tuple[BaselineAuditConcernV1, ...] = Field(max_length=_MAX_FRAGMENT_ITEMS)
@@ -525,7 +530,7 @@ class BaselineAuditAggregateV1(BaselineStrictModel):
     fragments: tuple[AcceptedBaselineAuditFragmentV1, ...] = Field(
         min_length=1, max_length=_MAX_FRAGMENTS
     )
-    concerns: tuple[BaselineAuditConcernV1, ...] = Field(max_length=_MAX_COMPILED_ITEMS)
+    concerns: tuple[IndexedBaselineAuditConcernV1, ...] = Field(max_length=_MAX_COMPILED_ITEMS)
     importance_findings: tuple[ImportanceAuditFindingV1, ...] = Field(
         max_length=_MAX_COMPILED_ITEMS
     )
@@ -781,24 +786,42 @@ class BaselineCorrectionActionV1(BaselineStrictModel):
 
     @model_validator(mode="after")
     def validate_action_payload(self) -> Self:
-        requirement_actions = {"add_requirement", "replace_requirement", "remove_requirement"}
-        replacement_required = {
+        requirement_actions = {
             "add_requirement",
             "replace_requirement",
-            "add_relationship",
-            "replace_relationship",
+            "remove_requirement",
         }
         is_requirement = self.action in requirement_actions
-        if is_requirement != (self.relationship_id is None and self.relationship is None):
+        if is_requirement and (
+            self.relationship_id is not None or self.relationship is not None
+        ):
             raise ValueError("correction action has a mismatched typed payload")
-        if not is_requirement != (self.requirement_id is None and self.requirement is None):
+        if not is_requirement and (
+            self.requirement_id is not None or self.requirement is not None
+        ):
             raise ValueError("correction action has a mismatched typed payload")
-        if self.action in replacement_required and (
-            self.requirement is None and self.relationship is None
+        if self.action == "add_requirement" and (
+            self.requirement_id is not None or self.requirement is None
         ):
             raise ValueError("correction replacement actions require one replacement")
-        if self.action not in replacement_required and (
-            self.requirement is not None or self.relationship is not None
+        if self.action == "replace_requirement" and (
+            self.requirement_id is None or self.requirement is None
+        ):
+            raise ValueError("correction replacement actions require one replacement")
+        if self.action == "add_relationship" and (
+            self.relationship_id is not None or self.relationship is None
+        ):
+            raise ValueError("correction replacement actions require one replacement")
+        if self.action == "replace_relationship" and (
+            self.relationship_id is None or self.relationship is None
+        ):
+            raise ValueError("correction replacement actions require one replacement")
+        if self.action == "remove_requirement" and (
+            self.requirement_id is None or self.requirement is not None
+        ):
+            raise ValueError("correction removal actions must omit replacements")
+        if self.action == "remove_relationship" and (
+            self.relationship_id is None or self.relationship is not None
         ):
             raise ValueError("correction removal actions must omit replacements")
         return self
