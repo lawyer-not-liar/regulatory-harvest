@@ -194,10 +194,21 @@ Neither protocol adds files to a Protocol 2.2 run. Both live in separate sibling
 directories under the approved control root, use immutable artifact storage,
 and bind their source artifacts by exact fingerprints.
 
-The first implementation may consume a verified Protocol 2.2 run to derive an
-initial baseline and readiness record. Subsequent report revisions for the same
-legal inputs use the sealed baseline and run only fresh grading and safety roles
-against the revised report. They do not repeat report-blind source review.
+The first implementation may consume a verified Protocol 2.2 run as historical
+evidence while deriving the initial baseline and readiness record. Subsequent
+report revisions for the same legal inputs use the sealed baseline and run fresh
+baseline-locked grading and safety roles against the revised report. They do not
+repeat report-blind source review, depend on a newly regenerated Protocol 2.2
+baseline, or guess a crosswalk between independently generated requirements.
+
+The readiness compiler applies the exact retained Protocol 2.2 grading credit,
+critical-recall, weighted-coverage, lane-reconciliation, and sensitivity rules
+to its fresh baseline-locked grading lanes. It records that result as
+`baseline_locked_strict_equivalent_disposition`. When an older verified Protocol
+2.2 run is supplied, its disposition is preserved separately as
+`historical_v22_strict_disposition` and may be compared only after exact baseline
+identity is proven. No retained Protocol 2.2 artifact, command, default, or
+result is rewritten.
 
 ## Stable baseline protocol
 
@@ -270,10 +281,39 @@ The readiness run binds:
 - verified qualification root and receipt;
 - verified generation capsule root and report hash;
 - deterministic generation validation receipt;
-- exact strict evaluation manifest root and result fingerprint when a Protocol
-  2.2 result is the grading source;
-- both grader-lane aggregates and sensitivity record; and
+- exact strict evaluation manifest root and result fingerprint when a verified
+  Protocol 2.2 result is supplied as historical evidence;
+- both fresh baseline-locked grader-lane aggregates and their sensitivity
+  record; and
 - readiness rubric version and bytes.
+
+### Baseline-locked report grading
+
+Every readiness run grades the exact candidate report against the exact sealed
+baseline through two fresh isolated lanes. The controller projects the verified
+baseline into one canonical gradeable shape; both lanes receive byte-identical
+requirements, relationships, evidence handles, importance assignments and
+rationales, with only their controller-issued lane identity differing. The
+projection fingerprint is stored in the readiness input and must match every
+grading request and result.
+
+The stable-baseline implementation exposes this handoff as
+`project_gradeable_baseline_v1(VerifiedBaselineContextV1) ->
+GradeableBaselineProjectionV1`. Readiness must pass the candidate projection
+through `verify_gradeable_baseline_projection_v1(...)` before issuing a grading
+request. These adapters are exact byte-and-fingerprint checks, not semantic
+similarity or inferred requirement mapping.
+
+The readiness compiler uses the retained Protocol 2.2 scoring semantics without
+calling or modifying a retained Protocol 2.2 run. It therefore produces a
+current strict disposition for each report revision while holding the legal
+baseline fixed. A supplied historical Protocol 2.2 result is never substituted
+for these fresh grades. If its baseline can be proven byte-equivalent, the
+readiness record may expose the historical disposition as a comparison only
+when its report hash also matches. A different baseline is
+`BASELINE_NOT_COMPARABLE`; a different report revision is
+`REPORT_NOT_COMPARABLE`. In both cases the old result remains bound provenance
+and no semantic comparison is claimed.
 
 ### Report-wide safety review
 
@@ -550,7 +590,9 @@ Readiness verification returns:
 - exit `5` for integrity or unsupported secure-storage failure; and
 - exit `6` for a verified resumable engine pause.
 
-JSON status output includes both `strict_disposition` and `delivery_readiness`.
+JSON status output includes `baseline_locked_strict_equivalent_disposition` and
+`delivery_readiness`, plus `historical_v22_strict_disposition` and its explicit
+cross-check status only when historical evidence was supplied.
 Human output never shortens `REVIEW_READY_WITH_GAPS` to `PASS`.
 
 ## Full and portable implementations
@@ -632,6 +674,13 @@ runtime module, template, documentation, or test fixture is omitted.
 
 ### Safety and delivery
 
+- two report revisions with identical legal inputs receive the same canonical
+  baseline projection and fresh grading lanes without rerunning source review;
+- current strict disposition is compiled from the readiness run's
+  baseline-locked grades, while any supplied Protocol 2.2 disposition remains
+  separately identified as historical evidence;
+- a regenerated or merely similar requirement set cannot be crosswalked into
+  the stable baseline;
 - visible partial and missing requirements become review-ready rows;
 - mutation-sensitive tests delete or genericize each rationale component and
   prove that readiness becomes `NOT_DELIVERABLE`;
