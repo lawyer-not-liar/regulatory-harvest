@@ -2164,3 +2164,22 @@ def test_stable_baseline_operator_and_security_contract_is_published() -> None:
         "explicit authorization",
     ):
         assert phrase in security
+
+
+def test_stable_baseline_docs_reject_unreasoned_importance_tiers() -> None:
+    """Installed guidance must not let roles infer an unreasoned importance label."""
+    for relative in (
+        "README.md",
+        "SKILL.md",
+        "docs/evaluation.md",
+        "references/attorney-evaluation.md",
+    ):
+        text = " ".join((ROOT / relative).read_text(encoding="utf-8").casefold().split())
+        assert (
+            "every baseline proposal and every audit correction must provide a "
+            "nonblank importance rationale tied to exactly one published "
+            "critical/material/supporting definition."
+        ) in text, relative
+        assert (
+            "missing or unreasoned tier labels are rejected rather than inferred."
+        ) in text, relative

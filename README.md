@@ -71,6 +71,10 @@ The operational importance definitions are exact:
 - **supporting:** useful explanatory, contextual, or implementation detail whose
   absence does not materially change the legal answer or required next action.
 
+Every baseline proposal and every audit correction must provide a nonblank
+importance rationale tied to exactly one published critical/material/supporting
+definition. Missing or unreasoned tier labels are rejected rather than inferred.
+
 A complete importance audit reviews every proposal. Every semantic or importance
 disagreement goes to a source-only referee; substantive unresolved alternatives
 remain contested rather than being silently resolved.
