@@ -725,6 +725,8 @@ def derive_delivery_readiness_v1(
     requirement_matrix: RequirementMatrixV1,
     gap_matrix: GapFollowUpMatrixV1,
     safety: ReconciledSafetyReviewV1,
+    safety_lane_1: SafetyLaneResponseV1,
+    safety_lane_2: SafetyLaneResponseV1,
 ) -> DeliveryReadinessResultV1: ...
 ```
 
@@ -822,6 +824,8 @@ Evaluate in this order:
 4. If the fresh baseline-locked strict-equivalent disposition is `PASS`, both fresh lanes meet `1.0` critical recall and `0.90` weighted coverage, deterministic validation is completed with all three booleans true, all quality checks are true, and no blocking baseline/contest/safety finding exists, return `HIGH_ASSURANCE`.
 5. If every gap is visible/actionable, critical disclosure/ownership is safe, no report completeness claim contradicts the matrix, and no blocker exists, return `REVIEW_READY_WITH_GAPS` even when the fresh strict-equivalent disposition is `FAIL` or substantive `INCONCLUSIVE`.
 6. Otherwise return `NOT_DELIVERABLE` with allowlisted blocker codes.
+
+Before evaluating this branch, reconstruct the exact candidate inventory from the verified inputs and strict lanes, rebuild every safety dispute from `safety_lane_1` and `safety_lane_2`, rerun `reconcile_safety_lanes_v1()` with the accepted decisions stored in `safety`, and require byte-exact equality with the supplied `ReconciledSafetyReviewV1`. The two source lane responses are mandatory because fingerprints or a final reconciliation alone cannot prove that an unresolved dispute was not deleted and resealed. A mismatch is `INTEGRITY_OR_PROVENANCE_INVALID`; the controller never treats missing replay evidence as a legitimate no-dispute case.
 
 Do not read optional historical Protocol 2.2 evidence in this branch. After the tier is fixed, attach `historical_v22_strict_disposition` and `NOT_PROVIDED`, `BASELINE_NOT_COMPARABLE`, `REPORT_NOT_COMPARABLE`, `MATCH`, or `DISPOSITION_DIFFERS` for transparency only.
 
