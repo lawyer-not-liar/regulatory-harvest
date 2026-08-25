@@ -45,9 +45,17 @@ _CONTESTED_REF_PATTERN = r"^CONT-[0-9]{4}$"
 _GAP_CANDIDATE_PATTERN = r"^GC-[0-9]{4}$"
 _SAFETY_DISPUTE_PATTERN = r"^SD-[0-9]{4}$"
 _GAP_REF_PATTERN = r"^GAP-[0-9]{4}$"
+_SOURCE_ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._:-]*"
+_EVIDENCE_REF_PATTERN = (
+    r"^(?:SOURCE-[0-9]{6}|BASELINE-REQ-[0-9]{4}|BASELINE-CONT-[0-9]{4}|"
+    r"PREREQUISITE-(?:CURRENTNESS|COMPLETENESS|LANGUAGE)-"
+    + _SOURCE_ID_PATTERN
+    + r"|PREREQUISITE-CLIENT-FACTS)$"
+)
 _MAX_FRAGMENT_ITEMS = 5
 _MAX_COMPILED_ITEMS = 640
 _MAX_FINDINGS = 640
+_MAX_EVIDENCE_REF_LENGTH = 256
 _MAX_WIRE_BYTES = 16 * 1024 * 1024
 _MAX_WIRE_DEPTH = 64
 _MAX_WIRE_NODES = 100_000
@@ -60,6 +68,14 @@ ContestedRef = Annotated[str, Field(pattern=_CONTESTED_REF_PATTERN, strict=True)
 GapCandidateRef = Annotated[str, Field(pattern=_GAP_CANDIDATE_PATTERN, strict=True)]
 SafetyDisputeRef = Annotated[str, Field(pattern=_SAFETY_DISPUTE_PATTERN, strict=True)]
 GapRef = Annotated[str, Field(pattern=_GAP_REF_PATTERN, strict=True)]
+EvidenceRefV1 = Annotated[
+    str,
+    Field(
+        max_length=_MAX_EVIDENCE_REF_LENGTH,
+        pattern=_EVIDENCE_REF_PATTERN,
+        strict=True,
+    ),
+]
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -86,6 +102,23 @@ def _unique_nonblank(values: tuple[str, ...], *, location: str) -> tuple[str, ..
     if len(checked) != len(set(checked)):
         raise ValueError(f"{location} must be unique")
     return checked
+
+
+def _unique_evidence_refs(
+    values: tuple[EvidenceRefV1, ...],
+    *,
+    location: str,
+) -> tuple[EvidenceRefV1, ...]:
+    if any(
+        type(value) is not str
+        or len(value) > _MAX_EVIDENCE_REF_LENGTH
+        or re.fullmatch(_EVIDENCE_REF_PATTERN, value) is None
+        for value in values
+    ):
+        raise ValueError(f"{location} contains an invalid controller evidence handle")
+    if len(values) != len(set(values)):
+        raise ValueError(f"{location} must be unique")
+    return values
 
 
 def _unique_exact_passages(values: object, *, location: str) -> object:
@@ -1151,12 +1184,7 @@ class BaselineLockedContestedGradeV1(ReadinessStrictModelV1):
     auditor_report_passages: tuple[str, ...] = Field(max_length=_MAX_FINDINGS)
     reviewer_rationale: str = Field(strict=True)
     auditor_rationale: str = Field(strict=True)
-    ambiguity_disposition: Literal[
-        "reviewer_supported",
-        "auditor_supported",
-        "both_plausible",
-        "neither_supported",
-    ]
+    ambiguity_disposition: Literal["acknowledged", "overstated", "omitted", "uncertain"]
     rationale: str = Field(strict=True)
     grade_fingerprint: Hash
 
@@ -1299,12 +1327,12 @@ class SafetyGapCandidateV1(ReadinessStrictModelV1):
     lane_2_disposition: RequirementDispositionV1 | None = None
     baseline_fingerprint: Hash
     report_hash: Hash
-    evidence_refs: tuple[str, ...]
+    evidence_refs: tuple[EvidenceRefV1, ...] = Field(max_length=_MAX_FINDINGS)
     candidate_fingerprint: Hash
 
     _validate_subject = field_validator("subject_id")(_nonblank)
     _validate_evidence = field_validator("evidence_refs")(
-        lambda values: _unique_nonblank(values, location="candidate evidence references")
+        lambda values: _unique_evidence_refs(values, location="candidate evidence references")
     )
 
 
@@ -1314,7 +1342,7 @@ class SafetyGapAssessmentV1(ReadinessStrictModelV1):
     rationale_kind: RationaleKindV1
     why_unresolved: str = Field(strict=True)
     why_it_matters: str = Field(strict=True)
-    evidence_refs: tuple[str, ...]
+    evidence_refs: tuple[EvidenceRefV1, ...] = Field(max_length=_MAX_FINDINGS)
     report_passages: tuple[str, ...] = ()
     disclosure_location: str | None = Field(default=None, strict=True)
     visibility: GapVisibilityV1
@@ -1333,7 +1361,7 @@ class SafetyGapAssessmentV1(ReadinessStrictModelV1):
         _optional_nonblank
     )
     _validate_evidence = field_validator("evidence_refs")(
-        lambda values: _unique_nonblank(values, location="assessment evidence references")
+        lambda values: _unique_evidence_refs(values, location="assessment evidence references")
     )
     _validate_passages = field_validator("report_passages", mode="before")(
         lambda values: _unique_exact_passages(
@@ -1351,7 +1379,7 @@ class SafetyFindingProposalV1(ReadinessStrictModelV1):
     rationale_kind: RationaleKindV1
     why_unresolved: str = Field(strict=True)
     why_it_matters: str = Field(strict=True)
-    evidence_refs: tuple[str, ...]
+    evidence_refs: tuple[EvidenceRefV1, ...] = Field(max_length=_MAX_FINDINGS)
     disclosure_location: str | None = Field(default=None, strict=True)
     visibility: GapVisibilityV1
     blocking_code: str | None = Field(default=None, strict=True)
@@ -1370,7 +1398,7 @@ class SafetyFindingProposalV1(ReadinessStrictModelV1):
         _optional_nonblank
     )
     _validate_evidence = field_validator("evidence_refs")(
-        lambda values: _unique_nonblank(values, location="finding evidence references")
+        lambda values: _unique_evidence_refs(values, location="finding evidence references")
     )
     _validate_passages = field_validator("report_passages", mode="before")(
         lambda values: _unique_exact_passages(
@@ -1436,11 +1464,11 @@ class SafetyRefereeDecisionV1(ReadinessStrictModelV1):
     dispute_id: SafetyDisputeRef
     disposition: Literal["lane_1", "lane_2", "blocking", "unresolved"]
     rationale: str = Field(strict=True)
-    evidence_refs: tuple[str, ...]
+    evidence_refs: tuple[EvidenceRefV1, ...] = Field(max_length=_MAX_FINDINGS)
 
     _validate_rationale = field_validator("rationale")(_nonblank)
     _validate_evidence = field_validator("evidence_refs")(
-        lambda values: _unique_nonblank(values, location="referee evidence references")
+        lambda values: _unique_evidence_refs(values, location="referee evidence references")
     )
 
 

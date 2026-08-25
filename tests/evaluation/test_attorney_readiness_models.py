@@ -54,7 +54,9 @@ from regulatory_harvest.evaluation.attorney_readiness_models import (
     SafetyFindingKindV1,
     SafetyFindingProposalV1,
     SafetyGapAssessmentV1,
+    SafetyGapCandidateV1,
     SafetyLaneResponseV1,
+    SafetyRefereeDecisionV1,
     load_readiness_rubric_v1,
     validate_readiness_evaluator_response_v1,
     validate_readiness_input_v1,
@@ -244,7 +246,7 @@ def valid_safety_assessment(**updates: object) -> dict[str, object]:
         "rationale_kind": "REPORT_OMISSION",
         "why_unresolved": "No report passage supplies the deadline.",
         "why_it_matters": "The deadline affects implementation.",
-        "evidence_refs": ("REQ-0001",),
+        "evidence_refs": ("BASELINE-REQ-0001",),
         "report_passages": (),
         "disclosure_location": None,
         "visibility": "prominent",
@@ -252,6 +254,24 @@ def valid_safety_assessment(**updates: object) -> dict[str, object]:
         "follow_up_code": "VERIFY_PRIMARY_AUTHORITY",
         "resolution_test": "Add and verify the deadline.",
         "owner_role": "reviewing_attorney",
+    }
+    value.update(updates)
+    return value
+
+
+def valid_safety_candidate(**updates: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "candidate_id": "GC-0001",
+        "canonical_order": 0,
+        "origin": "requirement",
+        "subject_id": "REQ-0001",
+        "importance": "critical",
+        "lane_1_disposition": "met",
+        "lane_2_disposition": "partially_met",
+        "baseline_fingerprint": "b" * 64,
+        "report_hash": "c" * 64,
+        "evidence_refs": ("SOURCE-000001",),
+        "candidate_fingerprint": "d" * 64,
     }
     value.update(updates)
     return value
@@ -266,13 +286,24 @@ def valid_finding_proposal(**updates: object) -> dict[str, object]:
         "rationale_kind": "UNSUPPORTED_ASSERTION",
         "why_unresolved": "The cited evidence does not support the assertion.",
         "why_it_matters": "The assertion could change the legal conclusion.",
-        "evidence_refs": ("REQ-0001",),
+        "evidence_refs": ("BASELINE-REQ-0001",),
         "disclosure_location": None,
         "visibility": "prominent",
         "blocking_code": "MATERIAL_UNSUPPORTED_ASSERTION",
         "follow_up_code": "CORRECT_UNSUPPORTED_ASSERTION",
         "resolution_test": "Correct or support the assertion.",
         "owner_role": "reviewing_attorney",
+    }
+    value.update(updates)
+    return value
+
+
+def valid_safety_referee_decision(**updates: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "dispute_id": "SD-0001",
+        "disposition": "lane_1",
+        "rationale": "Lane 1 is supported by the issued evidence.",
+        "evidence_refs": ("SOURCE-000001",),
     }
     value.update(updates)
     return value
@@ -313,7 +344,7 @@ def valid_contested_grade(**updates: object) -> dict[str, object]:
         "auditor_report_passages": (),
         "reviewer_rationale": "The reviewer interpretation is plausible.",
         "auditor_rationale": "The auditor interpretation is plausible.",
-        "ambiguity_disposition": "both_plausible",
+        "ambiguity_disposition": "acknowledged",
         "rationale": "The locked alternatives remain contested.",
         "grade_fingerprint": "f" * 64,
     }
@@ -428,6 +459,137 @@ def test_rationale_normalization_remains_trimmed() -> None:
     )
 
     assert checked.rationale == "Evidence-bound rationale."
+
+
+RETAINED_AMBIGUITY_DISPOSITIONS = ("acknowledged", "overstated", "omitted", "uncertain")
+REMOVED_AMBIGUITY_DISPOSITIONS = (
+    "reviewer_supported",
+    "auditor_supported",
+    "both_plausible",
+    "neither_supported",
+)
+
+
+@pytest.mark.parametrize("disposition", RETAINED_AMBIGUITY_DISPOSITIONS)
+def test_contested_grade_accepts_exact_retained_ambiguity_inventory(disposition: str) -> None:
+    checked = BaselineLockedContestedGradeV1.model_validate(
+        valid_contested_grade(ambiguity_disposition=disposition)
+    )
+
+    assert checked.ambiguity_disposition == disposition
+
+
+@pytest.mark.parametrize("disposition", REMOVED_AMBIGUITY_DISPOSITIONS)
+def test_contested_grade_rejects_removed_lane_proposed_ambiguity_inventory(
+    disposition: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        BaselineLockedContestedGradeV1.model_validate(
+            valid_contested_grade(ambiguity_disposition=disposition)
+        )
+
+
+def safety_evidence_cases(
+    evidence_refs: tuple[object, ...],
+) -> list[tuple[type[BaseModel], dict[str, object]]]:
+    return [
+        (
+            SafetyGapCandidateV1,
+            valid_safety_candidate(evidence_refs=evidence_refs),
+        ),
+        (
+            SafetyGapAssessmentV1,
+            valid_safety_assessment(evidence_refs=evidence_refs),
+        ),
+        (
+            SafetyFindingProposalV1,
+            valid_finding_proposal(evidence_refs=evidence_refs),
+        ),
+        (
+            SafetyRefereeDecisionV1,
+            valid_safety_referee_decision(evidence_refs=evidence_refs),
+        ),
+    ]
+
+
+EVIDENCE_REF_PREFIX = "PREREQUISITE-CURRENTNESS-"
+VALID_EVIDENCE_REFS = (
+    "SOURCE-000001",
+    "SOURCE-999999",
+    "BASELINE-REQ-0001",
+    "BASELINE-CONT-0001",
+    "PREREQUISITE-CURRENTNESS-rule-1",
+    "PREREQUISITE-COMPLETENESS-src_abc.1",
+    "PREREQUISITE-LANGUAGE-source:1",
+    "PREREQUISITE-CLIENT-FACTS",
+    EVIDENCE_REF_PREFIX + "a" * (256 - len(EVIDENCE_REF_PREFIX)),
+)
+INVALID_EVIDENCE_REFS = (
+    "REQ-0001",
+    "REPORT-0001",
+    "SOURCE-00001",
+    "SOURCE-0000001",
+    "BASELINE-REQ-001",
+    "BASELINE-CONT-00001",
+    "PREREQUISITE-CURRENTNESS-",
+    "PREREQUISITE-COMPLETENESS-/private/path",
+    "PREREQUISITE-LANGUAGE-.hidden",
+    "PREREQUISITE-CLIENT-FACTS-extra",
+    "SOURCE-000001\n",
+    EVIDENCE_REF_PREFIX + "a" * (257 - len(EVIDENCE_REF_PREFIX)),
+)
+
+
+@pytest.mark.parametrize("evidence_ref", VALID_EVIDENCE_REFS)
+@pytest.mark.parametrize("model,value", safety_evidence_cases(("SOURCE-000001",)))
+def test_safety_evidence_refs_accept_exact_bounded_controller_grammar(
+    model: type[BaseModel],
+    value: dict[str, object],
+    evidence_ref: str,
+) -> None:
+    checked = model.model_validate(value | {"evidence_refs": (evidence_ref,)})
+
+    assert checked.evidence_refs == (evidence_ref,)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("evidence_ref", INVALID_EVIDENCE_REFS)
+@pytest.mark.parametrize("model,value", safety_evidence_cases(("SOURCE-000001",)))
+def test_safety_evidence_refs_reject_out_of_grammar_values(
+    model: type[BaseModel],
+    value: dict[str, object],
+    evidence_ref: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        model.model_validate(value | {"evidence_refs": (evidence_ref,)})
+
+
+@pytest.mark.parametrize("model,value", safety_evidence_cases(("SOURCE-000001",)))
+def test_safety_evidence_refs_reject_non_native_strings(
+    model: type[BaseModel],
+    value: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        model.model_validate(value | {"evidence_refs": (b"SOURCE-000001",)})
+
+
+@pytest.mark.parametrize("model,value", safety_evidence_cases(("SOURCE-000001",)))
+def test_safety_evidence_refs_reject_exact_duplicates(
+    model: type[BaseModel],
+    value: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError, match="unique"):
+        model.model_validate(value | {"evidence_refs": ("SOURCE-000001", "SOURCE-000001")})
+
+
+@pytest.mark.parametrize("model,value", safety_evidence_cases(("SOURCE-000001",)))
+def test_safety_evidence_refs_reject_more_than_bounded_count(
+    model: type[BaseModel],
+    value: dict[str, object],
+) -> None:
+    evidence_refs = tuple(f"SOURCE-{index:06d}" for index in range(641))
+
+    with pytest.raises(ValidationError):
+        model.model_validate(value | {"evidence_refs": evidence_refs})
 
 
 def exact_passage_cases(
