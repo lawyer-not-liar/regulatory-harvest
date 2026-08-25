@@ -3716,6 +3716,84 @@ def test_baseline_review_fix_report_only_revision_reuses_grade_target(tmp_path: 
     assert portable_projection["binding"] == full_projection.binding.model_dump(mode="json")
 
 
+@pytest.mark.parametrize("mutation", ("one-byte", "unknown-extra-key"))
+def test_baseline_parity_public_policy_mutation_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    """Public verification refuses a fully rehashed non-packaged policy identically."""
+    control = _baseline_cli_control(tmp_path)
+    full_run = tmp_path / f"policy-full-{mutation}"
+    portable_run = tmp_path / f"policy-portable-{mutation}"
+    common = ("--input", str(control), "--nonce-hex", "3" * 64)
+    _assert_baseline_surface_parity(
+        ("eval-baseline-init", *common, "--run", str(full_run)),
+        ("eval-baseline-init", *common, "--run", str(portable_run)),
+    )
+    full_attack = tmp_path / f"policy-full-attack-{mutation}"
+    portable_attack = tmp_path / f"policy-portable-attack-{mutation}"
+    shutil.copytree(full_run, full_attack)
+    shutil.copytree(portable_run, portable_attack)
+
+    portable_spec = importlib.util.spec_from_file_location(
+        f"attorney_eval_portable_policy_verify_{mutation}",
+        ROOT / "scripts" / "attorney_eval_portable.py",
+    )
+    assert portable_spec is not None and portable_spec.loader is not None
+    portable = importlib.util.module_from_spec(portable_spec)
+    sys.modules[portable_spec.name] = portable
+    portable_spec.loader.exec_module(portable)
+    packaged = (ROOT / "assets" / "evaluation-baseline-policy-v1.json").read_bytes()
+    policy = json.loads(packaged)
+    if mutation == "one-byte":
+        policy["definitions"]["critical"] = policy["definitions"]["critical"].replace(
+            "omission", "Omission", 1
+        )
+    else:
+        policy["unknown_policy_key"] = True
+    mutated_policy = _canonical_bytes(policy)
+    if mutation == "one-byte":
+        assert len(mutated_policy) == len(packaged)
+        assert sum(left != right for left, right in zip(packaged, mutated_policy, strict=True)) == 1
+    policy_fingerprint = hashlib.sha256(mutated_policy).hexdigest()
+    portable_input: dict[str, object] | None = None
+    for run in (full_attack, portable_attack):
+        baseline_input = json.loads((run / "baseline-input.json").read_bytes())
+        baseline_input["importance_policy_bytes"] = mutated_policy.decode()
+        baseline_input["importance_policy_fingerprint"] = policy_fingerprint
+        baseline_input["compiler_contract"] = portable._baseline_contract(policy_fingerprint)
+        baseline_input["compiler_contract_fingerprint"] = hashlib.sha256(
+            _canonical_bytes(baseline_input["compiler_contract"])
+        ).hexdigest()
+        baseline_input["legal_input_fingerprint"] = hashlib.sha256(
+            _canonical_bytes(portable._baseline_legal_projection(baseline_input))
+        ).hexdigest()
+        _reseal_baseline_parity_run(
+            run,
+            {"baseline-input.json": _canonical_bytes(baseline_input)},
+            manifest_updates={
+                "legal_input_fingerprint": baseline_input["legal_input_fingerprint"]
+            },
+        )
+        if run == portable_attack:
+            portable_input = baseline_input
+
+    full, observed = _assert_baseline_surface_parity(
+        ("eval-baseline-verify", "--run", str(full_attack)),
+        ("eval-baseline-verify", "--run", str(portable_attack)),
+    )
+    assert full.returncode == observed.returncode == 5
+    assert portable_input is not None
+    with pytest.raises(portable.EvaluationIntegrityError):
+        portable._baseline_validate_input(portable_input)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            portable,
+            "_baseline_policy",
+            lambda: (mutated_policy, policy, policy_fingerprint),
+        )
+        assert portable._baseline_validate_input(portable_input) == portable_input
+
+
 def test_baseline_full_runner_exposes_exact_commands_safe_status_and_exit_mapping(
     tmp_path: Path,
 ) -> None:

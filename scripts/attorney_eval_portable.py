@@ -13641,10 +13641,12 @@ def _baseline_validate_input(value: object) -> JsonObject:
     )
     policy_bytes, policy, policy_fingerprint = _baseline_policy()
     contract = _baseline_contract(policy_fingerprint)
+    if result["schema_version"] != "baseline-input-v1" or result[
+        "qualification_readiness"
+    ] != "ADMITTED":
+        raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
     if (
-        result["schema_version"] != "baseline-input-v1"
-        or result["qualification_readiness"] != "ADMITTED"
-        or result["compiler_contract"] != contract
+        result["compiler_contract"] != contract
         or result["compiler_contract_fingerprint"] != _sha256(canonical_json_bytes(contract))
         or result["evaluation_rubric_version"] != _BASELINE_RUBRIC["version"]
         or result["evaluation_rubric_bytes"] != _BASELINE_RUBRIC_BYTES.decode()
@@ -13653,7 +13655,7 @@ def _baseline_validate_input(value: object) -> JsonObject:
         or result["importance_policy_bytes"] != policy_bytes.decode()
         or result["importance_policy_fingerprint"] != policy_fingerprint
     ):
-        raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
+        raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
     source_ids = _baseline_validate_sources(result["sources"])
     _baseline_validate_authorities(result["requested_authorities"], source_ids)
     _baseline_validate_json_tree(result["compiler_contract"])
@@ -14829,6 +14831,10 @@ def _baseline_context(run_dir: Path) -> tuple[JsonObject, dict[str, bytes], Json
         baseline_input = _baseline_validate_input(
             _baseline_read_json(files["baseline-input.json"], location="baseline-input.json")
         )
+    except EvaluationIntegrityError as error:
+        if str(error) == "BASELINE_SEMANTIC_REPLAY_INVALID":
+            raise
+        raise EvaluationIntegrityError("BASELINE_ARTIFACT_INVALID") from error
     except (KeyError, BaselineInputError, PortableEvaluationInputError, TypeError, ValueError) as error:
         raise EvaluationIntegrityError("BASELINE_ARTIFACT_INVALID") from error
     try:
