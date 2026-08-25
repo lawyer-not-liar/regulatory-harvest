@@ -278,7 +278,11 @@ attorney-approved correction record that:
 The readiness run binds:
 
 - verified baseline root and fingerprint;
-- verified qualification root and receipt;
+- a separately loaded, verified qualification capsule root and receipt, cross-bound
+  to the baseline's qualification, source-record, and legal-input identities;
+- the qualification case schema, exact admission checks and issues, replayed
+  readiness status, issue codes and rationale, and each source's declared
+  language-treatment method, rationale, and limitations;
 - verified generation capsule root and report hash;
 - deterministic generation validation receipt;
 - exact strict evaluation manifest root and result fingerprint when a verified
@@ -322,6 +326,16 @@ unsupported assertions or hidden limitations. The readiness run therefore
 issues two fresh, isolated, report-wide safety-review requests. Each receives
 only the stable baseline, exact report, exact source record, qualification
 limits, client-fact boundary, and readiness safety schema.
+
+The readiness controller accepts the qualification evidence only through an
+explicit qualification-run pointer. It does not infer qualification limitations
+from a hash, a language code, or the baseline run. The persisted readiness input
+contains a path-free typed projection: exact checks and issues remain distinct,
+the receipt's readiness status, issue codes, and rationale remain receipt
+evidence rather than being renamed as a new finding, and each source treatment
+states whether a limitation was declared. An absent declared limitation remains
+`NOT_DECLARED`; the controller does not turn that absence into a claim that no
+limitation exists.
 
 Each safety lane reports only controller-bound findings for:
 
@@ -576,6 +590,10 @@ Add a separate readiness command family rather than changing retained commands:
 - `eval-readiness-status`
 - `eval-readiness-verify`
 
+`eval-readiness-init` requires explicit baseline, qualification, generation,
+validation-receipt, and output-run paths. The qualification path is used only by
+the exclusive verified qualification loader and is never persisted.
+
 Existing Protocol 1.3, 2.0, 2.1, and 2.2 command outputs and exit codes remain
 unchanged.
 
@@ -699,7 +717,9 @@ runtime module, template, documentation, or test fixture is omitted.
 ### Replay, storage, and concurrency
 
 - tamper and reseal attempts;
-- cross-run, report, baseline, qualification, and capsule swaps;
+- cross-run, report, baseline, qualification, and capsule swaps, including a
+  qualification capsule whose root, receipt, source record, legal inputs, or
+  per-source language treatments do not match the verified baseline;
 - orphan and unexpected artifacts;
 - symlink, FIFO, hard-link, root-replacement, and rollback races;
 - concurrent submit, status, verify, and alias access;
