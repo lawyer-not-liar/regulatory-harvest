@@ -13195,6 +13195,8 @@ def resume_evaluation(run_dir: Path) -> JsonObject:  # type: ignore[no-redef]
 
 BASELINE_PROTOCOL_V1 = "evaluation-baseline-v1"
 BASELINE_EXTERNAL_RESPONSE_INVALID = "BASELINE_EXTERNAL_RESPONSE_INVALID"
+BASELINE_PROVIDER_FAILURE = "BASELINE_PROVIDER_FAILURE"
+_BASELINE_SUBMISSION_LOCKS = tuple(_threading.RLock() for _ in range(64))
 _BASELINE_POLICY_PATH = (
     Path(__file__).resolve().parents[1] / "assets" / "evaluation-baseline-policy-v1.json"
 )
@@ -13491,22 +13493,134 @@ def _baseline_build_input(control_path: Path) -> JsonObject:
 
 def _baseline_validate_json_tree(value: object) -> JsonObject:
     root = _object(value, location="baseline report-blind value")
-    stack: list[object] = [root]
+    stack: list[tuple[object, int, bool]] = [(root, 1, False)]
+    active: set[int] = set()
     while stack:
-        current = stack.pop()
+        current, depth, exiting = stack.pop()
+        if depth > 64:
+            raise PortableEvaluationInputError("baseline value exceeds the JSON depth limit")
+        if exiting:
+            active.remove(id(current))
+            continue
         if type(current) is dict:
+            if id(current) in active:
+                raise PortableEvaluationInputError("baseline value contains a JSON cycle")
+            active.add(id(current))
+            stack.append((current, depth, True))
             for key, item in cast(JsonObject, current).items():
+                if type(key) is not str:
+                    raise PortableEvaluationInputError("baseline value has a non-string key")
                 if key in _BASELINE_REPORT_KEYS:
                     raise PortableEvaluationInputError("baseline value contains report-bound keys")
-                stack.append(item)
+                stack.append((item, depth + 1, False))
         elif type(current) is list:
-            stack.extend(cast(list[object], current))
+            if id(current) in active:
+                raise PortableEvaluationInputError("baseline value contains a JSON cycle")
+            active.add(id(current))
+            stack.append((current, depth, True))
+            stack.extend((item, depth + 1, False) for item in cast(list[object], current))
         elif current is None or type(current) in {str, bool, int} or (type(current) is float and math.isfinite(current)):
             continue
         else:
             raise PortableEvaluationInputError("baseline value is not a JSON wire value")
     canonical_json_bytes(root)
     return root
+
+
+def _baseline_identifier(value: object, *, location: str) -> str:
+    identifier = _string(value, location=location, nonblank=True)
+    if re.fullmatch(r"[A-Za-z0-9._:-]+", identifier) is None:
+        raise PortableEvaluationInputError(f"{location} is invalid")
+    return identifier
+
+
+def _baseline_optional_nonblank(value: object, *, location: str) -> None:
+    if value is not None:
+        _string(value, location=location, nonblank=True)
+
+
+def _baseline_validate_sources(value: object) -> set[str]:
+    sources = _array(value, location="baseline sources")
+    if not sources or len(sources) > 640:
+        raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
+    source_ids: set[str] = set()
+    for item in sources:
+        source = _shape(
+            item,
+            required={
+                "source_id", "title", "normalized_text", "content_hash",
+                "canonical_url", "publisher", "jurisdiction", "authority_type",
+                "source_role", "source_quality", "completeness", "language", "version",
+                "effective_date", "supersession", "relationship_ids",
+            },
+            location="baseline source",
+        )
+        source_id = _baseline_identifier(source["source_id"], location="baseline source id")
+        if source_id in source_ids:
+            raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
+        source_ids.add(source_id)
+        for key in ("title", "jurisdiction", "authority_type", "language"):
+            _string(source[key], location=f"baseline source.{key}", nonblank=True)
+        normalized = _exact_content(
+            source["normalized_text"], location="baseline source.normalized_text"
+        )
+        if source["content_hash"] != _sha256(normalized.encode()):
+            raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
+        for key in ("canonical_url", "publisher", "version", "effective_date", "supersession"):
+            _baseline_optional_nonblank(source[key], location=f"baseline source.{key}")
+        _enum(
+            source["source_role"],
+            {"official_primary", "secondary", "commentary_analysis"},
+            location="baseline source.source_role",
+        )
+        _enum(
+            source["source_quality"],
+            {"primary", "secondary", "unknown", "unusable"},
+            location="baseline source.source_quality",
+        )
+        _enum(
+            source["completeness"],
+            {"complete", "consolidated", "amending", "partial", "snippet", "unknown"},
+            location="baseline source.completeness",
+        )
+        relationships = _array(
+            source["relationship_ids"], location="baseline source.relationship_ids"
+        )
+        checked = [
+            _baseline_identifier(item, location="baseline source relationship id")
+            for item in relationships
+        ]
+        if len(checked) != len(set(checked)):
+            raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
+    return source_ids
+
+
+def _baseline_validate_authorities(value: object, source_ids: set[str]) -> None:
+    authorities = _array(value, location="baseline authorities")
+    if not authorities:
+        raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
+    authority_ids: set[str] = set()
+    for item in authorities:
+        authority = _shape(
+            item,
+            required={"authority_id", "title", "jurisdiction", "authority_type", "source_ids"},
+            location="baseline authority",
+        )
+        authority_id = _baseline_identifier(
+            authority["authority_id"], location="baseline authority id"
+        )
+        if authority_id in authority_ids:
+            raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
+        authority_ids.add(authority_id)
+        for key in ("title", "jurisdiction", "authority_type"):
+            _string(authority[key], location=f"baseline authority.{key}", nonblank=True)
+        values = _array(authority["source_ids"], location="baseline authority source ids")
+        checked = [
+            _baseline_identifier(item, location="baseline authority source id")
+            for item in values
+        ]
+        if not checked or len(checked) != len(set(checked)) or not set(checked) <= source_ids:
+            raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
 
 
 def _baseline_validate_input(value: object) -> JsonObject:
@@ -13540,10 +13654,9 @@ def _baseline_validate_input(value: object) -> JsonObject:
         or result["importance_policy_fingerprint"] != policy_fingerprint
     ):
         raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
-    if not _array(result["sources"], location="baseline sources"):
-        raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
-    if not _array(result["requested_authorities"], location="baseline authorities"):
-        raise EvaluationIntegrityError("BASELINE_INPUT_INVALID")
+    source_ids = _baseline_validate_sources(result["sources"])
+    _baseline_validate_authorities(result["requested_authorities"], source_ids)
+    _baseline_validate_json_tree(result["compiler_contract"])
     for key in (
         "source_record_fingerprint", "qualification_root", "qualification_receipt_fingerprint",
         "compiler_contract_fingerprint", "evaluation_rubric_fingerprint",
@@ -14764,10 +14877,16 @@ def _baseline_checked_outer_response(
 
 
 def _baseline_replay_files(
-    manifest: JsonObject, files: Mapping[str, bytes], baseline_input: JsonObject
-) -> None:
+    manifest: JsonObject,
+    files: Mapping[str, bytes],
+    baseline_input: JsonObject,
+    *,
+    correction_prior: tuple[JsonObject, dict[str, bytes], JsonObject, JsonObject] | None = None,
+) -> JsonObject | None:
     if "baseline-correction.json" in files:
-        _baseline_replay_correction(files, baseline_input)
+        corrected = _baseline_replay_correction(
+            files, baseline_input, prior=correction_prior
+        )
         expected_phase = "completed"
         allowed = {
             "baseline-input.json", "baseline-correction.json", "correction-proof.json",
@@ -14777,10 +14896,11 @@ def _baseline_replay_files(
             raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
         if manifest["phase"] != expected_phase:
             raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
-        return
+        return corrected
     bound = {"baseline-input.json"}
     review_history: list[JsonObject] = []
     review: JsonObject | None = None
+    baseline: JsonObject | None = None
     review_pending = False
     for ordinal in range(1, 129):
         request_path = f"requests/source-review-{ordinal:04d}.json"
@@ -14893,6 +15013,14 @@ def _baseline_replay_files(
                 raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
             bound.add("source-referees.json")
             baseline = _baseline_compile(baseline_input, review, audit, referees)
+            try:
+                _baseline_checked_canonical_baseline(
+                    _baseline_read_json(
+                        files["canonical-baseline.json"], location="canonical-baseline.json"
+                    )
+                )
+            except (KeyError, PortableEvaluationInputError, TypeError, ValueError) as error:
+                raise EvaluationIntegrityError("BASELINE_ARTIFACT_INVALID") from error
             if files.get("canonical-baseline.json") != canonical_json_bytes(baseline):
                 raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
             bound.add("canonical-baseline.json")
@@ -14903,7 +15031,8 @@ def _baseline_replay_files(
         bound.add("baseline-verification.json")
     expected_phase = (
         "source_review" if review is None else "source_audit" if audit is None
-        else "source_referee" if referees is None else "completed"
+        else "source_referee" if referees is None
+        else "completed" if verification is not None else "baseline_sealed"
     )
     if manifest["phase"] != expected_phase or set(files) != bound:
         raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
@@ -14913,6 +15042,7 @@ def _baseline_replay_files(
         expected_phase == "source_audit"
     ) or referee_pending != (expected_phase == "source_referee"):
         raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+    return baseline
 
 
 def _baseline_validate_referee_choice(dispute: JsonObject, decision: JsonObject) -> None:
@@ -14954,56 +15084,283 @@ def _baseline_validate_referee_choice(dispute: JsonObject, decision: JsonObject)
         raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
 
 
+def _baseline_checked_embedded_correction(value: object) -> JsonObject:
+    correction = _shape(
+        value,
+        required={
+            "schema_version", "prior_baseline_root", "prior_baseline_fingerprint",
+            "correction_id", "actions", "reason", "attorney_approval",
+            "correction_fingerprint",
+        },
+        location="baseline correction",
+    )
+    if (
+        correction["schema_version"] != "baseline-correction-v1"
+        or type(correction["correction_id"]) is not str
+        or re.fullmatch(r"CORR-[0-9]{4}", cast(str, correction["correction_id"])) is None
+    ):
+        raise PortableEvaluationInputError("baseline correction identity is invalid")
+    for field in (
+        "prior_baseline_root", "prior_baseline_fingerprint", "correction_fingerprint"
+    ):
+        _hash(correction[field], location=f"baseline correction.{field}")
+    correction["reason"] = _baseline_nonblank(
+        correction["reason"], location="baseline correction reason"
+    )
+    approval = _shape(
+        correction["attorney_approval"],
+        required={"approved_by", "approved_at", "approval_statement"},
+        location="baseline correction approval",
+    )
+    for field in approval:
+        approval[field] = _baseline_nonblank(
+            approval[field], location=f"baseline correction approval.{field}"
+        )
+    actions = _array(correction["actions"], location="baseline correction actions")
+    if not actions:
+        raise PortableEvaluationInputError("baseline correction actions must be nonempty")
+    for item in actions:
+        action = _shape(
+            item,
+            required={
+                "action", "requirement_id", "relationship_id", "requirement", "relationship"
+            },
+            location="baseline correction action",
+        )
+        name = _enum(
+            action["action"],
+            {
+                "add_requirement", "replace_requirement", "remove_requirement",
+                "add_relationship", "replace_relationship", "remove_relationship",
+            },
+            location="baseline correction action",
+        )
+        if action["requirement_id"] is not None and (
+            type(action["requirement_id"]) is not str
+            or re.fullmatch(r"REQ-[0-9]{4}", cast(str, action["requirement_id"])) is None
+        ):
+            raise PortableEvaluationInputError("baseline correction requirement id is invalid")
+        if action["relationship_id"] is not None and (
+            type(action["relationship_id"]) is not str
+            or re.fullmatch(r"REL-[0-9]{4}", cast(str, action["relationship_id"])) is None
+        ):
+            raise PortableEvaluationInputError("baseline correction relationship id is invalid")
+        requirement = (
+            None
+            if action["requirement"] is None
+            else _baseline_checked_requirement(action["requirement"])
+        )
+        relationship = (
+            None
+            if action["relationship"] is None
+            else _baseline_checked_relationship(action["relationship"])
+        )
+        required_payload = {
+            "add_requirement": (None, None, requirement, None),
+            "replace_requirement": (action["requirement_id"], None, requirement, None),
+            "remove_requirement": (action["requirement_id"], None, None, None),
+            "add_relationship": (None, None, None, relationship),
+            "replace_relationship": (None, action["relationship_id"], None, relationship),
+            "remove_relationship": (None, action["relationship_id"], None, None),
+        }[name]
+        actual_payload = (
+            action["requirement_id"], action["relationship_id"], requirement, relationship
+        )
+        if actual_payload != required_payload or (
+            name.startswith(("add", "replace"))
+            and requirement is None
+            and relationship is None
+        ):
+            raise PortableEvaluationInputError("baseline correction action payload is invalid")
+    expected = _sha256(
+        canonical_json_bytes(
+            {key: item for key, item in correction.items() if key != "correction_fingerprint"}
+        )
+    )
+    if correction["correction_fingerprint"] != expected:
+        raise PortableEvaluationInputError("baseline correction fingerprint is invalid")
+    return correction
+
+
+def _baseline_checked_proof(value: object) -> tuple[JsonObject, list[JsonObject]]:
+    proof = _shape(
+        value,
+        required={"schema_version", "nodes", "proof_fingerprint"},
+        location="baseline correction proof",
+    )
+    nodes = _array(proof["nodes"], location="baseline correction proof nodes")
+    if proof["schema_version"] != "baseline-correction-proof-v1" or not 1 <= len(nodes) <= 128:
+        raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+    checked_nodes: list[JsonObject] = []
+    for item in nodes:
+        node = _shape(
+            item,
+            required={"manifest_json", "artifacts"},
+            location="baseline correction proof node",
+        )
+        manifest_json = _string(
+            node["manifest_json"], location="baseline correction proof manifest"
+        )
+        if len(manifest_json) > 16 * 1024 * 1024:
+            raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+        artifacts = _array(
+            node["artifacts"], location="baseline correction proof artifacts"
+        )
+        if not 1 <= len(artifacts) <= 2048:
+            raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+        paths: list[str] = []
+        for artifact_item in artifacts:
+            artifact = _shape(
+                artifact_item,
+                required={"artifact_path", "artifact_hash", "artifact_json"},
+                location="baseline correction proof artifact",
+            )
+            path = _string(
+                artifact["artifact_path"], location="baseline correction proof path",
+                nonblank=True,
+            )
+            _validate_relative_path(path)
+            if path == "correction-proof.json":
+                raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+            _hash(artifact["artifact_hash"], location="baseline correction proof hash")
+            artifact_json = _string(
+                artifact["artifact_json"], location="baseline correction proof json"
+            )
+            if len(artifact_json) > 16 * 1024 * 1024 or _sha256(
+                artifact_json.encode()
+            ) != artifact["artifact_hash"]:
+                raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+            paths.append(path)
+        if paths != sorted(set(paths)):
+            raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+        checked_nodes.append(node)
+    unsigned = {"schema_version": "baseline-correction-proof-v1", "nodes": nodes}
+    if proof["proof_fingerprint"] != _sha256(canonical_json_bytes(unsigned)):
+        raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+    return proof, checked_nodes
+
+
+def _baseline_prefix_proof(nodes: list[JsonObject]) -> tuple[JsonObject, bytes]:
+    unsigned: JsonObject = {
+        "schema_version": "baseline-correction-proof-v1", "nodes": _copy_json(nodes)
+    }
+    proof = {**unsigned, "proof_fingerprint": _sha256(canonical_json_bytes(unsigned))}
+    return proof, canonical_json_bytes(proof)
+
+
+def _baseline_replay_proof(
+    proof: JsonObject,
+) -> tuple[JsonObject, dict[str, bytes], JsonObject, JsonObject]:
+    _, nodes = _baseline_checked_proof(proof)
+    prior: tuple[JsonObject, dict[str, bytes], JsonObject, JsonObject] | None = None
+    prefix: list[JsonObject] = []
+    roots: set[str] = set()
+    for node in nodes:
+        manifest_data = _string(
+            node["manifest_json"], location="baseline correction proof manifest"
+        ).encode()
+        manifest = _baseline_read_json(
+            manifest_data, location="baseline correction proof manifest"
+        )
+        files: dict[str, bytes] = {}
+        for item in cast(list[JsonObject], node["artifacts"]):
+            path = cast(str, item["artifact_path"])
+            files[path] = cast(str, item["artifact_json"]).encode()
+        proof_binding = manifest.get("correction_proof_fingerprint")
+        if proof_binding is not None:
+            if not prefix:
+                raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+            prefix_proof, prefix_data = _baseline_prefix_proof(prefix)
+            if proof_binding != prefix_proof["proof_fingerprint"]:
+                raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+            files["correction-proof.json"] = prefix_data
+        records = _array(manifest.get("artifacts"), location="baseline proof manifest artifacts")
+        expected: dict[str, str] = {}
+        for item in records:
+            record = _shape(
+                item, required={"artifact_path", "artifact_hash"},
+                location="baseline proof manifest artifact",
+            )
+            path = _string(record["artifact_path"], location="baseline proof manifest path")
+            if path in expected:
+                raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+            expected[path] = _hash(
+                record["artifact_hash"], location="baseline proof manifest hash"
+            )
+        if set(files) != set(expected) or any(
+            _sha256(data) != expected[path] for path, data in files.items()
+        ):
+            raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+        baseline_input = _baseline_validate_input(
+            _baseline_read_json(files["baseline-input.json"], location="baseline-input.json")
+        )
+        if _baseline_manifest(
+            baseline_input, files, cast(str, manifest["phase"])
+        ) != manifest:
+            raise EvaluationIntegrityError("BASELINE_MANIFEST_INVALID")
+        baseline = _baseline_replay_files(
+            manifest, files, baseline_input, correction_prior=prior
+        )
+        linked = prior is None or (
+            manifest.get("prior_baseline_root") == prior[0]["root_hash"]
+            and manifest.get("prior_baseline_fingerprint")
+            == prior[3]["baseline_fingerprint"]
+            and manifest.get("correction_record_fingerprint") is not None
+        )
+        terminal = manifest["phase"] in {"completed", "inconclusive"} and manifest[
+            "terminal_status"
+        ] in {"COMPLETED", "INCONCLUSIVE"}
+        if (
+            baseline is None
+            or files.get("baseline-verification.json")
+            != canonical_json_bytes({"valid": True, "issues": []})
+            or not terminal
+            or not linked
+            or manifest["root_hash"] in roots
+        ):
+            raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+        roots.add(cast(str, manifest["root_hash"]))
+        prefix.append(node)
+        prior = (manifest, files, baseline_input, baseline)
+    if prior is None:
+        raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+    return prior
+
+
 def _baseline_replay_correction(
-    files: Mapping[str, bytes], baseline_input: JsonObject
-) -> None:
-    correction = _baseline_read_json(
-        files["baseline-correction.json"], location="baseline-correction.json"
+    files: Mapping[str, bytes],
+    baseline_input: JsonObject,
+    *,
+    prior: tuple[JsonObject, dict[str, bytes], JsonObject, JsonObject] | None = None,
+) -> JsonObject:
+    correction = _baseline_checked_embedded_correction(
+        _baseline_read_json(files["baseline-correction.json"], location="baseline-correction.json")
     )
     proof = _baseline_read_json(files["correction-proof.json"], location="correction-proof.json")
-    unsigned = {"schema_version": proof.get("schema_version"), "nodes": proof.get("nodes")}
+    checked_proof, _ = _baseline_checked_proof(proof)
+    if prior is None:
+        prior = _baseline_replay_proof(checked_proof)
+    prior_manifest, _, prior_input, prior_baseline = prior
     if (
-        proof.get("schema_version") != "baseline-correction-proof-v1"
-        or proof.get("proof_fingerprint") != _sha256(canonical_json_bytes(unsigned))
-    ):
-        raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
-    nodes = _array(proof["nodes"], location="baseline correction proof nodes")
-    if not nodes:
-        raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
-    last = _shape(
-        nodes[-1], required={"manifest_json", "artifacts"},
-        location="baseline correction proof node",
-    )
-    prior_manifest_data = _string(
-        last["manifest_json"], location="baseline correction prior manifest"
-    ).encode()
-    prior_manifest = _baseline_read_json(
-        prior_manifest_data, location="baseline correction prior manifest"
-    )
-    prior_files: dict[str, bytes] = {}
-    for item in _array(last["artifacts"], location="baseline correction proof artifacts"):
-        artifact = _shape(
-            item, required={"artifact_path", "artifact_hash", "artifact_json"},
-            location="baseline correction proof artifact",
-        )
-        path = _string(artifact["artifact_path"], location="baseline proof path")
-        data = _string(artifact["artifact_json"], location="baseline proof json").encode()
-        if _sha256(data) != artifact["artifact_hash"]:
-            raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
-        prior_files[path] = data
-    prior_baseline = _baseline_read_json(
-        prior_files["canonical-baseline.json"], location="prior canonical-baseline.json"
-    )
-    if (
-        correction["prior_baseline_root"] != prior_manifest["root_hash"]
+        baseline_input != prior_input
+        or correction["prior_baseline_root"] != prior_manifest["root_hash"]
         or correction["prior_baseline_fingerprint"] != prior_baseline["baseline_fingerprint"]
     ):
         raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
     corrected = _baseline_apply_correction(baseline_input, prior_baseline, correction)
+    try:
+        _baseline_checked_canonical_baseline(
+            _baseline_read_json(
+                files["canonical-baseline.json"], location="canonical-baseline.json"
+            )
+        )
+    except (KeyError, PortableEvaluationInputError, TypeError, ValueError) as error:
+        raise EvaluationIntegrityError("BASELINE_ARTIFACT_INVALID") from error
     if files["canonical-baseline.json"] != canonical_json_bytes(corrected) or files[
         "baseline-verification.json"
     ] != canonical_json_bytes({"valid": True, "issues": []}):
         raise EvaluationIntegrityError("BASELINE_SEMANTIC_REPLAY_INVALID")
+    return corrected
 
 
 def _baseline_accepted_fragments(
@@ -15082,11 +15439,131 @@ def _baseline_state(manifest: JsonObject) -> JsonObject:
 
 def next_baseline_request_v1(run_dir: Path) -> JsonObject | None:
     manifest, files, _ = _baseline_context(run_dir)
+    if manifest["phase"] == "baseline_sealed":
+        _baseline_complete_sealed(run_dir, manifest)
+        manifest, files, _ = _baseline_context(run_dir)
     pending = cast(JsonObject | None, manifest["pending_call"])
     if pending is None:
         return None
     path = cast(str, pending["request_artifact_path"])
     return _baseline_read_json(files[path], location=path)
+
+
+def _baseline_complete_sealed(run_dir: Path, manifest: JsonObject) -> JsonObject:
+    if manifest["phase"] != "baseline_sealed":
+        return manifest
+    return _baseline_commit(
+        run_dir,
+        {"baseline-verification.json": canonical_json_bytes({"valid": True, "issues": []})},
+        "completed",
+        initialize=False,
+        expected_manifest_fingerprint=cast(str, manifest["manifest_fingerprint"]),
+    )
+
+
+def resume_baseline_v1(run_dir: Path) -> JsonObject:
+    manifest, _, _ = _baseline_context(run_dir)
+    return _baseline_state(_baseline_complete_sealed(run_dir, manifest))
+
+
+@dataclass(frozen=True)
+class BaselineDraftPromptV1:
+    request: JsonObject
+    attempt: int
+    repair_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BaselineDriverOutcomeV1:
+    state: JsonObject
+    engine_paused: bool
+    pause_reason_codes: tuple[str, ...] = ()
+    pending_request: JsonObject | None = None
+    exit_code: int = 0
+
+
+def _baseline_pause_outcome(
+    run_dir: Path, request: JsonObject, reason: str
+) -> BaselineDriverOutcomeV1:
+    return BaselineDriverOutcomeV1(
+        state=resume_baseline_v1(run_dir),
+        engine_paused=True,
+        pause_reason_codes=(reason,),
+        pending_request=request,
+        exit_code=6,
+    )
+
+
+async def _baseline_drive_one_role(
+    run_dir: Path, evaluator: object
+) -> BaselineDriverOutcomeV1:
+    request = next_baseline_request_v1(run_dir)
+    if request is None:
+        return BaselineDriverOutcomeV1(
+            state=resume_baseline_v1(run_dir), engine_paused=False
+        )
+    repair_codes: tuple[str, ...] = ()
+    for attempt in (1, 2):
+        prompt = BaselineDraftPromptV1(
+            request=_copy_json(request), attempt=attempt, repair_codes=repair_codes
+        )
+        try:
+            draft = await evaluator.evaluate_draft(prompt)  # type: ignore[attr-defined]
+        except Exception:
+            return _baseline_pause_outcome(run_dir, request, BASELINE_PROVIDER_FAILURE)
+        submitted = guarded_submit_baseline_response_v1(
+            run_dir,
+            draft,
+            provider_name=evaluator.provider_name,  # type: ignore[attr-defined]
+            model_name=evaluator.model_name,  # type: ignore[attr-defined]
+            judge_isolation=evaluator.judge_isolation,  # type: ignore[attr-defined]
+        )
+        if submitted["accepted"] and submitted["state"] is not None:
+            return BaselineDriverOutcomeV1(
+                state=cast(JsonObject, submitted["state"]),
+                engine_paused=False,
+                pending_request=next_baseline_request_v1(run_dir),
+            )
+        current = next_baseline_request_v1(run_dir)
+        if current is None or current["request_fingerprint"] != request["request_fingerprint"]:
+            return BaselineDriverOutcomeV1(
+                state=resume_baseline_v1(run_dir),
+                engine_paused=False,
+                pending_request=current,
+            )
+        if attempt == 1:
+            repair_codes = (BASELINE_EXTERNAL_RESPONSE_INVALID,)
+        else:
+            return _baseline_pause_outcome(
+                run_dir, request, BASELINE_EXTERNAL_RESPONSE_INVALID
+            )
+    raise AssertionError("unreachable baseline attempt state")
+
+
+async def continue_baseline_v1(
+    run_dir: Path, evaluator: object, *, max_roles: int | None = None
+) -> BaselineDriverOutcomeV1:
+    if any(
+        not hasattr(evaluator, field)
+        for field in ("provider_name", "model_name", "judge_isolation", "evaluate_draft")
+    ) or not callable(getattr(evaluator, "evaluate_draft", None)):
+        raise TypeError("evaluator must implement BaselineDraftEvaluatorV1")
+    if max_roles is not None and (type(max_roles) is not int or max_roles < 1):
+        raise ValueError("max_roles must be a positive integer")
+    roles = 0
+    while max_roles is None or roles < max_roles:
+        state = resume_baseline_v1(run_dir)
+        if state["terminal_status"] is not None:
+            return BaselineDriverOutcomeV1(state=state, engine_paused=False)
+        outcome = await _baseline_drive_one_role(run_dir, evaluator)
+        if outcome.engine_paused:
+            return outcome
+        roles += 1
+    return BaselineDriverOutcomeV1(
+        state=resume_baseline_v1(run_dir),
+        engine_paused=False,
+        pending_request=next_baseline_request_v1(run_dir),
+    )
 
 
 def _baseline_response(
@@ -15115,7 +15592,7 @@ def _baseline_response(
     return response, checked_payload
 
 
-def guarded_submit_baseline_response_v1(
+def _baseline_guarded_submit_unlocked(
     run_dir: Path,
     payload: object,
     *,
@@ -15212,10 +15689,7 @@ def guarded_submit_baseline_response_v1(
                     baseline = _baseline_compile(baseline_input, review, audit, referees)
                     additions["source-referees.json"] = canonical_json_bytes(referees)
                     additions["canonical-baseline.json"] = canonical_json_bytes(baseline)
-                    additions["baseline-verification.json"] = canonical_json_bytes(
-                        {"valid": True, "issues": []}
-                    )
-                    phase = "completed"
+                    phase = "baseline_sealed"
         else:
             review = _baseline_read_json(files["source-review.json"], location="source-review.json")
             audit = _baseline_read_json(files["source-audit.json"], location="source-audit.json")
@@ -15256,10 +15730,7 @@ def guarded_submit_baseline_response_v1(
                 baseline = _baseline_compile(baseline_input, review, audit, referees)
                 additions["source-referees.json"] = canonical_json_bytes(referees)
                 additions["canonical-baseline.json"] = canonical_json_bytes(baseline)
-                additions["baseline-verification.json"] = canonical_json_bytes(
-                    {"valid": True, "issues": []}
-                )
-                phase = "completed"
+                phase = "baseline_sealed"
         successor = _baseline_commit(
             run_dir,
             additions,
@@ -15267,11 +15738,53 @@ def guarded_submit_baseline_response_v1(
             initialize=False,
             expected_manifest_fingerprint=cast(str, manifest["manifest_fingerprint"]),
         )
+        if successor["phase"] == "baseline_sealed":
+            successor = _baseline_complete_sealed(run_dir, successor)
         return {"accepted": True, "diagnostics": [], "state": _baseline_state(successor)}
     except EvaluationIntegrityError:
         raise
     except (KeyError, PortableEvaluationInputError, RecursionError, TypeError, ValueError):
         return {"accepted": False, "diagnostics": [BASELINE_EXTERNAL_RESPONSE_INVALID], "state": None}
+
+
+@contextmanager
+def _baseline_submission_guard(run_dir: Path) -> Iterator[None]:
+    try:
+        before = os.stat(run_dir, follow_symlinks=False)
+    except (NotImplementedError, OSError, TypeError, ValueError) as error:
+        raise EvaluationIntegrityError("BASELINE_STORAGE_UNSAFE") from error
+    if not stat.S_ISDIR(before.st_mode):
+        raise EvaluationIntegrityError("BASELINE_STORAGE_UNSAFE")
+    identity = (before.st_dev, before.st_ino)
+    index = int(_sha256(f"{identity[0]}:{identity[1]}".encode())[:8], 16) % len(
+        _BASELINE_SUBMISSION_LOCKS
+    )
+    with _BASELINE_SUBMISSION_LOCKS[index]:
+        current = os.stat(run_dir, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != identity or not stat.S_ISDIR(current.st_mode):
+            raise EvaluationIntegrityError("BASELINE_STORAGE_UNSAFE")
+        yield
+        current = os.stat(run_dir, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != identity or not stat.S_ISDIR(current.st_mode):
+            raise EvaluationIntegrityError("BASELINE_STORAGE_UNSAFE")
+
+
+def guarded_submit_baseline_response_v1(
+    run_dir: Path,
+    payload: object,
+    *,
+    provider_name: str,
+    model_name: str,
+    judge_isolation: str,
+) -> JsonObject:
+    with _baseline_submission_guard(run_dir):
+        return _baseline_guarded_submit_unlocked(
+            run_dir,
+            payload,
+            provider_name=provider_name,
+            model_name=model_name,
+            judge_isolation=judge_isolation,
+        )
 
 
 def baseline_status_payload_v1(
@@ -15492,6 +16005,24 @@ def _baseline_load_correction(path: Path) -> JsonObject:
                 valid = action["relationship_id"] is not None and action["relationship"] is None
             if not valid:
                 raise ValueError
+            if action["requirement_id"] is not None and (
+                type(action["requirement_id"]) is not str
+                or re.fullmatch(r"REQ-[0-9]{4}", cast(str, action["requirement_id"])) is None
+            ):
+                raise ValueError
+            if action["relationship_id"] is not None and (
+                type(action["relationship_id"]) is not str
+                or re.fullmatch(r"REL-[0-9]{4}", cast(str, action["relationship_id"])) is None
+            ):
+                raise ValueError
+            if action["requirement"] is not None:
+                action["requirement"] = _baseline_checked_requirement(
+                    action["requirement"]
+                )
+            if action["relationship"] is not None:
+                action["relationship"] = _baseline_checked_relationship(
+                    action["relationship"]
+                )
             checked_actions.append(action)
         correction["actions"] = checked_actions
         expected = _sha256(
@@ -15504,6 +16035,227 @@ def _baseline_load_correction(path: Path) -> JsonObject:
         return correction
     except (EvaluationIntegrityError, OSError, TypeError, UnicodeError, ValueError) as error:
         raise BaselineInputError("BASELINE_CORRECTION_INVALID") from error
+
+
+def _baseline_checked_requirement(value: object) -> JsonObject:
+    requirement = _shape(
+        value,
+        required={
+            "requirement_id", "canonical_order", "statement", "kind", "importance",
+            "importance_basis", "importance_rationale", "passages", "dependency",
+            "confidence", "substantive_rationale",
+        },
+        location="baseline requirement",
+    )
+    if (
+        type(requirement["requirement_id"]) is not str
+        or re.fullmatch(r"REQ-[0-9]{4}", cast(str, requirement["requirement_id"])) is None
+        or type(requirement["canonical_order"]) is not int
+        or cast(int, requirement["canonical_order"]) < 0
+    ):
+        raise PortableEvaluationInputError("baseline requirement identity is invalid")
+    requirement["statement"] = _baseline_nonblank(
+        requirement["statement"], location="baseline requirement statement"
+    )
+    requirement["kind"] = _enum(
+        requirement["kind"], _BASELINE_KINDS, location="baseline requirement kind"
+    )
+    importance, basis, rationale = _baseline_importance(
+        requirement["importance"], requirement["importance_basis"],
+        requirement["importance_rationale"],
+    )
+    requirement["importance"] = importance
+    requirement["importance_basis"] = basis
+    requirement["importance_rationale"] = rationale
+    passages = _array(requirement["passages"], location="baseline resolved passages")
+    if not passages:
+        raise PortableEvaluationInputError("baseline resolved passages must be nonempty")
+    checked_passages: list[JsonObject] = []
+    for item in passages:
+        passage = _shape(
+            item,
+            required={"source_id", "quote", "start_char", "end_char"},
+            location="baseline resolved passage",
+        )
+        passage["source_id"] = _baseline_nonblank(
+            passage["source_id"], location="baseline resolved passage source"
+        )
+        passage["quote"] = _baseline_nonblank(
+            passage["quote"], location="baseline resolved passage quote"
+        )
+        if (
+            type(passage["start_char"]) is not int
+            or type(passage["end_char"]) is not int
+            or cast(int, passage["start_char"]) < 0
+            or cast(int, passage["end_char"]) <= cast(int, passage["start_char"])
+        ):
+            raise PortableEvaluationInputError("baseline resolved passage offsets are invalid")
+        checked_passages.append(passage)
+    requirement["passages"] = checked_passages
+    dependency = requirement["dependency"]
+    if dependency is not None:
+        checked_dependency = _shape(
+            dependency,
+            required={"relationship", "target_statement"},
+            location="baseline requirement dependency",
+        )
+        checked_dependency["relationship"] = _enum(
+            checked_dependency["relationship"], _BASELINE_RELATIONSHIPS,
+            location="baseline requirement dependency relationship",
+        )
+        checked_dependency["target_statement"] = _baseline_nonblank(
+            checked_dependency["target_statement"],
+            location="baseline requirement dependency target",
+        )
+        requirement["dependency"] = checked_dependency
+    requirement["confidence"] = _enum(
+        requirement["confidence"], {"clear", "ambiguous", "unresolved"},
+        location="baseline requirement confidence",
+    )
+    requirement["substantive_rationale"] = _baseline_nonblank(
+        requirement["substantive_rationale"],
+        location="baseline requirement substantive rationale",
+    )
+    return requirement
+
+
+def _baseline_checked_relationship(value: object) -> JsonObject:
+    relationship = _shape(
+        value,
+        required={
+            "relationship_id", "relationship", "source_requirement_id",
+            "target_requirement_id",
+        },
+        location="baseline relationship",
+    )
+    for field, pattern in (
+        ("relationship_id", r"REL-[0-9]{4}"),
+        ("source_requirement_id", r"REQ-[0-9]{4}"),
+        ("target_requirement_id", r"REQ-[0-9]{4}"),
+    ):
+        if type(relationship[field]) is not str or re.fullmatch(
+            pattern, cast(str, relationship[field])
+        ) is None:
+            raise PortableEvaluationInputError("baseline relationship identity is invalid")
+    relationship["relationship"] = _enum(
+        relationship["relationship"], _BASELINE_RELATIONSHIPS,
+        location="baseline relationship kind",
+    )
+    return relationship
+
+
+def _baseline_checked_canonical_baseline(value: object) -> JsonObject:
+    baseline = _shape(
+        value,
+        required={
+            "protocol_version", "legal_input_fingerprint", "requirements", "relationships",
+            "contested_requirements", "provenance", "prior_baseline_fingerprint",
+            "correction_record_fingerprint", "baseline_fingerprint",
+        },
+        location="canonical baseline",
+    )
+    if baseline["protocol_version"] != BASELINE_PROTOCOL_V1:
+        raise PortableEvaluationInputError("canonical baseline protocol is invalid")
+    for field in ("legal_input_fingerprint", "baseline_fingerprint"):
+        _hash(baseline[field], location=f"canonical baseline.{field}")
+    for field in ("prior_baseline_fingerprint", "correction_record_fingerprint"):
+        if baseline[field] is not None:
+            _hash(baseline[field], location=f"canonical baseline.{field}")
+    requirements = [
+        _baseline_checked_requirement(item)
+        for item in _array(baseline["requirements"], location="canonical requirements")
+    ]
+    if [item["requirement_id"] for item in requirements] != [
+        f"REQ-{index:04d}" for index in range(1, len(requirements) + 1)
+    ] or [item["canonical_order"] for item in requirements] != list(range(len(requirements))):
+        raise PortableEvaluationInputError("canonical requirement inventory is invalid")
+    contests: list[JsonObject] = []
+    for index, item in enumerate(
+        _array(baseline["contested_requirements"], location="canonical contests"), 1
+    ):
+        contest = _shape(
+            item,
+            required={
+                "contested_requirement_id", "reviewer_alternative", "auditor_alternative",
+                "unresolved_reason", "importance", "importance_basis",
+                "importance_rationale", "substantive_rationale",
+                "referee_fragment_fingerprint",
+            },
+            location="canonical contest",
+        )
+        if contest["contested_requirement_id"] != f"CONT-{index:04d}":
+            raise PortableEvaluationInputError("canonical contest identity is invalid")
+        alternatives: list[JsonObject] = []
+        for field in ("reviewer_alternative", "auditor_alternative"):
+            if contest[field] is not None:
+                alternatives.append(_baseline_checked_requirement(contest[field]))
+        expected_id = f"REQ-{len(requirements) + index:04d}"
+        expected_order = len(requirements) + index - 1
+        if not alternatives or any(
+            item["requirement_id"] != expected_id
+            or item["canonical_order"] != expected_order
+            for item in alternatives
+        ):
+            raise PortableEvaluationInputError("canonical contest alternatives are invalid")
+        contest["unresolved_reason"] = _enum(
+            contest["unresolved_reason"],
+            {"SOURCE_AMBIGUITY", "SOURCE_CONFLICT", "SOURCE_GAP", "BOTH_POSITIONS_UNSUPPORTED"},
+            location="canonical contest reason",
+        )
+        importance, basis, rationale = _baseline_importance(
+            contest["importance"], contest["importance_basis"],
+            contest["importance_rationale"],
+        )
+        contest["importance"] = importance
+        contest["importance_basis"] = basis
+        contest["importance_rationale"] = rationale
+        contest["substantive_rationale"] = _baseline_nonblank(
+            contest["substantive_rationale"], location="canonical contest rationale"
+        )
+        _hash(
+            contest["referee_fragment_fingerprint"],
+            location="canonical contest referee fingerprint",
+        )
+        contests.append(contest)
+    known = {cast(str, item["requirement_id"]) for item in requirements}
+    known.update(
+        cast(str, alternative["requirement_id"])
+        for contest in contests
+        for alternative in (contest["reviewer_alternative"], contest["auditor_alternative"])
+        if alternative is not None
+    )
+    relationships = [
+        _baseline_checked_relationship(item)
+        for item in _array(baseline["relationships"], location="canonical relationships")
+    ]
+    edges: list[tuple[object, object, object]] = []
+    for index, relationship in enumerate(relationships, 1):
+        source = relationship["source_requirement_id"]
+        target = relationship["target_requirement_id"]
+        if (
+            relationship["relationship_id"] != f"REL-{index:04d}"
+            or source not in known
+            or target not in known
+            or source == target
+        ):
+            raise PortableEvaluationInputError("canonical relationship inventory is invalid")
+        edges.append((relationship["relationship"], source, target))
+    if len(edges) != len(set(edges)):
+        raise PortableEvaluationInputError("canonical relationship inventory is duplicated")
+    provenance = _shape(
+        baseline["provenance"],
+        required={
+            "legal_input_fingerprint", "source_review_aggregate_fingerprint",
+            "source_audit_aggregate_fingerprint", "source_referee_aggregate_fingerprint",
+            "importance_policy_fingerprint", "compiler_contract_fingerprint",
+        },
+        location="canonical baseline provenance",
+    )
+    for field in provenance:
+        _hash(provenance[field], location=f"canonical baseline provenance.{field}")
+    if provenance["legal_input_fingerprint"] != baseline["legal_input_fingerprint"]:
+        raise PortableEvaluationInputError("canonical baseline provenance is unbound")
+    return baseline
 
 
 def _baseline_apply_correction(

@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import hashlib
 import importlib.util
 import json
@@ -6,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -2397,7 +2399,12 @@ def _complete_baseline_parity_pair(
     return control, full_run, portable_run
 
 
-def _reseal_baseline_parity_run(run: Path, changes: dict[str, bytes]) -> None:
+def _reseal_baseline_parity_run(
+    run: Path,
+    changes: dict[str, bytes],
+    *,
+    manifest_updates: dict[str, object] | None = None,
+) -> None:
     """Rehash changed artifacts and both outer manifest fingerprints only."""
     manifest_path = run / "baseline-manifest.json"
     manifest = json.loads(manifest_path.read_bytes())
@@ -2408,6 +2415,8 @@ def _reseal_baseline_parity_run(run: Path, changes: dict[str, bytes]) -> None:
         target.write_bytes(data)
         records[path]["artifact_hash"] = hashlib.sha256(data).hexdigest()
     manifest["artifacts"] = [records[path] for path in sorted(records)]
+    if manifest_updates is not None:
+        manifest.update(manifest_updates)
     manifest["root_hash"] = "0" * 64
     manifest["manifest_fingerprint"] = "0" * 64
     manifest["manifest_fingerprint"] = hashlib.sha256(
@@ -2424,6 +2433,146 @@ def _reseal_baseline_parity_run(run: Path, changes: dict[str, bytes]) -> None:
     ).hexdigest()
     manifest_path.chmod(0o600)
     manifest_path.write_bytes(_canonical_bytes(manifest))
+
+
+def _write_baseline_parity_correction(
+    tmp_path: Path, prior_run: Path, *, suffix: str, correction_id: str
+) -> Path:
+    manifest = json.loads((prior_run / "baseline-manifest.json").read_bytes())
+    baseline = json.loads((prior_run / "canonical-baseline.json").read_bytes())
+    replacement = dict(baseline["requirements"][0])
+    replacement["statement"] = f"The covered operator must file a notice {suffix}."
+    payload = {
+        "schema_version": "baseline-correction-v1",
+        "prior_baseline_root": manifest["root_hash"],
+        "prior_baseline_fingerprint": baseline["baseline_fingerprint"],
+        "correction_id": correction_id,
+        "actions": [
+            {
+                "action": "replace_requirement",
+                "requirement_id": replacement["requirement_id"],
+                "relationship_id": None,
+                "requirement": replacement,
+                "relationship": None,
+            }
+        ],
+        "reason": "The attorney approved a source-bound wording correction.",
+        "attorney_approval": {
+            "approved_by": "Fictional Reviewing Attorney",
+            "approved_at": "2026-08-24T20:00:00-07:00",
+            "approval_statement": "I approve this source-bound baseline correction.",
+        },
+        "correction_fingerprint": "0" * 64,
+    }
+    payload["correction_fingerprint"] = hashlib.sha256(
+        _canonical_bytes(
+            {key: value for key, value in payload.items() if key != "correction_fingerprint"}
+        )
+    ).hexdigest()
+    path = tmp_path / f"correction-{suffix}.json"
+    path.write_bytes(_canonical_bytes(payload))
+    return path
+
+
+def _correct_baseline_parity_pair(
+    tmp_path: Path,
+    control: Path,
+    full_prior: Path,
+    portable_prior: Path,
+    *,
+    full_ancestry: tuple[Path, ...] = (),
+    portable_ancestry: tuple[Path, ...] = (),
+    suffix: str,
+    correction_id: str,
+) -> tuple[Path, Path]:
+    correction = _write_baseline_parity_correction(
+        tmp_path, full_prior, suffix=suffix, correction_id=correction_id
+    )
+    full_run = tmp_path / f"full-corrected-{suffix}"
+    portable_run = tmp_path / f"portable-corrected-{suffix}"
+    shared = (
+        "eval-baseline-init", "--input", str(control), "--nonce-hex", "7" * 64,
+        "--correction", str(correction),
+    )
+    full_priors = tuple(
+        item for prior in (*full_ancestry, full_prior) for item in ("--prior-baseline", str(prior))
+    )
+    portable_priors = tuple(
+        item
+        for prior in (*portable_ancestry, portable_prior)
+        for item in ("--prior-baseline", str(prior))
+    )
+    _assert_baseline_surface_parity(
+        (*shared, *full_priors, "--run", str(full_run)),
+        (*shared, *portable_priors, "--run", str(portable_run)),
+    )
+    assert _run_snapshot(portable_run) == _run_snapshot(full_run)
+    return full_run, portable_run
+
+
+def _rewrite_baseline_proof_attack(run: Path, attack: str) -> None:
+    proof = json.loads((run / "correction-proof.json").read_bytes())
+    nodes = proof["nodes"]
+    assert len(nodes) == 2
+    if attack == "tampered-resealed":
+        node = nodes[0]
+        artifact = next(
+            item for item in node["artifacts"]
+            if item["artifact_path"] == "canonical-baseline.json"
+        )
+        baseline = json.loads(artifact["artifact_json"])
+        baseline["requirements"][0]["substantive_rationale"] = "Forged ancestor rationale."
+        baseline["baseline_fingerprint"] = "0" * 64
+        unsigned_baseline = dict(baseline)
+        unsigned_baseline.pop("baseline_fingerprint")
+        baseline["baseline_fingerprint"] = hashlib.sha256(
+            _canonical_bytes(unsigned_baseline)
+        ).hexdigest()
+        artifact["artifact_json"] = _canonical_bytes(baseline).decode()
+        artifact["artifact_hash"] = hashlib.sha256(
+            artifact["artifact_json"].encode()
+        ).hexdigest()
+        ancestor_manifest = json.loads(node["manifest_json"])
+        for record in ancestor_manifest["artifacts"]:
+            if record["artifact_path"] == "canonical-baseline.json":
+                record["artifact_hash"] = artifact["artifact_hash"]
+        ancestor_manifest["baseline_fingerprint"] = baseline["baseline_fingerprint"]
+        ancestor_manifest["root_hash"] = "0" * 64
+        ancestor_manifest["manifest_fingerprint"] = "0" * 64
+        ancestor_manifest["manifest_fingerprint"] = hashlib.sha256(
+            _canonical_bytes(
+                {
+                    key: value for key, value in ancestor_manifest.items()
+                    if key not in {"manifest_fingerprint", "root_hash"}
+                }
+            )
+        ).hexdigest()
+        ancestor_manifest["root_hash"] = hashlib.sha256(
+            _canonical_bytes(
+                {key: value for key, value in ancestor_manifest.items() if key != "root_hash"}
+            )
+        ).hexdigest()
+        node["manifest_json"] = _canonical_bytes(ancestor_manifest).decode()
+    elif attack == "omitted-prefix":
+        proof["nodes"] = nodes[1:]
+    elif attack == "reordered":
+        proof["nodes"] = list(reversed(nodes))
+    elif attack == "disconnected-prefix":
+        node = nodes[0]
+        manifest = json.loads(node["manifest_json"])
+        manifest["root_hash"] = "f" * 64
+        node["manifest_json"] = _canonical_bytes(manifest).decode()
+    else:
+        assert attack == "truncated-prefix"
+        proof["nodes"] = nodes[:1]
+    unsigned = {"schema_version": proof["schema_version"], "nodes": proof["nodes"]}
+    proof["proof_fingerprint"] = hashlib.sha256(_canonical_bytes(unsigned)).hexdigest()
+    proof_bytes = _canonical_bytes(proof)
+    _reseal_baseline_parity_run(
+        run,
+        {"correction-proof.json": proof_bytes},
+        manifest_updates={"correction_proof_fingerprint": proof["proof_fingerprint"]},
+    )
 
 
 def test_baseline_parity_stable_zero_dispute_lifecycle_and_complete_tree(
@@ -3039,6 +3188,532 @@ def test_baseline_parity_transition_failure_preserves_owned_trees(
         parked_snapshots[label] = _run_snapshot(parked)
         assert set(before).issubset(parked_snapshots[label])
     assert parked_snapshots["portable"] == parked_snapshots["full"]
+
+
+@pytest.mark.parametrize(
+    "attack",
+    (
+        "tampered-resealed",
+        "omitted-prefix",
+        "reordered",
+        "disconnected-prefix",
+        "truncated-prefix",
+    ),
+)
+def test_baseline_review_fix_multihop_proof_attacks_match_full(
+    tmp_path: Path, attack: str
+) -> None:
+    """Deleting oldest-to-newest replay makes a two-hop proof attack pass portably."""
+    control, full_zero, portable_zero = _complete_baseline_parity_pair(
+        tmp_path, suffix=f"proof-zero-{attack}"
+    )
+    full_one, portable_one = _correct_baseline_parity_pair(
+        tmp_path,
+        control,
+        full_zero,
+        portable_zero,
+        suffix=f"proof-one-{attack}",
+        correction_id="CORR-0001",
+    )
+    full_two, portable_two = _correct_baseline_parity_pair(
+        tmp_path,
+        control,
+        full_one,
+        portable_one,
+        full_ancestry=(full_zero,),
+        portable_ancestry=(portable_zero,),
+        suffix=f"proof-two-{attack}",
+        correction_id="CORR-0002",
+    )
+    full_attack = tmp_path / f"full-proof-attack-{attack}"
+    portable_attack = tmp_path / f"portable-proof-attack-{attack}"
+    shutil.copytree(full_two, full_attack)
+    shutil.copytree(portable_two, portable_attack)
+    _rewrite_baseline_proof_attack(full_attack, attack)
+    _rewrite_baseline_proof_attack(portable_attack, attack)
+    full = _run_baseline_surface(
+        SKILL_RUNNER, "eval-baseline-verify", "--run", str(full_attack)
+    )
+    portable = _run_baseline_surface(
+        PORTABLE_RUNNER, "eval-baseline-verify", "--run", str(portable_attack)
+    )
+    assert (portable.returncode, portable.stdout, portable.stderr) == (
+        full.returncode, full.stdout, full.stderr
+    )
+    assert full.returncode == 5
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("source-extra", "authority-extra", "source-type", "client-facts-type"),
+)
+def test_baseline_review_fix_nested_input_is_as_strict_as_full(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Removing nested input checks makes malformed legal identity portable-only valid."""
+    control = _baseline_cli_control(tmp_path)
+    portable_run = tmp_path / f"portable-input-{mutation}"
+    initialized = _run_baseline_surface(
+        PORTABLE_RUNNER,
+        "eval-baseline-init", "--input", str(control), "--run", str(portable_run),
+        "--nonce-hex", "6" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    raw = json.loads((portable_run / "baseline-input.json").read_bytes())
+    if mutation == "source-extra":
+        raw["sources"][0]["unknown_nested_key"] = True
+    elif mutation == "authority-extra":
+        raw["requested_authorities"][0]["unknown_nested_key"] = True
+    elif mutation == "source-type":
+        raw["sources"][0]["normalized_text"] = 7
+    else:
+        raw["client_facts"] = 7
+    portable_spec = importlib.util.spec_from_file_location(
+        f"attorney_eval_portable_input_{mutation}",
+        ROOT / "scripts" / "attorney_eval_portable.py",
+    )
+    assert portable_spec is not None and portable_spec.loader is not None
+    portable = importlib.util.module_from_spec(portable_spec)
+    sys.modules[portable_spec.name] = portable
+    portable_spec.loader.exec_module(portable)
+    raw["legal_input_fingerprint"] = hashlib.sha256(
+        _canonical_bytes(portable._baseline_legal_projection(raw))
+    ).hexdigest()
+
+    from regulatory_harvest.evaluation.attorney_baseline_models import BaselineInputV1
+
+    full_raw = json.loads(_canonical_bytes(raw))
+    full_raw["evaluation_rubric_bytes"] = full_raw["evaluation_rubric_bytes"].encode()
+    full_raw["importance_policy_bytes"] = full_raw["importance_policy_bytes"].encode()
+    with pytest.raises(ValueError):
+        BaselineInputV1.model_validate(full_raw)
+    with pytest.raises((portable.EvaluationIntegrityError, portable.PortableEvaluationInputError)):
+        portable._baseline_validate_input(raw)
+
+
+@pytest.mark.parametrize("mutation", ("requirement-extra", "relationship-extra"))
+def test_baseline_review_fix_nested_correction_is_as_strict_as_full(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Nested correction values must reject extras before any canonical baseline write."""
+    requirement = {
+        "requirement_id": "REQ-0002",
+        "canonical_order": 1,
+        "statement": "The notice must identify the operator.",
+        "kind": "obligation",
+        "importance": "material",
+        "importance_basis": ["attorney_briefing"],
+        "importance_rationale": "Necessary for a competent attorney briefing.",
+        "passages": [
+            {
+                "source_id": "source-1", "quote": "presentará aviso",
+                "start_char": 32, "end_char": 48,
+            }
+        ],
+        "dependency": None,
+        "confidence": "clear",
+        "substantive_rationale": "The source supports the corrected requirement.",
+    }
+    relationship = {
+        "relationship_id": "REL-0001",
+        "relationship": "depends_on",
+        "source_requirement_id": "REQ-0001",
+        "target_requirement_id": "REQ-0002",
+    }
+    if mutation == "requirement-extra":
+        requirement["unknown_nested_key"] = True
+        action = {
+            "action": "add_requirement", "requirement_id": None,
+            "relationship_id": None, "requirement": requirement, "relationship": None,
+        }
+    else:
+        relationship["unknown_nested_key"] = True
+        action = {
+            "action": "add_relationship", "requirement_id": None,
+            "relationship_id": None, "requirement": None, "relationship": relationship,
+        }
+    payload = {
+        "schema_version": "baseline-correction-v1",
+        "prior_baseline_root": "a" * 64,
+        "prior_baseline_fingerprint": "b" * 64,
+        "correction_id": "CORR-0001",
+        "actions": [action],
+        "reason": "The attorney approved the exact source-bound correction.",
+        "attorney_approval": {
+            "approved_by": "Fictional Reviewing Attorney",
+            "approved_at": "2026-08-24T20:00:00-07:00",
+            "approval_statement": "I approve this exact source-bound correction.",
+        },
+        "correction_fingerprint": "0" * 64,
+    }
+    payload["correction_fingerprint"] = hashlib.sha256(
+        _canonical_bytes(
+            {key: value for key, value in payload.items() if key != "correction_fingerprint"}
+        )
+    ).hexdigest()
+    path = tmp_path / f"nested-{mutation}.json"
+    path.write_bytes(_canonical_bytes(payload))
+    from regulatory_harvest.evaluation.attorney_baseline_models import (
+        BaselineCorrectionRecordV1,
+    )
+
+    with pytest.raises(ValueError):
+        BaselineCorrectionRecordV1.model_validate_json(path.read_bytes())
+    portable_spec = importlib.util.spec_from_file_location(
+        f"attorney_eval_portable_correction_{mutation}",
+        ROOT / "scripts" / "attorney_eval_portable.py",
+    )
+    assert portable_spec is not None and portable_spec.loader is not None
+    portable = importlib.util.module_from_spec(portable_spec)
+    sys.modules[portable_spec.name] = portable
+    portable_spec.loader.exec_module(portable)
+    with pytest.raises(portable.BaselineInputError):
+        portable._baseline_load_correction(path)
+
+
+def test_baseline_review_fix_sealed_crash_boundary_matches_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after sealing resumes verification without repeating accepted work."""
+    control = _baseline_cli_control(tmp_path)
+    full_run = tmp_path / "sealed-full"
+    portable_run = tmp_path / "sealed-portable"
+    common = ("--input", str(control), "--nonce-hex", "7" * 64)
+    _assert_baseline_surface_parity(
+        ("eval-baseline-init", *common, "--run", str(full_run)),
+        ("eval-baseline-init", *common, "--run", str(portable_run)),
+    )
+    review_payload = {
+        "proposals": [
+            {
+                "statement": "A covered operator must file notice.",
+                "kind": "obligation",
+                "importance": "critical",
+                "importance_basis": ["legal_bottom_line"],
+                "importance_rationale": "Omission could change the legal bottom line.",
+                "passages": [{"source_id": "source-1", "quote": "presentará aviso"}],
+                "dependency": None,
+                "confidence": "clear",
+                "substantive_rationale": "The fictional rule uses mandatory language.",
+            }
+        ],
+        "review_complete": True,
+    }
+    review_response = tmp_path / "sealed-review.json"
+    review_response.write_bytes(_canonical_bytes(review_payload))
+    flags = (
+        "--response", str(review_response), "--provider-name", "fictional-provider",
+        "--model-name", "fictional-model", "--judge-isolation", "scripted_fixture",
+    )
+    _assert_baseline_surface_parity(
+        ("eval-baseline-submit-safe", "--run", str(full_run), *flags),
+        ("eval-baseline-submit-safe", "--run", str(portable_run), *flags),
+    )
+    audit_payload = {
+        "concerns": [],
+        "importance_findings": [
+            {
+                "proposal_ref": "PR-0001",
+                "reviewed_importance": "critical",
+                "reviewed_importance_basis": ["legal_bottom_line"],
+                "importance_rationale": "Omission could change the legal bottom line.",
+                "disposition": "agree",
+            }
+        ],
+        "audit_complete": True,
+    }
+    from regulatory_harvest.evaluation import attorney_baseline_artifacts as full_artifacts
+    from regulatory_harvest.evaluation.attorney_baseline_workflow import (
+        guarded_submit_baseline_response_v1 as full_submit,
+    )
+
+    portable_spec = importlib.util.spec_from_file_location(
+        "attorney_eval_portable_sealed_crash",
+        ROOT / "scripts" / "attorney_eval_portable.py",
+    )
+    assert portable_spec is not None and portable_spec.loader is not None
+    portable = importlib.util.module_from_spec(portable_spec)
+    sys.modules[portable_spec.name] = portable
+    portable_spec.loader.exec_module(portable)
+
+    original_full_commit = full_artifacts.commit_baseline_transition_v1
+
+    def crash_after_full_seal(*args: object, **kwargs: object) -> object:
+        successor = args[3]
+        result = original_full_commit(*args, **kwargs)
+        if successor.phase.value == "baseline_sealed":
+            raise full_artifacts.EvaluationIntegrityError("injected crash after seal")
+        return result
+
+    monkeypatch.setattr(full_artifacts, "commit_baseline_transition_v1", crash_after_full_seal)
+    with pytest.raises(full_artifacts.EvaluationIntegrityError):
+        full_submit(
+            full_run, audit_payload, provider_name="fictional-provider",
+            model_name="fictional-model", judge_isolation="scripted_fixture",
+        )
+    monkeypatch.setattr(
+        full_artifacts, "commit_baseline_transition_v1", original_full_commit
+    )
+
+    original_portable_commit = portable._baseline_commit
+
+    def crash_after_portable_seal(*args: object, **kwargs: object) -> object:
+        successor = original_portable_commit(*args, **kwargs)
+        if successor["phase"] == "baseline_sealed":
+            raise portable.EvaluationIntegrityError("injected crash after seal")
+        return successor
+
+    monkeypatch.setattr(portable, "_baseline_commit", crash_after_portable_seal)
+    with pytest.raises(portable.EvaluationIntegrityError):
+        portable.guarded_submit_baseline_response_v1(
+            portable_run, audit_payload, provider_name="fictional-provider",
+            model_name="fictional-model", judge_isolation="scripted_fixture",
+        )
+    monkeypatch.setattr(portable, "_baseline_commit", original_portable_commit)
+
+    assert json.loads((full_run / "baseline-manifest.json").read_bytes())["phase"] == (
+        "baseline_sealed"
+    )
+    assert _run_snapshot(portable_run) == _run_snapshot(full_run)
+    _assert_baseline_surface_parity(
+        ("eval-baseline-status", "--run", str(full_run)),
+        ("eval-baseline-status", "--run", str(portable_run)),
+    )
+    _assert_baseline_surface_parity(
+        ("eval-baseline-verify", "--run", str(full_run)),
+        ("eval-baseline-verify", "--run", str(portable_run)),
+    )
+    _assert_baseline_surface_parity(
+        ("eval-baseline-next", "--run", str(full_run)),
+        ("eval-baseline-next", "--run", str(portable_run)),
+    )
+    manifest = json.loads((portable_run / "baseline-manifest.json").read_bytes())
+    assert manifest["phase"] == "completed"
+    assert len(manifest["accepted_calls"]) == 2
+    assert _run_snapshot(portable_run) == _run_snapshot(full_run)
+
+
+@pytest.mark.parametrize("failure_type", (RuntimeError, OSError, ValueError))
+def test_baseline_review_fix_provider_exception_taxonomy_matches_full(
+    tmp_path: Path, failure_type: type[Exception]
+) -> None:
+    """Ordinary provider exceptions pause without mutating the pending request."""
+    control = _baseline_cli_control(tmp_path)
+    full_run = tmp_path / f"provider-full-{failure_type.__name__}"
+    portable_run = tmp_path / f"provider-portable-{failure_type.__name__}"
+    common = ("--input", str(control), "--nonce-hex", "5" * 64)
+    _assert_baseline_surface_parity(
+        ("eval-baseline-init", *common, "--run", str(full_run)),
+        ("eval-baseline-init", *common, "--run", str(portable_run)),
+    )
+    before_full = _run_snapshot(full_run)
+    before_portable = _run_snapshot(portable_run)
+
+    class FailingEvaluator:
+        provider_name = "fictional-provider"
+        model_name = "fictional-model"
+        judge_isolation = "scripted_fixture"
+
+        async def evaluate_draft(self, prompt: object) -> object:
+            del prompt
+            raise failure_type("private provider detail")
+
+    from regulatory_harvest.evaluation.attorney_baseline_workflow import (
+        continue_baseline_v1 as full_continue,
+    )
+
+    portable_spec = importlib.util.spec_from_file_location(
+        f"attorney_eval_portable_provider_{failure_type.__name__}",
+        ROOT / "scripts" / "attorney_eval_portable.py",
+    )
+    assert portable_spec is not None and portable_spec.loader is not None
+    portable = importlib.util.module_from_spec(portable_spec)
+    sys.modules[portable_spec.name] = portable
+    portable_spec.loader.exec_module(portable)
+    full = asyncio.run(full_continue(full_run, FailingEvaluator(), max_roles=1))
+    observed = asyncio.run(
+        portable.continue_baseline_v1(portable_run, FailingEvaluator(), max_roles=1)
+    )
+    assert (
+        observed.exit_code,
+        observed.engine_paused,
+        observed.pause_reason_codes,
+        observed.state,
+        observed.pending_request,
+    ) == (
+        full.exit_code,
+        full.engine_paused,
+        full.pause_reason_codes,
+        full.state.model_dump(mode="json"),
+        None if full.pending_request is None else full.pending_request.model_dump(mode="json"),
+    )
+    assert _run_snapshot(full_run) == before_full
+    assert _run_snapshot(portable_run) == before_portable
+
+
+def test_baseline_review_fix_concurrent_submit_matches_full(tmp_path: Path) -> None:
+    """Concurrent duplicate drafts accept once and safely refuse every stale duplicate."""
+    control = _baseline_cli_control(tmp_path)
+    full_run = tmp_path / "submit-full"
+    portable_run = tmp_path / "submit-portable"
+    common = ("--input", str(control), "--nonce-hex", "4" * 64)
+    _assert_baseline_surface_parity(
+        ("eval-baseline-init", *common, "--run", str(full_run)),
+        ("eval-baseline-init", *common, "--run", str(portable_run)),
+    )
+    payload = {
+        "proposals": [
+            {
+                "statement": "A covered operator must file notice.",
+                "kind": "obligation",
+                "importance": "critical",
+                "importance_basis": ["legal_bottom_line"],
+                "importance_rationale": "Omission could change the legal bottom line.",
+                "passages": [{"source_id": "source-1", "quote": "presentará aviso"}],
+                "dependency": None,
+                "confidence": "clear",
+                "substantive_rationale": "The fictional rule uses mandatory language.",
+            }
+        ],
+        "review_complete": True,
+    }
+    from regulatory_harvest.evaluation.attorney_baseline_workflow import (
+        guarded_submit_baseline_response_v1 as full_submit,
+    )
+
+    portable_spec = importlib.util.spec_from_file_location(
+        "attorney_eval_portable_concurrent_submit",
+        ROOT / "scripts" / "attorney_eval_portable.py",
+    )
+    assert portable_spec is not None and portable_spec.loader is not None
+    portable = importlib.util.module_from_spec(portable_spec)
+    sys.modules[portable_spec.name] = portable
+    portable_spec.loader.exec_module(portable)
+
+    def batch(submit: object, run: Path) -> list[tuple[bool, tuple[str, ...]]]:
+        barrier = threading.Barrier(8)
+
+        def one() -> tuple[bool, tuple[str, ...]]:
+            barrier.wait()
+            result = submit(  # type: ignore[operator]
+                run, payload, provider_name="fictional-provider",
+                model_name="fictional-model", judge_isolation="scripted_fixture",
+            )
+            if isinstance(result, dict):
+                return bool(result["accepted"]), tuple(result["diagnostics"])
+            return result.accepted, tuple(result.issue_codes)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(one) for _ in range(8)]
+            return sorted(future.result() for future in futures)
+
+    assert batch(portable.guarded_submit_baseline_response_v1, portable_run) == batch(
+        full_submit, full_run
+    )
+    assert _run_snapshot(portable_run) == _run_snapshot(full_run)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "requirement-identity",
+        "relationship-inventory",
+        "contested-inventory",
+        "provenance-binding",
+        "baseline-fingerprint",
+    ),
+)
+def test_baseline_review_fix_projection_semantic_mutations_match_full(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Every gradeable semantic identity remains downstream of verified run replay."""
+    _, full_run, portable_run = _complete_baseline_parity_pair(
+        tmp_path, suffix=f"projection-{mutation}"
+    )
+    for run in (full_run, portable_run):
+        baseline = json.loads((run / "canonical-baseline.json").read_bytes())
+        if mutation == "requirement-identity":
+            baseline["requirements"][0]["statement"] += " Tampered."
+        elif mutation == "relationship-inventory":
+            baseline["relationships"] = [
+                {
+                    "relationship_id": "REL-0001",
+                    "relationship": "depends_on",
+                    "source_requirement_id": "REQ-0001",
+                    "target_requirement_id": "REQ-0001",
+                }
+            ]
+        elif mutation == "contested-inventory":
+            baseline["contested_requirements"] = [
+                {
+                    "contested_requirement_id": "CONT-0001",
+                    "reviewer_alternative": None,
+                    "auditor_alternative": None,
+                    "unresolved_reason": "SOURCE_GAP",
+                    "importance": "critical",
+                    "importance_basis": ["legal_bottom_line"],
+                    "importance_rationale": "Omission could change the legal bottom line.",
+                    "substantive_rationale": "The source remains unresolved.",
+                    "referee_fragment_fingerprint": "a" * 64,
+                }
+            ]
+        elif mutation == "provenance-binding":
+            baseline["provenance"]["legal_input_fingerprint"] = "b" * 64
+        else:
+            baseline["baseline_fingerprint"] = "c" * 64
+        if mutation != "baseline-fingerprint":
+            baseline["baseline_fingerprint"] = hashlib.sha256(
+                _canonical_bytes(
+                    {key: value for key, value in baseline.items() if key != "baseline_fingerprint"}
+                )
+            ).hexdigest()
+        _reseal_baseline_parity_run(
+            run,
+            {"canonical-baseline.json": _canonical_bytes(baseline)},
+            manifest_updates={"baseline_fingerprint": baseline["baseline_fingerprint"]},
+        )
+    _assert_baseline_surface_parity(
+        ("eval-baseline-verify", "--run", str(full_run)),
+        ("eval-baseline-verify", "--run", str(portable_run)),
+    )
+    full = _run_baseline_surface(
+        SKILL_RUNNER, "eval-baseline-verify", "--run", str(full_run)
+    )
+    assert full.returncode == 5
+
+
+def test_baseline_review_fix_report_only_revision_reuses_grade_target(tmp_path: Path) -> None:
+    """Distinct report bytes have no field in the verified grade-target projection."""
+    _, full_run, portable_run = _complete_baseline_parity_pair(
+        tmp_path, suffix="report-only-grade-target"
+    )
+    report_a = b"First report revision."
+    report_b = b"Materially different second report revision."
+    assert report_a != report_b
+    portable_spec = importlib.util.spec_from_file_location(
+        "attorney_eval_portable_report_only_projection",
+        ROOT / "scripts" / "attorney_eval_portable.py",
+    )
+    assert portable_spec is not None and portable_spec.loader is not None
+    portable = importlib.util.module_from_spec(portable_spec)
+    sys.modules[portable_spec.name] = portable
+    portable_spec.loader.exec_module(portable)
+    projection_a = portable._baseline_gradeable_projection_bytes_for_test(
+        _run_snapshot(portable_run)
+    )
+    projection_b = portable._baseline_gradeable_projection_bytes_for_test(
+        _run_snapshot(portable_run)
+    )
+    assert projection_a == projection_b
+    assert report_a not in projection_a and report_b not in projection_b
+
+    from regulatory_harvest.evaluation.attorney_baseline_projection import (
+        project_gradeable_baseline_v1,
+    )
+
+    full_projection = project_gradeable_baseline_v1(load_verified_baseline_run(full_run))
+    portable_projection = json.loads(projection_a)
+    assert portable_projection["binding"] == full_projection.binding.model_dump(mode="json")
 
 
 def test_baseline_full_runner_exposes_exact_commands_safe_status_and_exit_mapping(
