@@ -5,6 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
+import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
@@ -421,12 +424,19 @@ def _reseal_manifest(run_dir: Path, mutate: Mapping[str, bytes]) -> None:
         target.write_bytes(data)
         artifacts[path]["artifact_hash"] = sha256_digest(data)
     raw["artifacts"] = [artifacts[path] for path in sorted(artifacts)]
+    raw["root_hash"] = "0" * 64
     raw["manifest_fingerprint"] = "0" * 64
     provisional = BaselineManifestV1.model_validate(raw)
     raw["manifest_fingerprint"] = sha256_digest(
         canonical_json_bytes(
-            provisional.model_dump(mode="json", exclude={"manifest_fingerprint"})
+            provisional.model_dump(
+                mode="json", exclude={"manifest_fingerprint", "root_hash"}
+            )
         )
+    )
+    with_fingerprint = BaselineManifestV1.model_validate(raw)
+    raw["root_hash"] = sha256_digest(
+        canonical_json_bytes(with_fingerprint.model_dump(mode="json", exclude={"root_hash"}))
     )
     manifest_path.chmod(0o600)
     manifest_path.write_bytes(canonical_json_bytes(raw))
@@ -449,6 +459,75 @@ def test_terminal_inventory_and_verified_context_are_exact(tmp_path: Path) -> No
     assert context.verification == BaselineVerificationV1(valid=True)
     assert set(_artifact_paths(context.manifest)) == set(files_by_path)
     assert set(_snapshot(run_dir)) == {BASELINE_MANIFEST_PATH, *files_by_path}
+
+
+def test_verified_context_is_recursively_immutable(tmp_path: Path) -> None:
+    _, files_by_path, manifest = _complete_graph()
+    run_dir = tmp_path / "immutable-context"
+    initialize_baseline_storage_v1(run_dir, manifest, files_by_path)
+    context = load_verified_baseline_run(run_dir)
+    before = _snapshot(run_dir)
+
+    with pytest.raises((AttributeError, TypeError, ValueError)):
+        context.manifest.artifacts[0].artifact_hash = "f" * 64
+    with pytest.raises((AttributeError, TypeError, ValueError)):
+        context.baseline_input.sources[0].title = "mutated"
+    with pytest.raises((AttributeError, TypeError, ValueError)):
+        context.baseline_input.requested_authorities[0].source_ids.append("other")
+
+    assert _snapshot(run_dir) == before
+    assert verify_baseline_run(run_dir).valid
+
+
+def test_terminal_manifest_binds_calls_aggregates_and_root(tmp_path: Path) -> None:
+    _, files_by_path, manifest = _complete_graph()
+    run_dir = tmp_path / "manifest-bindings"
+    committed = initialize_baseline_storage_v1(run_dir, manifest, files_by_path)
+    context = load_verified_baseline_run(run_dir)
+
+    assert committed.pending_call is None
+    assert [call.call_id for call in committed.accepted_calls] == [
+        "source-review-0001",
+        "source-audit-0001",
+    ]
+    assert committed.source_review_aggregate_fingerprint == (
+        context.baseline.provenance.source_review_aggregate_fingerprint
+    )
+    assert committed.source_audit_aggregate_fingerprint == (
+        context.baseline.provenance.source_audit_aggregate_fingerprint
+    )
+    assert committed.source_referee_aggregate_fingerprint == (
+        context.baseline.provenance.source_referee_aggregate_fingerprint
+    )
+    assert committed.prior_baseline_root is None
+    assert committed.prior_baseline_fingerprint is None
+    assert committed.correction_record_fingerprint is None
+    assert committed.root_hash != "0" * 64
+
+
+def test_sealed_baseline_without_persisted_verification_cannot_load(
+    tmp_path: Path,
+) -> None:
+    baseline_input, complete, terminal_manifest = _complete_graph()
+    files_by_path = {
+        path: data
+        for path, data in complete.items()
+        if path != BASELINE_VERIFICATION_PATH
+    }
+    run_dir = tmp_path / "sealed-without-receipt"
+    initialize_baseline_storage_v1(
+        run_dir,
+        _manifest(
+            baseline_input,
+            BaselinePhaseV1.BASELINE_SEALED,
+            baseline_fingerprint=terminal_manifest.baseline_fingerprint,
+        ),
+        files_by_path,
+    )
+
+    assert verify_baseline_run(run_dir).valid
+    with pytest.raises(EvaluationIntegrityError, match="BASELINE_RESULT_REQUIRED"):
+        load_verified_baseline_run(run_dir)
 
 
 @pytest.mark.parametrize(
@@ -508,6 +587,61 @@ def test_each_nonterminal_phase_has_one_exact_manifest_inventory(
     )
     assert _artifact_paths(committed) == tuple(sorted(selected))
     assert verify_baseline_run(tmp_path / phase.value).valid
+
+
+def test_pending_call_is_exactly_bound_by_the_manifest(tmp_path: Path) -> None:
+    baseline_input, complete, _ = _complete_graph()
+    run_dir = tmp_path / "pending-binding"
+    committed = initialize_baseline_storage_v1(
+        run_dir,
+        _manifest(baseline_input, BaselinePhaseV1.SOURCE_REVIEW),
+        {
+            BASELINE_INPUT_PATH: complete[BASELINE_INPUT_PATH],
+            _REVIEW_REQUEST: complete[_REVIEW_REQUEST],
+        },
+    )
+
+    assert committed.accepted_calls == ()
+    assert committed.pending_call is not None
+    assert committed.pending_call.call_id == "source-review-0001"
+    assert committed.pending_call.request_artifact_path == _REVIEW_REQUEST
+    assert committed.pending_call.response_artifact_path is None
+    assert committed.pending_call.response_fingerprint is None
+
+
+def test_replay_rejects_rehashed_manifest_call_and_root_tamper(tmp_path: Path) -> None:
+    _, files_by_path, manifest = _complete_graph()
+    call_dir = tmp_path / "call-binding-tamper"
+    initialize_baseline_storage_v1(call_dir, manifest, files_by_path)
+    manifest_path = call_dir / BASELINE_MANIFEST_PATH
+    raw = json.loads(manifest_path.read_bytes())
+    raw["accepted_calls"][0]["response_fingerprint"] = "f" * 64
+    raw["root_hash"] = "0" * 64
+    raw["manifest_fingerprint"] = "0" * 64
+    provisional = BaselineManifestV1.model_validate(raw)
+    raw["manifest_fingerprint"] = sha256_digest(
+        canonical_json_bytes(
+            provisional.model_dump(
+                mode="json", exclude={"manifest_fingerprint", "root_hash"}
+            )
+        )
+    )
+    with_fingerprint = BaselineManifestV1.model_validate(raw)
+    raw["root_hash"] = sha256_digest(
+        canonical_json_bytes(with_fingerprint.model_dump(mode="json", exclude={"root_hash"}))
+    )
+    manifest_path.chmod(0o600)
+    manifest_path.write_bytes(canonical_json_bytes(raw))
+    assert not verify_baseline_run(call_dir).valid
+
+    root_dir = tmp_path / "root-tamper"
+    initialize_baseline_storage_v1(root_dir, manifest, files_by_path)
+    root_manifest = root_dir / BASELINE_MANIFEST_PATH
+    root_raw = json.loads(root_manifest.read_bytes())
+    root_raw["root_hash"] = "f" * 64
+    root_manifest.chmod(0o600)
+    root_manifest.write_bytes(canonical_json_bytes(root_raw))
+    assert not verify_baseline_run(root_dir).valid
 
 
 def test_referee_phase_and_terminal_history_are_reconstructed_from_bytes(
@@ -670,12 +804,12 @@ def test_transition_rolls_back_after_post_commit_replay_failure(
     original = baseline_artifacts._verify_or_raise
     calls = 0
 
-    def fail_third(storage: object) -> object:
+    def fail_third(storage: object, **kwargs: object) -> object:
         nonlocal calls
         calls += 1
         if calls == 3:
             raise EvaluationIntegrityError("injected post-commit replay failure")
-        return original(storage)  # type: ignore[arg-type]
+        return original(storage, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(baseline_artifacts, "_verify_or_raise", fail_third)
     with pytest.raises(EvaluationIntegrityError, match="post-commit replay"):
@@ -767,10 +901,10 @@ def test_concurrent_verify_never_observes_a_mixed_transition(
         shared_artifacts._PosixRunStorage, "atomic_write", pause_after_artifact
     )
 
-    def observe_verify(storage: object) -> object:
+    def observe_verify(storage: object, **kwargs: object) -> object:
         if artifact_visible.is_set() and not release_writer.is_set():
             verifier_entered_mixed_state.set()
-        return original_verify(storage)  # type: ignore[arg-type]
+        return original_verify(storage, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(baseline_artifacts, "_verify_or_raise", observe_verify)
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -791,6 +925,78 @@ def test_concurrent_verify_never_observes_a_mixed_transition(
     assert not observed_mixed
     assert verification.valid
     assert verify_baseline_run(run_dir).valid
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cross-process lock proof")
+def test_cross_process_alias_verify_never_observes_a_mixed_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    baseline_input, complete, _ = _complete_graph()
+    run_dir = tmp_path / "cross-process"
+    current = initialize_baseline_storage_v1(
+        run_dir,
+        _manifest(baseline_input, BaselinePhaseV1.CREATED),
+        {BASELINE_INPUT_PATH: complete[BASELINE_INPUT_PATH]},
+    )
+    case_alias = run_dir.with_name(run_dir.name.swapcase())
+    alias = (
+        case_alias
+        if case_alias.exists() and case_alias.samefile(run_dir)
+        else run_dir / ".." / run_dir.name
+    )
+    assert alias.samefile(run_dir)
+    artifact_visible = Event()
+    release_writer = Event()
+    original = shared_artifacts._PosixRunStorage.atomic_write
+
+    def pause_after_artifact(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> bool:
+        created = original(storage, path, data, mutable=mutable)  # type: ignore[arg-type]
+        if path == _REVIEW_REQUEST:
+            artifact_visible.set()
+            assert release_writer.wait(timeout=5)
+        return created
+
+    monkeypatch.setattr(
+        shared_artifacts._PosixRunStorage, "atomic_write", pause_after_artifact
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        writer = executor.submit(
+            commit_baseline_transition_v1,
+            run_dir,
+            current.manifest_fingerprint,
+            {_REVIEW_REQUEST: complete[_REVIEW_REQUEST]},
+            _manifest(baseline_input, BaselinePhaseV1.SOURCE_REVIEW),
+        )
+        assert artifact_visible.wait(timeout=5)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    "from regulatory_harvest.evaluation.attorney_baseline_artifacts "
+                    "import verify_baseline_run; "
+                    "print(verify_baseline_run(Path(sys.argv[1])).valid, flush=True)"
+                ),
+                os.fspath(alias),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "PYTHONPATH": "src"},
+        )
+        time.sleep(0.25)
+        blocked_during_transition = process.poll() is None
+        release_writer.set()
+        writer.result(timeout=5)
+        stdout, stderr = process.communicate(timeout=5)
+
+    assert blocked_during_transition, (stdout, stderr)
+    assert process.returncode == 0, stderr
+    assert stdout.strip() == "True"
 
 
 def test_replay_rejects_semantic_tamper_even_after_hash_reseal(tmp_path: Path) -> None:
@@ -984,7 +1190,7 @@ def test_verified_prior_creates_new_sibling_correction_without_mutation(
         substantive_rationale="The source expressly identifies the required content.",
     )
     correction = _correction(
-        prior.manifest.manifest_fingerprint,
+        prior.manifest.root_hash,
         prior.baseline.baseline_fingerprint,
         added,
     )
@@ -992,27 +1198,26 @@ def test_verified_prior_creates_new_sibling_correction_without_mutation(
         prior.baseline_input,
         prior.baseline,
         correction,
-        prior_baseline_root=prior.manifest.manifest_fingerprint,
+        prior_baseline_root=prior.manifest.root_hash,
     )
-    sibling_files = dict(files_by_path)
-    sibling_files[BASELINE_CORRECTION_PATH] = _canonical(correction)
-    sibling_files[CANONICAL_BASELINE_PATH] = _canonical(corrected)
     sibling_dir = tmp_path / "corrected"
-    initialize_baseline_storage_v1(
+    baseline_artifacts.initialize_corrected_baseline_storage_v1(
+        prior_dir,
         sibling_dir,
-        _manifest(
-            baseline_input,
-            BaselinePhaseV1.COMPLETED,
-            baseline_fingerprint=corrected.baseline_fingerprint,
-            terminal_status="COMPLETED",
-        ),
-        sibling_files,
+        correction,
     )
 
-    loaded = load_verified_baseline_run(sibling_dir)
+    loaded = load_verified_baseline_run(sibling_dir, prior_run_dir=prior_dir)
     assert loaded.baseline == corrected
     assert loaded.baseline.prior_baseline_fingerprint == prior.baseline.baseline_fingerprint
     assert loaded.baseline.correction_record_fingerprint == correction.correction_fingerprint
+    assert set(_snapshot(sibling_dir)) == {
+        BASELINE_MANIFEST_PATH,
+        BASELINE_INPUT_PATH,
+        BASELINE_CORRECTION_PATH,
+        CANONICAL_BASELINE_PATH,
+        BASELINE_VERIFICATION_PATH,
+    }
     assert _snapshot(prior_dir) == before
 
     original = shared_artifacts._PosixRunStorage.atomic_write
@@ -1031,17 +1236,121 @@ def test_verified_prior_creates_new_sibling_correction_without_mutation(
         crash_after_correction,
     )
     with pytest.raises(EvaluationIntegrityError):
-        initialize_baseline_storage_v1(
+        baseline_artifacts.initialize_corrected_baseline_storage_v1(
+            prior_dir,
             tmp_path / "corrected-crash",
-            _manifest(
-                baseline_input,
-                BaselinePhaseV1.COMPLETED,
-                baseline_fingerprint=corrected.baseline_fingerprint,
-                terminal_status="COMPLETED",
-            ),
-            sibling_files,
+            correction,
         )
     assert _snapshot(prior_dir) == before
+
+
+def test_correction_requires_the_exact_verified_prior_sibling(tmp_path: Path) -> None:
+    baseline_input, files_by_path, manifest = _complete_graph()
+    prior_dir = tmp_path / "prior"
+    initialize_baseline_storage_v1(prior_dir, manifest, files_by_path)
+    prior = load_verified_baseline_run(prior_dir)
+    source_text = baseline_input.sources[0].normalized_text
+    quote = "must identify the operator"
+    start = source_text.find(quote)
+    requirement = prior.baseline.requirements[0].model_copy(
+        update={
+            "requirement_id": "REQ-9999",
+            "canonical_order": 999,
+            "statement": "The notice must identify the operator.",
+            "passages": (
+                {
+                    "source_id": "rule-1",
+                    "quote": quote,
+                    "start_char": start,
+                    "end_char": start + len(quote),
+                },
+            ),
+        }
+    )
+    correction = _correction(
+        prior.manifest.root_hash,
+        prior.baseline.baseline_fingerprint,
+        requirement,
+    )
+    sibling_dir = tmp_path / "corrected"
+    baseline_artifacts.initialize_corrected_baseline_storage_v1(
+        prior_dir,
+        sibling_dir,
+        correction,
+    )
+
+    assert not verify_baseline_run(sibling_dir).valid
+    with pytest.raises(EvaluationIntegrityError):
+        load_verified_baseline_run(sibling_dir)
+    missing = tmp_path / "missing-prior"
+    assert not verify_baseline_run(sibling_dir, prior_run_dir=missing).valid
+    with pytest.raises(EvaluationIntegrityError):
+        load_verified_baseline_run(sibling_dir, prior_run_dir=missing)
+    assert verify_baseline_run(sibling_dir, prior_run_dir=prior_dir).valid
+    assert (
+        load_verified_baseline_run(sibling_dir, prior_run_dir=prior_dir).baseline
+        .prior_baseline_fingerprint
+        == prior.baseline.baseline_fingerprint
+    )
+
+
+def test_correction_accepts_an_authentic_verified_inconclusive_prior(
+    tmp_path: Path,
+) -> None:
+    baseline_input, files_by_path, terminal_manifest = _complete_graph()
+    prior_dir = tmp_path / "inconclusive-prior"
+    initialize_baseline_storage_v1(
+        prior_dir,
+        _manifest(
+            baseline_input,
+            BaselinePhaseV1.INCONCLUSIVE,
+            baseline_fingerprint=terminal_manifest.baseline_fingerprint,
+            terminal_status="INCONCLUSIVE",
+        ),
+        files_by_path,
+    )
+    prior = load_verified_baseline_run(prior_dir)
+    text = baseline_input.sources[0].normalized_text
+    quote = "must identify the operator"
+    start = text.find(quote)
+    added = BaselineRequirementV1(
+        requirement_id="REQ-9999",
+        canonical_order=999,
+        statement="The notice must identify the operator.",
+        kind="obligation",
+        importance="material",
+        importance_basis=("attorney_briefing",),
+        importance_rationale="The detail is necessary for a competent attorney briefing.",
+        passages=(
+            {
+                "source_id": "rule-1",
+                "quote": quote,
+                "start_char": start,
+                "end_char": start + len(quote),
+            },
+        ),
+        confidence="clear",
+        substantive_rationale="The source expressly identifies the required content.",
+    )
+    correction = _correction(
+        prior.manifest.root_hash,
+        prior.baseline.baseline_fingerprint,
+        added,
+    )
+    sibling_dir = tmp_path / "corrected-from-inconclusive"
+
+    baseline_artifacts.initialize_corrected_baseline_storage_v1(
+        prior_dir,
+        sibling_dir,
+        correction,
+    )
+
+    assert verify_baseline_run(sibling_dir, prior_run_dir=prior_dir).valid
+    assert (
+        load_verified_baseline_run(sibling_dir, prior_run_dir=prior_dir)
+        .manifest.prior_baseline_root
+        == prior.manifest.root_hash
+    )
 
 
 def test_unexpected_or_noncanonical_artifact_is_refused(tmp_path: Path) -> None:

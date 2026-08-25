@@ -11,9 +11,9 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import ClassVar, TypeVar, cast
 
-from pydantic import ValidationError
+from pydantic import ConfigDict, ValidationError
 
 from regulatory_harvest.storage import canonical_json_bytes, sha256_digest
 
@@ -40,12 +40,14 @@ from .attorney_baseline_models import (
     AcceptedBaselineReviewFragmentV1,
     BaselineAuditAggregateV1,
     BaselineAuditFragmentV1,
+    BaselineCallRecordV1,
     BaselineCorrectionRecordV1,
     BaselineDisputeV1,
     BaselineEvaluatorRequestV1,
     BaselineEvaluatorResponseV1,
     BaselineInputV1,
     BaselineManifestV1,
+    BaselineOperationV1,
     BaselinePhaseV1,
     BaselineRefereeAggregateV1,
     BaselineRefereeDecisionV1,
@@ -61,7 +63,7 @@ from .attorney_baseline_requests import (
     build_baseline_source_referee_request_v1,
     build_baseline_source_review_request_v1,
 )
-from .attorney_models import ArtifactRecord
+from .attorney_models import ArtifactRecord, EvaluationSource, RequestedAuthority
 
 BASELINE_MANIFEST_PATH = "baseline-manifest.json"
 BASELINE_INPUT_PATH = "baseline-input.json"
@@ -98,7 +100,53 @@ _REFEREE_RESPONSE_RE = re.compile(
 
 _ModelT = TypeVar("_ModelT", bound=BaselineStrictModel)
 _LOCKS_GUARD = threading.Lock()
-_RUN_LOCKS: dict[str, threading.RLock] = {}
+_RUN_LOCKS: dict[tuple[int, int], threading.RLock] = {}
+
+
+class _FrozenList(list[str]):
+    @staticmethod
+    def _immutable(*_: object, **__: object) -> None:
+        raise TypeError("verified baseline context values are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable  # type: ignore[assignment]
+    __imul__ = _immutable  # type: ignore[assignment]
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable  # type: ignore[assignment]
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+
+class _FrozenArtifactRecord(ArtifactRecord):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", frozen=True)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, ArtifactRecord) and self.model_dump(
+            mode="json"
+        ) == other.model_dump(mode="json")
+
+
+class _FrozenEvaluationSource(EvaluationSource):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", frozen=True)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, EvaluationSource) and self.model_dump(
+            mode="json"
+        ) == other.model_dump(mode="json")
+
+
+class _FrozenRequestedAuthority(RequestedAuthority):
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", frozen=True)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, RequestedAuthority) and self.model_dump(
+            mode="json"
+        ) == other.model_dump(mode="json")
 
 
 @dataclass(frozen=True)
@@ -116,23 +164,113 @@ class _Replay:
     manifest: BaselineManifestV1
     baseline_input: BaselineInputV1
     baseline: CanonicalBaselineV1 | None
-    verification: BaselineVerificationV1
+    verification: BaselineVerificationV1 | None
 
 
-def _run_lock_key(run_dir: Path) -> str:
+def _frozen_artifact_record(value: ArtifactRecord) -> ArtifactRecord:
+    return _FrozenArtifactRecord.model_validate(
+        value.model_dump(mode="python", warnings="error"), strict=True
+    )
+
+
+def _frozen_evaluation_source(value: EvaluationSource) -> EvaluationSource:
+    snapshot = _FrozenEvaluationSource.model_validate(
+        value.model_dump(mode="python", warnings="error"), strict=True
+    )
+    object.__setattr__(
+        snapshot, "relationship_ids", _FrozenList(snapshot.relationship_ids)
+    )
+    return snapshot
+
+
+def _frozen_requested_authority(value: RequestedAuthority) -> RequestedAuthority:
+    snapshot = _FrozenRequestedAuthority.model_validate(
+        value.model_dump(mode="python", warnings="error"), strict=True
+    )
+    object.__setattr__(snapshot, "source_ids", _FrozenList(snapshot.source_ids))
+    return snapshot
+
+
+def _immutable_context(replay: _Replay) -> VerifiedBaselineContextV1:
+    if replay.baseline is None or replay.verification is None:
+        raise EvaluationIntegrityError("BASELINE_RESULT_REQUIRED")
+    manifest = replay.manifest.model_copy(
+        update={
+            "artifacts": tuple(
+                _frozen_artifact_record(item) for item in replay.manifest.artifacts
+            )
+        }
+    )
+    baseline_input = replay.baseline_input.model_copy(
+        update={
+            "sources": tuple(
+                _frozen_evaluation_source(item)
+                for item in replay.baseline_input.sources
+            ),
+            "requested_authorities": tuple(
+                _frozen_requested_authority(item)
+                for item in replay.baseline_input.requested_authorities
+            ),
+        }
+    )
+    return VerifiedBaselineContextV1(
+        manifest=manifest,
+        baseline_input=baseline_input,
+        baseline=replay.baseline,
+        verification=replay.verification,
+    )
+
+
+def _run_lock_parent(run_dir: Path) -> Path:
     try:
-        return os.path.normcase(os.path.abspath(os.fspath(run_dir)))
+        return Path(os.path.abspath(os.fspath(run_dir))).parent
     except (OSError, TypeError, ValueError) as error:
         raise EvaluationIntegrityError("baseline run path is invalid") from error
 
 
 @contextmanager
-def _run_operation_lock(run_dir: Path) -> Iterator[None]:
-    key = _run_lock_key(run_dir)
+def _open_locked_storage(
+    run_dir: Path,
+    *,
+    initialize: bool = False,
+    exclusive: bool,
+) -> Iterator[RunStorage]:
+    parent = _run_lock_parent(run_dir)
+    try:
+        metadata = os.stat(parent, follow_symlinks=False)
+        key = (metadata.st_dev, metadata.st_ino)
+    except (NotImplementedError, OSError, TypeError, ValueError) as error:
+        raise EvaluationIntegrityError("baseline storage lock root is unavailable") from error
     with _LOCKS_GUARD:
         lock = _RUN_LOCKS.setdefault(key, threading.RLock())
-    with lock:
-        yield
+    with lock, open_evaluation_storage(parent) as lock_storage:
+        _lock_storage_descriptor(lock_storage, exclusive=exclusive)
+        lock_storage.assert_root_identity()
+        with open_evaluation_storage(run_dir, initialize=initialize) as storage:
+            _lock_storage_descriptor(storage, exclusive=exclusive)
+            storage.assert_root_identity()
+            yield storage
+            storage.assert_root_identity()
+        lock_storage.assert_root_identity()
+
+
+def _lock_storage_descriptor(storage: RunStorage, *, exclusive: bool) -> None:
+    descriptor = getattr(storage, "_root_descriptor", None)
+    if os.name != "posix" or type(descriptor) is not int:
+        raise EvaluationIntegrityError(
+            "baseline cross-process storage locking is unavailable"
+        )
+    try:
+        import fcntl
+
+        fcntl.flock(
+            descriptor,
+            fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+        )
+    except (ImportError, NotImplementedError, OSError) as error:
+        raise EvaluationIntegrityError(
+            "baseline cross-process storage locking is unavailable"
+        ) from error
 
 
 def _error(code: str) -> EvaluationIntegrityError:
@@ -268,14 +406,193 @@ def _snapshot_files(files: Mapping[str, bytes]) -> dict[str, bytes]:
 def _manifest_fingerprint(manifest: BaselineManifestV1) -> str:
     return sha256_digest(
         canonical_json_bytes(
-            manifest.model_dump(mode="json", exclude={"manifest_fingerprint"})
+            manifest.model_dump(
+                mode="json", exclude={"manifest_fingerprint", "root_hash"}
+            )
         )
     )
 
 
+def _manifest_root_hash(manifest: BaselineManifestV1) -> str:
+    return sha256_digest(
+        canonical_json_bytes(manifest.model_dump(mode="json", exclude={"root_hash"}))
+    )
+
+
+def _call_record(
+    files: Mapping[str, bytes],
+    *,
+    operation: BaselineOperationV1,
+    call_id: str,
+    fragment_ordinal: int | None = None,
+    dispute_id: str | None = None,
+) -> BaselineCallRecordV1:
+    request_path = f"requests/{call_id}.json"
+    response_path = f"responses/{call_id}.json"
+    request = _model_from_file(
+        files[request_path], BaselineEvaluatorRequestV1, location=request_path
+    )
+    response: BaselineEvaluatorResponseV1 | None = None
+    if response_path in files:
+        response = _model_from_file(
+            files[response_path], BaselineEvaluatorResponseV1, location=response_path
+        )
+    return BaselineCallRecordV1(
+        call_id=call_id,
+        operation=operation,
+        state="pending" if response is None else "accepted",
+        request_artifact_path=request_path,
+        request_fingerprint=request.request_fingerprint,
+        response_artifact_path=None if response is None else response_path,
+        response_fingerprint=(
+            None if response is None else sha256_digest(files[response_path])
+        ),
+        provider_name=None if response is None else response.provider_name,
+        model_name=None if response is None else response.model_name,
+        judge_isolation=None if response is None else response.judge_isolation,
+        fragment_ordinal=fragment_ordinal,
+        dispute_id=dispute_id,
+    )
+
+
+def _manifest_calls(
+    files: Mapping[str, bytes],
+) -> tuple[BaselineCallRecordV1 | None, tuple[BaselineCallRecordV1, ...]]:
+    calls: list[BaselineCallRecordV1] = []
+    for ordinal in cast(
+        tuple[int, ...], _indexed_paths(files, _REVIEW_REQUEST_RE, integer=True)
+    ):
+        calls.append(
+            _call_record(
+                files,
+                operation=BaselineOperationV1.SOURCE_REVIEW,
+                call_id=f"source-review-{ordinal:04d}",
+                fragment_ordinal=ordinal,
+            )
+        )
+    for ordinal in cast(
+        tuple[int, ...], _indexed_paths(files, _AUDIT_REQUEST_RE, integer=True)
+    ):
+        calls.append(
+            _call_record(
+                files,
+                operation=BaselineOperationV1.SOURCE_AUDIT,
+                call_id=f"source-audit-{ordinal:04d}",
+                fragment_ordinal=ordinal,
+            )
+        )
+    for dispute_id in cast(
+        tuple[str, ...], _indexed_paths(files, _REFEREE_REQUEST_RE, integer=False)
+    ):
+        calls.append(
+            _call_record(
+                files,
+                operation=BaselineOperationV1.SOURCE_REFEREE,
+                call_id=f"source-referee-{dispute_id}",
+                dispute_id=dispute_id,
+            )
+        )
+    pending = tuple(call for call in calls if call.state == "pending")
+    if len(pending) > 1:
+        raise _error("CALL_HISTORY")
+    return (None if not pending else pending[0]), tuple(
+        call for call in calls if call.state == "accepted"
+    )
+
+
+def _derived_manifest_bindings(files: Mapping[str, bytes]) -> dict[str, object]:
+    pending, accepted = _manifest_calls(files)
+    review = (
+        None
+        if BASELINE_REVIEW_PATH not in files
+        else _model_from_file(
+            files[BASELINE_REVIEW_PATH],
+            BaselineReviewAggregateV1,
+            location=BASELINE_REVIEW_PATH,
+        )
+    )
+    audit = (
+        None
+        if BASELINE_AUDIT_PATH not in files
+        else _model_from_file(
+            files[BASELINE_AUDIT_PATH],
+            BaselineAuditAggregateV1,
+            location=BASELINE_AUDIT_PATH,
+        )
+    )
+    referees = (
+        None
+        if BASELINE_REFEREES_PATH not in files
+        else _model_from_file(
+            files[BASELINE_REFEREES_PATH],
+            BaselineRefereeAggregateV1,
+            location=BASELINE_REFEREES_PATH,
+        )
+    )
+    baseline = (
+        None
+        if CANONICAL_BASELINE_PATH not in files
+        else _model_from_file(
+            files[CANONICAL_BASELINE_PATH],
+            CanonicalBaselineV1,
+            location=CANONICAL_BASELINE_PATH,
+        )
+    )
+    correction = (
+        None
+        if BASELINE_CORRECTION_PATH not in files
+        else _model_from_file(
+            files[BASELINE_CORRECTION_PATH],
+            BaselineCorrectionRecordV1,
+            location=BASELINE_CORRECTION_PATH,
+        )
+    )
+    provenance = None if baseline is None else baseline.provenance
+    return {
+        "pending_call": pending,
+        "accepted_calls": accepted,
+        "source_review_aggregate_fingerprint": (
+            review.aggregate_fingerprint
+            if review is not None
+            else None
+            if provenance is None
+            else provenance.source_review_aggregate_fingerprint
+        ),
+        "source_audit_aggregate_fingerprint": (
+            audit.aggregate_fingerprint
+            if audit is not None
+            else None
+            if provenance is None
+            else provenance.source_audit_aggregate_fingerprint
+        ),
+        "source_referee_aggregate_fingerprint": (
+            referees.aggregate_fingerprint
+            if referees is not None
+            else None
+            if provenance is None
+            else provenance.source_referee_aggregate_fingerprint
+        ),
+        "baseline_fingerprint": (
+            None if baseline is None else baseline.baseline_fingerprint
+        ),
+        "prior_baseline_root": (
+            None if correction is None else correction.prior_baseline_root
+        ),
+        "prior_baseline_fingerprint": (
+            None if correction is None else correction.prior_baseline_fingerprint
+        ),
+        "correction_record_fingerprint": (
+            None if correction is None else correction.correction_fingerprint
+        ),
+    }
+
+
 def _manifest_bytes(manifest: BaselineManifestV1) -> tuple[BaselineManifestV1, bytes]:
     checked, data = _canonical_model_bytes(manifest, BaselineManifestV1)
-    if checked.manifest_fingerprint != _manifest_fingerprint(checked):
+    if (
+        checked.manifest_fingerprint != _manifest_fingerprint(checked)
+        or checked.root_hash != _manifest_root_hash(checked)
+    ):
         raise _error("MANIFEST_FINGERPRINT")
     return checked, data
 
@@ -295,10 +612,18 @@ def _with_inventory(
         )
     )
     provisional = checked.model_copy(
-        update={"artifacts": inventory, "manifest_fingerprint": "0" * 64}
+        update={
+            **_derived_manifest_bindings(files),
+            "artifacts": inventory,
+            "root_hash": "0" * 64,
+            "manifest_fingerprint": "0" * 64,
+        }
     )
-    committed = provisional.model_copy(
+    with_fingerprint = provisional.model_copy(
         update={"manifest_fingerprint": _manifest_fingerprint(provisional)}
+    )
+    committed = with_fingerprint.model_copy(
+        update={"root_hash": _manifest_root_hash(with_fingerprint)}
     )
     return cast(
         BaselineManifestV1,
@@ -312,7 +637,10 @@ def _manifest_from_bytes(data: bytes) -> BaselineManifestV1:
         BaselineManifestV1,
         location=BASELINE_MANIFEST_PATH,
     )
-    if manifest.manifest_fingerprint != _manifest_fingerprint(manifest):
+    if (
+        manifest.manifest_fingerprint != _manifest_fingerprint(manifest)
+        or manifest.root_hash != _manifest_root_hash(manifest)
+    ):
         raise _error("MANIFEST_FINGERPRINT")
     paths = tuple(item.artifact_path for item in manifest.artifacts)
     if paths != tuple(sorted(set(paths))) or BASELINE_MANIFEST_PATH in paths:
@@ -611,6 +939,7 @@ def _phase_requires(
     referee_pending: bool,
     baseline: CanonicalBaselineV1 | None,
     has_verification: bool,
+    is_correction: bool,
 ) -> None:
     phase = manifest.phase
     terminal = manifest.terminal_status
@@ -671,9 +1000,10 @@ def _phase_requires(
         )
     elif phase is BaselinePhaseV1.COMPLETED:
         valid = (
-            review is not None
-            and audit is not None
-            and referees is not None
+            (
+                is_correction
+                or (review is not None and audit is not None and referees is not None)
+            )
             and not referee_pending
             and baseline is not None
             and terminal == "COMPLETED"
@@ -681,9 +1011,10 @@ def _phase_requires(
         )
     elif phase is BaselinePhaseV1.INCONCLUSIVE:
         valid = (
-            review is not None
-            and audit is not None
-            and referees is not None
+            (
+                is_correction
+                or (review is not None and audit is not None and referees is not None)
+            )
             and not referee_pending
             and baseline is not None
             and terminal == "INCONCLUSIVE"
@@ -695,30 +1026,11 @@ def _phase_requires(
         raise _error("PHASE_INVENTORY")
 
 
-def _expected_prior_root(
-    baseline_input: BaselineInputV1,
-    baseline: CanonicalBaselineV1,
-    files: Mapping[str, bytes],
-) -> str:
-    prior_files = dict(files)
-    prior_files.pop(BASELINE_CORRECTION_PATH, None)
-    prior_files[CANONICAL_BASELINE_PATH] = canonical_json_bytes(
-        baseline.model_dump(mode="json", warnings="error")
-    )
-    prior_manifest = BaselineManifestV1(
-        legal_input_fingerprint=baseline_input.legal_input_fingerprint,
-        baseline_fingerprint=baseline.baseline_fingerprint,
-        phase=BaselinePhaseV1.COMPLETED,
-        terminal_status="COMPLETED",
-        artifacts=(),
-        manifest_fingerprint="0" * 64,
-    )
-    return _with_inventory(prior_manifest, prior_files).manifest_fingerprint
-
-
 def _verify_baseline_snapshot(
     manifest: BaselineManifestV1,
     files: Mapping[str, bytes],
+    *,
+    prior: _Replay | None = None,
 ) -> _Replay:
     try:
         baseline_input = _model_from_file(
@@ -731,61 +1043,78 @@ def _verify_baseline_snapshot(
     if manifest.legal_input_fingerprint != baseline_input.legal_input_fingerprint:
         raise _error("INPUT_BINDING")
     bound = {BASELINE_INPUT_PATH}
-    try:
-        review, review_pending = _replay_review(baseline_input, files, bound)
-        audit: BaselineAuditAggregateV1 | None = None
-        audit_pending = False
-        disputes: tuple[BaselineDisputeV1, ...] = ()
-        referees: BaselineRefereeAggregateV1 | None = None
-        referee_pending = False
-        if review is not None:
-            audit, audit_pending = _replay_audit(
-                baseline_input, review, files, bound
-            )
-        if audit is not None:
-            assert review is not None
-            disputes = build_baseline_disputes_v1(baseline_input, review, audit)
-            referees, referee_pending = _replay_referees(
-                baseline_input, disputes, files, bound
-            )
-    except (BaselineCompilationError, KeyError, TypeError, ValueError) as error:
-        if isinstance(error, EvaluationIntegrityError):
-            raise
-        raise _error("ROLE_REPLAY") from error
-
-    baseline: CanonicalBaselineV1 | None = None
+    review: BaselineReviewAggregateV1 | None = None
+    review_pending = False
+    audit: BaselineAuditAggregateV1 | None = None
+    audit_pending = False
+    disputes: tuple[BaselineDisputeV1, ...] = ()
+    referees: BaselineRefereeAggregateV1 | None = None
+    referee_pending = False
+    is_correction = BASELINE_CORRECTION_PATH in files
     compiled: CanonicalBaselineV1 | None = None
-    if referees is not None:
-        assert review is not None and audit is not None
-        try:
-            compiled = compile_canonical_baseline_v1(
-                baseline_input, review, audit, referees
+    if is_correction:
+        if (
+            prior is None
+            or prior.baseline is None
+            or prior.verification is None
+            or prior.verification.valid is not True
+            or prior.manifest.phase
+            not in {BaselinePhaseV1.COMPLETED, BaselinePhaseV1.INCONCLUSIVE}
+        ):
+            raise _error("CORRECTION_PRIOR_REQUIRED")
+        if (
+            baseline_input != prior.baseline_input
+            or files[BASELINE_INPUT_PATH]
+            != canonical_json_bytes(
+                prior.baseline_input.model_dump(mode="json", warnings="error")
             )
-        except BaselineCompilationError as error:
-            raise _error("BASELINE_REPLAY") from error
-    correction: BaselineCorrectionRecordV1 | None = None
-    if BASELINE_CORRECTION_PATH in files:
-        if compiled is None or BASELINE_VERIFICATION_PATH not in files:
-            raise _error("CORRECTION_BINDING")
+        ):
+            raise _error("CORRECTION_INPUT_BINDING")
         correction = _model_from_file(
             files[BASELINE_CORRECTION_PATH],
             BaselineCorrectionRecordV1,
             location=BASELINE_CORRECTION_PATH,
         )
-        if correction.prior_baseline_root != _expected_prior_root(
-            baseline_input, compiled, files
+        if (
+            correction.prior_baseline_root != prior.manifest.root_hash
+            or correction.prior_baseline_fingerprint
+            != prior.baseline.baseline_fingerprint
         ):
             raise _error("CORRECTION_PRIOR_ROOT")
         try:
             compiled = apply_baseline_correction_v1(
                 baseline_input,
-                compiled,
+                prior.baseline,
                 correction,
-                prior_baseline_root=correction.prior_baseline_root,
+                prior_baseline_root=prior.manifest.root_hash,
             )
         except BaselineCompilationError as error:
             raise _error("CORRECTION_REPLAY") from error
         bound.add(BASELINE_CORRECTION_PATH)
+    else:
+        try:
+            review, review_pending = _replay_review(baseline_input, files, bound)
+            if review is not None:
+                audit, audit_pending = _replay_audit(
+                    baseline_input, review, files, bound
+                )
+            if audit is not None:
+                assert review is not None
+                disputes = build_baseline_disputes_v1(baseline_input, review, audit)
+                referees, referee_pending = _replay_referees(
+                    baseline_input, disputes, files, bound
+                )
+            if referees is not None:
+                assert review is not None and audit is not None
+                compiled = compile_canonical_baseline_v1(
+                    baseline_input, review, audit, referees
+                )
+        except (BaselineCompilationError, KeyError, TypeError, ValueError) as error:
+            if isinstance(error, EvaluationIntegrityError):
+                raise
+            raise _error("ROLE_REPLAY") from error
+
+    baseline: CanonicalBaselineV1 | None = None
     if CANONICAL_BASELINE_PATH in files:
         if compiled is None:
             raise _error("BASELINE_UNEXPECTED")
@@ -807,18 +1136,27 @@ def _verify_baseline_snapshot(
         raise _error("BASELINE_BINDING")
 
     has_verification = BASELINE_VERIFICATION_PATH in files
-    verification = BaselineVerificationV1(valid=True)
+    verification: BaselineVerificationV1 | None = None
     if has_verification:
+        expected_verification = BaselineVerificationV1(valid=True)
         stored_verification = _model_from_file(
             files[BASELINE_VERIFICATION_PATH],
             BaselineVerificationV1,
             location=BASELINE_VERIFICATION_PATH,
         )
-        if stored_verification != verification or files[
+        if stored_verification != expected_verification or files[
             BASELINE_VERIFICATION_PATH
-        ] != canonical_json_bytes(verification.model_dump(mode="json")):
+        ] != canonical_json_bytes(expected_verification.model_dump(mode="json")):
             raise _error("VERIFICATION_RECEIPT")
+        verification = stored_verification
         bound.add(BASELINE_VERIFICATION_PATH)
+
+    derived_bindings = _derived_manifest_bindings(files)
+    if any(
+        getattr(manifest, field_name) != expected
+        for field_name, expected in derived_bindings.items()
+    ):
+        raise _error("MANIFEST_BINDING")
 
     _phase_requires(
         manifest,
@@ -831,6 +1169,7 @@ def _verify_baseline_snapshot(
         referee_pending=referee_pending,
         baseline=baseline,
         has_verification=has_verification,
+        is_correction=is_correction,
     )
     extras = set(files) - bound
     if extras:
@@ -842,7 +1181,7 @@ def _verify_baseline_snapshot(
     return _Replay(manifest, baseline_input, baseline, verification)
 
 
-def _verify_or_raise(storage: RunStorage) -> _Replay:
+def _verify_or_raise(storage: RunStorage, *, prior: _Replay | None = None) -> _Replay:
     storage.assert_root_identity()
     initial_inventory = storage.scan_inventory()
     paths = {path for path in initial_inventory if not path.endswith("/")}
@@ -871,7 +1210,7 @@ def _verify_or_raise(storage: RunStorage) -> _Replay:
             raise _error("ARTIFACT_HASH")
         _parse_canonical_json(data, location=artifact.artifact_path)
         files[artifact.artifact_path] = data
-    replay = _verify_baseline_snapshot(manifest, files)
+    replay = _verify_baseline_snapshot(manifest, files, prior=prior)
     if storage.scan_inventory() != initial_inventory:
         raise _error("INVENTORY_CHANGED")
     storage.assert_root_identity()
@@ -924,6 +1263,7 @@ def _commit_with_rollback(
     successor: BaselineManifestV1,
     *,
     expected_manifest_fingerprint: str | None = None,
+    prior_replay: _Replay | None = None,
 ) -> BaselineManifestV1:
     snapshot_files = _snapshot_files(files)
     existing = storage.scan_files()
@@ -956,7 +1296,7 @@ def _commit_with_rollback(
     if prior_manifest is not None:
         _validate_successor_transition(prior_manifest, committed)
     _, manifest_bytes = _manifest_bytes(committed)
-    _verify_baseline_snapshot(committed, all_files)
+    _verify_baseline_snapshot(committed, all_files, prior=prior_replay)
     storage.assert_root_identity()
     created: list[tuple[str, bytes, _NodeIdentity]] = []
     manifest_installed = False
@@ -1035,7 +1375,7 @@ def _commit_with_rollback(
                     else None if receipt is None else receipt.identity
                 )
             raise
-        installed = _verify_or_raise(storage)
+        installed = _verify_or_raise(storage, prior=prior_replay)
         if installed.manifest != committed:
             raise EvaluationIntegrityError("BASELINE_STALE_TRANSITION")
     except BaseException as error:
@@ -1118,11 +1458,104 @@ def initialize_baseline_storage_v1(
     files: Mapping[str, bytes],
 ) -> BaselineManifestV1:
     """Create an empty baseline root and expose only a replay-valid first state."""
-    with (
-        _run_operation_lock(run_dir),
-        open_evaluation_storage(run_dir, initialize=True) as storage,
-    ):
+    with _open_locked_storage(
+        run_dir, initialize=True, exclusive=True
+    ) as storage:
         return _commit_with_rollback(storage, files, manifest)
+
+
+def _terminal_replay(run_dir: Path) -> _Replay:
+    with _open_locked_storage(run_dir, exclusive=False) as storage:
+        replay = _verify_or_raise(storage)
+        storage.assert_root_identity()
+    if (
+        replay.baseline is None
+        or replay.verification is None
+        or replay.verification.valid is not True
+        or replay.manifest.phase
+        not in {BaselinePhaseV1.COMPLETED, BaselinePhaseV1.INCONCLUSIVE}
+        or replay.manifest.terminal_status not in {"COMPLETED", "INCONCLUSIVE"}
+    ):
+        raise EvaluationIntegrityError("BASELINE_RESULT_REQUIRED")
+    return replay
+
+
+def initialize_corrected_baseline_storage_v1(
+    prior_run_dir: Path,
+    run_dir: Path,
+    correction: BaselineCorrectionRecordV1,
+) -> BaselineManifestV1:
+    """Create one corrected sibling from an actual verified terminal prior run."""
+    try:
+        prior_parent = os.stat(_run_lock_parent(prior_run_dir), follow_symlinks=False)
+        successor_parent = os.stat(_run_lock_parent(run_dir), follow_symlinks=False)
+    except (NotImplementedError, OSError, TypeError, ValueError) as error:
+        raise EvaluationIntegrityError("baseline correction parent is unavailable") from error
+    if (prior_parent.st_dev, prior_parent.st_ino) != (
+        successor_parent.st_dev,
+        successor_parent.st_ino,
+    ):
+        raise EvaluationIntegrityError("baseline correction must create a sibling run")
+    if os.path.lexists(run_dir):
+        raise EvaluationIntegrityError("baseline correction must create a new sibling")
+
+    prior = _terminal_replay(prior_run_dir)
+    assert prior.baseline is not None
+    if (
+        correction.prior_baseline_root != prior.manifest.root_hash
+        or correction.prior_baseline_fingerprint
+        != prior.baseline.baseline_fingerprint
+    ):
+        raise EvaluationIntegrityError("BASELINE_CORRECTION_PRIOR_ROOT")
+    try:
+        checked_correction, correction_bytes = _canonical_model_bytes(
+            correction, BaselineCorrectionRecordV1
+        )
+        corrected = apply_baseline_correction_v1(
+            prior.baseline_input,
+            prior.baseline,
+            checked_correction,
+            prior_baseline_root=prior.manifest.root_hash,
+        )
+        _, input_bytes = _canonical_model_bytes(prior.baseline_input, BaselineInputV1)
+        _, baseline_bytes = _canonical_model_bytes(corrected, CanonicalBaselineV1)
+        verification = BaselineVerificationV1(valid=True)
+        _, verification_bytes = _canonical_model_bytes(
+            verification, BaselineVerificationV1
+        )
+    except (BaselineCompilationError, TypeError, ValidationError, ValueError) as error:
+        raise EvaluationIntegrityError("BASELINE_CORRECTION_INVALID") from error
+    files = {
+        BASELINE_INPUT_PATH: input_bytes,
+        BASELINE_CORRECTION_PATH: correction_bytes,
+        CANONICAL_BASELINE_PATH: baseline_bytes,
+        BASELINE_VERIFICATION_PATH: verification_bytes,
+    }
+    successor = BaselineManifestV1(
+        legal_input_fingerprint=prior.baseline_input.legal_input_fingerprint,
+        baseline_fingerprint=corrected.baseline_fingerprint,
+        phase=BaselinePhaseV1.COMPLETED,
+        terminal_status="COMPLETED",
+        prior_baseline_root=prior.manifest.root_hash,
+        prior_baseline_fingerprint=prior.baseline.baseline_fingerprint,
+        correction_record_fingerprint=checked_correction.correction_fingerprint,
+        artifacts=(),
+        root_hash="0" * 64,
+        manifest_fingerprint="0" * 64,
+    )
+    with _open_locked_storage(
+        run_dir, initialize=True, exclusive=True
+    ) as storage:
+        committed = _commit_with_rollback(
+            storage,
+            files,
+            successor,
+            prior_replay=prior,
+        )
+    observed_prior = _terminal_replay(prior_run_dir)
+    if observed_prior.manifest.root_hash != prior.manifest.root_hash:
+        raise EvaluationIntegrityError("BASELINE_CORRECTION_PRIOR_CHANGED")
+    return committed
 
 
 def commit_baseline_transition_v1(
@@ -1132,7 +1565,7 @@ def commit_baseline_transition_v1(
     successor: BaselineManifestV1,
 ) -> None:
     """Commit one immutable successor iff the verified current root still matches."""
-    with _run_operation_lock(run_dir), open_evaluation_storage(run_dir) as storage:
+    with _open_locked_storage(run_dir, exclusive=True) as storage:
         current = _verify_or_raise(storage).manifest
         if current.manifest_fingerprint != expected_manifest_fingerprint:
             raise EvaluationIntegrityError("BASELINE_STALE_TRANSITION")
@@ -1172,11 +1605,16 @@ def _safe_issue_code(error: BaseException) -> str:
     return "BASELINE_STORAGE_UNSAFE"
 
 
-def verify_baseline_run(run_dir: Path) -> BaselineVerificationV1:
+def verify_baseline_run(
+    run_dir: Path,
+    *,
+    prior_run_dir: Path | None = None,
+) -> BaselineVerificationV1:
     """Return only bounded diagnostics after exact inventory and semantic replay."""
     try:
-        with _run_operation_lock(run_dir), open_evaluation_storage(run_dir) as storage:
-            replay = _verify_or_raise(storage)
+        prior = None if prior_run_dir is None else _terminal_replay(prior_run_dir)
+        with _open_locked_storage(run_dir, exclusive=False) as storage:
+            replay = _verify_or_raise(storage, prior=prior)
             storage.assert_root_identity()
     except (
         EvaluationIntegrityError,
@@ -1190,19 +1628,26 @@ def verify_baseline_run(run_dir: Path) -> BaselineVerificationV1:
             valid=False,
             issues=(_safe_issue_code(error),),
         )
-    return replay.verification
+    return replay.verification or BaselineVerificationV1(valid=True)
 
 
-def load_verified_baseline_run(run_dir: Path) -> VerifiedBaselineContextV1:
+def load_verified_baseline_run(
+    run_dir: Path,
+    *,
+    prior_run_dir: Path | None = None,
+) -> VerifiedBaselineContextV1:
     """Load the exact four-field baseline context from one complete verified replay."""
-    with _run_operation_lock(run_dir), open_evaluation_storage(run_dir) as storage:
-        replay = _verify_or_raise(storage)
+    prior = None if prior_run_dir is None else _terminal_replay(prior_run_dir)
+    with _open_locked_storage(run_dir, exclusive=False) as storage:
+        replay = _verify_or_raise(storage, prior=prior)
         storage.assert_root_identity()
-        if replay.baseline is None or replay.verification.valid is not True:
+        if (
+            replay.baseline is None
+            or replay.verification is None
+            or replay.verification.valid is not True
+            or replay.manifest.phase
+            not in {BaselinePhaseV1.COMPLETED, BaselinePhaseV1.INCONCLUSIVE}
+            or replay.manifest.terminal_status not in {"COMPLETED", "INCONCLUSIVE"}
+        ):
             raise EvaluationIntegrityError("BASELINE_RESULT_REQUIRED")
-        return VerifiedBaselineContextV1(
-            manifest=replay.manifest,
-            baseline_input=replay.baseline_input,
-            baseline=replay.baseline,
-            verification=replay.verification,
-        )
+        return _immutable_context(replay)

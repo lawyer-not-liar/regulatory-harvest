@@ -895,14 +895,118 @@ class BaselineCorrectionRecordV1(BaselineStrictModel):
         return value
 
 
+class BaselineCallRecordV1(BaselineStrictModel):
+    """One exact report-blind evaluator request and its optional accepted response."""
+
+    call_id: str = Field(strict=True)
+    operation: BaselineOperationV1
+    state: Literal["pending", "accepted"]
+    request_artifact_path: str = Field(strict=True)
+    request_fingerprint: Hash
+    response_artifact_path: str | None = Field(default=None, strict=True)
+    response_fingerprint: Hash | None = None
+    provider_name: str | None = Field(default=None, strict=True)
+    model_name: str | None = Field(default=None, strict=True)
+    judge_isolation: Literal["fresh_context", "scripted_fixture"] | None = None
+    fragment_ordinal: int | None = Field(default=None, ge=1, le=_MAX_FRAGMENTS)
+    dispute_id: DisputeRef | None = None
+
+    _validate_call_id = field_validator("call_id", "request_artifact_path")(_nonblank)
+    _validate_optional_names = field_validator(
+        "response_artifact_path", "provider_name", "model_name"
+    )(_optional_nonblank)
+
+    @model_validator(mode="after")
+    def validate_call(self) -> Self:
+        response = (
+            self.response_artifact_path,
+            self.response_fingerprint,
+            self.provider_name,
+            self.model_name,
+            self.judge_isolation,
+        )
+        if self.state == "pending" and any(item is not None for item in response):
+            raise ValueError("pending baseline calls must omit response provenance")
+        if self.state == "accepted" and any(item is None for item in response):
+            raise ValueError("accepted baseline calls require complete response provenance")
+        if self.operation in {
+            BaselineOperationV1.SOURCE_REVIEW,
+            BaselineOperationV1.SOURCE_AUDIT,
+        }:
+            if self.fragment_ordinal is None or self.dispute_id is not None:
+                raise ValueError("source fragment calls require one ordinal")
+            prefix = (
+                "source-review"
+                if self.operation is BaselineOperationV1.SOURCE_REVIEW
+                else "source-audit"
+            )
+            suffix = f"{self.fragment_ordinal:04d}"
+        else:
+            if self.dispute_id is None or self.fragment_ordinal is not None:
+                raise ValueError("referee calls require one dispute ID")
+            prefix = "source-referee"
+            suffix = self.dispute_id
+        if self.call_id != f"{prefix}-{suffix}":
+            raise ValueError("baseline call ID does not match its role binding")
+        if self.request_artifact_path != f"requests/{self.call_id}.json":
+            raise ValueError("baseline request path does not match its call ID")
+        expected_response = f"responses/{self.call_id}.json"
+        if self.state == "accepted" and self.response_artifact_path != expected_response:
+            raise ValueError("baseline response path does not match its call ID")
+        return self
+
+
 class BaselineManifestV1(BaselineStrictModel):
     protocol_version: Literal["evaluation-baseline-v1"] = BASELINE_PROTOCOL_V1
     legal_input_fingerprint: Hash
     baseline_fingerprint: Hash | None = None
     phase: BaselinePhaseV1
     terminal_status: Literal["COMPLETED", "INCONCLUSIVE"] | None = None
+    pending_call: BaselineCallRecordV1 | None = None
+    accepted_calls: tuple[BaselineCallRecordV1, ...] = ()
+    source_review_aggregate_fingerprint: Hash | None = None
+    source_audit_aggregate_fingerprint: Hash | None = None
+    source_referee_aggregate_fingerprint: Hash | None = None
+    prior_baseline_root: Hash | None = None
+    prior_baseline_fingerprint: Hash | None = None
+    correction_record_fingerprint: Hash | None = None
     artifacts: tuple[ArtifactRecord, ...]
+    root_hash: Hash = "0" * 64
     manifest_fingerprint: Hash
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> Self:
+        terminal = {
+            BaselinePhaseV1.COMPLETED: "COMPLETED",
+            BaselinePhaseV1.INCONCLUSIVE: "INCONCLUSIVE",
+        }.get(self.phase)
+        if self.terminal_status != terminal:
+            raise ValueError("terminal baseline phase and status must match exactly")
+        if terminal is not None and self.pending_call is not None:
+            raise ValueError("terminal baseline manifests must not retain a pending call")
+        if self.pending_call is not None and self.pending_call.state != "pending":
+            raise ValueError("pending_call must contain a pending call")
+        if any(call.state != "accepted" for call in self.accepted_calls):
+            raise ValueError("accepted_calls must contain only accepted calls")
+        calls = (*self.accepted_calls, *((self.pending_call,) if self.pending_call else ()))
+        call_ids = [call.call_id for call in calls]
+        if len(call_ids) != len(set(call_ids)):
+            raise ValueError("baseline call IDs must be unique")
+        paths = [artifact.artifact_path for artifact in self.artifacts]
+        if paths != sorted(paths) or len(paths) != len(set(paths)):
+            raise ValueError("baseline artifacts must be uniquely path-sorted")
+        correction = (
+            self.prior_baseline_root,
+            self.prior_baseline_fingerprint,
+            self.correction_record_fingerprint,
+        )
+        if any(item is not None for item in correction) and any(
+            item is None for item in correction
+        ):
+            raise ValueError("baseline correction bindings must be complete")
+        if correction[0] is not None and terminal is None:
+            raise ValueError("baseline corrections must be terminal")
+        return self
 
 
 class BaselineRunStateV1(BaselineStrictModel):
