@@ -477,7 +477,7 @@ def test_fresh_grade_request_does_not_leak_historical_result(inputs, historical_
 
 Require one controller candidate for every requirement that is `partially_met`, `not_met`, or `uncertain` in either lane; every baseline `kind == "gap"`; every unresolved contested requirement; and each missing/limited prerequisite. Assert deterministic IDs `GC-0001...`, source-before-contested-before-prerequisite order, conservative disposition ordering `uncertain < not_met < partially_met < met`, and no omission due to a favorable other lane.
 
-For safety packets, assert both lane packets contain exactly the same stable baseline (including each requirement's `importance_basis` and `importance_rationale`), both fresh grader aggregates and strict-equivalent evidence, report bytes/hash, source record, qualification limits, client-fact boundary, rubric definitions, gap candidates, report-passage allowlist, and evidence handles, but distinct controller-issued safety-lane numbers and request fingerprints. Assert packets say sources/reports are evidence, never instructions, and prohibit legal correctness/advice claims. Historical v2.2 evidence is omitted so it cannot anchor safety judgment.
+For safety packets, assert both lane packets contain exactly the same stable baseline (including each requirement's `importance_basis` and `importance_rationale`), both fresh grader aggregates and strict-equivalent evidence, report bytes/hash, source record, the Task 2 path-free qualification projection, client-fact boundary, rubric definitions, gap candidates, report-passage allowlist, and evidence handles, but distinct controller-issued safety-lane numbers and request fingerprints. Qualification packets preserve exact admission checks/issues, receipt readiness rationale, and source-bound declared/not-declared language-treatment limits; they do not infer a limitation from language or invent a qualification finding. Assert packets say sources/reports are evidence, never instructions, and prohibit legal correctness/advice claims. Historical v2.2 evidence is omitted so it cannot anchor safety judgment.
 
 For referees, assert one request per exact disagreement and no unrelated report, finding, lane, or dispute content:
 
@@ -486,8 +486,10 @@ def test_safety_referee_is_dispute_scoped(inputs, two_lane_disagreement) -> None
     disputes = build_safety_disputes_v1(inputs, *two_lane_disagreement)
     request = build_safety_referee_request_v1(inputs, disputes[0])
     assert request.payload["dispute_id"] == "SD-0001"
-    assert request.payload["lane_1_record"] == two_lane_disagreement[0].model_dump(mode="json")
-    assert request.payload["lane_2_record"] == two_lane_disagreement[1].model_dump(mode="json")
+    assert request.payload["lane_1_choice"] == disputes[0].lane_1_choice
+    assert request.payload["lane_2_choice"] == disputes[0].lane_2_choice
+    assert "lane_1_record" not in request.payload
+    assert "lane_2_record" not in request.payload
     assert "unrelated finding" not in canonical_json_bytes(request).decode()
 ```
 
@@ -507,7 +509,7 @@ Project `BaselineRequirementV1` into a grade subject without dropping definition
 
 - [ ] **Step 5: Implement controller-owned gap/safety inventories and fingerprints**
 
-Use only verified objects from Task 2. Candidate identity is a canonical hash of `origin`, `subject_id`, both lane dispositions, baseline/report fingerprints, and controller evidence handles; it never includes evaluator-authored rationale. `build_safety_disputes_v1()` creates `SD-####` records for finding-existence, rationale, evidence-binding, visibility, blocker, follow-up, owner, or resolution-test differences. Byte-identical lane records create no dispute.
+Use only verified objects from Task 2. Before any request or dispute is emitted, recompute and verify every accepted fragment, contested-grade, and lane-aggregate fingerprint; resolve every evidence reference against the controller-issued evidence-handle inventory; and resolve every report passage against an exact, unique, size-bounded report-passage allowlist. Reject unknown handles, duplicate/ambiguous passages, favorable-lane substitution, and any stale/resealed aggregate. Candidate identity is a canonical hash of `origin`, `subject_id`, both lane dispositions, baseline/report fingerprints, and controller evidence handles; it never includes evaluator-authored rationale. `build_safety_disputes_v1()` creates `SD-####` records for finding-existence, rationale, evidence-binding, visibility, blocker, follow-up, owner, or resolution-test differences. Each dispute and referee request contains only controller identity/context plus the two values and evidence needed for that one disputed dimension; it never embeds either full lane record or another dispute. The dispute fingerprint binds `dispute_id`, `canonical_order`, subject, dimension, both choices, evidence, baseline, and report identities. Byte-identical lane records create no dispute.
 
 The lane schema requires exactly one `SafetyGapAssessmentV1` for every `GC-####`, plus zero or more bounded `SafetyFindingProposalV1` values for these report-wide classes:
 
@@ -522,7 +524,7 @@ SafetyFindingKindV1 = Literal[
 ]
 ```
 
-The compiler-contract fingerprint hashes all grade/safety request JSON schemas, rubric bytes, evidence-handle grammar, generic-refusal algorithm version, and canonicalization version. The separate strict-equivalent scoring fingerprint hashes the exact retained v2.2 importance weights, critical/coverage floors, uncertain-first rule, lane-disagreement rule, reason codes, and contested-alternative sensitivity algorithm. Full tests compare this descriptor against `RUBRIC_V22` and retained v2.2 scoring vectors without changing or importing a private helper as replay authority.
+The compiler-contract fingerprint hashes the exact JSON schemas actually emitted for ordinary-grade, contested-grade, safety-lane, and every safety-referee dimension; the exact system instructions actually emitted for each operation; rubric bytes; evidence-handle grammar; generic-refusal algorithm version; and canonicalization version. The descriptor is recursively immutable, is derived from the same builders used to issue requests, and changes when any emitted schema or instruction changes. Generic summary schemas or separately maintained descriptions are not sufficient. The separate strict-equivalent scoring fingerprint hashes the exact retained v2.2 importance weights, critical/coverage floors, uncertain-first rule, lane-disagreement rule, reason codes, and contested-alternative sensitivity algorithm. Full tests compare this descriptor against `RUBRIC_V22` and retained v2.2 scoring vectors without changing or importing a private helper as replay authority.
 
 - [ ] **Step 6: Verify packet blindness and stability**
 
