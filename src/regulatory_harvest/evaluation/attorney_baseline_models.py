@@ -34,11 +34,16 @@ _GENERIC_RATIONALES = frozenset(
 )
 _REPORT_BOUND_KEYS = frozenset(
     {
+        "candidate",
         "candidate_id",
+        "generation",
         "report_text",
+        "report",
         "report_hash",
+        "label",
         "anonymous_label",
         "generation_metadata",
+        "grader",
         "grader_responses",
         "run_seed",
         "case_fingerprint",
@@ -139,8 +144,10 @@ def _validate_report_blind_json_tree(value: object, *, location: str) -> object:
             active.add(identity)
             pending.append((current, True))
             pending.extend((item, False) for item in current)
-        elif current is None or type(current) in {str, bool, int} or (
-            type(current) is float and math.isfinite(current)
+        elif (
+            current is None
+            or type(current) in {str, bool, int}
+            or (type(current) is float and math.isfinite(current))
         ):
             continue
         else:
@@ -524,6 +531,11 @@ class BaselineEvaluatorRequestV1(BaselineStrictModel):
     safe_metadata: dict[str, str] = Field(default_factory=dict)
 
     _validate_instructions = field_validator("system_instructions")(_nonblank)
+
+    @field_validator("json_schema", "payload", "safe_metadata", mode="before")
+    @classmethod
+    def validate_report_blind_request_tree(cls, value: object) -> object:
+        return _validate_report_blind_json_tree(value, location="evaluator request")
 
 
 class BaselineEvaluatorResponseV1(BaselineStrictModel):
