@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -2247,6 +2248,221 @@ def test_controller_defaults_to_protocol_21_and_preserves_truthful_template_meta
     assert json.loads(
         (ROOT / "assets" / "attorney-evaluation-response.template.json").read_bytes()
     )["judge_isolation"] == "fresh_context"
+
+
+def _baseline_cli_control(tmp_path: Path) -> Path:
+    fixture_root = tmp_path / "baseline-fixture"
+    case_path = _write_qualification_fixture(fixture_root, schema_version="1.1")
+    qualification = tmp_path / "qualification"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-qualify-init",
+        "--case",
+        str(case_path),
+        "--run",
+        str(qualification),
+        "--nonce-hex",
+        "1" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    request_result = _run_runner(
+        SKILL_RUNNER, "eval-qualify-next", "--run", str(qualification)
+    )
+    assert request_result.returncode == 0, request_result.stderr
+    request = json.loads(request_result.stdout)
+    response_path = tmp_path / "qualification-response.json"
+    response_path.write_bytes(_canonical_bytes(_qualification_response_envelope(request)))
+    submitted = _run_runner(
+        SKILL_RUNNER,
+        "eval-qualify-submit",
+        "--run",
+        str(qualification),
+        "--response",
+        str(response_path),
+    )
+    assert submitted.returncode == 0, submitted.stderr
+    control = tmp_path / "baseline-control.json"
+    control.write_bytes(
+        _canonical_bytes(
+            {
+                "client_facts_path": None,
+                "qualification_capsule_path": "qualification",
+                "schema_version": "1.0",
+            }
+        )
+    )
+    return control
+
+
+def test_baseline_full_runner_exposes_exact_commands_safe_status_and_exit_mapping(
+    tmp_path: Path,
+) -> None:
+    """The additive baseline family stays separate from retained legal dispositions."""
+    parser = skill_runner._full_evaluation_runner()._parser()
+    subparser_action = next(
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    )
+    assert set(subparser_action.choices) >= {
+        "eval-baseline-init",
+        "eval-baseline-next",
+        "eval-baseline-submit-safe",
+        "eval-baseline-status",
+        "eval-baseline-verify",
+    }
+    retained = parser.parse_args(
+        ["eval-init", "--case", "case.json", "--run", "run", "--seed-hex", "0" * 64]
+    )
+    assert retained.protocol == "2.1"
+
+    run = tmp_path / "baseline"
+    initialized = _run_runner(
+        SKILL_RUNNER,
+        "eval-baseline-init",
+        "--input",
+        str(_baseline_cli_control(tmp_path)),
+        "--run",
+        str(run),
+        "--nonce-hex",
+        "2" * 64,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    first = _run_runner(SKILL_RUNNER, "eval-baseline-next", "--run", str(run))
+    second = _run_runner(SKILL_RUNNER, "eval-baseline-next", "--run", str(run))
+    assert first.returncode == second.returncode == 0
+    assert first.stdout == second.stdout
+    request = json.loads(first.stdout)
+    assert request["operation"] == "baseline_source_review"
+
+    malformed = tmp_path / "malformed-baseline-response.json"
+    malformed.write_bytes(_canonical_bytes({"private_path": str(tmp_path), "source": "secret"}))
+    before = _run_snapshot(run)
+    refused = _run_runner(
+        SKILL_RUNNER,
+        "eval-baseline-submit-safe",
+        "--run",
+        str(run),
+        "--response",
+        str(malformed),
+        "--provider-name",
+        "fictional-provider",
+        "--model-name",
+        "fictional-model",
+        "--judge-isolation",
+        "scripted_fixture",
+    )
+    assert refused.returncode == 2
+    assert json.loads(refused.stderr)["code"] == "BASELINE_EXTERNAL_RESPONSE_INVALID"
+    assert str(tmp_path) not in refused.stderr
+    assert "secret" not in refused.stderr
+    assert _run_snapshot(run) == before
+
+    review = tmp_path / "review.json"
+    review.write_bytes(
+        _canonical_bytes(
+            {
+                "proposals": [
+                    {
+                        "statement": "A covered operator must file notice.",
+                        "kind": "obligation",
+                        "importance": "critical",
+                        "importance_basis": ["legal_bottom_line"],
+                        "importance_rationale": (
+                            "Omission could change the legal bottom line."
+                        ),
+                        "passages": [
+                            {"source_id": "source-1", "quote": "presentará aviso"}
+                        ],
+                        "dependency": None,
+                        "confidence": "clear",
+                        "substantive_rationale": "The fictional rule uses mandatory language.",
+                    }
+                ],
+                "review_complete": True,
+            }
+        )
+    )
+    accepted = _run_runner(
+        SKILL_RUNNER,
+        "eval-baseline-submit-safe",
+        "--run",
+        str(run),
+        "--response",
+        str(review),
+        "--provider-name",
+        "fictional-provider",
+        "--model-name",
+        "fictional-model",
+        "--judge-isolation",
+        "scripted_fixture",
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    audit_request = json.loads(
+        _run_runner(SKILL_RUNNER, "eval-baseline-next", "--run", str(run)).stdout
+    )
+    assert audit_request["operation"] == "baseline_source_audit"
+    audit = tmp_path / "audit.json"
+    audit.write_bytes(
+        _canonical_bytes(
+            {
+                "concerns": [],
+                "importance_findings": [
+                    {
+                        "proposal_ref": "PR-0001",
+                        "reviewed_importance": "critical",
+                        "reviewed_importance_basis": ["legal_bottom_line"],
+                        "importance_rationale": (
+                            "Omission could change the legal bottom line."
+                        ),
+                        "disposition": "agree",
+                    }
+                ],
+                "audit_complete": True,
+            }
+        )
+    )
+    completed = _run_runner(
+        SKILL_RUNNER,
+        "eval-baseline-submit-safe",
+        "--run",
+        str(run),
+        "--response",
+        str(audit),
+        "--provider-name",
+        "fictional-provider",
+        "--model-name",
+        "fictional-model",
+        "--judge-isolation",
+        "scripted_fixture",
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    status = _run_runner(SKILL_RUNNER, "eval-baseline-status", "--run", str(run))
+    verified = _run_runner(SKILL_RUNNER, "eval-baseline-verify", "--run", str(run))
+    assert status.returncode == verified.returncode == 0
+    status_payload = json.loads(status.stdout)
+    assert set(status_payload) == {
+        "baseline_fingerprint",
+        "engine_paused",
+        "legal_input_fingerprint",
+        "manifest_fingerprint",
+        "pending_operation",
+        "phase",
+        "protocol_version",
+        "request_fingerprint",
+        "root_hash",
+    }
+    assert status_payload["phase"] == "completed"
+    assert status_payload["pending_operation"] is None
+    assert status_payload["request_fingerprint"] is None
+    assert status_payload["engine_paused"] is False
+    assert "PASS" not in status.stdout
+    assert str(tmp_path) not in status.stdout + verified.stdout
+    assert "presentará aviso" not in status.stdout + verified.stdout
+    assert json.loads(verified.stdout) == {
+        "issues": [],
+        "ok": True,
+        "protocol_version": "evaluation-baseline-v1",
+    }
 
 
 def test_controller_stops_on_integrity_failure_without_consuming_response(

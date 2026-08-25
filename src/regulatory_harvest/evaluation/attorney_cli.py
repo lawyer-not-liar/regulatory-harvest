@@ -30,6 +30,8 @@ from .attorney_artifacts import (
     load_verified_evaluation_run,
     verify_evaluation_run,
 )
+from .attorney_baseline_models import BaselineOperationV1
+from .attorney_baseline_workflow import BaselineDraftPromptV1
 from .attorney_models import (
     AttorneyEvaluationCase,
     AttorneyEvaluationResult,
@@ -892,6 +894,141 @@ class _ScriptedDraftProbeInputError(_ScriptedDraftFixtureError):
 
 class _ScriptedDraftProviderProbeError(Exception):
     """A provider failure observed while validating a disposable probe."""
+
+
+class _ScriptedBaselineDraftFixtureError(ValueError):
+    """A baseline draft fixture does not match its declared prompt sequence."""
+
+
+class _ScriptedBaselineDraftExhaustedError(_ScriptedBaselineDraftFixtureError):
+    """A baseline draft fixture ends before the pending prompt sequence."""
+
+
+class _ScriptedFixtureBaselineDraftEvaluatorV1:
+    """Fixture-only adapter for bounded baseline role-draft tests."""
+
+    provider_name = "local-scripted-fixture"
+    model_name = "no-provider"
+    judge_isolation: Literal["scripted_fixture"] = "scripted_fixture"
+
+    def __init__(self, responses: dict[str, object]) -> None:
+        if (
+            set(responses) != {"fixture_type", "responses"}
+            or responses["fixture_type"]
+            != "local-scripted-drafts-evaluation-baseline-v1"
+        ):
+            raise _ScriptedBaselineDraftFixtureError(
+                "scripted drafts are not an evaluation-baseline-v1 fixture"
+            )
+        raw = responses["responses"]
+        if type(raw) is not list:
+            raise _ScriptedBaselineDraftFixtureError(
+                "scripted baseline drafts must be an array"
+            )
+        self._responses: list[
+            tuple[BaselineOperationV1, object, str, Literal[1, 2], tuple[str, ...]]
+        ] = []
+        seen: set[bytes] = set()
+        for item in raw:
+            if type(item) is not dict or set(item) != {
+                "draft",
+                "expect",
+                "operation",
+            }:
+                raise _ScriptedBaselineDraftFixtureError(
+                    "scripted baseline draft has an unexpected shape"
+                )
+            operation = item["operation"]
+            expectation = item["expect"]
+            if type(operation) is not str or type(expectation) is not dict:
+                raise _ScriptedBaselineDraftFixtureError(
+                    "scripted baseline draft is malformed"
+                )
+            expected = cast(dict[str, object], expectation)
+            if set(expected) != {
+                "attempt",
+                "repair_codes",
+                "request_fingerprint",
+            }:
+                raise _ScriptedBaselineDraftFixtureError(
+                    "scripted baseline expectation has an unexpected shape"
+                )
+            attempt = expected["attempt"]
+            fingerprint = expected["request_fingerprint"]
+            repair_codes = expected["repair_codes"]
+            if (
+                type(attempt) is not int
+                or attempt not in {1, 2}
+                or type(fingerprint) is not str
+                or _HASH_RE.fullmatch(fingerprint) is None
+                or type(repair_codes) is not list
+                or any(type(code) is not str or not code for code in repair_codes)
+            ):
+                raise _ScriptedBaselineDraftFixtureError(
+                    "scripted baseline expectation is malformed"
+                )
+            try:
+                operation_value = BaselineOperationV1(operation)
+            except ValueError as error:
+                raise _ScriptedBaselineDraftFixtureError(
+                    "scripted baseline operation is unsupported"
+                ) from error
+            signature = canonical_json_bytes(item)
+            if signature in seen:
+                raise _ScriptedBaselineDraftFixtureError(
+                    "scripted baseline draft is duplicated"
+                )
+            seen.add(signature)
+            self._responses.append(
+                (
+                    operation_value,
+                    item["draft"],
+                    fingerprint,
+                    cast(Literal[1, 2], attempt),
+                    tuple(cast(list[str], repair_codes)),
+                )
+            )
+
+    async def evaluate_draft(self, prompt: BaselineDraftPromptV1) -> object:
+        if not self._responses:
+            raise _ScriptedBaselineDraftExhaustedError(
+                "scripted baseline drafts exhausted"
+            )
+        operation, draft, fingerprint, attempt, repair_codes = self._responses.pop(0)
+        if (
+            operation is not prompt.request.operation
+            or fingerprint != prompt.request.request_fingerprint
+            or attempt != prompt.attempt
+            or repair_codes != prompt.repair_codes
+        ):
+            raise _ScriptedBaselineDraftFixtureError(
+                "scripted baseline draft prompt mismatched"
+            )
+        return draft
+
+    def assert_exhausted(self) -> None:
+        if self._responses:
+            raise _ScriptedBaselineDraftFixtureError(
+                "scripted baseline drafts contain unused entries"
+            )
+
+
+def render_baseline_status_human_v1(payload: dict[str, object]) -> str:
+    """Render only the fixed baseline status projection without a legal grade."""
+    fields = (
+        "protocol_version",
+        "phase",
+        "pending_operation",
+        "request_fingerprint",
+        "legal_input_fingerprint",
+        "baseline_fingerprint",
+        "manifest_fingerprint",
+        "root_hash",
+        "engine_paused",
+    )
+    if set(payload) != set(fields):
+        raise ValueError("baseline status has an unexpected shape")
+    return "\n".join(f"{field}: {payload[field]}" for field in fields)
 
 
 class _ScriptedFixtureDraftEvaluatorV22:

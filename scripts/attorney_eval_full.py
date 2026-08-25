@@ -26,6 +26,16 @@ from regulatory_harvest.evaluation.attorney_artifacts import (
     read_evaluation_artifact,
     verify_evaluation_run,
 )
+from regulatory_harvest.evaluation.attorney_baseline_artifacts import verify_baseline_run
+from regulatory_harvest.evaluation.attorney_baseline_input import BaselineInputError
+from regulatory_harvest.evaluation.attorney_baseline_models import BASELINE_PROTOCOL_V1
+from regulatory_harvest.evaluation.attorney_baseline_workflow import (
+    BASELINE_EXTERNAL_RESPONSE_INVALID,
+    baseline_status_payload_v1,
+    guarded_submit_baseline_response_v1,
+    initialize_baseline_v1,
+    next_baseline_request_v1,
+)
 from regulatory_harvest.evaluation.attorney_cli import (
     _case_and_capsules_from_fixture,
     _probe_resumed_scripted_v22_run,
@@ -164,6 +174,28 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(
         dest="command", required=True, parser_class=_JsonArgumentParser
     )
+    baseline_init_parser = subparsers.add_parser("eval-baseline-init")
+    baseline_init_parser.add_argument("--input", required=True)
+    baseline_init_parser.add_argument("--run", required=True)
+    baseline_init_parser.add_argument("--nonce-hex", required=True)
+    baseline_init_parser.add_argument("--prior-baseline", action="append")
+    baseline_init_parser.add_argument("--correction")
+    baseline_next_parser = subparsers.add_parser("eval-baseline-next")
+    baseline_next_parser.add_argument("--run", required=True)
+    baseline_submit_parser = subparsers.add_parser("eval-baseline-submit-safe")
+    baseline_submit_parser.add_argument("--run", required=True)
+    baseline_submit_parser.add_argument("--response", required=True)
+    baseline_submit_parser.add_argument("--provider-name", required=True)
+    baseline_submit_parser.add_argument("--model-name", required=True)
+    baseline_submit_parser.add_argument(
+        "--judge-isolation",
+        choices=("fresh_context", "scripted_fixture"),
+        required=True,
+    )
+    baseline_status_parser = subparsers.add_parser("eval-baseline-status")
+    baseline_status_parser.add_argument("--run", required=True)
+    baseline_verify_parser = subparsers.add_parser("eval-baseline-verify")
+    baseline_verify_parser.add_argument("--run", required=True)
     eval_init_parser = subparsers.add_parser("eval-init")
     eval_init_parser.add_argument("--case", required=True)
     eval_init_parser.add_argument("--run", required=True)
@@ -1033,6 +1065,82 @@ def _run_qualification_command(args: argparse.Namespace) -> int:
         raise EvaluationCliInputError("EVALUATION_INPUT_INVALID", str(error)) from error
 
 
+def _run_baseline_command(args: argparse.Namespace) -> int:
+    """Run the report-blind baseline lifecycle without legal-grade exit codes."""
+    run = _physical_run_path(args.run)
+    try:
+        if args.command == "eval-baseline-init":
+            prior_values = getattr(args, "prior_baseline", None) or []
+            if type(prior_values) is not list or any(
+                type(value) is not str for value in prior_values
+            ):
+                raise EvaluationCliInputError(
+                    "BASELINE_INPUT_INVALID", "The baseline ancestry is invalid."
+                )
+            prior_paths = tuple(_physical_run_path(value) for value in prior_values)
+            correction_value = getattr(args, "correction", None)
+            initialize_baseline_v1(
+                Path(args.input),
+                run,
+                nonce_hex=args.nonce_hex,
+                prior_baseline_path=prior_paths[-1] if prior_paths else None,
+                correction_path=(
+                    None if correction_value is None else Path(correction_value)
+                ),
+                prior_ancestry=prior_paths[:-1],
+            )
+            _eval_json(
+                baseline_status_payload_v1(
+                    run,
+                    prior_baseline_path=prior_paths[-1] if prior_paths else None,
+                    prior_ancestry=prior_paths[:-1],
+                )
+            )
+            return EVAL_EXIT_SUCCESS
+        if args.command == "eval-baseline-next":
+            request = next_baseline_request_v1(run)
+            _eval_json(None if request is None else request.model_dump(mode="json"))
+            return EVAL_EXIT_SUCCESS
+        if args.command == "eval-baseline-submit-safe":
+            payload = _read_guarded_eval_object(Path(args.response))
+            result = guarded_submit_baseline_response_v1(
+                run,
+                payload,
+                provider_name=args.provider_name,
+                model_name=args.model_name,
+                judge_isolation=args.judge_isolation,
+            )
+            if not result.accepted:
+                raise EvaluationCliInputError(
+                    BASELINE_EXTERNAL_RESPONSE_INVALID,
+                    "The baseline response is invalid.",
+                )
+            _eval_json(baseline_status_payload_v1(run))
+            return EVAL_EXIT_SUCCESS
+        if args.command == "eval-baseline-status":
+            _eval_json(baseline_status_payload_v1(run))
+            return EVAL_EXIT_SUCCESS
+        verification = verify_baseline_run(run)
+        _eval_json(
+            {
+                "issues": list(verification.issues),
+                "ok": verification.valid,
+                "protocol_version": BASELINE_PROTOCOL_V1,
+            }
+        )
+        return EVAL_EXIT_SUCCESS if verification.valid else EVAL_EXIT_INTEGRITY
+    except (EvaluationCliInputError, EvaluationIntegrityError):
+        raise
+    except BaselineInputError as error:
+        raise EvaluationCliInputError(
+            "BASELINE_INPUT_INVALID", "The baseline input is invalid."
+        ) from error
+    except (OSError, RecursionError, TypeError, UnicodeError, ValidationError, ValueError) as error:
+        raise EvaluationCliInputError(
+            "BASELINE_INPUT_INVALID", "The baseline command input is invalid."
+        ) from error
+
+
 def _generation_json(value: object) -> None:
     print(generation.canonical_json_bytes(value).decode("utf-8"))
 
@@ -1062,6 +1170,8 @@ def _run_generation_command(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
+        if args.command.startswith("eval-baseline-"):
+            return _run_baseline_command(args)
         if args.command.startswith("eval-gen-"):
             return _run_generation_command(args)
         if args.command.startswith("eval-qualify-"):

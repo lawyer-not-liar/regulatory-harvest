@@ -59,8 +59,19 @@ def _full_evaluation_runner() -> Any:
 # narrower dependency surface than research. Dispatch it before probing or
 # importing the research/briefing stack so a clean evaluation installation
 # cannot be broken by unrelated optional models.
+_IS_BASELINE_EVALUATION_COMMAND = (
+    __name__ == "__main__"
+    and len(sys.argv) > 1
+    and sys.argv[1].startswith("eval-baseline-")
+)
+_IS_GENERIC_EVALUATION_COMMAND = (
+    __name__ == "__main__"
+    and len(sys.argv) > 1
+    and not _IS_BASELINE_EVALUATION_COMMAND
+    and sys.argv[1].startswith("eval-")
+)
 _IS_EVALUATION_COMMAND = (
-    __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1].startswith("eval-")
+    _IS_BASELINE_EVALUATION_COMMAND or _IS_GENERIC_EVALUATION_COMMAND
 )
 if _IS_EVALUATION_COMMAND and importlib.util.find_spec("pydantic") is not None:
     try:
@@ -590,6 +601,8 @@ def _safe_evaluation_verification_issues(issues: tuple[str, ...]) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0].startswith("eval-baseline-"):
+        return cast(int, _full_evaluation_runner().main(arguments))
     if arguments and arguments[0].startswith("eval-"):
         return cast(int, _full_evaluation_runner().main(arguments))
     try:

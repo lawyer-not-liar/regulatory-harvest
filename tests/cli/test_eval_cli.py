@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import shutil
@@ -57,6 +58,81 @@ ATTORNEY_V22_FIXTURE = Path(__file__).parents[1] / "fixtures" / "attorney-eval-v
 ROOT = Path(__file__).parents[2]
 FULL_PUBLIC_RUNNER = ROOT / "scripts" / "harvest_skill.py"
 PORTABLE_PUBLIC_RUNNER = ROOT / "scripts" / "harvest_portable.py"
+
+
+def test_baseline_scripted_fixture_has_bounded_exhaustion_and_malformed_taxonomy() -> None:
+    """Fixture defects stay input defects and never become provider/runtime failures."""
+    from regulatory_harvest.evaluation.attorney_baseline_models import (
+        BaselineEvaluatorRequestV1,
+    )
+    from regulatory_harvest.evaluation.attorney_baseline_workflow import (
+        BaselineDraftPromptV1,
+    )
+    from regulatory_harvest.evaluation.attorney_cli import (
+        _ScriptedBaselineDraftExhaustedError,
+        _ScriptedBaselineDraftFixtureError,
+        _ScriptedFixtureBaselineDraftEvaluatorV1,
+    )
+
+    with pytest.raises(_ScriptedBaselineDraftFixtureError):
+        _ScriptedFixtureBaselineDraftEvaluatorV1(
+            {"fixture_type": "local-scripted-drafts-evaluation-baseline-v1", "responses": {}}
+        )
+
+    request = BaselineEvaluatorRequestV1(
+        operation="baseline_source_review",
+        request_fingerprint="0" * 64,
+        system_instructions="Return only the strict source-review payload.",
+        json_schema={},
+        payload={},
+    )
+    fixture = _ScriptedFixtureBaselineDraftEvaluatorV1(
+        {
+            "fixture_type": "local-scripted-drafts-evaluation-baseline-v1",
+            "responses": [
+                {
+                    "draft": {"proposals": [], "review_complete": True},
+                    "expect": {
+                        "attempt": 1,
+                        "repair_codes": [],
+                        "request_fingerprint": "0" * 64,
+                    },
+                    "operation": "baseline_source_review",
+                }
+            ],
+        }
+    )
+    prompt = BaselineDraftPromptV1(request=request, attempt=1)
+    assert asyncio.run(fixture.evaluate_draft(prompt)) == {
+        "proposals": [],
+        "review_complete": True,
+    }
+    with pytest.raises(_ScriptedBaselineDraftExhaustedError):
+        asyncio.run(fixture.evaluate_draft(prompt))
+
+
+def test_baseline_human_status_is_bounded_and_never_says_pass() -> None:
+    """Human status communicates phase and pause without claiming legal substance."""
+    from regulatory_harvest.evaluation.attorney_cli import render_baseline_status_human_v1
+
+    rendered = render_baseline_status_human_v1(
+        {
+            "protocol_version": "evaluation-baseline-v1",
+            "phase": "source_review",
+            "pending_operation": "baseline_source_review",
+            "request_fingerprint": "a" * 64,
+            "legal_input_fingerprint": "b" * 64,
+            "baseline_fingerprint": None,
+            "manifest_fingerprint": "c" * 64,
+            "root_hash": "d" * 64,
+            "engine_paused": False,
+        }
+    )
+
+    assert "evaluation-baseline-v1" in rendered
+    assert "source_review" in rendered
+    assert "PASS" not in rendered
+    assert "/private/" not in rendered
 
 
 def test_eval_cli_runs_user_supplied_synthetic_dataset(

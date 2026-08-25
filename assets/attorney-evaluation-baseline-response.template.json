@@ -1,0 +1,1 @@
+{"judge_isolation":"scripted_fixture","model_name":"illustrative-model","operation":"baseline_source_review","payload":{"proposals":[],"review_complete":true},"provider_name":"illustrative-provider","request_fingerprint":"0000000000000000000000000000000000000000000000000000000000000000","schema_version":"evaluation-baseline-v1"}
