@@ -206,6 +206,14 @@ def valid_grade(requirement_id: str = "REQ-0001") -> dict[str, object]:
     }
 
 
+def native_python_wire(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: native_python_wire(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [native_python_wire(item) for item in value]
+    return value
+
+
 def valid_fragment(**updates: object) -> dict[str, object]:
     value: dict[str, object] = {
         "protocol_version": "delivery-readiness-v1",
@@ -564,6 +572,31 @@ def test_constructed_response_cannot_launder_raw_tuples_into_json_lists() -> Non
         validate_readiness_evaluator_response_v1(forged)
 
 
+def test_constructed_external_response_subclass_cannot_launder_raw_tuples() -> None:
+    class ExternalResponse(ReadinessEvaluatorResponseV1):
+        pass
+
+    forged = ExternalResponse.model_construct(
+        **valid_response(payload={"raw_tuple": ("not", "json")})
+    )
+    with pytest.raises(ValueError, match=r"^readiness evaluator response is invalid$"):
+        validate_readiness_evaluator_response_v1(forged)
+
+
+def test_forged_imported_grade_cannot_launder_list_field_tuples() -> None:
+    forged = RequirementGradeV2.model_construct(
+        **(valid_grade() | {"report_passages": ("not native wire",)})
+    )
+    with pytest.raises(ValidationError):
+        BaselineLockedGradeFragmentV1.model_validate(valid_fragment(requirement_grades=(forged,)))
+
+
+def test_validated_internal_frozen_tuples_rehydrate_to_exact_wire() -> None:
+    fragment = BaselineLockedGradeFragmentV1.model_validate(valid_fragment())
+    checked = BaselineLockedGradeFragmentV1.model_validate(fragment)
+    assert checked.model_dump(mode="json") == fragment.model_dump(mode="json")
+
+
 @pytest.mark.parametrize(
     ("model", "value", "field"),
     [
@@ -648,6 +681,22 @@ def test_aggregate_requires_exact_flattened_grades_and_controller_order() -> Non
         )
 
 
+def test_aggregate_requires_numeric_requirement_order_across_fragments() -> None:
+    first = valid_fragment(requirement_grades=(valid_grade("REQ-0002"),))
+    second = valid_fragment(
+        batch_ref="GB-1-0002",
+        requirement_grades=(valid_grade("REQ-0001"),),
+        fragment_fingerprint="1" * 64,
+    )
+    with pytest.raises(ValidationError, match="requirement order"):
+        BaselineLockedGraderAggregateV1.model_validate(
+            valid_aggregate(
+                ordinary_fragments=(first, second),
+                requirement_grades=(valid_grade("REQ-0002"), valid_grade("REQ-0001")),
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "unsafe",
     ["/Users/client/private.json", "../private", "private client detail", "safety-lane-1\nsecret"],
@@ -688,6 +737,38 @@ def test_verification_issues_are_safe_bounded_codes(issue: str) -> None:
         ReadinessVerificationV1.model_validate({"valid": False, "checks": {}, "issues": (issue,)})
 
 
+APPROVED_VERIFICATION_ISSUES = (
+    "INTEGRITY_OR_PROVENANCE_INVALID",
+    "RATIONALE_EVIDENCE_UNBOUND",
+    "READINESS_ARTIFACT_INVALID",
+    "READINESS_COMPILER_INVARIANT",
+    "READINESS_COMPILER_PREFLIGHT_DISAGREEMENT",
+    "READINESS_INVENTORY_INVALID",
+    "READINESS_MANIFEST_INVALID",
+    "READINESS_RESULT_REQUIRED",
+    "READINESS_SEMANTIC_REPLAY_INVALID",
+    "READINESS_STORAGE_UNSAFE",
+    "READINESS_VALIDATION_RECEIPT_INVALID",
+)
+
+
+@pytest.mark.parametrize("issue", APPROVED_VERIFICATION_ISSUES)
+def test_verification_accepts_only_reviewed_future_issue_inventory(issue: str) -> None:
+    checked = ReadinessVerificationV1.model_validate(
+        {"valid": False, "checks": {}, "issues": (issue,)}
+    )
+    assert checked.issues == (issue,)
+
+
+@pytest.mark.parametrize(
+    "issue",
+    ["CLIENT_MATTER_1234", "PRIVATE_REPORT_PRESENT", "SECRET_DATA_FOUND"],
+)
+def test_verification_rejects_private_code_shaped_issues(issue: str) -> None:
+    with pytest.raises(ValidationError):
+        ReadinessVerificationV1.model_validate({"valid": False, "checks": {}, "issues": (issue,)})
+
+
 def test_manifest_detaches_and_freezes_legacy_artifact_records() -> None:
     original = ArtifactRecord(artifact_path="a.json", artifact_hash=HASH)
     manifest = ReadinessManifestV1.model_validate(valid_manifest(artifacts=(original,)))
@@ -698,12 +779,10 @@ def test_manifest_detaches_and_freezes_legacy_artifact_records() -> None:
 
 
 def test_fragment_detaches_imported_requirement_grade_aliases() -> None:
-    original = RequirementGradeV2.model_validate(valid_grade())
-    fragment = BaselineLockedGradeFragmentV1.model_validate(
-        valid_fragment(requirement_grades=(original,))
-    )
-    object.__setattr__(original, "rationale", "mutated")
-    assert fragment.requirement_grades[0].rationale != "mutated"
+    original = BaselineLockedGradeFragmentV1.model_validate(valid_fragment())
+    checked = BaselineLockedGradeFragmentV1.model_validate(original)
+    object.__setattr__(original.requirement_grades[0], "rationale", "mutated")
+    assert checked.requirement_grades[0].rationale != "mutated"
 
 
 def test_input_detaches_and_rehydrates_verified_projection_alias(tmp_path: Path) -> None:
@@ -715,7 +794,9 @@ def test_input_detaches_and_rehydrates_verified_projection_alias(tmp_path: Path)
     value = ReadinessInputV1.model_validate(
         {
             "protocol_version": "delivery-readiness-v1",
-            "gradeable_baseline": projection,
+            "gradeable_baseline": native_python_wire(
+                projection.model_dump(mode="python", warnings="error")
+            ),
             "grade_target_fingerprint": expected_grade_target,
             "report_text": "A report.",
             "report_hash": HASH,
@@ -735,8 +816,6 @@ def test_input_detaches_and_rehydrates_verified_projection_alias(tmp_path: Path)
             "historical_v22_cross_check": None,
         }
     )
-    object.__setattr__(projection.binding, "grade_target_fingerprint", "9" * 64)
-    assert value.gradeable_baseline.binding.grade_target_fingerprint == expected_grade_target
-    assert validate_readiness_input_v1(value).model_dump(mode="json") == value.model_dump(
-        mode="json"
-    )
+    checked = validate_readiness_input_v1(value)
+    object.__setattr__(value.gradeable_baseline.binding, "grade_target_fingerprint", "9" * 64)
+    assert checked.gradeable_baseline.binding.grade_target_fingerprint == expected_grade_target

@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from datetime import date, datetime, time
 from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Annotated, Literal, Self, TypeVar, cast
+from typing import Annotated, Literal, Self, TypeVar, cast, get_origin
 
 from pydantic import (
     BaseModel,
@@ -113,7 +113,6 @@ def _wire_snapshot_inner(
     *,
     budget: list[int],
     depth: int,
-    thaw_model_state: bool,
 ) -> object:
     """Return one bounded raw view without normalizing scalar provenance."""
     budget[0] += 1
@@ -139,13 +138,15 @@ def _wire_snapshot_inner(
             extra = object.__getattribute__(value, "__pydantic_extra__")
             if extra:
                 state.update(extra)
+            serialized = value.model_dump(mode="json", warnings="error")
+            if _has_unmarked_json_array(state, serialized):
+                raise ValueError("model state contains an unmarked JSON array tuple")
             return {
                 key: _wire_snapshot_inner(
                     item,
                     active,
                     budget=budget,
                     depth=depth + 1,
-                    thaw_model_state=type(value).__module__ != __name__,
                 )
                 for key, item in dict.items(state)
             }
@@ -163,12 +164,10 @@ def _wire_snapshot_inner(
                     active,
                     budget=budget,
                     depth=depth + 1,
-                    thaw_model_state=thaw_model_state,
                 )
                 for item in tuple.__iter__(cast(tuple[object, ...], value))
             )
-            should_thaw = thaw_model_state or isinstance(value, _FrozenJsonList)
-            return list(values) if should_thaw else values
+            return values
         finally:
             active.remove(identity)
     if isinstance(value, list):
@@ -183,7 +182,6 @@ def _wire_snapshot_inner(
                     active,
                     budget=budget,
                     depth=depth + 1,
-                    thaw_model_state=thaw_model_state,
                 )
                 for item in list.__iter__(cast(list[object], value))
             ]
@@ -202,7 +200,6 @@ def _wire_snapshot_inner(
                     active,
                     budget=budget,
                     depth=depth + 1,
-                    thaw_model_state=thaw_model_state,
                 )
                 if wire_key in result:
                     raise ValueError("readiness model wire snapshot contains duplicate keys")
@@ -211,7 +208,6 @@ def _wire_snapshot_inner(
                     active,
                     budget=budget,
                     depth=depth + 1,
-                    thaw_model_state=thaw_model_state,
                 )
             return result
         finally:
@@ -229,7 +225,6 @@ def _wire_snapshot(value: object) -> object:
                 set(),
                 budget=[0, 0],
                 depth=1,
-                thaw_model_state=False,
             )
     except Exception:
         raise ValueError("readiness model wire snapshot is invalid") from None
@@ -250,18 +245,29 @@ class _FrozenDict(dict[str, object]):
     update = _immutable
 
 
-class _FrozenJsonList(tuple[object, ...]):
-    """Marker distinguishing internally frozen JSON arrays from raw tuples."""
+class _FrozenWireTuple(tuple[object, ...]):
+    """Marker for a validated tuple field that serializes as a JSON array."""
 
 
-def _deep_freeze(value: object) -> object:
-    if type(value) is dict:
-        return _FrozenDict({key: _deep_freeze(item) for key, item in value.items()})
-    if type(value) is list:
-        return _FrozenJsonList(_deep_freeze(item) for item in cast(list[object], value))
-    if type(value) is tuple:
-        return tuple(_deep_freeze(item) for item in cast(tuple[object, ...], value))
-    return value
+class _FrozenJsonList(list[object]):
+    """Immutable marker for a validated JSON list."""
+
+    @staticmethod
+    def _immutable(*_: object, **__: object) -> None:
+        raise TypeError("delivery-readiness-v1 values are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable  # type: ignore[assignment]
+    __imul__ = _immutable  # type: ignore[assignment]
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
 
 
 def _json_key(value: object) -> object:
@@ -269,6 +275,80 @@ def _json_key(value: object) -> object:
         return value.value
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
+    return value
+
+
+def _has_unmarked_json_array(value: object, serialized: object) -> bool:
+    """Detect tuples whose JSON-list provenance was not established by validation."""
+    if isinstance(value, BaseModel):
+        state = dict(object.__getattribute__(value, "__dict__"))
+        return _has_unmarked_json_array(
+            state,
+            value.model_dump(mode="json", warnings="error"),
+        )
+    if isinstance(value, dict) and isinstance(serialized, dict):
+        return any(
+            _json_key(key) not in serialized
+            or _has_unmarked_json_array(item, serialized[_json_key(key)])
+            for key, item in dict.items(value)
+        )
+    if isinstance(value, tuple) and isinstance(serialized, list):
+        if not isinstance(value, _FrozenWireTuple):
+            return True
+        return len(value) != len(serialized) or any(
+            _has_unmarked_json_array(item, wire_item)
+            for item, wire_item in zip(value, serialized, strict=True)
+        )
+    if isinstance(value, list) and isinstance(serialized, list):
+        return len(value) != len(serialized) or any(
+            _has_unmarked_json_array(item, wire_item)
+            for item, wire_item in zip(value, serialized, strict=True)
+        )
+    return False
+
+
+def _freeze_validated_wire(
+    value: object,
+    serialized: object,
+    *,
+    annotation: object | None = None,
+) -> object:
+    """Freeze one validated value while marking its exact JSON-array representation."""
+    if isinstance(value, BaseModel):
+        if not isinstance(serialized, dict):
+            raise ValueError("validated readiness model has invalid serialized state")
+        for field_name, field_info in type(value).model_fields.items():
+            if field_name not in serialized:
+                raise ValueError("validated readiness model is missing serialized state")
+            item = getattr(value, field_name)
+            frozen = _freeze_validated_wire(
+                item,
+                serialized[field_name],
+                annotation=field_info.annotation,
+            )
+            if frozen is not item:
+                object.__setattr__(value, field_name, frozen)
+        return value
+    if isinstance(value, dict):
+        if not isinstance(serialized, dict):
+            raise ValueError("validated readiness mapping has invalid serialized state")
+        frozen_items: dict[object, object] = {}
+        for key, item in dict.items(value):
+            wire_key = _json_key(key)
+            if wire_key not in serialized:
+                raise ValueError("validated readiness mapping is missing serialized state")
+            frozen_items[key] = _freeze_validated_wire(item, serialized[wire_key])
+        return _FrozenDict(cast(dict[str, object], frozen_items))
+    if isinstance(value, (list, tuple)):
+        if not isinstance(serialized, list) or len(value) != len(serialized):
+            raise ValueError("validated readiness sequence has invalid serialized state")
+        frozen_sequence = (
+            _freeze_validated_wire(item, wire_item)
+            for item, wire_item in zip(value, serialized, strict=True)
+        )
+        if get_origin(annotation) is tuple:
+            return _FrozenWireTuple(frozen_sequence)
+        return _FrozenJsonList(frozen_sequence)
     return value
 
 
@@ -404,9 +484,14 @@ class ReadinessStrictModelV1(BaseModel):
 
     @model_validator(mode="after")
     def freeze_nested_values(self) -> Self:
-        for field_name in type(self).model_fields:
+        serialized = self.model_dump(mode="json", warnings="error")
+        for field_name, field_info in type(self).model_fields.items():
             value = getattr(self, field_name)
-            frozen = _deep_freeze(value)
+            frozen = _freeze_validated_wire(
+                value,
+                serialized[field_name],
+                annotation=field_info.annotation,
+            )
             if frozen is not value:
                 object.__setattr__(self, field_name, frozen)
         return self
@@ -523,6 +608,21 @@ _GENERIC_RATIONALES = (
     "more research needed",
     "insufficient information",
     "requirement partially met",
+)
+_VERIFICATION_ISSUE_CODES = frozenset(
+    {
+        "INTEGRITY_OR_PROVENANCE_INVALID",
+        "RATIONALE_EVIDENCE_UNBOUND",
+        "READINESS_ARTIFACT_INVALID",
+        "READINESS_COMPILER_INVARIANT",
+        "READINESS_COMPILER_PREFLIGHT_DISAGREEMENT",
+        "READINESS_INVENTORY_INVALID",
+        "READINESS_MANIFEST_INVALID",
+        "READINESS_RESULT_REQUIRED",
+        "READINESS_SEMANTIC_REPLAY_INVALID",
+        "READINESS_STORAGE_UNSAFE",
+        "READINESS_VALIDATION_RECEIPT_INVALID",
+    }
 )
 
 
@@ -869,8 +969,9 @@ class BaselineLockedGraderAggregateV1(ReadinessStrictModelV1):
         if self.requirement_grades != flattened:
             raise ValueError("grader aggregate flattened requirement grades must match fragments")
         ids = tuple(item.requirement_id for item in self.requirement_grades)
-        if len(ids) != len(set(ids)):
-            raise ValueError("grader aggregate requirement IDs must be unique")
+        expected_ids = tuple(f"REQ-{index:04d}" for index in range(1, len(ids) + 1))
+        if ids != expected_ids:
+            raise ValueError("grader aggregate must use exact numeric requirement order")
         return self
 
 
@@ -1452,8 +1553,8 @@ class ReadinessVerificationV1(ReadinessStrictModelV1):
     @classmethod
     def validate_issues(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         checked = tuple(_nonblank(value) for value in values)
-        if any(re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", value) is None for value in checked):
-            raise ValueError("readiness verification issues must use bounded public codes")
+        if any(value not in _VERIFICATION_ISSUE_CODES for value in checked):
+            raise ValueError("readiness verification issues must use the reviewed inventory")
         if checked != tuple(sorted(set(checked))):
             raise ValueError("readiness verification issues must be sorted and unique")
         return checked
