@@ -61,9 +61,9 @@ _MAX_DRAFT_ITEMS = 640
 _MAX_PROVENANCE_TEXT = 128
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _EVIDENCE_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9._:\-])(?:SOURCE-[0-9]{6}|BASELINE-(?:REQ|CONT)-[0-9]{4}|"
+    r"(?:SOURCE-[0-9]{6}|BASELINE-(?:REQ|CONT)-[0-9]{4}|"
     r"PREREQUISITE-(?:CURRENTNESS|COMPLETENESS|LANGUAGE)-"
-    r"[A-Za-z0-9][A-Za-z0-9._:-]*|PREREQUISITE-CLIENT-FACTS)(?![A-Za-z0-9._:\-])"
+    r"[A-Za-z0-9][A-Za-z0-9._:-]*|PREREQUISITE-CLIENT-FACTS)"
 )
 _PRIVATE_PATH_RE = re.compile(
     r"(?i)(?:file:/|[A-Z]:[\\/]|\\\\|/(?:Applications|Library|System|Users|Volumes|"
@@ -142,6 +142,31 @@ _FINDING_EVIDENCE_PREFIXES = {
     ),
     SafetyFindingKindV1.UNDISCLOSED_GRADER_GAP: ("BASELINE-",),
 }
+_QUALIFICATION_KEYS = frozenset(
+    {
+        "case_schema_version",
+        "admission_status",
+        "qualification_readiness",
+        "qualification_root",
+        "qualification_receipt_fingerprint",
+        "case_fingerprint",
+        "source_record_fingerprint",
+        "request_fingerprint",
+        "judgment_fingerprint",
+        "requested_authorities",
+        "admission_checks",
+        "admission_issues",
+        "receipt_readiness",
+        "language_treatments",
+    }
+)
+_ADMISSION_CHECK_KEYS = frozenset({"code", "satisfied", "material", "rationale", "source_ids"})
+_ADMISSION_ISSUE_KEYS = frozenset({"code", "severity", "message", "related_ids"})
+_RECEIPT_READINESS_KEYS = frozenset({"status", "issue_codes", "rationale"})
+_LANGUAGE_TREATMENT_KEYS = frozenset(
+    {"sources", "method", "rationale", "limitation_status", "limitation_text"}
+)
+_LANGUAGE_SOURCE_KEYS = frozenset({"source_id", "content_hash", "language"})
 _NORMALIZED_DUPLICATES = "DRAFT_NORMALIZED_DUPLICATES"
 
 
@@ -809,6 +834,8 @@ def _validate_safety_evidence_packet(
     if type(qualification) is not dict:
         raise _ControllerInvariant("safety qualification evidence is invalid")
     limits = cast(dict[str, object], qualification)
+    if set(limits) != _QUALIFICATION_KEYS:
+        raise _ControllerInvariant("safety qualification evidence is invalid")
     baseline_input = baseline.baseline_input
     requested_authorities = limits.get("requested_authorities")
     if (
@@ -840,7 +867,8 @@ def _validate_safety_evidence_packet(
         material = check.get("material")
         source_ids = check.get("source_ids")
         if (
-            type(code) is not str
+            set(check) != _ADMISSION_CHECK_KEYS
+            or type(code) is not str
             or code not in request_builders._CHECK_PREREQUISITE_KIND
             or type(satisfied) is not bool
             or type(material) is not bool
@@ -860,6 +888,15 @@ def _validate_safety_evidence_packet(
     receipt_readiness = limits.get("receipt_readiness")
     if type(issues) is not list or type(receipt_readiness) is not dict:
         raise _ControllerInvariant("safety qualification evidence is invalid")
+    if set(receipt_readiness) != _RECEIPT_READINESS_KEYS:
+        raise _ControllerInvariant("safety qualification evidence is invalid")
+    for raw_issue in cast(list[object], issues):
+        if (
+            type(raw_issue) is not dict
+            or set(cast(dict[str, object], raw_issue)) != _ADMISSION_ISSUE_KEYS
+            or type(cast(dict[str, object], raw_issue).get("related_ids")) is not list
+        ):
+            raise _ControllerInvariant("safety qualification evidence is invalid")
     try:
         judgment = CaseAdmissionJudgment.model_validate(
             {
@@ -905,7 +942,8 @@ def _validate_safety_evidence_packet(
         treatment_sources = treatment.get("sources")
         limitation_status = treatment.get("limitation_status")
         if (
-            limitation_status not in {"DECLARED", "NOT_DECLARED"}
+            set(treatment) != _LANGUAGE_TREATMENT_KEYS
+            or limitation_status not in {"DECLARED", "NOT_DECLARED"}
             or type(treatment_sources) is not list
             or type(treatment.get("method")) is not str
             or type(treatment.get("rationale")) is not str
@@ -916,7 +954,7 @@ def _validate_safety_evidence_packet(
                 raise _ControllerInvariant("safety qualification evidence is invalid")
             source = cast(dict[str, object], raw_source)
             treatment_source_id = source.get("source_id")
-            if type(treatment_source_id) is not str:
+            if set(source) != _LANGUAGE_SOURCE_KEYS or type(treatment_source_id) is not str:
                 raise _ControllerInvariant("safety qualification evidence is invalid")
             expected_source = source_by_id.get(treatment_source_id)
             if (
@@ -1511,7 +1549,7 @@ def _validate_rationale(
     normalized_matters = _generic_key(matters)
     if not any(item in normalized_matters for item in _CONSEQUENCES):
         raise _Clarification(ReadinessDraftReasonCodeV1.RATIONALE_CONSEQUENCE_MISSING)
-    mentioned = tuple(_EVIDENCE_TOKEN_RE.findall(matters))
+    mentioned = _evidence_tokens(matters)
     remainder = matters
     for value in mentioned:
         remainder = remainder.replace(value, " ")
@@ -1540,6 +1578,23 @@ def _validate_rationale(
     ):
         raise _Clarification(ReadinessDraftReasonCodeV1.RESOLUTION_TEST_INVALID)
     return mentioned
+
+
+def _unicode_identifier_continuation(value: str) -> bool:
+    return value in "._:-" or ("A" + value).isidentifier()
+
+
+def _evidence_tokens(value: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    for match in _EVIDENCE_TOKEN_RE.finditer(value):
+        before = value[match.start() - 1] if match.start() else ""
+        after = value[match.end()] if match.end() < len(value) else ""
+        if (before and _unicode_identifier_continuation(before)) or (
+            after and _unicode_identifier_continuation(after)
+        ):
+            continue
+        tokens.append(match.group(0))
+    return tuple(tokens)
 
 
 def _seal(

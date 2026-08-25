@@ -567,10 +567,6 @@ def test_accepted_rationale_bytes_are_preserved_exactly(
             "legal_conclusion: SOURCE-999999 changes the answer.",
             ReadinessDraftReasonCodeV1.REFERENCE_UNKNOWN,
         ),
-        (
-            "legal_conclusion: SOURCE-000001suffix changes the scoped answer.",
-            ReadinessDraftReasonCodeV1.RATIONALE_EVIDENCE_UNBOUND,
-        ),
     ],
 )
 def test_why_it_matters_binds_fixed_consequence_and_exact_evidence(
@@ -699,6 +695,23 @@ def test_finding_kind_cannot_bypass_semantic_evidence_with_generic_rationale_kin
     finding["evidence_refs"] = [baseline_ref]
     finding["why_it_matters"] = (
         f"legal_conclusion: {baseline_ref} leaves the scoped answer incomplete."
+    )
+    _assert_clarification(
+        compile_readiness_draft_v1(safety_request, draft, _provenance()),
+        ReadinessDraftReasonCodeV1.RATIONALE_EVIDENCE_UNBOUND,
+    )
+
+
+@pytest.mark.parametrize("suffix", ["suffix", "é", "\N{COMBINING ACUTE ACCENT}"])
+def test_finding_citations_require_complete_unicode_identifier_boundaries(
+    safety_request: ReadinessEvaluatorRequestV1,
+    suffix: str,
+) -> None:
+    draft = _safety_draft(safety_request)
+    finding = cast(dict[str, object], draft["finding_proposals"][0])
+    source_ref = cast(list[str], finding["evidence_refs"])[0]
+    finding["why_it_matters"] = (
+        f"legal_conclusion: {source_ref}{suffix} could change the scoped answer."
     )
     _assert_clarification(
         compile_readiness_draft_v1(safety_request, draft, _provenance()),
@@ -1115,6 +1128,10 @@ def test_resealed_safety_source_and_handle_content_must_match_stable_baseline(
         "requested_authority",
         "admission_issue",
         "receipt_readiness",
+        "qualification_extra",
+        "admission_check_extra",
+        "receipt_readiness_extra",
+        "language_treatment_extra",
     ],
 )
 def test_resealed_safety_packet_must_reconstruct_every_controller_binding(
@@ -1157,9 +1174,20 @@ def test_resealed_safety_packet_must_reconstruct_every_controller_binding(
                     "related_ids": [],
                 }
             )
-        else:
+        elif target == "receipt_readiness":
             readiness = cast(dict[str, object], limits["receipt_readiness"])
             readiness["rationale"] = "Resealed receipt rationale"
+        elif target == "qualification_extra":
+            limits["unsealed_extra"] = "attacker-controlled"
+        elif target == "admission_check_extra":
+            check = cast(list[dict[str, object]], limits["admission_checks"])[0]
+            check["unsealed_extra"] = "attacker-controlled"
+        elif target == "receipt_readiness_extra":
+            readiness = cast(dict[str, object], limits["receipt_readiness"])
+            readiness["unsealed_extra"] = "attacker-controlled"
+        else:
+            treatment = cast(list[dict[str, object]], limits["language_treatments"])[0]
+            treatment["unsealed_extra"] = "attacker-controlled"
     resealed = _reseal_request(raw)
     assert compile_readiness_draft_v1(
         resealed,
