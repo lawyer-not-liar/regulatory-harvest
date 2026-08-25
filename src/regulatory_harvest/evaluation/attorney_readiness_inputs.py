@@ -76,7 +76,21 @@ from .attorney_v22_artifacts import load_verified_v22_context
 
 _MAX_JSON_BYTES = 16 * 1024 * 1024
 _MAX_REPORT_BYTES = 64 * 1024 * 1024
+_MAX_QUALIFICATION_PUBLIC_ITEMS = 1024
+_MAX_QUALIFICATION_PUBLIC_TEXT_BYTES = 64 * 1024
+_MAX_QUALIFICATION_PUBLIC_TOTAL_BYTES = 4 * 1024 * 1024
+_MAX_QUALIFICATION_PUBLIC_TEXT_FIELDS = 8192
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_POSIX_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9:/])/(?:[^/\s\x00\"'<>]+/)+[^/\s\x00\"'<>]*")
+_POSIX_PRIVATE_ROOT_RE = re.compile(
+    r"(?<![A-Za-z0-9:/])/(?:Users|home|private|tmp|var|Volumes)(?:/|(?=[\s,.;:!?)]|$))"
+)
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9])[A-Z]:[\\/][^\s\x00\"'<>|?*]+")
+_WINDOWS_UNC_PATH_RE = re.compile(
+    r"(?<![\\A-Za-z0-9])\\\\[^\\/\s\x00\"'<>|?*]+[\\/]"
+    r"[^\s\x00\"'<>|?*]+"
+)
+_FILE_URI_RE = re.compile(r"(?i)(?<![A-Za-z0-9])file:///[^\s\x00\"'<>]+")
 _DOSSIER_NAME = "agent-dossier.json"
 _DOSSIER_FIELDS = {
     "coverage_contract_version",
@@ -387,6 +401,209 @@ class QualificationLimitsV1:
     admission_issues: tuple[QualificationAdmissionIssueV1, ...]
     receipt_readiness: QualificationReceiptReadinessV1
     language_treatments: tuple[QualificationLanguageTreatmentV1, ...]
+
+
+def _contains_private_absolute_path(value: str) -> bool:
+    return any(
+        pattern.search(value) is not None
+        for pattern in (
+            _POSIX_ABSOLUTE_PATH_RE,
+            _POSIX_PRIVATE_ROOT_RE,
+            _WINDOWS_ABSOLUTE_PATH_RE,
+            _WINDOWS_UNC_PATH_RE,
+            _FILE_URI_RE,
+        )
+    )
+
+
+def _validate_qualification_public_projection(
+    limits: QualificationLimitsV1,
+    *,
+    forbidden_payloads: tuple[bytes, ...],
+) -> QualificationLimitsV1:
+    """Reject unsafe public text without rewriting accepted qualification evidence."""
+    code = "READINESS_QUALIFICATION_INVALID"
+    try:
+        if type(limits) is not QualificationLimitsV1 or type(forbidden_payloads) is not tuple:
+            raise TypeError("qualification public projection has an invalid type")
+        if len(forbidden_payloads) > _MAX_QUALIFICATION_PUBLIC_ITEMS + 1 or any(
+            type(payload) is not bytes for payload in forbidden_payloads
+        ):
+            raise TypeError("qualification forbidden payload inventory is invalid")
+        if (
+            type(limits.case_schema_version) is not str
+            or limits.case_schema_version != "1.1"
+            or type(limits.admission_status) is not str
+            or limits.admission_status != "qualified"
+            or type(limits.qualification_readiness) is not str
+            or limits.qualification_readiness != "ADMITTED"
+        ):
+            raise ValueError("qualification public state is invalid")
+        for fingerprint in (
+            limits.qualification_root,
+            limits.qualification_receipt_fingerprint,
+            limits.case_fingerprint,
+            limits.source_record_fingerprint,
+            limits.request_fingerprint,
+            limits.judgment_fingerprint,
+        ):
+            _hash(fingerprint, code=code)
+
+        text_field_count = 0
+        total_text_bytes = 0
+
+        def bounded_native_text(value: object) -> tuple[str, bytes]:
+            nonlocal text_field_count, total_text_bytes
+            if type(value) is not str or not value or value.isspace():
+                raise TypeError("qualification text must be a native nonblank string")
+            if len(value) > _MAX_QUALIFICATION_PUBLIC_TEXT_BYTES:
+                raise ValueError("qualification text is excessive")
+            try:
+                encoded = value.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError("qualification text is not UTF-8") from error
+            text_field_count += 1
+            total_text_bytes += len(encoded)
+            if (
+                len(encoded) > _MAX_QUALIFICATION_PUBLIC_TEXT_BYTES
+                or text_field_count > _MAX_QUALIFICATION_PUBLIC_TEXT_FIELDS
+                or total_text_bytes > _MAX_QUALIFICATION_PUBLIC_TOTAL_BYTES
+            ):
+                raise ValueError("qualification text exceeds public resource limits")
+            return value, encoded
+
+        def public_text(value: object) -> str:
+            checked, encoded = bounded_native_text(value)
+            if encoded in forbidden_payloads or _contains_private_absolute_path(checked):
+                raise ValueError("qualification public text is unsafe")
+            return checked
+
+        def native_text(value: object) -> str:
+            checked, _ = bounded_native_text(value)
+            return checked
+
+        authorities = limits.requested_authorities
+        checks = limits.admission_checks
+        issues = limits.admission_issues
+        treatments = limits.language_treatments
+        if (
+            type(authorities) is not tuple
+            or len(authorities) > _MAX_QUALIFICATION_PUBLIC_ITEMS
+            or type(checks) is not tuple
+            or len(checks) != len(_ADMISSION_CHECK_CODES)
+            or type(issues) is not tuple
+            or len(issues) > _MAX_QUALIFICATION_PUBLIC_ITEMS
+            or type(treatments) is not tuple
+            or len(treatments) > _MAX_QUALIFICATION_PUBLIC_ITEMS
+        ):
+            raise TypeError("qualification public inventory is invalid")
+
+        for authority in authorities:
+            if type(authority) is not QualificationRequestedAuthorityV1:
+                raise TypeError("qualification authority projection is invalid")
+            native_text(authority.authority_id)
+            public_text(authority.title)
+            public_text(authority.jurisdiction)
+            public_text(authority.authority_type)
+            if (
+                type(authority.source_ids) is not tuple
+                or len(authority.source_ids) > _MAX_QUALIFICATION_PUBLIC_ITEMS
+            ):
+                raise TypeError("qualification authority source inventory is invalid")
+            for source_id in authority.source_ids:
+                native_text(source_id)
+
+        observed_check_codes: set[str] = set()
+        for check in checks:
+            if type(check) is not QualificationAdmissionCheckV1:
+                raise TypeError("qualification check projection is invalid")
+            code_value = native_text(check.code)
+            observed_check_codes.add(code_value)
+            if type(check.satisfied) is not bool or type(check.material) is not bool:
+                raise TypeError("qualification check flags are invalid")
+            public_text(check.rationale)
+            if (
+                type(check.source_ids) is not tuple
+                or len(check.source_ids) > _MAX_QUALIFICATION_PUBLIC_ITEMS
+            ):
+                raise TypeError("qualification check source inventory is invalid")
+            for source_id in check.source_ids:
+                native_text(source_id)
+        if observed_check_codes != _ADMISSION_CHECK_CODES:
+            raise ValueError("qualification check inventory is invalid")
+
+        for issue in issues:
+            if type(issue) is not QualificationAdmissionIssueV1:
+                raise TypeError("qualification issue projection is invalid")
+            native_text(issue.code)
+            if type(issue.severity) is not str or issue.severity not in {
+                "error",
+                "warning",
+                "info",
+            }:
+                raise TypeError("qualification issue severity is invalid")
+            public_text(issue.message)
+            if (
+                type(issue.related_ids) is not tuple
+                or len(issue.related_ids) > _MAX_QUALIFICATION_PUBLIC_ITEMS
+            ):
+                raise TypeError("qualification issue relation inventory is invalid")
+            for related_id in issue.related_ids:
+                native_text(related_id)
+
+        readiness = limits.receipt_readiness
+        if (
+            type(readiness) is not QualificationReceiptReadinessV1
+            or type(readiness.status) is not str
+            or readiness.status != "ADMITTED"
+            or type(readiness.issue_codes) is not tuple
+            or len(readiness.issue_codes) > _MAX_QUALIFICATION_PUBLIC_ITEMS
+        ):
+            raise TypeError("qualification receipt readiness projection is invalid")
+        for issue_code in readiness.issue_codes:
+            native_text(issue_code)
+        public_text(readiness.rationale)
+
+        treatment_source_count = 0
+        for treatment in treatments:
+            if type(treatment) is not QualificationLanguageTreatmentV1:
+                raise TypeError("qualification language treatment projection is invalid")
+            if (
+                type(treatment.sources) is not tuple
+                or len(treatment.sources) > _MAX_QUALIFICATION_PUBLIC_ITEMS
+            ):
+                raise TypeError("qualification language source inventory is invalid")
+            treatment_source_count += len(treatment.sources)
+            if treatment_source_count > _MAX_QUALIFICATION_PUBLIC_ITEMS:
+                raise ValueError("qualification language source inventory is excessive")
+            for source in treatment.sources:
+                if type(source) is not QualificationLanguageSourceV1:
+                    raise TypeError("qualification language source projection is invalid")
+                native_text(source.source_id)
+                _hash(source.content_hash, code=code)
+                native_text(source.language)
+            public_text(treatment.method)
+            public_text(treatment.rationale)
+            if type(treatment.limitation_status) is not str:
+                raise TypeError("qualification limitation status is invalid")
+            if treatment.limitation_status == "DECLARED":
+                public_text(treatment.limitation_text)
+            elif (
+                treatment.limitation_status != "NOT_DECLARED"
+                or treatment.limitation_text is not None
+            ):
+                raise ValueError("qualification limitation declaration is invalid")
+        return limits
+    except ReadinessInputError:
+        raise
+    except (
+        AttributeError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ) as error:
+        raise _fail(code, error) from error
 
 
 @dataclass(frozen=True)
@@ -1409,6 +1626,16 @@ def build_verified_readiness_input_v1(
     report_text, report_bytes, generation_binding = _load_verified_generation(
         generation_run_dir,
         projection,
+    )
+    qualification_limits = _validate_qualification_public_projection(
+        qualification_limits,
+        forbidden_payloads=(
+            *(
+                source.normalized_text.encode("utf-8")
+                for source in projection.baseline_input.sources
+            ),
+            report_bytes,
+        ),
     )
     report_hash = sha256_digest(report_bytes)
     generation_validation = _load_generation_validation(

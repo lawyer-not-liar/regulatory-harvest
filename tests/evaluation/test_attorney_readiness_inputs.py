@@ -64,6 +64,7 @@ from regulatory_harvest.evaluation.attorney_qualification import (
     submit_case_qualification,
 )
 from regulatory_harvest.evaluation.attorney_readiness_inputs import (
+    QualificationAdmissionIssueV1,
     ReadinessInputError,
     build_verified_readiness_input_v1,
 )
@@ -1122,6 +1123,208 @@ def test_qualification_limits_are_detached_immutable_and_path_free(
     assert verified_inputs.report_text.encode("utf-8") not in wire
     for source in verified_inputs.baseline_context.baseline_input.sources:
         assert source.normalized_text.encode("utf-8") not in wire
+
+
+def _qualification_limits_with_text(
+    limits: object,
+    *,
+    surface: str,
+    value: str,
+) -> object:
+    if surface == "check-rationale":
+        checks = list(limits.admission_checks)  # type: ignore[attr-defined]
+        checks[0] = replace(checks[0], rationale=value)
+        return replace(limits, admission_checks=tuple(checks))
+    if surface == "issue-message":
+        issue = QualificationAdmissionIssueV1(
+            code="SYNTHETIC_ISSUE",
+            severity="warning",
+            message=value,
+            related_ids=(),
+        )
+        return replace(limits, admission_issues=(issue,))
+    if surface == "receipt-rationale":
+        receipt = replace(limits.receipt_readiness, rationale=value)  # type: ignore[attr-defined]
+        return replace(limits, receipt_readiness=receipt)
+    if surface == "authority-title":
+        authorities = list(limits.requested_authorities)  # type: ignore[attr-defined]
+        authorities[0] = replace(authorities[0], title=value)
+        return replace(limits, requested_authorities=tuple(authorities))
+    treatments = list(limits.language_treatments)  # type: ignore[attr-defined]
+    if surface == "language-method":
+        treatments[0] = replace(treatments[0], method=value)
+    elif surface == "language-rationale":
+        treatments[0] = replace(treatments[0], rationale=value)
+    else:
+        treatments[0] = replace(
+            treatments[0],
+            limitation_status="DECLARED",
+            limitation_text=value,
+        )
+    return replace(limits, language_treatments=tuple(treatments))
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "check-rationale",
+        "issue-message",
+        "receipt-rationale",
+        "authority-title",
+        "language-method",
+        "language-rationale",
+        "language-limitations",
+    ],
+)
+@pytest.mark.parametrize("payload", ["private-path", "complete-source", "complete-report"])
+def test_qualification_public_text_rejects_private_paths_and_complete_payload_duplicates(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    payload: str,
+) -> None:
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    if payload == "private-path":
+        value = "Inspect /private/var/folders/secret/client-matter.json for support."
+    elif payload == "complete-source":
+        value = verified_inputs.baseline_context.baseline_input.sources[0].normalized_text
+    else:
+        value = verified_inputs.report_text
+    unsafe = _qualification_limits_with_text(
+        admitted.qualification_limits,
+        surface=surface,
+        value=value,
+    )
+    monkeypatch.setattr(
+        inputs_module,
+        "_load_qualification_limits",
+        lambda *_: unsafe,
+    )
+
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+def test_qualification_public_text_preserves_safe_bytes_without_substring_false_positives(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    source = verified_inputs.baseline_context.baseline_input.sources[0].normalized_text
+    safe = (
+        "  Compare https://public.example/source, section 1/2, /single-token, and this "
+        f"non-complete source prefix: {source[:-1]}  "
+    )
+    limits = _qualification_limits_with_text(
+        admitted.qualification_limits,
+        surface="check-rationale",
+        value=safe,
+    )
+    monkeypatch.setattr(inputs_module, "_load_qualification_limits", lambda *_: limits)
+
+    rebuilt = build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+    assert rebuilt.qualification_limits.admission_checks[0].rationale == safe
+
+
+@pytest.mark.parametrize(
+    "unsafe_value",
+    [
+        "C:\\Users\\private\\client-matter.json",
+        "file:///Users/private/client-matter.json",
+        "/home/private/client-matter.json",
+    ],
+)
+def test_qualification_public_text_rejects_cross_platform_absolute_paths(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_value: str,
+) -> None:
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    limits = _qualification_limits_with_text(
+        admitted.qualification_limits,
+        surface="language-rationale",
+        value=f"Inspect {unsafe_value} for support.",
+    )
+    monkeypatch.setattr(inputs_module, "_load_qualification_limits", lambda *_: limits)
+
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+def test_qualification_public_text_rejects_non_native_and_oversize_values(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TextSubclass(str):
+        pass
+
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    for value in (TextSubclass("apparently safe"), "x" * (64 * 1024 + 1)):
+        limits = _qualification_limits_with_text(
+            admitted.qualification_limits,
+            surface="receipt-rationale",
+            value=value,
+        )
+        monkeypatch.setattr(
+            inputs_module,
+            "_load_qualification_limits",
+            lambda *_, candidate=limits: candidate,
+        )
+        with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+            build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+@pytest.mark.parametrize("container", ["list", "tuple-subclass", "generator", "cycle"])
+def test_qualification_public_projection_rejects_unsafe_containers_boundedly(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    container: str,
+) -> None:
+    class TupleSubclass(tuple):
+        pass
+
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    checks = admitted.qualification_limits.admission_checks
+    if container == "list":
+        unsafe_checks: object = list(checks)
+    elif container == "tuple-subclass":
+        unsafe_checks = TupleSubclass(checks)
+    elif container == "generator":
+        unsafe_checks = (item for item in checks)
+    else:
+        cyclic: list[object] = []
+        cyclic.append(cyclic)
+        unsafe_checks = cyclic
+    unsafe = replace(
+        admitted.qualification_limits,
+        admission_checks=cast(tuple[object, ...], unsafe_checks),
+    )
+    monkeypatch.setattr(inputs_module, "_load_qualification_limits", lambda *_: unsafe)
+
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+def test_qualification_public_projection_rejects_excessive_text_inventory(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    issue = QualificationAdmissionIssueV1(
+        code="SYNTHETIC_ISSUE",
+        severity="warning",
+        message="Bounded safe issue.",
+        related_ids=(),
+    )
+    unsafe = replace(
+        admitted.qualification_limits,
+        admission_issues=(issue,) * 1025,
+    )
+    monkeypatch.setattr(inputs_module, "_load_qualification_limits", lambda *_: unsafe)
+
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
 
 
 def test_persistable_input_contains_no_private_path(
