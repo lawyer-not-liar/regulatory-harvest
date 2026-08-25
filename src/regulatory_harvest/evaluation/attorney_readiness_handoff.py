@@ -101,7 +101,8 @@ _REMEDIATION_CLASS = {
 }
 _GENERIC_ONLY = re.compile(
     r"^(?:more research (?:is )?needed|insufficient information|requirement partially met|"
-    r"partially met|partially_met|not met|not_met|uncertain|met|[01](?:\.0|\.5)?)$"
+    r"(?:requirement )?(?:is )?(?:partially met|not met|uncertain|met)|partially_met|"
+    r"not_met|[01](?:\.0|\.5)?)$"
 )
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -134,6 +135,8 @@ def _charge_text(value: str, budget: list[int]) -> None:
             cost += 1
         elif codepoint < 0x800:
             cost += 2
+        elif 0xD800 <= codepoint <= 0xDFFF:
+            raise _invalid()
         elif codepoint < 0x10000:
             cost += 3
         else:
@@ -303,6 +306,7 @@ def _generic(value: str) -> bool:
             for character in normalized
         ).split()
     )
+    normalized = normalized.rstrip(".")
     return bool(_GENERIC_ONLY.fullmatch(normalized))
 
 
@@ -332,6 +336,13 @@ def _validate_delivery_semantics(
     if result.minimum_lane_weighted_coverage < rubric.review_ready_weighted_coverage_floor:
         raise _invalid()
 
+    requirement_by_id = {row.requirement_id: row for row in requirements.rows}
+    contested_rows = tuple(
+        row for row in gaps.rows if row.origin is GapOriginV1.CONTESTED_REQUIREMENT
+    )
+    if len({row.subject_id for row in contested_rows}) != len(contested_rows):
+        raise _invalid()
+
     for gap_row in gaps.rows:
         prose = (
             gap_row.shortfall_description,
@@ -344,17 +355,79 @@ def _validate_delivery_semantics(
             or not gap_row.evidence_refs
             or gap_row.visibility is GapVisibilityV1.HIDDEN
             or gap_row.disclosure_location is None
+            or gap_row.disclosure_location not in report
             or not gap_row.report_passages
             or any(report.count(passage) != 1 for passage in gap_row.report_passages)
             or gap_row.blocking_code is not None
         ):
             raise _invalid()
+        if gap_row.origin in {GapOriginV1.REQUIREMENT, GapOriginV1.BASELINE_GAP}:
+            requirement_row = requirement_by_id.get(gap_row.subject_id)
+            if requirement_row is None or (
+                gap_row.kind,
+                gap_row.importance,
+                gap_row.importance_basis,
+                gap_row.importance_rationale,
+                gap_row.lane_1_disposition,
+                gap_row.lane_2_disposition,
+                gap_row.conservative_disposition,
+            ) != (
+                requirement_row.kind,
+                requirement_row.importance,
+                requirement_row.importance_basis,
+                requirement_row.importance_rationale,
+                requirement_row.lane_1_disposition,
+                requirement_row.lane_2_disposition,
+                requirement_row.conservative_disposition,
+            ):
+                raise _invalid()
         if gap_row.importance is BaselineImportanceV1.CRITICAL and (
             gap_row.visibility is not GapVisibilityV1.PROMINENT
             or gap_row.owner_role
             not in {OwnerRoleV1.REVIEWING_ATTORNEY, OwnerRoleV1.OUTSIDE_COUNSEL}
         ):
             raise _invalid()
+
+    lane_weighted: list[float] = []
+    lane_critical: list[float] = []
+    for lane in (1, 2):
+        observations: list[tuple[BaselineImportanceV1, RequirementDispositionV1]] = [
+            (
+                row.importance,
+                row.lane_1_disposition if lane == 1 else row.lane_2_disposition,
+            )
+            for row in requirements.rows
+        ]
+        for row in contested_rows:
+            disposition = row.lane_1_disposition if lane == 1 else row.lane_2_disposition
+            if disposition is None:
+                raise _invalid()
+            observations.append((row.importance, disposition))
+        denominator = 2 * sum(
+            rubric.strict_importance_weights[importance] for importance, _ in observations
+        )
+        numerator = sum(
+            rubric.strict_importance_weights[importance]
+            * (2 if disposition is RequirementDispositionV1.MET else 1)
+            for importance, disposition in observations
+            if disposition in {RequirementDispositionV1.MET, RequirementDispositionV1.PARTIALLY_MET}
+        )
+        critical = [
+            disposition
+            for importance, disposition in observations
+            if importance is BaselineImportanceV1.CRITICAL
+        ]
+        critical_numerator = sum(
+            2 if disposition is RequirementDispositionV1.MET else 1
+            for disposition in critical
+            if disposition in {RequirementDispositionV1.MET, RequirementDispositionV1.PARTIALLY_MET}
+        )
+        lane_weighted.append(1.0 if denominator == 0 else numerator / denominator)
+        lane_critical.append(1.0 if not critical else critical_numerator / (2 * len(critical)))
+    if result.lane_weighted_coverage != tuple(
+        lane_weighted
+    ) or result.lane_critical_recall != tuple(lane_critical):
+        raise _invalid()
 
     gap_identities = {(row.origin, row.subject_id) for row in gaps.rows}
     for requirement_row in requirements.rows:
@@ -462,7 +535,7 @@ def _validate_bindings(
         if requirement_row.conservative_disposition is not expected:
             raise _invalid()
         if any(
-            passage not in report
+            report.count(passage) != 1
             for passage in (
                 *requirement_row.lane_1_report_passages,
                 *requirement_row.lane_2_report_passages,

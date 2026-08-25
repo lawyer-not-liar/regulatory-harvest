@@ -94,9 +94,11 @@ def _reseal_gap_matrix(
 def _case(
     tmp_path: Path,
     dispositions: tuple[str, ...],
+    *,
+    importance: str = "supporting",
 ) -> dict[str, object]:
     inputs = _request_inputs_fixture.__wrapped__(tmp_path)
-    exact = _clean_qualification(_with_requirements(inputs, count=10, importance="supporting"))
+    exact = _clean_qualification(_with_requirements(inputs, count=10, importance=importance))
     lanes = _lanes(exact, dispositions)
     _, requirement_matrix, gap_matrix, _, result = _compile(exact, lanes)
     return {
@@ -128,6 +130,17 @@ def blocked_case(tmp_path: Path) -> dict[str, object]:
     return _case(
         case_path,
         ("met",) * 6 + ("partially_met",) + ("not_met",) * 3,
+    )
+
+
+@pytest.fixture
+def critical_review_case(tmp_path: Path) -> dict[str, object]:
+    case_path = tmp_path / "critical-review"
+    case_path.mkdir()
+    return _case(
+        case_path,
+        ("met",) * 9 + ("partially_met",),
+        importance="critical",
     )
 
 
@@ -199,8 +212,10 @@ def test_follow_up_priority_is_critical_then_owner_then_canonical_order(
     review_case: dict[str, object],
 ) -> None:
     gap = cast(GapFollowUpMatrixV1, review_case["gap_matrix"])
+    requirement = cast(RequirementMatrixV1, review_case["requirement_matrix"])
     result = cast(DeliveryReadinessResultV1, review_case["result"])
     changed: list[GapFollowUpRowV1] = []
+    requirement_contracts: dict[str, tuple[str, list[str], str]] = {}
     contracts = (
         (
             "critical",
@@ -235,16 +250,58 @@ def test_follow_up_priority_is_critical_then_owner_then_canonical_order(
             owner_role=owner,
             follow_up_code=follow_up,
             visibility="prominent" if importance == "critical" else "visible",
+            lane_1_disposition="partially_met",
+            lane_2_disposition="partially_met",
+            conservative_disposition="partially_met",
         )
+        requirement_contracts[row.subject_id] = (importance, basis, rationale)
         changed.append(
             cast(
                 GapFollowUpRowV1,
                 _seal(GapFollowUpRowV1, "row_fingerprint", **descriptor),
             )
         )
+    changed_requirements: list[RequirementMatrixRowV1] = []
+    for row in requirement.rows:
+        contract = requirement_contracts.get(row.requirement_id)
+        if contract is None:
+            changed_requirements.append(row)
+            continue
+        importance, basis, rationale = contract
+        descriptor = row.model_dump(mode="json", exclude={"row_fingerprint"})
+        descriptor.update(
+            importance=importance,
+            importance_basis=basis,
+            importance_rationale=rationale,
+            lane_1_disposition="partially_met",
+            lane_2_disposition="partially_met",
+            conservative_disposition="partially_met",
+        )
+        changed_requirements.append(
+            cast(
+                RequirementMatrixRowV1,
+                _seal(RequirementMatrixRowV1, "row_fingerprint", **descriptor),
+            )
+        )
     gap = _reseal_gap_matrix(gap, rows=tuple(changed))
-    result = _reseal_result(result, gap_matrix_fingerprint=gap.matrix_fingerprint)
-    case = {**review_case, "gap_matrix": gap, "result": result}
+    requirement = _reseal_requirement_matrix(
+        requirement,
+        rows=tuple(changed_requirements),
+    )
+    result = _reseal_result(
+        result,
+        requirement_matrix_fingerprint=requirement.matrix_fingerprint,
+        gap_matrix_fingerprint=gap.matrix_fingerprint,
+        minimum_lane_weighted_coverage=22 / 30,
+        lane_weighted_coverage=[22 / 30, 22 / 30],
+        lane_critical_recall=[0.5, 0.5],
+    )
+    case = {
+        **review_case,
+        "requirement_matrix": requirement,
+        "gap_matrix": gap,
+        "result": result,
+    }
 
     rendered = render_attorney_review_handoff_v1(**case).decode("utf-8")
     actions = [line for line in rendered.splitlines() if line[:3] in {"1. ", "2. ", "3. "}]
@@ -602,6 +659,8 @@ def test_coordinated_reseals_cannot_manufacture_an_unsafe_delivery_tier(
         ({"visibility": "hidden"}, {}),
         ({"blocking_code": "HIDDEN_MATERIAL_GAP"}, {}),
         ({"why_unresolved": "more research needed"}, {}),
+        ({"why_unresolved": "Requirement not met."}, {}),
+        ({"disclosure_location": "Footnote 99"}, {}),
         (
             {"visibility": "visible", "owner_role": "research_operator"},
             {
@@ -665,6 +724,77 @@ def test_high_assurance_eligible_result_cannot_be_resealed_as_review_ready(
     )
     with pytest.raises(ValueError, match="handoff input is invalid"):
         render_attorney_review_handoff_v1(**{**high_case, "result": downgraded})
+
+
+def test_resealed_scores_cannot_upgrade_below_floor_matrix(
+    blocked_case: dict[str, object],
+) -> None:
+    result = cast(DeliveryReadinessResultV1, blocked_case["result"])
+    forged = _reseal_result(
+        result,
+        delivery_readiness="REVIEW_READY_WITH_GAPS",
+        minimum_lane_weighted_coverage=0.7,
+        lane_weighted_coverage=[0.7, 0.7],
+        blocking_codes=[],
+    )
+    with pytest.raises(ValueError, match="handoff input is invalid"):
+        render_attorney_review_handoff_v1(**{**blocked_case, "result": forged})
+
+
+def test_gap_importance_and_dispositions_are_bound_to_requirement_matrix(
+    critical_review_case: dict[str, object],
+) -> None:
+    gap = cast(GapFollowUpMatrixV1, critical_review_case["gap_matrix"])
+    descriptor = gap.rows[0].model_dump(mode="json", exclude={"row_fingerprint"})
+    descriptor.update(
+        importance="supporting",
+        importance_basis=["implementation_detail"],
+        importance_rationale="The point supplies useful implementation detail.",
+        visibility="visible",
+        owner_role="research_operator",
+    )
+    downgraded = cast(
+        GapFollowUpRowV1,
+        _seal(GapFollowUpRowV1, "row_fingerprint", **descriptor),
+    )
+    changed_gap = _reseal_gap_matrix(gap, rows=(downgraded, *gap.rows[1:]))
+    result = _reseal_result(
+        cast(DeliveryReadinessResultV1, critical_review_case["result"]),
+        gap_matrix_fingerprint=changed_gap.matrix_fingerprint,
+    )
+    with pytest.raises(ValueError, match="handoff input is invalid"):
+        render_attorney_review_handoff_v1(
+            **{
+                **critical_review_case,
+                "gap_matrix": changed_gap,
+                "result": result,
+            }
+        )
+
+
+def test_requirement_passage_must_be_exactly_unique(
+    review_case: dict[str, object],
+) -> None:
+    requirement = cast(RequirementMatrixV1, review_case["requirement_matrix"])
+    descriptor = requirement.rows[0].model_dump(mode="json", exclude={"row_fingerprint"})
+    descriptor["lane_1_report_passages"] = ["e"]
+    row = cast(
+        RequirementMatrixRowV1,
+        _seal(RequirementMatrixRowV1, "row_fingerprint", **descriptor),
+    )
+    changed = _reseal_requirement_matrix(
+        requirement,
+        rows=(row, *requirement.rows[1:]),
+    )
+    result = _reseal_result(
+        cast(DeliveryReadinessResultV1, review_case["result"]),
+        requirement_matrix_fingerprint=changed.matrix_fingerprint,
+    )
+    assert cast(str, review_case["report_text"]).count("e") > 1
+    with pytest.raises(ValueError, match="handoff input is invalid"):
+        render_attorney_review_handoff_v1(
+            **{**review_case, "requirement_matrix": changed, "result": result}
+        )
 
 
 def test_report_markdown_cannot_capture_matrices_or_warning(
@@ -732,6 +862,17 @@ def test_validation_error_chain_does_not_disclose_suppressed_private_text(
         render_attorney_review_handoff_v1(**{**review_case, "gap_matrix": malformed_gap})
     formatted = "".join(traceback.format_exception(caught.value))
     assert private not in formatted
+    assert caught.value.__cause__ is None
+
+
+def test_invalid_report_encoding_is_generic_and_does_not_retain_private_report(
+    review_case: dict[str, object],
+) -> None:
+    private = "PRIVATE REPORT BODY\ud800"
+    with pytest.raises(ValueError, match="handoff input is invalid") as caught:
+        render_attorney_review_handoff_v1(**{**review_case, "report_text": private})
+    formatted = "".join(traceback.format_exception(caught.value))
+    assert "PRIVATE REPORT BODY" not in formatted
     assert caught.value.__cause__ is None
 
 
