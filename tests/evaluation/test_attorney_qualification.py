@@ -46,6 +46,7 @@ from regulatory_harvest.evaluation.attorney_models import (
 from regulatory_harvest.evaluation.attorney_qualification import (
     guarded_submit_case_qualification,
     initialize_case_qualification,
+    load_verified_qualification_context,
     next_qualification_request,
     preflight_case_qualification,
     resume_case_qualification,
@@ -1402,6 +1403,55 @@ def test_qualification_refuses_symlink_target_path(tmp_path: Path) -> None:
         )
 
     assert _tree_bytes(owned) == {}
+
+
+def test_verified_qualification_context_returns_one_replay_typed_snapshot(
+    tmp_path: Path,
+) -> None:
+    request = _initialize_and_next(qualification_case_schema_1_1(), tmp_path)
+    receipt = submit_case_qualification(tmp_path, admitted_response(request))
+
+    context = load_verified_qualification_context(tmp_path)
+
+    assert context.case == qualification_case_schema_1_1()
+    assert context.receipt == receipt
+    assert context.manifest.root_hash == resume_case_qualification(tmp_path).root_hash
+    assert context.artifact_bytes == {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in sorted(tmp_path.iterdir())
+        if path.is_file()
+    }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="root inode replacement is POSIX-specific")
+def test_verified_qualification_context_rejects_root_replacement_during_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "qualification"
+    request = _initialize_and_next(qualification_case_schema_1_1(), run)
+    submit_case_qualification(run, admitted_response(request))
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "outside.txt").write_bytes(b"outside\n")
+    parked = tmp_path / "parked"
+    original = attorney_qualification._load_manifest
+    swapped = False
+
+    def swap_before_manifest_read(storage: object) -> object:
+        nonlocal swapped
+        run.rename(parked)
+        replacement.rename(run)
+        swapped = True
+        return original(storage)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(attorney_qualification, "_load_manifest", swap_before_manifest_read)
+
+    with pytest.raises(EvaluationIntegrityError, match=r"identity|changed"):
+        load_verified_qualification_context(run)
+
+    assert swapped
+    assert (run / "outside.txt").read_bytes() == b"outside\n"
 
 
 def test_qualification_template_is_candidate_free_and_uses_only_relative_paths() -> None:

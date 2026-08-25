@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import cast
 
 from pydantic import ValidationError
@@ -69,6 +71,16 @@ class _QualificationContext:
     readiness: CaseReadiness
     response: JudgeResponse | None = None
     response_bytes: bytes | None = None
+
+
+@dataclass(frozen=True)
+class VerifiedQualificationContext:
+    """One replay-verified typed snapshot of a terminal qualification capsule."""
+
+    manifest: QualificationManifest
+    case: QualificationCase
+    receipt: QualificationReceipt
+    artifact_bytes: Mapping[str, bytes]
 
 
 def _strict_case(case: QualificationCase) -> QualificationCase:
@@ -151,12 +163,13 @@ def _receipt(
     return QualificationReceipt.model_validate(payload)
 
 
-def _load_manifest(storage: _RunStorage) -> QualificationManifest:
+def _load_manifest(storage: _RunStorage) -> tuple[QualificationManifest, bytes]:
+    manifest_bytes = storage.read_artifact(_MANIFEST_PATH)
     return _load_model_bytes(
-        storage.read_artifact(_MANIFEST_PATH),
+        manifest_bytes,
         QualificationManifest,
         location=_MANIFEST_PATH,
-    )
+    ), manifest_bytes
 
 
 def _artifacts_by_path(manifest: QualificationManifest) -> dict[str, ArtifactRecord]:
@@ -183,9 +196,15 @@ def _verify_artifact_hashes(
 
 def _verify_in_storage(
     storage: _RunStorage,
-) -> tuple[QualificationManifest, QualificationCase, JudgeRequest, QualificationReceipt | None]:
+) -> tuple[
+    QualificationManifest,
+    QualificationCase,
+    JudgeRequest,
+    QualificationReceipt | None,
+    dict[str, bytes],
+]:
     try:
-        manifest = _load_manifest(storage)
+        manifest, manifest_bytes = _load_manifest(storage)
         data = _verify_artifact_hashes(storage, manifest)
         case = _load_model_bytes(
             data[_CASE_PATH],
@@ -296,7 +315,7 @@ def _verify_in_storage(
         if manifest != expected_manifest:
             raise EvaluationIntegrityError("qualification root does not replay")
         storage.assert_root_identity()
-        return manifest, case, request, receipt
+        return manifest, case, request, receipt, {_MANIFEST_PATH: manifest_bytes, **data}
     except EvaluationIntegrityError:
         raise
     except (KeyError, TypeError, ValidationError, ValueError) as error:
@@ -346,14 +365,14 @@ def initialize_case_qualification(
 def resume_case_qualification(run_dir: Path) -> QualificationState:
     """Replay every qualification artifact before exposing resumable state."""
     with _open_run_storage(run_dir) as storage:
-        manifest, _, _, _ = _verify_in_storage(storage)
+        manifest, _, _, _, _ = _verify_in_storage(storage)
         return _state(manifest)
 
 
 def next_qualification_request(run_dir: Path) -> JudgeRequest | None:
     """Return the exact pending request or none after qualification is terminal."""
     with _open_run_storage(run_dir) as storage:
-        manifest, _, request, _ = _verify_in_storage(storage)
+        manifest, _, request, _, _ = _verify_in_storage(storage)
         return request if manifest.status == "awaiting-judgment" else None
 
 
@@ -557,7 +576,7 @@ def _preflight_in_storage(
     storage: _RunStorage,
     judgment_value: object,
 ) -> tuple[EvaluationPreflightResult, _QualificationContext | None]:
-    manifest, case, request, _ = _verify_in_storage(storage)
+    manifest, case, request, _, _ = _verify_in_storage(storage)
     if manifest.status != "awaiting-judgment":
         return _preflight_result(None, _no_pending_issue()), None
     response: JudgeResponse | None = None
@@ -717,7 +736,7 @@ def verify_case_qualification(run_dir: Path) -> QualificationVerification:
     """Replay the full capsule and return only a bounded integrity result."""
     try:
         with _open_run_storage(run_dir) as storage:
-            manifest, _, _, _ = _verify_in_storage(storage)
+            manifest, _, _, _, _ = _verify_in_storage(storage)
             return QualificationVerification(
                 valid=True,
                 root_hash=manifest.root_hash,
@@ -726,4 +745,18 @@ def verify_case_qualification(run_dir: Path) -> QualificationVerification:
         return QualificationVerification(
             valid=False,
             issues=("QUALIFICATION_INTEGRITY_INVALID",),
+        )
+
+
+def load_verified_qualification_context(run_dir: Path) -> VerifiedQualificationContext:
+    """Replay once and return the exact terminal artifacts as a typed context."""
+    with _open_run_storage(run_dir) as storage:
+        manifest, case, _, receipt, artifact_bytes = _verify_in_storage(storage)
+        if receipt is None:
+            raise EvaluationIntegrityError("qualification capsule is not terminal")
+        return VerifiedQualificationContext(
+            manifest=manifest,
+            case=case,
+            receipt=receipt,
+            artifact_bytes=MappingProxyType(dict(sorted(artifact_bytes.items()))),
         )

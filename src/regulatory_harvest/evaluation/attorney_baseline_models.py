@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 from enum import StrEnum
-from typing import Annotated, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -18,6 +19,9 @@ from .attorney_v2_models import (
     SemanticDependency,
     SemanticPassage,
 )
+
+if TYPE_CHECKING:
+    from .attorney_qualification import VerifiedQualificationContext
 
 BASELINE_PROTOCOL_V1: Literal["evaluation-baseline-v1"] = "evaluation-baseline-v1"
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -284,6 +288,65 @@ class BaselineInputV1(BaselineStrictModel):
     _validate_text = field_validator(
         "question", "jurisdiction", "as_of", "evaluation_rubric_version"
     )(_nonblank)
+
+    @classmethod
+    def from_verified_qualification(
+        cls,
+        qualification: VerifiedQualificationContext,
+        *,
+        client_facts: str | None,
+        compiler_contract: dict[str, object],
+        evaluation_rubric: bytes,
+        importance_policy: bytes,
+    ) -> BaselineInputV1:
+        """Build the sole canonical legal-input projection from replayed qualification bytes."""
+        try:
+            rubric_payload = json.loads(evaluation_rubric.decode("utf-8"))
+            policy_payload = json.loads(importance_policy.decode("utf-8"))
+            rubric_version = rubric_payload["version"]
+            policy_version = policy_payload["importance_policy_version"]
+            if type(rubric_version) is not str or type(policy_version) is not str:
+                raise TypeError("input version must be a string")
+            case = qualification.case
+            receipt = qualification.receipt
+            payload: dict[str, object] = {
+                "schema_version": "baseline-input-v1",
+                "sources": tuple(source.model_dump(mode="python") for source in case.sources),
+                "source_record_fingerprint": qualification.manifest.source_record_fingerprint,
+                "question": case.question,
+                "jurisdiction": case.jurisdiction,
+                "as_of": case.as_of.isoformat(),
+                "requested_authorities": tuple(
+                    authority.model_dump(mode="python") for authority in case.requested_authorities
+                ),
+                "client_facts": client_facts,
+                "client_facts_binding": (
+                    "explicit-null"
+                    if client_facts is None
+                    else f"sha256:{sha256_digest(client_facts.encode('utf-8'))}"
+                ),
+                "qualification_root": qualification.manifest.root_hash,
+                "qualification_receipt_fingerprint": receipt.receipt_fingerprint,
+                "qualification_readiness": receipt.readiness.status.value,
+                "compiler_contract": compiler_contract,
+                "compiler_contract_fingerprint": sha256_digest(
+                    canonical_json_bytes(compiler_contract)
+                ),
+                "evaluation_rubric_version": rubric_version,
+                "evaluation_rubric_bytes": evaluation_rubric,
+                "evaluation_rubric_fingerprint": sha256_digest(evaluation_rubric),
+                "importance_policy_version": policy_version,
+                "importance_policy_bytes": importance_policy,
+                "importance_policy_fingerprint": sha256_digest(importance_policy),
+                "legal_input_fingerprint": "0" * 64,
+            }
+            provisional = cls.model_validate(payload)
+            from .attorney_baseline_input import legal_input_fingerprint_v1
+
+            payload["legal_input_fingerprint"] = legal_input_fingerprint_v1(provisional)
+            return cls.model_validate(payload)
+        except (AttributeError, KeyError, TypeError, UnicodeDecodeError, ValueError) as error:
+            raise ValueError("verified qualification cannot form a baseline input") from error
 
     @field_validator("compiler_contract", mode="before")
     @classmethod
