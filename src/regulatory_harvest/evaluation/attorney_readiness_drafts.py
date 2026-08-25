@@ -21,12 +21,17 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from regulatory_harvest.storage import canonical_json_bytes, sha256_digest
 
 from . import attorney_readiness_requests as request_builders
-from .attorney_baseline_models import BaselineImportanceV1
+from .attorney_baseline_models import (
+    BaselineImportanceV1,
+    GradeableBaselineProjectionV1,
+)
 from .attorney_readiness_models import (
     BaselineLockedContestedGradeV1,
     BaselineLockedGradeFragmentV1,
+    BaselineLockedGraderAggregateV1,
     FollowUpCodeV1,
     GapVisibilityV1,
+    GenerationValidationBindingV1,
     OwnerRoleV1,
     RationaleKindV1,
     ReadinessEvaluatorRequestV1,
@@ -393,7 +398,34 @@ class _CheckedRequest:
 
 def _preflight_json_tree(value: object) -> None:
     nodes = 0
+    wire_bytes = 0
     active: set[int] = set()
+
+    def add_wire_bytes(size: int) -> None:
+        nonlocal wire_bytes
+        wire_bytes += size
+        if wire_bytes > _MAX_DRAFT_BYTES:
+            raise _Clarification(ReadinessDraftReasonCodeV1.DRAFT_TOO_LARGE)
+
+    def add_json_string(value: str) -> None:
+        add_wire_bytes(2)
+        for character in value:
+            codepoint = ord(character)
+            if character in {'"', "\\", "\b", "\f", "\n", "\r", "\t"}:
+                size = 2
+            elif codepoint < 0x20:
+                size = 6
+            elif codepoint <= 0x7F:
+                size = 1
+            elif codepoint <= 0x7FF:
+                size = 2
+            elif 0xD800 <= codepoint <= 0xDFFF:
+                raise _Clarification(ReadinessDraftReasonCodeV1.DRAFT_INVALID)
+            elif codepoint <= 0xFFFF:
+                size = 3
+            else:
+                size = 4
+            add_wire_bytes(size)
 
     def visit(item: object, depth: int) -> None:
         nonlocal nodes
@@ -402,11 +434,22 @@ def _preflight_json_tree(value: object) -> None:
             raise _Clarification(ReadinessDraftReasonCodeV1.DRAFT_NODE_LIMIT_EXCEEDED)
         if depth > _MAX_DRAFT_DEPTH:
             raise _Clarification(ReadinessDraftReasonCodeV1.DRAFT_DEPTH_EXCEEDED)
-        if item is None or type(item) in {bool, int, str}:
+        if item is None:
+            add_wire_bytes(4)
+            return
+        if type(item) is bool:
+            add_wire_bytes(4 if item else 5)
+            return
+        if type(item) is int:
+            add_wire_bytes(len(str(item)))
+            return
+        if type(item) is str:
+            add_json_string(item)
             return
         if type(item) is float:
             if not math.isfinite(item):
                 raise _Clarification(ReadinessDraftReasonCodeV1.DRAFT_INVALID)
+            add_wire_bytes(len(json.dumps(item)))
             return
         if type(item) not in {dict, list}:
             raise _Clarification(ReadinessDraftReasonCodeV1.DRAFT_INVALID)
@@ -417,15 +460,20 @@ def _preflight_json_tree(value: object) -> None:
         try:
             if type(item) is dict:
                 mapping = cast(dict[object, object], item)
+                add_wire_bytes(2 + max(0, len(mapping) - 1))
                 for key, child in mapping.items():
                     if type(key) is not str:
                         raise _Clarification(ReadinessDraftReasonCodeV1.DRAFT_INVALID)
                     nodes += 1
                     if nodes > _MAX_DRAFT_NODES:
                         raise _Clarification(ReadinessDraftReasonCodeV1.DRAFT_NODE_LIMIT_EXCEEDED)
+                    add_json_string(key)
+                    add_wire_bytes(1)
                     visit(child, depth + 1)
             else:
-                for child in cast(list[object], item):
+                sequence = cast(list[object], item)
+                add_wire_bytes(2 + max(0, len(sequence) - 1))
+                for child in sequence:
                     visit(child, depth + 1)
         finally:
             active.remove(identity)
@@ -667,6 +715,336 @@ def _sealed_fingerprint_valid(value: object, field: str) -> bool:
     )
 
 
+def _verified_baseline(payload: dict[str, object]) -> GradeableBaselineProjectionV1:
+    raw = payload.get("stable_baseline")
+    if type(raw) is not dict:
+        raise _ControllerInvariant("request stable baseline is invalid")
+    try:
+        candidate = dict(cast(dict[str, object], raw))
+        baseline_input_raw = candidate.get("baseline_input")
+        if type(baseline_input_raw) is not dict:
+            raise ValueError
+        baseline_input = dict(cast(dict[str, object], baseline_input_raw))
+        for field in ("evaluation_rubric_bytes", "importance_policy_bytes"):
+            value = baseline_input.get(field)
+            if type(value) is not str:
+                raise ValueError
+            baseline_input[field] = value.encode("utf-8")
+        candidate["baseline_input"] = baseline_input
+        baseline = GradeableBaselineProjectionV1.model_validate(candidate)
+        if canonical_json_bytes(baseline.model_dump(mode="json", warnings="error")) != (
+            canonical_json_bytes(raw)
+        ):
+            raise ValueError
+    except (AttributeError, TypeError, ValidationError, ValueError) as error:
+        raise _ControllerInvariant("request stable baseline is invalid") from error
+    return baseline
+
+
+def _validate_safety_evidence_packet(
+    payload: dict[str, object],
+    baseline: GradeableBaselineProjectionV1,
+    *,
+    report_hash: str,
+) -> list[tuple[str, str, tuple[str, ...]]]:
+    source_record = payload.get("source_record")
+    expected_sources = [item.model_dump(mode="json") for item in baseline.baseline_input.sources]
+    if type(source_record) is not list or canonical_json_bytes(source_record) != (
+        canonical_json_bytes(expected_sources)
+    ):
+        raise _ControllerInvariant("safety source record is invalid")
+    source_by_id = {
+        item.source_id: item.model_dump(mode="json") for item in baseline.baseline_input.sources
+    }
+    source_refs = {
+        source_id: f"SOURCE-{index:06d}" for index, source_id in enumerate(source_by_id, 1)
+    }
+    expected_handles: list[dict[str, object]] = [
+        {
+            "evidence_ref": source_refs[item.source_id],
+            "evidence_kind": "source",
+            "evidence": item.model_dump(mode="json"),
+        }
+        for item in baseline.baseline_input.sources
+    ]
+    expected_handles.extend(
+        {
+            "evidence_ref": f"BASELINE-{item.requirement.requirement_id}",
+            "evidence_kind": "baseline_requirement",
+            "evidence": item.model_dump(mode="json"),
+        }
+        for item in baseline.requirements
+    )
+    expected_handles.extend(
+        {
+            "evidence_ref": (f"BASELINE-{item.contested_requirement.contested_requirement_id}"),
+            "evidence_kind": "contested_requirement",
+            "evidence": item.model_dump(mode="json"),
+        }
+        for item in baseline.contested_requirements
+    )
+
+    qualification = payload.get("qualification_limits")
+    if type(qualification) is not dict:
+        raise _ControllerInvariant("safety qualification evidence is invalid")
+    limits = cast(dict[str, object], qualification)
+    if limits.get("source_record_fingerprint") != (baseline.binding.source_record_fingerprint):
+        raise _ControllerInvariant("safety qualification evidence is invalid")
+    grouped: dict[tuple[str, str], list[tuple[str, object, bool]]] = {}
+    prerequisites: list[tuple[str, str, tuple[str, ...]]] = []
+    checks = limits.get("admission_checks")
+    if type(checks) is not list:
+        raise _ControllerInvariant("safety qualification evidence is invalid")
+    for raw_check in cast(list[object], checks):
+        if type(raw_check) is not dict:
+            raise _ControllerInvariant("safety qualification evidence is invalid")
+        check = cast(dict[str, object], raw_check)
+        code = check.get("code")
+        satisfied = check.get("satisfied")
+        material = check.get("material")
+        source_ids = check.get("source_ids")
+        if (
+            type(code) is not str
+            or code not in request_builders._CHECK_PREREQUISITE_KIND
+            or type(satisfied) is not bool
+            or type(material) is not bool
+            or type(check.get("rationale")) is not str
+            or type(source_ids) is not list
+            or len(source_ids) != len(set(cast(list[object], source_ids)))
+            or any(type(item) is not str or item not in source_by_id for item in source_ids)
+        ):
+            raise _ControllerInvariant("safety qualification evidence is invalid")
+        if not satisfied:
+            kind = request_builders._CHECK_PREREQUISITE_KIND[code]
+            for source_id in cast(list[str], source_ids):
+                grouped.setdefault((kind, source_id), []).append(
+                    ("qualification_admission_check", check, material)
+                )
+    treatments = limits.get("language_treatments")
+    if type(treatments) is not list:
+        raise _ControllerInvariant("safety qualification evidence is invalid")
+    for raw_treatment in cast(list[object], treatments):
+        if type(raw_treatment) is not dict:
+            raise _ControllerInvariant("safety qualification evidence is invalid")
+        treatment = cast(dict[str, object], raw_treatment)
+        treatment_sources = treatment.get("sources")
+        limitation_status = treatment.get("limitation_status")
+        if (
+            limitation_status not in {"DECLARED", "NOT_DECLARED"}
+            or type(treatment_sources) is not list
+            or type(treatment.get("method")) is not str
+            or type(treatment.get("rationale")) is not str
+        ):
+            raise _ControllerInvariant("safety qualification evidence is invalid")
+        for raw_source in cast(list[object], treatment_sources):
+            if type(raw_source) is not dict:
+                raise _ControllerInvariant("safety qualification evidence is invalid")
+            source = cast(dict[str, object], raw_source)
+            treatment_source_id = source.get("source_id")
+            if type(treatment_source_id) is not str:
+                raise _ControllerInvariant("safety qualification evidence is invalid")
+            expected_source = source_by_id.get(treatment_source_id)
+            if (
+                expected_source is None
+                or source.get("content_hash") != expected_source["content_hash"]
+                or source.get("language") != expected_source["language"]
+            ):
+                raise _ControllerInvariant("safety qualification evidence is invalid")
+            if limitation_status == "DECLARED":
+                grouped.setdefault(("LANGUAGE", treatment_source_id), []).append(
+                    ("qualification_language_treatment", treatment, True)
+                )
+    for source_id in source_by_id:
+        for kind in request_builders._PREREQUISITE_KIND_ORDER:
+            items = grouped.get((kind, source_id))
+            if not items:
+                continue
+            if len(items) == 1:
+                evidence_kind, evidence, material = items[0]
+            else:
+                evidence_kind = "qualification_prerequisite_evidence"
+                material = any(item_material for _, _, item_material in items)
+                evidence = [
+                    {"evidence_kind": item_kind, "evidence": item_evidence}
+                    for item_kind, item_evidence, _ in items
+                ]
+            expected_handles.append(
+                {
+                    "evidence_ref": f"PREREQUISITE-{kind}-{source_id}",
+                    "evidence_kind": evidence_kind,
+                    "subject_id": f"{kind}:{source_id}",
+                    "evidence": evidence,
+                }
+            )
+            prerequisites.append(
+                (
+                    f"{kind}:{source_id}",
+                    "critical" if material else "material",
+                    (source_refs[source_id], f"PREREQUISITE-{kind}-{source_id}"),
+                )
+            )
+
+    facts = baseline.baseline_input.client_facts
+    facts_hash = None if facts is None else sha256_digest(facts.encode("utf-8"))
+    expected_boundary = {
+        "client_facts": facts,
+        "client_facts_binding": baseline.baseline_input.client_facts_binding,
+        "client_facts_hash": facts_hash,
+    }
+    if canonical_json_bytes(payload.get("client_fact_boundary")) != canonical_json_bytes(
+        expected_boundary
+    ):
+        raise _ControllerInvariant("safety client-fact boundary is invalid")
+    if facts is None:
+        expected_handles.append(
+            {
+                "evidence_ref": "PREREQUISITE-CLIENT-FACTS",
+                "evidence_kind": "client_fact_boundary",
+                "evidence": expected_boundary,
+            }
+        )
+        prerequisites.append(("CLIENT_FACTS", "critical", ("PREREQUISITE-CLIENT-FACTS",)))
+    if canonical_json_bytes(payload.get("evidence_handles")) != canonical_json_bytes(
+        expected_handles
+    ):
+        raise _ControllerInvariant("safety evidence-handle inventory is invalid")
+    try:
+        generation = GenerationValidationBindingV1.model_validate(
+            payload.get("generation_validation")
+        )
+    except (TypeError, ValidationError, ValueError) as error:
+        raise _ControllerInvariant("safety generation validation is invalid") from error
+    if generation.report_hash != report_hash:
+        raise _ControllerInvariant("safety generation validation is invalid")
+    if canonical_json_bytes(payload.get("readiness_rubric")) != canonical_json_bytes(
+        load_readiness_rubric_v1().model_dump(mode="json")
+    ):
+        raise _ControllerInvariant("safety readiness rubric is invalid")
+    return prerequisites
+
+
+def _ordered_evidence_refs(
+    leading_ref: str,
+    passage_sources: tuple[str, ...],
+    source_refs: dict[str, str],
+) -> list[str]:
+    refs = [leading_ref]
+    for source_id in passage_sources:
+        ref = source_refs.get(source_id)
+        if ref is None:
+            raise _ControllerInvariant("baseline passage source is invalid")
+        if ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def _validate_exact_safety_candidates(
+    raw_candidates: object,
+    baseline: GradeableBaselineProjectionV1,
+    lanes: tuple[BaselineLockedGraderAggregateV1, BaselineLockedGraderAggregateV1],
+    prerequisites: list[tuple[str, str, tuple[str, ...]]],
+    *,
+    report_hash: str,
+) -> None:
+    if type(raw_candidates) is not list:
+        raise _ControllerInvariant("safety candidate inventory is invalid")
+    source_refs = {
+        item.source_id: f"SOURCE-{index:06d}"
+        for index, item in enumerate(baseline.baseline_input.sources, 1)
+    }
+    pending: list[dict[str, object]] = []
+    lane_grade_maps = [
+        {item.requirement_id: str(item.disposition) for item in lane.requirement_grades}
+        for lane in lanes
+    ]
+    for item in baseline.requirements:
+        requirement = item.requirement
+        first = lane_grade_maps[0][requirement.requirement_id]
+        second = lane_grade_maps[1][requirement.requirement_id]
+        is_gap = requirement.kind.value == "gap"
+        if not is_gap and first == second == "met":
+            continue
+        pending.append(
+            {
+                "origin": "baseline_gap" if is_gap else "requirement",
+                "subject_id": requirement.requirement_id,
+                "importance": requirement.importance.value,
+                "lane_1_disposition": first,
+                "lane_2_disposition": second,
+                "evidence_refs": _ordered_evidence_refs(
+                    f"BASELINE-{requirement.requirement_id}",
+                    tuple(passage.source_id for passage in requirement.passages),
+                    source_refs,
+                ),
+            }
+        )
+    disposition_rank = {"uncertain": 0, "not_met": 1, "partially_met": 2, "met": 3}
+    lane_contest_maps = [
+        {item.contested_requirement_id: item for item in lane.contested_grades} for lane in lanes
+    ]
+    for contested_item in baseline.contested_requirements:
+        contest = contested_item.contested_requirement
+        lane_values: list[str] = []
+        for lane_map in lane_contest_maps:
+            grade = lane_map[contest.contested_requirement_id]
+            choices = (
+                str(grade.reviewer_alternative_disposition),
+                str(grade.auditor_alternative_disposition),
+            )
+            lane_values.append(min(choices, key=disposition_rank.__getitem__))
+        passage_sources: list[str] = []
+        for alternative in (contest.reviewer_alternative, contest.auditor_alternative):
+            if alternative is not None:
+                passage_sources.extend(passage.source_id for passage in alternative.passages)
+        pending.append(
+            {
+                "origin": "contested_requirement",
+                "subject_id": contest.contested_requirement_id,
+                "importance": contest.importance.value,
+                "lane_1_disposition": lane_values[0],
+                "lane_2_disposition": lane_values[1],
+                "evidence_refs": _ordered_evidence_refs(
+                    f"BASELINE-{contest.contested_requirement_id}",
+                    tuple(passage_sources),
+                    source_refs,
+                ),
+            }
+        )
+    pending.extend(
+        {
+            "origin": "prerequisite",
+            "subject_id": subject_id,
+            "importance": importance,
+            "lane_1_disposition": None,
+            "lane_2_disposition": None,
+            "evidence_refs": list(evidence_refs),
+        }
+        for subject_id, importance, evidence_refs in prerequisites
+    )
+    expected: list[dict[str, object]] = []
+    for index, pending_item in enumerate(pending, 1):
+        descriptor = {
+            "origin": pending_item["origin"],
+            "subject_id": pending_item["subject_id"],
+            "lane_1_disposition": pending_item["lane_1_disposition"],
+            "lane_2_disposition": pending_item["lane_2_disposition"],
+            "baseline_fingerprint": baseline.binding.baseline_fingerprint,
+            "report_hash": report_hash,
+            "evidence_refs": pending_item["evidence_refs"],
+        }
+        expected.append(
+            {
+                "candidate_id": f"GC-{index:04d}",
+                "canonical_order": index - 1,
+                **descriptor,
+                "importance": pending_item["importance"],
+                "candidate_fingerprint": sha256_digest(canonical_json_bytes(descriptor)),
+            }
+        )
+    if canonical_json_bytes(raw_candidates) != canonical_json_bytes(expected):
+        raise _ControllerInvariant("safety candidate inventory is invalid")
+
+
 def _validate_common_request_bindings(
     operation: ReadinessOperationV1,
     payload: dict[str, object],
@@ -686,24 +1064,25 @@ def _validate_common_request_bindings(
             type(dispute_id) is not str
             or type(order) is not int
             or dispute_id != f"SD-{order + 1:04d}"
+            or payload.get("controller_referee_id") != f"safety-referee-{dispute_id}"
         ):
             raise _ControllerInvariant("referee request identity is invalid")
         return
     report = payload.get("report_text")
     report_hash = payload.get("report_hash")
-    baseline = payload.get("stable_baseline")
+    baseline_raw = payload.get("stable_baseline")
     if (
         type(report) is not str
         or type(report_hash) is not str
         or sha256_digest(report.encode("utf-8")) != report_hash
-        or type(baseline) is not dict
-        or type(cast(dict[str, object], baseline).get("binding")) is not dict
+        or type(baseline_raw) is not dict
+        or type(cast(dict[str, object], baseline_raw).get("binding")) is not dict
     ):
         raise _ControllerInvariant("request report or baseline binding is invalid")
-    binding = cast(dict[str, object], cast(dict[str, object], baseline)["binding"])
-    if binding.get("grade_target_fingerprint") != payload.get(
+    baseline = _verified_baseline(payload)
+    if baseline.binding.grade_target_fingerprint != payload.get(
         "grade_target_fingerprint"
-    ) or binding.get("baseline_fingerprint") != payload.get("baseline_fingerprint"):
+    ) or baseline.binding.baseline_fingerprint != payload.get("baseline_fingerprint"):
         raise _ControllerInvariant("request grade-target binding is invalid")
     if operation in {
         ReadinessOperationV1.BASELINE_LOCKED_GRADE,
@@ -724,17 +1103,51 @@ def _validate_common_request_bindings(
             raise _ControllerInvariant("grade request lane is invalid")
         if operation is ReadinessOperationV1.BASELINE_LOCKED_GRADE:
             batch_ref = payload.get("batch_ref")
+            match = (
+                None
+                if type(batch_ref) is not str
+                else re.fullmatch(r"GB-([12])-([0-9]{4})", batch_ref)
+            )
+            batch_size = request_builders.READINESS_COMPILER_CONTRACT_V1.get("ordinary_batch_size")
+            if match is None or type(batch_size) is not int:
+                raise _ControllerInvariant("ordinary request identity is invalid")
+            batch_ordinal = int(match.group(2))
+            start = (batch_ordinal - 1) * batch_size
+            expected_requirements = baseline.requirements[start : start + batch_size]
+            issued = payload.get("requirements")
             if (
-                type(batch_ref) is not str
+                match.group(1) != str(lane)
+                or batch_ordinal < 1
+                or not expected_requirements
+                or type(issued) is not list
+                or canonical_json_bytes(issued)
+                != canonical_json_bytes(
+                    [item.model_dump(mode="json") for item in expected_requirements]
+                )
                 or payload.get("controller_lane_id") != f"grade-lane-{lane}-{batch_ref}"
             ):
                 raise _ControllerInvariant("ordinary request identity is invalid")
         else:
-            contest = cast(dict[str, object], payload["contested_requirement"])
-            identifier = cast(dict[str, object], contest["contested_requirement"]).get(
-                "contested_requirement_id"
+            contest = payload.get("contested_requirement")
+            if type(contest) is not dict:
+                raise _ControllerInvariant("contested request identity is invalid")
+            inner = cast(dict[str, object], contest).get("contested_requirement")
+            identifier = (
+                None
+                if type(inner) is not dict
+                else cast(dict[str, object], inner).get("contested_requirement_id")
             )
-            if payload.get("controller_lane_id") != (f"contested-grade-lane-{lane}-{identifier}"):
+            matches = [
+                item
+                for item in baseline.contested_requirements
+                if item.contested_requirement.contested_requirement_id == identifier
+            ]
+            if (
+                len(matches) != 1
+                or canonical_json_bytes(contest)
+                != canonical_json_bytes(matches[0].model_dump(mode="json"))
+                or payload.get("controller_lane_id") != f"contested-grade-lane-{lane}-{identifier}"
+            ):
                 raise _ControllerInvariant("contested request identity is invalid")
         return
     if (
@@ -742,56 +1155,71 @@ def _validate_common_request_bindings(
         != request_builders.READINESS_STRICT_EQUIVALENT_SCORING_FINGERPRINT_V1
     ):
         raise _ControllerInvariant("safety scoring binding is invalid")
+    safety_lane = payload.get("lane")
+    if (
+        type(safety_lane) is not int
+        or safety_lane not in {1, 2}
+        or payload.get("controller_safety_lane_id") != f"safety-lane-{safety_lane}"
+    ):
+        raise _ControllerInvariant("safety request identity is invalid")
+    prerequisites = _validate_safety_evidence_packet(payload, baseline, report_hash=report_hash)
     handles = set(_request_evidence_refs(payload))
     lanes = payload.get("grader_lanes")
     if type(lanes) is not list or len(lanes) != 2:
         raise _ControllerInvariant("safety grader lanes are invalid")
+    checked_lanes: list[BaselineLockedGraderAggregateV1] = []
     for expected_lane, lane_raw in enumerate(cast(list[object], lanes), 1):
         if type(lane_raw) is not dict:
             raise _ControllerInvariant("safety grader lanes are invalid")
+        try:
+            aggregate = BaselineLockedGraderAggregateV1.model_validate(lane_raw)
+            if canonical_json_bytes(aggregate.model_dump(mode="json")) != (
+                canonical_json_bytes(lane_raw)
+            ):
+                raise ValueError
+        except (TypeError, ValidationError, ValueError) as error:
+            raise _ControllerInvariant("safety grader lanes are invalid") from error
         lane = cast(dict[str, object], lane_raw)
         if (
-            lane.get("lane") != expected_lane
-            or lane.get("grade_target_fingerprint") != payload.get("grade_target_fingerprint")
-            or lane.get("baseline_fingerprint") != payload.get("baseline_fingerprint")
-            or lane.get("report_hash") != report_hash
+            aggregate.lane != expected_lane
+            or aggregate.grade_target_fingerprint != payload.get("grade_target_fingerprint")
+            or aggregate.baseline_fingerprint != payload.get("baseline_fingerprint")
+            or aggregate.report_hash != report_hash
+            or tuple(item.requirement_id for item in aggregate.requirement_grades)
+            != tuple(item.requirement.requirement_id for item in baseline.requirements)
+            or tuple(item.contested_requirement_id for item in aggregate.contested_grades)
+            != tuple(
+                item.contested_requirement.contested_requirement_id
+                for item in baseline.contested_requirements
+            )
             or not _sealed_fingerprint_valid(lane, "aggregate_fingerprint")
         ):
             raise _ControllerInvariant("safety grader lanes are invalid")
-        for fragment in cast(list[object], lane.get("ordinary_fragments", [])):
-            if not _sealed_fingerprint_valid(fragment, "fragment_fingerprint"):
+        for fragment in aggregate.ordinary_fragments:
+            if not _sealed_fingerprint_valid(
+                fragment.model_dump(mode="json"), "fragment_fingerprint"
+            ):
                 raise _ControllerInvariant("safety grader fragment is invalid")
-        for grade in cast(list[object], lane.get("contested_grades", [])):
-            if not _sealed_fingerprint_valid(grade, "grade_fingerprint"):
+        for grade in aggregate.contested_grades:
+            if not _sealed_fingerprint_valid(grade.model_dump(mode="json"), "grade_fingerprint"):
                 raise _ControllerInvariant("safety contested grade is invalid")
-    candidates = payload.get("gap_candidates")
-    if type(candidates) is not list:
+        checked_lanes.append(aggregate)
+    if len(checked_lanes) != 2:
+        raise _ControllerInvariant("safety grader lanes are invalid")
+    _validate_exact_safety_candidates(
+        payload.get("gap_candidates"),
+        baseline,
+        (checked_lanes[0], checked_lanes[1]),
+        prerequisites,
+        report_hash=report_hash,
+    )
+    candidate_refs = {
+        ref
+        for candidate in cast(list[dict[str, object]], payload["gap_candidates"])
+        for ref in cast(list[str], candidate["evidence_refs"])
+    }
+    if not candidate_refs.issubset(handles):
         raise _ControllerInvariant("safety candidate inventory is invalid")
-    for index, candidate_raw in enumerate(cast(list[object], candidates), 1):
-        if type(candidate_raw) is not dict:
-            raise _ControllerInvariant("safety candidate inventory is invalid")
-        candidate = cast(dict[str, object], candidate_raw)
-        descriptor = {
-            "origin": candidate.get("origin"),
-            "subject_id": candidate.get("subject_id"),
-            "lane_1_disposition": candidate.get("lane_1_disposition"),
-            "lane_2_disposition": candidate.get("lane_2_disposition"),
-            "baseline_fingerprint": candidate.get("baseline_fingerprint"),
-            "report_hash": candidate.get("report_hash"),
-            "evidence_refs": candidate.get("evidence_refs"),
-        }
-        candidate_refs = candidate.get("evidence_refs")
-        if (
-            candidate.get("candidate_id") != f"GC-{index:04d}"
-            or candidate.get("canonical_order") != index - 1
-            or candidate.get("baseline_fingerprint") != payload.get("baseline_fingerprint")
-            or candidate.get("report_hash") != report_hash
-            or type(candidate_refs) is not list
-            or not set(cast(list[str], candidate_refs)).issubset(handles)
-            or candidate.get("candidate_fingerprint")
-            != sha256_digest(canonical_json_bytes(descriptor))
-        ):
-            raise _ControllerInvariant("safety candidate inventory is invalid")
 
 
 def _strict_request(request: object) -> _CheckedRequest:
@@ -993,7 +1421,7 @@ def _validate_rationale(
     evidence_refs: tuple[str, ...],
     all_evidence_refs: tuple[str, ...],
     resolution_test: str,
-) -> None:
+) -> tuple[str, ...]:
     shortfall = _exact_prose(shortfall_description, rationale=True)
     unresolved = _exact_prose(why_unresolved, rationale=True)
     matters = _exact_prose(why_it_matters, rationale=True)
@@ -1036,6 +1464,7 @@ def _validate_rationale(
         item in normalized_resolution for item in _RESOLUTION_ACTIONS
     ):
         raise _Clarification(ReadinessDraftReasonCodeV1.RESOLUTION_TEST_INVALID)
+    return mentioned
 
 
 def _seal(
@@ -1168,6 +1597,9 @@ def _candidate_map(payload: dict[str, object]) -> dict[str, SafetyGapCandidateV1
 def _validate_rationale_evidence_kind(
     rationale_kind: RationaleKindV1,
     evidence_refs: tuple[str, ...],
+    *,
+    scoped_refs: tuple[str, ...] | None = None,
+    mentioned_refs: tuple[str, ...],
 ) -> None:
     required_prefixes: tuple[str, ...] | None
     if rationale_kind in {
@@ -1184,8 +1616,10 @@ def _validate_rationale_evidence_kind(
         required_prefixes = ("PREREQUISITE-CLIENT-FACTS",)
     else:
         required_prefixes = None
+    scoped = set(evidence_refs if scoped_refs is None else scoped_refs)
     if required_prefixes is not None and not any(
-        ref.startswith(required_prefixes) for ref in evidence_refs
+        ref in scoped and ref in mentioned_refs and ref.startswith(required_prefixes)
+        for ref in evidence_refs
     ):
         raise _Clarification(ReadinessDraftReasonCodeV1.RATIONALE_EVIDENCE_UNBOUND)
 
@@ -1204,7 +1638,7 @@ def _compile_assessment(
         missing_reason=ReadinessDraftReasonCodeV1.EVIDENCE_NOT_FOUND,
     )
     rationale_kind = RationaleKindV1(item.rationale_kind)
-    _validate_rationale(
+    mentioned_refs = _validate_rationale(
         shortfall_description=item.shortfall_description,
         rationale_kind=rationale_kind,
         why_unresolved=item.why_unresolved,
@@ -1213,7 +1647,12 @@ def _compile_assessment(
         all_evidence_refs=all_refs,
         resolution_test=item.resolution_test,
     )
-    _validate_rationale_evidence_kind(rationale_kind, refs)
+    _validate_rationale_evidence_kind(
+        rationale_kind,
+        refs,
+        scoped_refs=candidate.evidence_refs,
+        mentioned_refs=mentioned_refs,
+    )
     if not set(refs).intersection(candidate.evidence_refs):
         raise _Clarification(ReadinessDraftReasonCodeV1.RATIONALE_EVIDENCE_UNBOUND)
     if candidate.importance is BaselineImportanceV1.CRITICAL:
@@ -1260,7 +1699,7 @@ def _compile_finding(
     if finding_kind in _REPORT_CONTENT_FINDINGS and not passages:
         raise _Clarification(ReadinessDraftReasonCodeV1.REPORT_PASSAGE_REQUIRED)
     rationale_kind = RationaleKindV1(item.rationale_kind)
-    _validate_rationale(
+    mentioned_refs = _validate_rationale(
         shortfall_description=item.shortfall_description,
         rationale_kind=rationale_kind,
         why_unresolved=item.why_unresolved,
@@ -1269,7 +1708,11 @@ def _compile_finding(
         all_evidence_refs=all_refs,
         resolution_test=item.resolution_test,
     )
-    _validate_rationale_evidence_kind(rationale_kind, refs)
+    _validate_rationale_evidence_kind(
+        rationale_kind,
+        refs,
+        mentioned_refs=mentioned_refs,
+    )
     if (
         item.blocking_code is not None
         and item.blocking_code not in load_readiness_rubric_v1().blocking_codes
@@ -1418,7 +1861,16 @@ def compile_readiness_draft_v1(
     try:
         checked = _strict_request(request)
         checked_provenance = _strict_provenance(provenance)
-    except _ControllerInvariant:
+    except (
+        _ControllerInvariant,
+        AttributeError,
+        KeyError,
+        TypeError,
+        ValidationError,
+        ValueError,
+        RecursionError,
+        UnicodeError,
+    ):
         return ReadinessEngineDefectV1("READINESS_COMPILER_INVARIANT")
     try:
         parsed = _parse_draft(checked.request.operation, draft)

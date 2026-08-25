@@ -19,6 +19,7 @@ from test_attorney_readiness_requests import (
 )
 
 from regulatory_harvest.evaluation import attorney_readiness_drafts as drafts_module
+from regulatory_harvest.evaluation import attorney_readiness_requests as requests_module
 from regulatory_harvest.evaluation.attorney_readiness_drafts import (
     CompiledReadinessDraftV1,
     NeedsReadinessClarificationV1,
@@ -630,6 +631,54 @@ def test_known_but_unrelated_candidate_evidence_is_refused(
     )
 
 
+def test_semantic_evidence_and_candidate_membership_cannot_be_split_across_refs(
+    safety_request: ReadinessEvaluatorRequestV1,
+) -> None:
+    draft = _safety_draft(safety_request)
+    candidates = cast(tuple[dict[str, object], ...], safety_request.payload["gap_candidates"])
+    candidate_refs = cast(tuple[str, ...], candidates[0]["evidence_refs"])
+    local_ref = next(ref for ref in candidate_refs if ref.startswith("BASELINE-"))
+    handles = cast(tuple[dict[str, object], ...], safety_request.payload["evidence_handles"])
+    foreign_ref = next(
+        cast(str, item["evidence_ref"])
+        for item in handles
+        if cast(str, item["evidence_ref"]).startswith("PREREQUISITE-CURRENTNESS-")
+        and item["evidence_ref"] not in candidate_refs
+    )
+    assessment = cast(dict[str, object], draft["candidate_assessments"][0])
+    assessment["rationale_kind"] = "CURRENTNESS_NOT_ESTABLISHED"
+    assessment["follow_up_code"] = "CONFIRM_CURRENTNESS"
+    assessment["evidence_refs"] = [local_ref, foreign_ref]
+    assessment["why_it_matters"] = (
+        f"legal_conclusion: {local_ref} leaves the scoped answer incomplete."
+    )
+    _assert_clarification(
+        compile_readiness_draft_v1(safety_request, draft, _provenance()),
+        ReadinessDraftReasonCodeV1.RATIONALE_EVIDENCE_UNBOUND,
+    )
+
+
+def test_why_it_matters_must_cite_the_exact_semantic_evidence_handle(
+    safety_request: ReadinessEvaluatorRequestV1,
+) -> None:
+    draft = _safety_draft(safety_request)
+    candidates = cast(tuple[dict[str, object], ...], safety_request.payload["gap_candidates"])
+    candidate_refs = cast(tuple[str, ...], candidates[0]["evidence_refs"])
+    baseline_ref = next(ref for ref in candidate_refs if ref.startswith("BASELINE-"))
+    source_ref = next(ref for ref in candidate_refs if ref.startswith("SOURCE-"))
+    assessment = cast(dict[str, object], draft["candidate_assessments"][0])
+    assessment["rationale_kind"] = "SOURCE_ABSENT"
+    assessment["follow_up_code"] = "VERIFY_PRIMARY_AUTHORITY"
+    assessment["evidence_refs"] = [baseline_ref, source_ref]
+    assessment["why_it_matters"] = (
+        f"legal_conclusion: {baseline_ref} leaves the scoped answer incomplete."
+    )
+    _assert_clarification(
+        compile_readiness_draft_v1(safety_request, draft, _provenance()),
+        ReadinessDraftReasonCodeV1.RATIONALE_EVIDENCE_UNBOUND,
+    )
+
+
 @pytest.mark.parametrize(
     "rationale_kind,follow_up_code,candidate_origin",
     [
@@ -836,6 +885,27 @@ def test_cycles_depth_nodes_and_bytes_are_bounded_before_compilation(
         )
 
 
+def test_nested_python_strings_are_byte_bounded_before_canonical_serialization(
+    ordinary_request: ReadinessEvaluatorRequestV1,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    draft = _ordinary_draft(ordinary_request)
+    oversized = "x" * 262_145
+    draft["rationale"] = oversized
+    original = drafts_module.canonical_json_bytes
+
+    def guarded_canonical_json_bytes(value: object) -> bytes:
+        if type(value) is dict and value.get("rationale") is oversized:
+            raise AssertionError("oversized nested string reached canonical serialization")
+        return original(value)
+
+    monkeypatch.setattr(drafts_module, "canonical_json_bytes", guarded_canonical_json_bytes)
+    _assert_clarification(
+        compile_readiness_draft_v1(ordinary_request, draft, _provenance()),
+        ReadinessDraftReasonCodeV1.DRAFT_TOO_LARGE,
+    )
+
+
 def test_json_bytes_reject_duplicate_keys_and_non_native_scalars(
     ordinary_request: ReadinessEvaluatorRequestV1,
 ) -> None:
@@ -869,6 +939,105 @@ def test_resealed_ambiguous_controller_passage_inventory_is_an_engine_defect(
     assert compile_readiness_draft_v1(
         resealed,
         _ordinary_draft(ordinary_request),
+        _provenance(),
+    ) == ReadinessEngineDefectV1("READINESS_COMPILER_INVARIANT")
+
+
+def test_resealed_ordinary_subject_must_match_exact_stable_baseline_member(
+    ordinary_request: ReadinessEvaluatorRequestV1,
+) -> None:
+    raw = ordinary_request.model_dump(mode="json")
+    payload = cast(dict[str, object], raw["payload"])
+    requirements = cast(list[dict[str, object]], payload["requirements"])
+    requirement = cast(dict[str, object], requirements[0]["requirement"])
+    requirement["requirement_id"] = "REQ-9999"
+    ids = [
+        cast(str, cast(dict[str, object], item["requirement"])["requirement_id"])
+        for item in requirements
+    ]
+    allowlist = cast(list[str], payload["report_passage_allowlist"])
+    raw["json_schema"] = requests_module._grade_response_schema_for_ids(ids, allowlist)
+    resealed = _reseal_request(raw)
+    assert compile_readiness_draft_v1(
+        resealed,
+        _ordinary_draft(resealed),
+        _provenance(),
+    ) == ReadinessEngineDefectV1("READINESS_COMPILER_INVARIANT")
+
+
+def test_malformed_resealed_nested_lane_returns_discriminated_engine_defect(
+    safety_request: ReadinessEvaluatorRequestV1,
+) -> None:
+    raw = safety_request.model_dump(mode="json")
+    payload = cast(dict[str, object], raw["payload"])
+    lanes = cast(list[dict[str, object]], payload["grader_lanes"])
+    lane = lanes[0]
+    lane["ordinary_fragments"] = None
+    descriptor = {key: value for key, value in lane.items() if key != "aggregate_fingerprint"}
+    lane["aggregate_fingerprint"] = sha256_digest(canonical_json_bytes(descriptor))
+    resealed = _reseal_request(raw)
+    assert compile_readiness_draft_v1(
+        resealed,
+        _safety_draft(safety_request),
+        _provenance(),
+    ) == ReadinessEngineDefectV1("READINESS_COMPILER_INVARIANT")
+
+
+@pytest.mark.parametrize("target", ["source_record", "evidence_handle"])
+def test_resealed_safety_source_and_handle_content_must_match_stable_baseline(
+    safety_request: ReadinessEvaluatorRequestV1,
+    target: str,
+) -> None:
+    raw = safety_request.model_dump(mode="json")
+    payload = cast(dict[str, object], raw["payload"])
+    if target == "source_record":
+        sources = cast(list[dict[str, object]], payload["source_record"])
+        sources[0]["normalized_text"] = "Resealed source text."
+    else:
+        handles = cast(list[dict[str, object]], payload["evidence_handles"])
+        source_handle = next(item for item in handles if item["evidence_kind"] == "source")
+        evidence = cast(dict[str, object], source_handle["evidence"])
+        evidence["title"] = "Resealed evidence description"
+    resealed = _reseal_request(raw)
+    assert compile_readiness_draft_v1(
+        resealed,
+        _safety_draft(safety_request),
+        _provenance(),
+    ) == ReadinessEngineDefectV1("READINESS_COMPILER_INVARIANT")
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["candidate", "client_fact_boundary", "generation_validation", "readiness_rubric"],
+)
+def test_resealed_safety_packet_must_reconstruct_every_controller_binding(
+    safety_request: ReadinessEvaluatorRequestV1,
+    target: str,
+) -> None:
+    raw = safety_request.model_dump(mode="json")
+    payload = cast(dict[str, object], raw["payload"])
+    if target == "candidate":
+        candidate = cast(list[dict[str, object]], payload["gap_candidates"])[0]
+        candidate["subject_id"] = "REQ-9999"
+        descriptor = {
+            key: value
+            for key, value in candidate.items()
+            if key not in {"candidate_id", "canonical_order", "importance", "candidate_fingerprint"}
+        }
+        candidate["candidate_fingerprint"] = sha256_digest(canonical_json_bytes(descriptor))
+    elif target == "client_fact_boundary":
+        boundary = cast(dict[str, object], payload[target])
+        boundary["client_facts"] = "Resealed client facts."
+    elif target == "generation_validation":
+        generation = cast(dict[str, object], payload[target])
+        generation["report_hash"] = "f" * 64
+    else:
+        rubric = cast(dict[str, object], payload[target])
+        cast(list[str], rubric["generic_rationales"]).append("resealed rationale")
+    resealed = _reseal_request(raw)
+    assert compile_readiness_draft_v1(
+        resealed,
+        _safety_draft(safety_request),
         _provenance(),
     ) == ReadinessEngineDefectV1("READINESS_COMPILER_INVARIANT")
 
