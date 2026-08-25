@@ -9,11 +9,13 @@ import pytest
 from regulatory_harvest.evaluation.attorney_baseline_models import (
     AcceptedBaselineAuditFragmentV1,
     AcceptedBaselineReviewFragmentV1,
+    BaselineAuditConcernV1,
     BaselineAuditFragmentV1,
     BaselineDisputeV1,
     BaselineEvaluatorRequestV1,
     BaselineReviewAggregateV1,
     BaselineReviewFragmentV1,
+    ImportanceAuditFindingV1,
 )
 from regulatory_harvest.evaluation.attorney_baseline_requests import (
     BASELINE_COMPILER_CONTRACT_FINGERPRINT_V1,
@@ -32,12 +34,78 @@ EXPECTED_COMPILER_CONTRACT_FINGERPRINT = (
 EXPECTED_REQUEST_FINGERPRINTS = (
     "11f41ef4022d06842d5c475cacf7cc748c842c767ef4987fcfe1ce7b793f8511",
     "564eddf5a9ada79b3af1ca0233f8437f6d53397a917e1fe2c9be9d1a817b0627",
-    "9d510fa297eeabb7c50d3db369da217027682eea807ff38fa3d368952ee420b4",
+    "a875394862a72d93920392ee1690cce96f0c7a78c45b6b0ca781793dffb2bcf6",
 )
 
 
 def _hash(value: object) -> str:
     return sha256_digest(canonical_json_bytes(value))
+
+
+def _dispute_fingerprint(
+    *,
+    dispute_id: str,
+    target_proposal_ref: str | None,
+    reviewer_proposal: object | None,
+    auditor_concern: object | None,
+    importance_finding: object | None,
+) -> str:
+    def wire(value: object | None) -> object | None:
+        return None if value is None else value.model_dump(mode="json")
+
+    return _hash(
+        {
+            "dispute_id": dispute_id,
+            "target_proposal_ref": target_proposal_ref,
+            "reviewer_proposal": wire(reviewer_proposal),
+            "auditor_concern": wire(auditor_concern),
+            "importance_finding": wire(importance_finding),
+        }
+    )
+
+
+def _dispute(
+    *,
+    dispute_id: str = "DSP-0001",
+    target_proposal_ref: str | None = None,
+    reviewer_proposal: object | None = None,
+    auditor_concern: object | None = None,
+    importance_finding: object | None = None,
+) -> BaselineDisputeV1:
+    return BaselineDisputeV1(
+        dispute_id=dispute_id,
+        dispute_fingerprint=_dispute_fingerprint(
+            dispute_id=dispute_id,
+            target_proposal_ref=target_proposal_ref,
+            reviewer_proposal=reviewer_proposal,
+            auditor_concern=auditor_concern,
+            importance_finding=importance_finding,
+        ),
+        target_proposal_ref=target_proposal_ref,
+        reviewer_proposal=reviewer_proposal,
+        auditor_concern=auditor_concern,
+        importance_finding=importance_finding,
+    )
+
+
+def _semantic_concern(review: BaselineReviewAggregateV1) -> BaselineAuditConcernV1:
+    return BaselineAuditConcernV1(
+        target_proposal_ref="PR-0001",
+        concern_type="incorrect_statement",
+        passages=({"source_id": "rule-1", "quote": "must file a notice"},),
+        explanation="The proposal needs a narrower statement.",
+        correction=review.proposals[0].proposal,
+    )
+
+
+def _importance_finding() -> ImportanceAuditFindingV1:
+    return ImportanceAuditFindingV1(
+        proposal_ref="PR-0001",
+        reviewed_importance="critical",
+        reviewed_importance_basis=("legal_bottom_line",),
+        importance_rationale="Omission could change the legal bottom line.",
+        disposition="agree",
+    )
 
 
 @pytest.fixture
@@ -141,19 +209,10 @@ def requests(baseline_input, review) -> tuple[BaselineEvaluatorRequestV1, ...]:
     audit_request = build_baseline_source_audit_request_v1(
         baseline_input, review, (), fragment_ordinal=1
     )
-    concern = {
-        "target_proposal_ref": "PR-0001",
-        "concern_type": "incorrect_statement",
-        "passages": [{"source_id": "rule-1", "quote": "must file a notice"}],
-        "explanation": "The proposal needs a narrower statement.",
-        "correction": review.proposals[0].proposal,
-    }
-    dispute = BaselineDisputeV1(
-        dispute_id="DSP-0001",
-        dispute_fingerprint=_hash({"dispute_id": "DSP-0001", "concern": concern}),
+    dispute = _dispute(
         target_proposal_ref="PR-0001",
         reviewer_proposal=review.proposals[0].proposal,
-        auditor_concern=concern,
+        auditor_concern=_semantic_concern(review),
     )
     referee_request = build_baseline_source_referee_request_v1(baseline_input, dispute)
     return review_request, audit_request, referee_request
@@ -212,6 +271,122 @@ def test_audit_packet_requires_one_importance_review_per_proposal(baseline_input
         item.proposal_ref for item in review.proposals
     )
     assert request.payload["max_new_items"] == 5
+
+
+def test_audit_fragment_combines_concerns_and_importance_findings_within_five_items() -> None:
+    concern = BaselineAuditConcernV1(
+        target_proposal_ref="PR-0001",
+        concern_type="ambiguity",
+        passages=({"source_id": "rule-1", "quote": "must file a notice"},),
+        explanation="The source needs attorney interpretation.",
+    )
+    accepted = BaselineAuditFragmentV1(
+        concerns=(concern, concern, concern, concern),
+        importance_findings=(_importance_finding(),),
+        audit_complete=False,
+    )
+    assert len(accepted.concerns) + len(accepted.importance_findings) == 5
+    with pytest.raises(ValueError, match="combined item limit"):
+        BaselineAuditFragmentV1(
+            concerns=(concern, concern, concern, concern, concern),
+            importance_findings=(_importance_finding(),),
+            audit_complete=False,
+        )
+
+
+def test_baseline_dispute_requires_exactly_one_complete_disagreement_kind(
+    review: BaselineReviewAggregateV1,
+) -> None:
+    semantic = _semantic_concern(review)
+    importance = _importance_finding()
+    with pytest.raises(ValueError, match="exactly one"):
+        _dispute(
+            target_proposal_ref="PR-0001",
+            reviewer_proposal=review.proposals[0].proposal,
+            auditor_concern=semantic,
+            importance_finding=importance,
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        _dispute()
+    with pytest.raises(ValueError, match="importance disputes"):
+        _dispute(target_proposal_ref="PR-0001", importance_finding=importance)
+    with pytest.raises(ValueError, match="semantic disputes"):
+        _dispute(target_proposal_ref="PR-0001", auditor_concern=semantic)
+    with pytest.raises(ValueError, match="importance disputes"):
+        _dispute(
+            target_proposal_ref="PR-9999",
+            reviewer_proposal=review.proposals[0].proposal,
+            importance_finding=importance,
+        )
+    semantic_dispute = _dispute(
+        target_proposal_ref="PR-0001",
+        reviewer_proposal=review.proposals[0].proposal,
+        auditor_concern=semantic,
+    )
+    importance_dispute = _dispute(
+        target_proposal_ref="PR-0001",
+        reviewer_proposal=review.proposals[0].proposal,
+        importance_finding=importance,
+    )
+    assert semantic_dispute.auditor_concern == semantic
+    assert importance_dispute.importance_finding == importance
+
+
+def test_referee_request_refuses_mutated_dispute_alternatives_with_old_fingerprint(
+    baseline_input, review
+) -> None:
+    semantic = _dispute(
+        target_proposal_ref="PR-0001",
+        reviewer_proposal=review.proposals[0].proposal,
+        auditor_concern=_semantic_concern(review),
+    )
+    importance = _dispute(
+        target_proposal_ref="PR-0001",
+        reviewer_proposal=review.proposals[0].proposal,
+        importance_finding=_importance_finding(),
+    )
+    mutations = (
+        semantic.model_copy(
+            update={
+                "reviewer_proposal": semantic.reviewer_proposal.model_copy(
+                    update={"statement": "A changed obligation."}
+                )
+            }
+        ),
+        semantic.model_copy(
+            update={
+                "auditor_concern": semantic.auditor_concern.model_copy(
+                    update={"explanation": "A changed audit explanation."}
+                )
+            }
+        ),
+        importance.model_copy(
+            update={
+                "importance_finding": importance.importance_finding.model_copy(
+                    update={
+                        "reviewed_importance": "material",
+                        "reviewed_importance_basis": ("attorney_briefing",),
+                    }
+                )
+            }
+        ),
+    )
+    for mutation in mutations:
+        with pytest.raises(ValueError, match="dispute fingerprint"):
+            build_baseline_source_referee_request_v1(baseline_input, mutation)
+
+
+def test_compiler_contract_cannot_be_mutated_after_fingerprinting() -> None:
+    original = canonical_json_bytes(BASELINE_COMPILER_CONTRACT_V1)
+    with pytest.raises(TypeError):
+        BASELINE_COMPILER_CONTRACT_V1["strict_schema_hashes"]["source_review"] = "tampered"
+    with pytest.raises(TypeError):
+        BASELINE_COMPILER_CONTRACT_V1["operation_order"].append("tampered")
+    assert canonical_json_bytes(BASELINE_COMPILER_CONTRACT_V1) == original
+    assert (
+        compiler_contract_fingerprint_v1(BASELINE_COMPILER_CONTRACT_V1)
+        == BASELINE_COMPILER_CONTRACT_FINGERPRINT_V1
+    )
 
 
 def test_referee_packet_contains_exactly_one_controller_dispute(baseline_input, requests) -> None:

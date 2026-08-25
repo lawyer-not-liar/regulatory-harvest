@@ -58,49 +58,96 @@ _INSTRUCTIONS = {
 }
 
 
+class _FrozenContractDict(dict[str, object]):
+    @staticmethod
+    def _immutable(*_: object, **__: object) -> None:
+        raise TypeError("baseline compiler contract is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable  # type: ignore[assignment]
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable  # type: ignore[assignment]
+    setdefault = _immutable
+    update = _immutable
+
+
+class _FrozenContractList(list[object]):
+    @staticmethod
+    def _immutable(*_: object, **__: object) -> None:
+        raise TypeError("baseline compiler contract is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable  # type: ignore[assignment]
+    __imul__ = _immutable  # type: ignore[assignment]
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+
+def _freeze_contract(value: object) -> object:
+    if type(value) is dict:
+        return _FrozenContractDict({key: _freeze_contract(item) for key, item in dict.items(value)})
+    if type(value) is list:
+        return _FrozenContractList(_freeze_contract(item) for item in value)
+    return value
+
+
 def _schema_hash(value: object) -> str:
     return sha256_digest(canonical_json_bytes(value))
 
 
-BASELINE_COMPILER_CONTRACT_V1: dict[str, object] = {
-    "protocol": "evaluation-baseline-v1",
-    "contract_version": "baseline-compiler-contract-v1",
-    "operations": [item.value for item in BaselineOperationV1],
-    "strict_schema_hashes": {
-        "source_review": _schema_hash(BaselineReviewFragmentV1.model_json_schema()),
-        "source_audit": _schema_hash(BaselineAuditFragmentV1.model_json_schema()),
-        "source_referee": _schema_hash(BaselineRefereeDecisionV1.model_json_schema()),
-    },
-    "importance_policy_fingerprint": _IMPORTANCE_POLICY_FINGERPRINT,
-    "evaluation_rubric_fingerprint": _EVALUATION_RUBRIC_FINGERPRINT,
-    "operation_order": [
-        BaselineOperationV1.SOURCE_REVIEW.value,
-        BaselineOperationV1.SOURCE_AUDIT.value,
-        BaselineOperationV1.SOURCE_REFEREE.value,
-    ],
-    "fragment_maximum": _MAX_FRAGMENT_ITEMS,
-    "fragments_per_operation_maximum": _MAX_FRAGMENTS,
-    "items_per_operation_maximum": _MAX_COMPILED_ITEMS,
-    "controller_id_formats": _ID_FORMATS,
-    "source_offset_resolution": "exact-normalized-source-substring-first-occurrence-v1",
-    "relationship_inventory": _RELATIONSHIPS,
-    "dispute_rules": {
-        "one_dispute_per_referee_request": True,
-        "semantic_or_importance_disagreement_requires_referee": True,
-        "unresolved_substantive_dispute_survives_as_contested_requirement": True,
-        "decisions": ["accept_reviewer", "accept_auditor", "unresolved"],
-    },
-    "correction_actions": [
-        "add_requirement",
-        "replace_requirement",
-        "remove_requirement",
-        "add_relationship",
-        "replace_relationship",
-        "remove_relationship",
-    ],
-    "canonical_ordering_version": "controller-canonical-order-v1",
-    "fingerprint_version": "canonical-json-sha256-v1",
-}
+BASELINE_COMPILER_CONTRACT_V1: dict[str, object] = cast(
+    dict[str, object],
+    _freeze_contract(
+        {
+            "protocol": "evaluation-baseline-v1",
+            "contract_version": "baseline-compiler-contract-v1",
+            "operations": [item.value for item in BaselineOperationV1],
+            "strict_schema_hashes": {
+                "source_review": _schema_hash(BaselineReviewFragmentV1.model_json_schema()),
+                "source_audit": _schema_hash(BaselineAuditFragmentV1.model_json_schema()),
+                "source_referee": _schema_hash(BaselineRefereeDecisionV1.model_json_schema()),
+            },
+            "importance_policy_fingerprint": _IMPORTANCE_POLICY_FINGERPRINT,
+            "evaluation_rubric_fingerprint": _EVALUATION_RUBRIC_FINGERPRINT,
+            "operation_order": [
+                BaselineOperationV1.SOURCE_REVIEW.value,
+                BaselineOperationV1.SOURCE_AUDIT.value,
+                BaselineOperationV1.SOURCE_REFEREE.value,
+            ],
+            "fragment_maximum": _MAX_FRAGMENT_ITEMS,
+            "fragments_per_operation_maximum": _MAX_FRAGMENTS,
+            "items_per_operation_maximum": _MAX_COMPILED_ITEMS,
+            "controller_id_formats": _ID_FORMATS,
+            "source_offset_resolution": "exact-normalized-source-substring-first-occurrence-v1",
+            "relationship_inventory": _RELATIONSHIPS,
+            "dispute_rules": {
+                "one_dispute_per_referee_request": True,
+                "semantic_or_importance_disagreement_requires_referee": True,
+                "unresolved_substantive_dispute_survives_as_contested_requirement": True,
+                "decisions": ["accept_reviewer", "accept_auditor", "unresolved"],
+            },
+            "correction_actions": [
+                "add_requirement",
+                "replace_requirement",
+                "remove_requirement",
+                "add_relationship",
+                "replace_relationship",
+                "remove_relationship",
+            ],
+            "canonical_ordering_version": "controller-canonical-order-v1",
+            "fingerprint_version": "canonical-json-sha256-v1",
+        }
+    ),
+)
 
 
 def compiler_contract_fingerprint_v1(contract: object) -> str:
@@ -289,9 +336,13 @@ def _build_baseline_request_v1(
             or dispute is None
         ):
             raise ValueError("source-referee request has an invalid controller shape")
-        checked_dispute = cast(
-            BaselineDisputeV1, strict_baseline_model_v1(BaselineDisputeV1, dispute)
-        )
+        try:
+            checked_dispute = cast(
+                BaselineDisputeV1,
+                strict_baseline_model_v1(BaselineDisputeV1, dispute),
+            )
+        except ValueError as error:
+            raise ValueError("referee dispute fingerprint or shape is invalid") from error
         payload: dict[str, object] = {
             "source_context": _source_context(checked_input),
             "evidence_handles": _evidence_handles(checked_input),

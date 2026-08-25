@@ -79,7 +79,7 @@ def _wire_snapshot(value: object) -> object:
         return {key: _wire_snapshot(item) for key, item in raw.items()}
     if isinstance(value, dict):
         return {key: _wire_snapshot(item) for key, item in dict.items(value)}
-    if type(value) is list:
+    if isinstance(value, list):
         return [_wire_snapshot(item) for item in value]
     if type(value) is tuple:
         return tuple(_wire_snapshot(item) for item in value)
@@ -444,6 +444,8 @@ class BaselineAuditFragmentV1(BaselineStrictModel):
 
     @model_validator(mode="after")
     def validate_progress(self) -> Self:
+        if len(self.concerns) + len(self.importance_findings) > _MAX_FRAGMENT_ITEMS:
+            raise ValueError("source-audit fragments exceed the combined item limit")
         if not self.audit_complete and not (self.concerns or self.importance_findings):
             raise ValueError("nonfinal source-audit fragments require at least one finding")
         return self
@@ -478,8 +480,53 @@ class BaselineDisputeV1(BaselineStrictModel):
 
     @model_validator(mode="after")
     def validate_alternatives(self) -> Self:
-        if self.auditor_concern is None and self.importance_finding is None:
-            raise ValueError("baseline disputes require an auditor alternative")
+        has_semantic = self.auditor_concern is not None
+        has_importance = self.importance_finding is not None
+        if has_semantic == has_importance:
+            raise ValueError("baseline disputes require exactly one disagreement kind")
+        if has_semantic:
+            assert self.auditor_concern is not None
+            if self.target_proposal_ref != self.auditor_concern.target_proposal_ref:
+                raise ValueError("semantic disputes must bind the auditor target exactly")
+            if self.target_proposal_ref is None:
+                if self.reviewer_proposal is not None:
+                    raise ValueError("omission disputes must not invent a reviewer alternative")
+            elif self.reviewer_proposal is None:
+                raise ValueError("semantic disputes require a reviewer alternative")
+        else:
+            assert self.importance_finding is not None
+            if (
+                self.target_proposal_ref != self.importance_finding.proposal_ref
+                or self.reviewer_proposal is None
+            ):
+                raise ValueError(
+                    "importance disputes require the exact target and reviewer alternative"
+                )
+        expected = sha256_digest(
+            canonical_json_bytes(
+                {
+                    "dispute_id": self.dispute_id,
+                    "target_proposal_ref": self.target_proposal_ref,
+                    "reviewer_proposal": (
+                        None
+                        if self.reviewer_proposal is None
+                        else self.reviewer_proposal.model_dump(mode="json")
+                    ),
+                    "auditor_concern": (
+                        None
+                        if self.auditor_concern is None
+                        else self.auditor_concern.model_dump(mode="json")
+                    ),
+                    "importance_finding": (
+                        None
+                        if self.importance_finding is None
+                        else self.importance_finding.model_dump(mode="json")
+                    ),
+                }
+            )
+        )
+        if self.dispute_fingerprint != expected:
+            raise ValueError("baseline dispute fingerprint does not match exact alternatives")
         return self
 
 
