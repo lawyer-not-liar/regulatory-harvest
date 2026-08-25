@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 
 import pytest
@@ -18,6 +17,15 @@ from regulatory_harvest.evaluation.attorney_baseline_models import (
 
 HASH = "a" * 64
 ROOT = Path(__file__).resolve().parents[2]
+EXPECTED_POLICY_BYTES = (
+    b'{"definitions":{"critical":"omission or material misstatement could change the legal '
+    b'bottom line, applicability, operative status, core duty or prohibition, enforcement '
+    b'exposure, remedy, or a dispositive deadline.","material":"necessary for a competent '
+    b'attorney briefing or implementation decision but not independently outcome-determinative '
+    b'under the current scoped question.","supporting":"useful explanatory, contextual, or '
+    b'implementation detail whose absence does not materially change the legal answer or required '
+    b'next action."},"importance_policy_version":"importance-policy-v1"}'
+)
 
 
 @pytest.fixture
@@ -97,24 +105,7 @@ def _proposal(
 
 
 def test_importance_policy_definitions_are_exact(policy_bytes: bytes) -> None:
-    assert json.loads(policy_bytes) == {
-        "importance_policy_version": "importance-policy-v1",
-        "definitions": {
-            "critical": (
-                "omission or material misstatement could change the legal bottom line, "
-                "applicability, operative status, core duty or prohibition, enforcement "
-                "exposure, remedy, or a dispositive deadline."
-            ),
-            "material": (
-                "necessary for a competent attorney briefing or implementation decision "
-                "but not independently outcome-determinative under the current scoped question."
-            ),
-            "supporting": (
-                "useful explanatory, contextual, or implementation detail whose absence "
-                "does not materially change the legal answer or required next action."
-            ),
-        },
-    }
+    assert policy_bytes == EXPECTED_POLICY_BYTES
 
 
 def test_importance_enums_are_closed() -> None:
@@ -168,6 +159,50 @@ def test_baseline_input_rejects_extra_object_keys(valid_input: dict[str, object]
     with pytest.raises(ValidationError):
         BaselineInputV1.model_validate(
             {**valid_input, "sources": ({**first_source, "report_text": "forbidden"},)}
+        )
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        "candidate_id",
+        "report_text",
+        "report_hash",
+        "anonymous_label",
+        "generation_metadata",
+        "grader_responses",
+        "run_seed",
+        "case_fingerprint",
+    ],
+)
+def test_baseline_input_recursively_rejects_report_bound_compiler_contract_keys(
+    valid_input: dict[str, object], forbidden: str
+) -> None:
+    with pytest.raises(ValidationError, match="report-bound"):
+        BaselineInputV1.model_validate(
+            {
+                **valid_input,
+                "compiler_contract": {
+                    "version": "baseline-compiler-contract-v1",
+                    "nested": {forbidden: "forbidden"},
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize("non_wire", [("tuple",), object()])
+def test_baseline_input_rejects_non_wire_compiler_contract_values(
+    valid_input: dict[str, object], non_wire: object
+) -> None:
+    with pytest.raises(ValidationError, match="compiler contract"):
+        BaselineInputV1.model_validate(
+            {
+                **valid_input,
+                "compiler_contract": {
+                    "version": "baseline-compiler-contract-v1",
+                    "nested": non_wire,
+                },
+            }
         )
 
 

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from regulatory_harvest.models.base import StrictModel
-from regulatory_harvest.storage import sha256_digest
+from regulatory_harvest.storage import canonical_json_bytes, sha256_digest
 
 from .attorney_models import ArtifactRecord, EvaluationSource, RequestedAuthority
 from .attorney_v2_models import (
@@ -30,6 +31,18 @@ _MAX_FRAGMENTS = 128
 _MAX_COMPILED_ITEMS = 640
 _GENERIC_RATIONALES = frozenset(
     {"critical", "material", "supporting", "important", "self evident", "as labeled"}
+)
+_REPORT_BOUND_KEYS = frozenset(
+    {
+        "candidate_id",
+        "report_text",
+        "report_hash",
+        "anonymous_label",
+        "generation_metadata",
+        "grader_responses",
+        "run_seed",
+        "case_fingerprint",
+    }
 )
 
 Hash = Annotated[str, Field(pattern=_HASH_PATTERN, strict=True)]
@@ -59,8 +72,8 @@ def _wire_snapshot(value: object) -> object:
         if extra:
             raw.update(extra)
         return {key: _wire_snapshot(item) for key, item in raw.items()}
-    if type(value) is dict:
-        return {key: _wire_snapshot(item) for key, item in value.items()}
+    if isinstance(value, dict):
+        return {key: _wire_snapshot(item) for key, item in dict.items(value)}
     if type(value) is list:
         return [_wire_snapshot(item) for item in value]
     if type(value) is tuple:
@@ -90,6 +103,52 @@ def _deep_freeze(value: object) -> object:
         return tuple(_deep_freeze(item) for item in value)
     if type(value) is tuple:
         return tuple(_deep_freeze(item) for item in value)
+    return value
+
+
+def _validate_report_blind_json_tree(value: object, *, location: str) -> object:
+    """Allow only exact JSON wire values and no report-bound key at any depth."""
+    if type(value) is not dict:
+        raise ValueError(f"{location} must be an object")
+    pending: list[tuple[object, bool]] = [(value, False)]
+    active: set[int] = set()
+    while pending:
+        current, exiting = pending.pop()
+        if type(current) is dict:
+            identity = id(current)
+            if exiting:
+                active.remove(identity)
+                continue
+            if identity in active:
+                raise ValueError(f"{location} must not contain a container cycle")
+            active.add(identity)
+            pending.append((current, True))
+            for key, item in dict.items(current):
+                if type(key) is not str:
+                    raise ValueError(f"{location} keys must be strings")
+                if key in _REPORT_BOUND_KEYS:
+                    raise ValueError(f"{location} must not contain report-bound keys")
+                pending.append((item, False))
+        elif type(current) is list:
+            identity = id(current)
+            if exiting:
+                active.remove(identity)
+                continue
+            if identity in active:
+                raise ValueError(f"{location} must not contain a container cycle")
+            active.add(identity)
+            pending.append((current, True))
+            pending.extend((item, False) for item in current)
+        elif current is None or type(current) in {str, bool, int} or (
+            type(current) is float and math.isfinite(current)
+        ):
+            continue
+        else:
+            raise ValueError(f"{location} must contain only JSON wire values")
+    try:
+        canonical_json_bytes(value)
+    except (TypeError, ValueError, RecursionError) as error:
+        raise ValueError(f"{location} is not canonical JSON") from error
     return value
 
 
@@ -218,6 +277,11 @@ class BaselineInputV1(BaselineStrictModel):
     _validate_text = field_validator(
         "question", "jurisdiction", "as_of", "evaluation_rubric_version"
     )(_nonblank)
+
+    @field_validator("compiler_contract", mode="before")
+    @classmethod
+    def validate_compiler_contract(cls, value: object) -> object:
+        return _validate_report_blind_json_tree(value, location="compiler contract")
 
     @field_validator("sources", mode="before")
     @classmethod
