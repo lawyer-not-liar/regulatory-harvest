@@ -1196,6 +1196,88 @@ def test_resealed_safety_packet_must_reconstruct_every_controller_binding(
     ) == ReadinessEngineDefectV1("READINESS_COMPILER_INVARIANT")
 
 
+@pytest.mark.parametrize("limitation_text", [{"malformed": "container"}, " "])
+def test_synchronized_language_evidence_requires_native_nonblank_limitation_text(
+    safety_request: ReadinessEvaluatorRequestV1,
+    limitation_text: object,
+) -> None:
+    raw = safety_request.model_dump(mode="json")
+    payload = cast(dict[str, object], raw["payload"])
+    limits = cast(dict[str, object], payload["qualification_limits"])
+    treatment = cast(list[dict[str, object]], limits["language_treatments"])[0]
+    treatment["limitation_text"] = limitation_text
+    handles = cast(list[dict[str, object]], payload["evidence_handles"])
+    handle = next(
+        item
+        for item in handles
+        if cast(str, item["evidence_ref"]).startswith("PREREQUISITE-LANGUAGE-")
+    )
+    handle["evidence"] = copy.deepcopy(treatment)
+    resealed = _reseal_request(raw)
+    assert compile_readiness_draft_v1(
+        resealed,
+        _safety_draft(safety_request),
+        _provenance(),
+    ) == ReadinessEngineDefectV1("READINESS_COMPILER_INVARIANT")
+
+
+def test_synchronized_language_evidence_rejects_duplicate_source_coverage(
+    safety_request: ReadinessEvaluatorRequestV1,
+) -> None:
+    raw = safety_request.model_dump(mode="json")
+    payload = cast(dict[str, object], raw["payload"])
+    limits = cast(dict[str, object], payload["qualification_limits"])
+    treatments = cast(list[dict[str, object]], limits["language_treatments"])
+    treatments.append(copy.deepcopy(treatments[0]))
+    handles = cast(list[dict[str, object]], payload["evidence_handles"])
+    handle = next(
+        item
+        for item in handles
+        if cast(str, item["evidence_ref"]).startswith("PREREQUISITE-LANGUAGE-")
+    )
+    handle["evidence_kind"] = "qualification_prerequisite_evidence"
+    handle["evidence"] = [
+        {
+            "evidence_kind": "qualification_language_treatment",
+            "evidence": copy.deepcopy(treatment),
+        }
+        for treatment in treatments
+    ]
+    resealed = _reseal_request(raw)
+    assert compile_readiness_draft_v1(
+        resealed,
+        _safety_draft(safety_request),
+        _provenance(),
+    ) == ReadinessEngineDefectV1("READINESS_COMPILER_INVARIANT")
+
+
+def test_not_declared_language_treatment_requires_exactly_null_limitation_text(
+    tmp_path: Path,
+) -> None:
+    fixture = _make_verified_inputs(tmp_path, limitations=None)
+    inputs = build_verified_readiness_input_v1(
+        baseline_run_dir=fixture.baseline_run_dir,
+        qualification_run_dir=fixture.qualification_run_dir,
+        generation_run_dir=fixture.generation_run_dir,
+        validation_receipt_path=fixture.validation_receipt_path,
+    )
+    lanes = _verified_grader_lanes(inputs)
+    candidates = build_gap_candidate_inventory_v1(inputs, lanes)
+    request = build_safety_lane_request_v1(inputs, lanes, candidates, lane=1)
+    raw = request.model_dump(mode="json")
+    payload = cast(dict[str, object], raw["payload"])
+    limits = cast(dict[str, object], payload["qualification_limits"])
+    treatment = cast(list[dict[str, object]], limits["language_treatments"])[0]
+    assert treatment["limitation_status"] == "NOT_DECLARED"
+    treatment["limitation_text"] = "Resealed undeclared limitation."
+    resealed = _reseal_request(raw)
+    assert compile_readiness_draft_v1(
+        resealed,
+        _safety_draft(request),
+        _provenance(),
+    ) == ReadinessEngineDefectV1("READINESS_COMPILER_INVARIANT")
+
+
 def test_request_provenance_rejects_subclasses_constructed_models_and_resealed_schema(
     ordinary_request: ReadinessEvaluatorRequestV1,
 ) -> None:

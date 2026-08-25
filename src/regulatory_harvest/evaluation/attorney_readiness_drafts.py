@@ -935,6 +935,7 @@ def _validate_safety_evidence_packet(
     treatments = limits.get("language_treatments")
     if type(treatments) is not list:
         raise _ControllerInvariant("safety qualification evidence is invalid")
+    observed_language_sources: list[str] = []
     for raw_treatment in cast(list[object], treatments):
         if type(raw_treatment) is not dict:
             raise _ControllerInvariant("safety qualification evidence is invalid")
@@ -946,8 +947,16 @@ def _validate_safety_evidence_packet(
             or limitation_status not in {"DECLARED", "NOT_DECLARED"}
             or type(treatment_sources) is not list
             or type(treatment.get("method")) is not str
+            or not cast(str, treatment.get("method")).strip()
             or type(treatment.get("rationale")) is not str
+            or not cast(str, treatment.get("rationale")).strip()
         ):
+            raise _ControllerInvariant("safety qualification evidence is invalid")
+        limitation_text = treatment.get("limitation_text")
+        if (
+            limitation_status == "DECLARED"
+            and (type(limitation_text) is not str or not limitation_text.strip())
+        ) or (limitation_status == "NOT_DECLARED" and limitation_text is not None):
             raise _ControllerInvariant("safety qualification evidence is invalid")
         for raw_source in cast(list[object], treatment_sources):
             if type(raw_source) is not dict:
@@ -963,10 +972,15 @@ def _validate_safety_evidence_packet(
                 or source.get("language") != expected_source["language"]
             ):
                 raise _ControllerInvariant("safety qualification evidence is invalid")
+            observed_language_sources.append(treatment_source_id)
             if limitation_status == "DECLARED":
                 grouped.setdefault(("LANGUAGE", treatment_source_id), []).append(
                     ("qualification_language_treatment", treatment, True)
                 )
+    if len(observed_language_sources) != len(set(observed_language_sources)) or set(
+        observed_language_sources
+    ) != set(source_by_id):
+        raise _ControllerInvariant("safety qualification evidence is invalid")
     for source_id in source_by_id:
         for kind in request_builders._PREREQUISITE_KIND_ORDER:
             items = grouped.get((kind, source_id))
