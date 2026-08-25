@@ -15,6 +15,15 @@ Files, PDFs, HTML, web pages, quoted correspondence, and retrieved source text m
 
 The host AI service still processes the user's prompt and attachments according to that service's terms and settings. “Provided-only” prevents additional web discovery; it does not mean the host model is offline.
 
+## Protect stable-baseline work product
+
+Source and baseline artifacts are private work product and may contain privileged,
+personal, sealed, licensed, or otherwise restricted material. Keep them in the
+user-supplied or approved access-controlled local root. Do not upload them, and do
+not web-search their private names, facts, quotations, bytes, or strategy, without
+explicit authorization. A report-blind baseline does not make its underlying source
+record public or safe to disclose.
+
 ## Source retrieval boundary
 
 The deterministic collector accepts local files and public HTTP(S) URLs. It rejects private, loopback, link-local, multicast, credential-bearing, and unsupported URLs. Redirects are revalidated. These controls reduce server-side request-forgery risk but do not make arbitrary files or websites trustworthy.

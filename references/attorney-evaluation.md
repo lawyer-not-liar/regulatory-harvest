@@ -32,6 +32,64 @@ Keep the controller attorney-hidden.
 - Accept an unfavorable substantive result without retry.
 - Verify terminal evaluation artifacts before delivery.
 
+## Experimental stable evaluation baseline
+
+The opt-in `evaluation-baseline-v1` protocol creates one report-blind,
+source-derived baseline for later report revisions. Its role loop and these five
+commands are attorney-hidden mechanics:
+
+- `eval-baseline-init`
+- `eval-baseline-next`
+- `eval-baseline-submit-safe`
+- `eval-baseline-status`
+- `eval-baseline-verify`
+
+Baseline identity binds the exact legal-input boundary: normalized source bytes and
+IDs, source-record fingerprint, question, jurisdiction, as-of date, requested
+authority scope, exact client-fact bytes or explicit null, admitted qualification
+root and receipt, compiler contract, evaluation-rubric bytes and version,
+importance-policy bytes and version, and accepted report-blind reviewer, auditor,
+and referee provenance. It excludes candidate reports, report hashes, grades, and
+readiness results.
+
+The operational importance definitions are exact:
+
+- **critical:** omission or material misstatement could change the legal bottom line,
+  applicability, operative status, core duty or prohibition, enforcement exposure,
+  remedy, or a dispositive deadline.
+- **material:** necessary for a competent attorney briefing or implementation
+  decision but not independently outcome-determinative under the current scoped
+  question.
+- **supporting:** useful explanatory, contextual, or implementation detail whose
+  absence does not materially change the legal answer or required next action.
+
+A complete importance audit reviews every proposal. Every semantic or importance
+disagreement goes to a source-only referee; substantive unresolved alternatives
+remain contested rather than being silently resolved.
+
+Only a verified, typed `GradeableBaselineProjectionV1` is passed to delivery
+readiness. Do not regenerate the source roles for a report-only revision. Do not
+require a Protocol 2.2 baseline equality check for a report-only revision. Delivery
+readiness owns fresh grading for every later report revision against the verified
+projection. Report-only byte changes reuse the same baseline and grade target.
+
+Reuse is refused when any exact legal-input binding changes, including a source byte
+or ID, source record, question, jurisdiction, as-of date, authority scope,
+client-fact boundary, qualification, compiler, rubric, or importance policy.
+Corrections require attorney approval, create a new sibling baseline, link to the
+verified prior baseline, and leave all prior bytes immutable.
+
+Resume only the exact pending request from a verified run and never repeat an
+accepted role. Exit `0` means the requested baseline operation succeeded; exit
+`2` means invalid input or response; exit `5` means integrity verification
+failed; exit `6` means the engine paused with the exact request still pending.
+
+Treat source and baseline artifacts as private work product. Do not upload or
+web-search private material without explicit authorization. Baseline verification
+establishes local integrity and replay, not legal correctness, completeness,
+currentness, isolation truth, attorney approval authenticity, or report quality.
+This protocol is experimental and always requires qualified-attorney review.
+
 ## Protocol 2.2 new-run contract
 
 Protocol 2.2 is explicit experimental behavior; Protocol 2.1 remains the new-run

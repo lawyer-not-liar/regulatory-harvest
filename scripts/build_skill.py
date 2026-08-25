@@ -39,10 +39,50 @@ V22_ARCHIVE_REQUIREMENTS = frozenset(
         "src/regulatory_harvest/evaluation/attorney_v22_workflow.py",
     }
 )
+BASELINE_ARCHIVE_REQUIREMENTS = frozenset(
+    {
+        "assets/attorney-evaluation-baseline-correction.template.json",
+        "assets/attorney-evaluation-baseline-input.template.json",
+        "assets/attorney-evaluation-baseline-response.template.json",
+        "assets/evaluation-baseline-policy-v1.json",
+        "src/regulatory_harvest/evaluation/attorney_baseline_artifacts.py",
+        "src/regulatory_harvest/evaluation/attorney_baseline_compiler.py",
+        "src/regulatory_harvest/evaluation/attorney_baseline_input.py",
+        "src/regulatory_harvest/evaluation/attorney_baseline_models.py",
+        "src/regulatory_harvest/evaluation/attorney_baseline_projection.py",
+        "src/regulatory_harvest/evaluation/attorney_baseline_requests.py",
+        "src/regulatory_harvest/evaluation/attorney_baseline_workflow.py",
+    }
+)
+BASELINE_CANONICAL_JSON_INPUTS = frozenset(
+    path for path in BASELINE_ARCHIVE_REQUIREMENTS if path.startswith("assets/")
+)
 
 
 class SkillBuildError(RuntimeError):
     """The universal skill archive could not be built safely."""
+
+
+def _assert_baseline_canonical_inputs() -> None:
+    for relative in sorted(BASELINE_CANONICAL_JSON_INPUTS):
+        data = (ROOT / relative).read_bytes()
+        try:
+            value = json.loads(data)
+            canonical = json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise SkillBuildError(
+                f"evaluation-baseline-v1 input is not canonical JSON: {relative}"
+            ) from error
+        if data != canonical:
+            raise SkillBuildError(
+                f"evaluation-baseline-v1 input is not canonical JSON: {relative}"
+            )
 
 
 def _runtime_files() -> list[Path]:
@@ -73,6 +113,12 @@ def _runtime_files() -> list[Path]:
         raise SkillBuildError(
             f"skill package manifest is missing Protocol 2.2 input: {missing_v22[0]}"
         )
+    missing_baseline = sorted(BASELINE_ARCHIVE_REQUIREMENTS - expected)
+    if missing_baseline:
+        raise SkillBuildError(
+            "skill package manifest is missing evaluation-baseline-v1 input: "
+            f"{missing_baseline[0]}"
+        )
     discovered: set[str] = set()
     for relative in GUARDED_TREES:
         tree = ROOT / relative
@@ -93,6 +139,7 @@ def _runtime_files() -> list[Path]:
         raise SkillBuildError(f"required runtime file is unavailable: {missing[0]}")
     if any(path.is_symlink() for path in paths):
         raise SkillBuildError("runtime archive inputs must not be symbolic links")
+    _assert_baseline_canonical_inputs()
     return sorted(set(paths), key=lambda path: path.relative_to(ROOT).as_posix())
 
 

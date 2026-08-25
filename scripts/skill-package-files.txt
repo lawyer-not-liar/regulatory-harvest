@@ -10,6 +10,9 @@ SKILL.md
 THIRD_PARTY_NOTICES.md
 agents/openai.yaml
 assets/analysis-draft.template.json
+assets/attorney-evaluation-baseline-correction.template.json
+assets/attorney-evaluation-baseline-input.template.json
+assets/attorney-evaluation-baseline-response.template.json
 assets/attorney-evaluation-case.template.json
 assets/attorney-evaluation-qualification.template.json
 assets/attorney-evaluation-response.template.json
@@ -18,6 +21,7 @@ assets/attorney-evaluation-v21-response.template.json
 assets/attorney-evaluation-v22-response.template.json
 assets/attorney-generation-input.template.json
 assets/attorney-generation-response.template.json
+assets/evaluation-baseline-policy-v1.json
 assets/research-charter.template.json
 docs/evaluation.md
 docs/integrations/cite.md
@@ -62,6 +66,13 @@ src/regulatory_harvest/combine/stages.py
 src/regulatory_harvest/evaluation/__init__.py
 src/regulatory_harvest/evaluation/attorney_admission.py
 src/regulatory_harvest/evaluation/attorney_artifacts.py
+src/regulatory_harvest/evaluation/attorney_baseline_artifacts.py
+src/regulatory_harvest/evaluation/attorney_baseline_compiler.py
+src/regulatory_harvest/evaluation/attorney_baseline_input.py
+src/regulatory_harvest/evaluation/attorney_baseline_models.py
+src/regulatory_harvest/evaluation/attorney_baseline_projection.py
+src/regulatory_harvest/evaluation/attorney_baseline_requests.py
+src/regulatory_harvest/evaluation/attorney_baseline_workflow.py
 src/regulatory_harvest/evaluation/attorney_cli.py
 src/regulatory_harvest/evaluation/attorney_contract.py
 src/regulatory_harvest/evaluation/attorney_generation.py

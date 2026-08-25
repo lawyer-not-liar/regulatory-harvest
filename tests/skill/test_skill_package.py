@@ -1,10 +1,30 @@
+import asyncio
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from regulatory_harvest.analysis import AnalysisDraft
+from regulatory_harvest.evaluation.attorney_baseline_artifacts import (
+    load_verified_baseline_run,
+    verify_baseline_run,
+)
+from regulatory_harvest.evaluation.attorney_baseline_input import (
+    baseline_reuse_decision_v1,
+)
+from regulatory_harvest.evaluation.attorney_baseline_projection import (
+    project_gradeable_baseline_v1,
+    verify_gradeable_baseline_projection_v1,
+)
+from regulatory_harvest.evaluation.attorney_baseline_workflow import (
+    BaselineDraftPromptV1,
+    continue_baseline_v1,
+    guarded_submit_baseline_response_v1,
+    initialize_baseline_v1,
+    next_baseline_request_v1,
+)
 from regulatory_harvest.evaluation.attorney_v21_models import EvaluatorResponseV21
 from regulatory_harvest.evaluation.attorney_v22_models import EvaluatorResponseV22
 
@@ -126,6 +146,74 @@ def _frontmatter(path: Path) -> tuple[dict[str, str], list[str]]:
         key, value = line.split(":", 1)
         metadata[key.strip()] = value.strip()
     return metadata, lines[end + 1 :]
+
+
+BASELINE_FIXTURE = ROOT / "tests" / "fixtures" / "attorney-eval-baseline"
+BASELINE_FIXTURE_FILES = {
+    "correction/correction.json",
+    "pause-resume/control-input.json",
+    "pause-resume/responses/initial.json",
+    "pause-resume/responses/resume.json",
+    "qualification/admission-request.json",
+    "qualification/admission-response.json",
+    "qualification/qualification-case.json",
+    "qualification/qualification-manifest.json",
+    "qualification/qualification-receipt.json",
+    "stable/client-facts.txt",
+    "stable/control-input.json",
+    "stable/responses/scripted-responses.json",
+}
+
+
+def _materialize_baseline_fixture(tmp_path: Path) -> Path:
+    target = tmp_path / "attorney-eval-baseline"
+    shutil.copytree(BASELINE_FIXTURE, target)
+    for control_root in (target / "stable", target / "pause-resume"):
+        qualification = control_root / "qualification"
+        shutil.copytree(target / "qualification", qualification)
+        descriptive = qualification / "qualification-manifest.json"
+        runtime = qualification / "manifest.json"
+        runtime.write_bytes(descriptive.read_bytes())
+        descriptive.unlink()
+    shutil.copyfile(
+        target / "stable" / "client-facts.txt",
+        target / "pause-resume" / "client-facts.txt",
+    )
+    return target
+
+
+def _tree_snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+class _BaselineFixtureEvaluator:
+    provider_name = "fictional-public-fixture-provider"
+    model_name = "fictional-public-fixture-model"
+    judge_isolation = "scripted_fixture"
+
+    def __init__(self, records: list[dict[str, object]]) -> None:
+        self.records = list(records)
+        self.seen: list[tuple[str, int, str]] = []
+
+    async def evaluate_draft(self, prompt: BaselineDraftPromptV1) -> object:
+        record = self.records.pop(0)
+        expected = record["expect"]
+        assert isinstance(expected, dict)
+        assert record["operation"] == prompt.request.operation.value
+        assert expected["attempt"] == prompt.attempt
+        assert expected["request_fingerprint"] == prompt.request.request_fingerprint
+        self.seen.append(
+            (
+                prompt.request.operation.value,
+                prompt.attempt,
+                prompt.request.request_fingerprint,
+            )
+        )
+        return record["draft"]
 
 
 def test_skill_uses_the_cross_platform_agent_skills_subset() -> None:
@@ -1801,3 +1889,278 @@ def test_skill_stops_before_hypothetical_analysis_without_permission() -> None:
     assert "hypothetical" in protocol
     assert "explicit permission" in protocol
     assert "do not finalize" in protocol
+
+
+def test_baseline_templates_are_strict_canonical_json_without_newlines() -> None:
+    """Copyable baseline inputs must not acquire whitespace that changes bound bytes."""
+    for relative in (
+        "assets/attorney-evaluation-baseline-correction.template.json",
+        "assets/attorney-evaluation-baseline-input.template.json",
+        "assets/attorney-evaluation-baseline-response.template.json",
+        "assets/evaluation-baseline-policy-v1.json",
+    ):
+        data = (ROOT / relative).read_bytes()
+        assert data == _canonical_bytes(json.loads(data)), relative
+        assert not data.endswith(b"\n"), relative
+
+
+def test_baseline_public_fixture_is_complete_canonical_licensed_and_identity_free() -> None:
+    """A direct public lifecycle fixture must be complete without private matter material."""
+    actual = {
+        path.relative_to(BASELINE_FIXTURE).as_posix()
+        for path in BASELINE_FIXTURE.rglob("*")
+        if path.is_file()
+    }
+    assert actual == BASELINE_FIXTURE_FILES
+    for relative in sorted(actual - {"stable/client-facts.txt"}):
+        data = (BASELINE_FIXTURE / relative).read_bytes()
+        assert data == _canonical_bytes(json.loads(data)), relative
+        assert not data.endswith(b"\n"), relative
+
+    combined = b"\n".join(
+        (BASELINE_FIXTURE / relative).read_bytes() for relative in sorted(actual)
+    ).lower()
+    for forbidden in (
+        b"/users/",
+        b"/home/",
+        b"remediation-2026-08",
+        b"earl mah",
+        b"client matter",
+        b"private evaluation",
+    ):
+        assert forbidden not in combined
+    assert b"fictional" in combined
+    assert b"not legal authority" in combined
+
+    licenses = (ROOT / "tests" / "fixtures" / "FIXTURE_LICENSES.md").read_text(
+        encoding="utf-8"
+    ).casefold()
+    assert "`attorney-eval-baseline/`" in licenses
+    assert "cc0 1.0" in licenses
+
+
+def test_baseline_stable_fixture_replays_projection_and_report_hash_reuse(
+    tmp_path: Path,
+) -> None:
+    """Report revisions reuse one verified, report-blind, importance-audited grade target."""
+    fixture = _materialize_baseline_fixture(tmp_path)
+    script = json.loads(
+        (fixture / "stable" / "responses" / "scripted-responses.json").read_bytes()
+    )
+    run = tmp_path / "stable-run"
+    initialize_baseline_v1(
+        fixture / "stable" / "control-input.json", run, nonce_hex="2" * 64
+    )
+    for record in script["responses"]:
+        request = next_baseline_request_v1(run)
+        assert request is not None
+        assert record["operation"] == request.operation.value
+        assert record["expect"]["request_fingerprint"] == request.request_fingerprint
+        submitted = guarded_submit_baseline_response_v1(
+            run,
+            record["payload"],
+            provider_name="fictional-public-fixture-provider",
+            model_name="fictional-public-fixture-model",
+            judge_isolation="scripted_fixture",
+        )
+        assert submitted.accepted
+
+    assert next_baseline_request_v1(run) is None
+    context = load_verified_baseline_run(run)
+    before_replay = _tree_snapshot(run)
+    assert verify_baseline_run(run).valid
+    assert _tree_snapshot(run) == before_replay
+    assert context.baseline_input.client_facts == (
+        "Fictional client fact: Example Cooperative is a covered operator and plans one filing.\n"
+    )
+    assert {item.importance.value for item in context.baseline.requirements} | {
+        item.importance.value for item in context.baseline.contested_requirements
+    } == {"critical", "material", "supporting"}
+    assert {item.relationship for item in context.baseline.relationships} == {
+        "depends_on",
+        "exception_to",
+    }
+    assert len(context.baseline.contested_requirements) == 1
+    assert {
+        record["payload"].get("decision")
+        for record in script["responses"]
+        if record["operation"] == "baseline_source_referee"
+    } == {"accept_reviewer", "accept_auditor", "unresolved"}
+
+    projection = project_gradeable_baseline_v1(context)
+    assert verify_gradeable_baseline_projection_v1(context, projection) == projection
+    report_hashes = script["synthetic_report_hashes"]
+    assert len(report_hashes) == len(set(report_hashes)) == 2
+    assert all(len(value) == 64 for value in report_hashes)
+    stable_bytes = b"".join(before_replay.values()) + _canonical_bytes(
+        projection.model_dump(mode="json")
+    )
+    assert all(value.encode() not in stable_bytes for value in report_hashes)
+    assert baseline_reuse_decision_v1(
+        context.baseline_input, context.baseline_input
+    ).model_dump(mode="json") == {"reusable": True, "reason_codes": []}
+
+
+def test_baseline_pause_fixture_resumes_exact_request_without_duplicate_role(
+    tmp_path: Path,
+) -> None:
+    """A second mechanical refusal pauses and resume continues the exact accepted history."""
+    fixture = _materialize_baseline_fixture(tmp_path)
+    run = tmp_path / "pause-run"
+    initialize_baseline_v1(
+        fixture / "pause-resume" / "control-input.json",
+        run,
+        nonce_hex="3" * 64,
+    )
+    initial = json.loads(
+        (fixture / "pause-resume" / "responses" / "initial.json").read_bytes()
+    )
+    first_evaluator = _BaselineFixtureEvaluator(initial["responses"])
+    paused = asyncio.run(continue_baseline_v1(run, first_evaluator))
+
+    assert paused.engine_paused
+    assert paused.exit_code == 6
+    assert paused.pause_reason_codes == ("BASELINE_EXTERNAL_RESPONSE_INVALID",)
+    assert paused.pending_request is not None
+    paused_fingerprint = paused.pending_request.request_fingerprint
+    paused_manifest = json.loads((run / "baseline-manifest.json").read_bytes())
+    assert [call["call_id"] for call in paused_manifest["accepted_calls"]] == [
+        "source-review-0001"
+    ]
+
+    resume = json.loads(
+        (fixture / "pause-resume" / "responses" / "resume.json").read_bytes()
+    )
+    assert resume["responses"][0]["expect"]["request_fingerprint"] == paused_fingerprint
+    resumed = asyncio.run(
+        continue_baseline_v1(run, _BaselineFixtureEvaluator(resume["responses"]))
+    )
+    assert resumed.exit_code == 0
+    assert not resumed.engine_paused
+    context = load_verified_baseline_run(run)
+    assert [call.call_id for call in context.manifest.accepted_calls] == [
+        "source-review-0001",
+        "source-audit-0001",
+    ]
+
+
+def test_baseline_correction_fixture_creates_verified_sibling_without_prior_write(
+    tmp_path: Path,
+) -> None:
+    """An approved correction creates a new tree while the exact prior tree stays immutable."""
+    fixture = _materialize_baseline_fixture(tmp_path)
+    script = json.loads(
+        (fixture / "stable" / "responses" / "scripted-responses.json").read_bytes()
+    )
+    prior = tmp_path / "prior"
+    initialize_baseline_v1(
+        fixture / "stable" / "control-input.json", prior, nonce_hex="2" * 64
+    )
+    for record in script["responses"]:
+        assert guarded_submit_baseline_response_v1(
+            prior,
+            record["payload"],
+            provider_name="fictional-public-fixture-provider",
+            model_name="fictional-public-fixture-model",
+            judge_isolation="scripted_fixture",
+        ).accepted
+    before = _tree_snapshot(prior)
+
+    corrected = tmp_path / "corrected"
+    initialize_baseline_v1(
+        fixture / "stable" / "control-input.json",
+        corrected,
+        nonce_hex="4" * 64,
+        prior_baseline_path=prior,
+        correction_path=fixture / "correction" / "correction.json",
+    )
+
+    assert _tree_snapshot(prior) == before
+    assert corrected.parent == prior.parent and corrected != prior
+    assert verify_baseline_run(corrected, prior_run_dir=prior).valid
+    prior_context = load_verified_baseline_run(prior)
+    corrected_context = load_verified_baseline_run(corrected, prior_run_dir=prior)
+    assert corrected_context.baseline.prior_baseline_fingerprint == (
+        prior_context.baseline.baseline_fingerprint
+    )
+    assert corrected_context.baseline.baseline_fingerprint != (
+        prior_context.baseline.baseline_fingerprint
+    )
+
+
+def test_stable_baseline_operator_and_security_contract_is_published() -> None:
+    """Every installed guidance surface must expose the same safe experimental boundary."""
+    contract_documents = (
+        "README.md",
+        "SKILL.md",
+        "docs/evaluation.md",
+        "references/attorney-evaluation.md",
+    )
+    for relative in contract_documents:
+        text = " ".join((ROOT / relative).read_text(encoding="utf-8").casefold().split())
+        for phrase in (
+            "evaluation-baseline-v1",
+            "attorney-hidden",
+            "baseline identity",
+            "report-blind",
+            "critical",
+            "material",
+            "supporting",
+            "complete importance audit",
+            "gradeablebaselineprojectionv1",
+            "every later report revision",
+            "fresh grading",
+            "exact legal-input",
+            "correction",
+            "attorney approval",
+            "resume",
+            "exit `0`",
+            "exit `2`",
+            "exit `5`",
+            "exit `6`",
+            "experimental",
+            "qualified-attorney",
+        ):
+            assert phrase in text, (relative, phrase)
+        for command in (
+            "eval-baseline-init",
+            "eval-baseline-next",
+            "eval-baseline-submit-safe",
+            "eval-baseline-status",
+            "eval-baseline-verify",
+        ):
+            assert f"`{command}`" in text, (relative, command)
+        assert "do not regenerate the source roles" in text
+        assert "protocol 2.2 baseline equality check" in text
+
+    reference = " ".join(
+        (ROOT / "references" / "attorney-evaluation.md")
+        .read_text(encoding="utf-8")
+        .casefold()
+        .split()
+    )
+    for limitation in (
+        "local integrity and replay",
+        "legal correctness",
+        "completeness",
+        "currentness",
+        "isolation truth",
+        "attorney approval authenticity",
+        "report quality",
+    ):
+        assert limitation in reference
+
+    security = " ".join(
+        (ROOT / "references" / "security-and-privacy.md")
+        .read_text(encoding="utf-8")
+        .casefold()
+        .split()
+    )
+    for phrase in (
+        "source and baseline artifacts",
+        "private work product",
+        "do not upload",
+        "do not web-search",
+        "explicit authorization",
+    ):
+        assert phrase in security

@@ -67,6 +67,20 @@ EVALUATOR_V22_PACKAGE_PATHS = (
     "src/regulatory_harvest/evaluation/attorney_v22_requests.py",
     "src/regulatory_harvest/evaluation/attorney_v22_workflow.py",
 )
+BASELINE_PACKAGE_PATHS = (
+    "assets/attorney-evaluation-baseline-correction.template.json",
+    "assets/attorney-evaluation-baseline-input.template.json",
+    "assets/attorney-evaluation-baseline-response.template.json",
+    "assets/evaluation-baseline-policy-v1.json",
+    "src/regulatory_harvest/evaluation/attorney_baseline_artifacts.py",
+    "src/regulatory_harvest/evaluation/attorney_baseline_compiler.py",
+    "src/regulatory_harvest/evaluation/attorney_baseline_input.py",
+    "src/regulatory_harvest/evaluation/attorney_baseline_models.py",
+    "src/regulatory_harvest/evaluation/attorney_baseline_projection.py",
+    "src/regulatory_harvest/evaluation/attorney_baseline_requests.py",
+    "src/regulatory_harvest/evaluation/attorney_baseline_workflow.py",
+)
+BASELINE_ASSET_PATHS = BASELINE_PACKAGE_PATHS[:4]
 SPEC = importlib.util.spec_from_file_location("regulatory_harvest_skill_builder", BUILDER)
 assert SPEC is not None and SPEC.loader is not None
 skill_builder = importlib.util.module_from_spec(SPEC)
@@ -628,6 +642,27 @@ def test_protocol_22_runtime_and_template_are_exactly_packaged(tmp_path: Path) -
             member = f"regulatory-harvest/{path}"
             assert names.count(member) == 1
             assert archive.read(member) == (ROOT / path).read_bytes()
+
+
+def test_baseline_runtime_and_assets_are_exactly_packaged_once(tmp_path: Path) -> None:
+    """An installable skill must carry the complete stable-baseline runtime byte-for-byte."""
+    entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert entries == sorted(set(entries))
+    assert all(entries.count(path) == 1 for path in BASELINE_PACKAGE_PATHS)
+
+    built = tmp_path / "baseline-skill.zip"
+    result = _build(built)
+    assert result.returncode == 0, result.stderr
+    with zipfile.ZipFile(built) as archive:
+        names = archive.namelist()
+        for path in BASELINE_PACKAGE_PATHS:
+            member = f"regulatory-harvest/{path}"
+            assert names.count(member) == 1
+            assert archive.read(member) == (ROOT / path).read_bytes()
+        assert not any("/tests/" in name for name in names)
+        assert not any("attorney-eval-baseline" in name for name in names)
 
 
 def test_atomic_v2_template_and_runtime_dependencies_are_byte_complete_in_archive(
@@ -1257,3 +1292,54 @@ def test_skill_build_refuses_manifest_missing_protocol_22_runtime(
         match="skill package manifest is missing Protocol 2.2 input: " + required,
     ):
         skill_builder._runtime_files()
+
+
+@pytest.mark.parametrize("required", BASELINE_PACKAGE_PATHS)
+def test_skill_build_refuses_each_missing_baseline_runtime_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    required: str,
+) -> None:
+    """Every stable-baseline runtime or asset omission must name the missing input."""
+    entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert required in entries
+    manifest = tmp_path / "skill-package-files.txt"
+    manifest.write_text(
+        "\n".join(entry for entry in entries if entry != required) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(skill_builder, "PACKAGE_MANIFEST", manifest)
+
+    with pytest.raises(
+        skill_builder.SkillBuildError,
+        match="skill package manifest is missing evaluation-baseline-v1 input: "
+        + required,
+    ):
+        skill_builder._runtime_files()
+
+
+@pytest.mark.parametrize("required", BASELINE_ASSET_PATHS)
+def test_skill_build_refuses_each_noncanonical_baseline_json_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    required: str,
+) -> None:
+    """Every stable-baseline JSON input is guarded as canonical, newline-free bytes."""
+    for relative in BASELINE_ASSET_PATHS:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, target)
+    target = tmp_path / required
+    target.write_text(
+        json.dumps(json.loads(target.read_bytes()), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(skill_builder, "ROOT", tmp_path)
+
+    with pytest.raises(
+        skill_builder.SkillBuildError,
+        match="evaluation-baseline-v1 input is not canonical JSON: " + required,
+    ):
+        skill_builder._assert_baseline_canonical_inputs()
