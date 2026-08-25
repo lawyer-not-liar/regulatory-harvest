@@ -1268,6 +1268,7 @@ def test_qualification_public_text_preserves_safe_routes_and_partial_payload_byt
         "/home/private/client.json",
         "/opt/private/client.json",
         "/private/client.json",
+        "/root/.ssh/id_rsa",
         "/tmp/client.json",
         "/usr/local/private/client.json",
         "/var/client/run.json",

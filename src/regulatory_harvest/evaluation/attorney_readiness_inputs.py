@@ -86,7 +86,7 @@ _MAX_QUALIFICATION_FORBIDDEN_PATTERN_BYTES = 1024 * 1024
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _POSIX_PRIVATE_ROOT_RE = re.compile(
     r"(?<![A-Za-z0-9:/])/(?:Applications|Library|System|Users|Volumes|etc|home|opt|"
-    r"private|tmp|usr|var)(?:/|(?=[\s,.;:!?)]|$))"
+    r"private|root|tmp|usr|var)(?:/|(?=[\s,.;:!?)]|$))"
 )
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9])[A-Z]:[\\/][^\s\x00\"'<>|?*]+")
 _WINDOWS_UNC_PATH_RE = re.compile(
