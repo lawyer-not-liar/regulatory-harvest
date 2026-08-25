@@ -87,6 +87,7 @@ BASELINE_SAFE_ISSUE_CODES = frozenset(
 
 _MAX_JSON_BYTES = 16 * 1024 * 1024
 _MAX_JSON_DEPTH = 64
+_MAX_CORRECTION_CHAIN = 128
 _REVIEW_REQUEST_RE = re.compile(r"^requests/source-review-([0-9]{4})\.json$")
 _REVIEW_RESPONSE_RE = re.compile(r"^responses/source-review-([0-9]{4})\.json$")
 _AUDIT_REQUEST_RE = re.compile(r"^requests/source-audit-([0-9]{4})\.json$")
@@ -1464,28 +1465,71 @@ def initialize_baseline_storage_v1(
         return _commit_with_rollback(storage, files, manifest)
 
 
-def _terminal_replay(run_dir: Path) -> _Replay:
-    with _open_locked_storage(run_dir, exclusive=False) as storage:
-        replay = _verify_or_raise(storage)
-        storage.assert_root_identity()
-    if (
-        replay.baseline is None
-        or replay.verification is None
-        or replay.verification.valid is not True
-        or replay.manifest.phase
-        not in {BaselinePhaseV1.COMPLETED, BaselinePhaseV1.INCONCLUSIVE}
-        or replay.manifest.terminal_status not in {"COMPLETED", "INCONCLUSIVE"}
+def _ancestry_paths(prior_ancestry: tuple[Path, ...]) -> tuple[Path, ...]:
+    if type(prior_ancestry) is not tuple or any(
+        not isinstance(path, Path) for path in prior_ancestry
     ):
-        raise EvaluationIntegrityError("BASELINE_RESULT_REQUIRED")
-    return replay
+        raise EvaluationIntegrityError("baseline correction ancestry is invalid")
+    if len(prior_ancestry) >= _MAX_CORRECTION_CHAIN:
+        raise EvaluationIntegrityError("baseline correction ancestry is too deep")
+    return prior_ancestry
+
+
+def _terminal_replay_chain(run_dirs: tuple[Path, ...]) -> tuple[_Replay, ...]:
+    if not run_dirs or len(run_dirs) > _MAX_CORRECTION_CHAIN:
+        raise EvaluationIntegrityError("baseline correction ancestry is invalid")
+    replays: list[_Replay] = []
+    prior: _Replay | None = None
+    roots: set[str] = set()
+    for run_dir in run_dirs:
+        with _open_locked_storage(run_dir, exclusive=False) as storage:
+            replay = _verify_or_raise(storage, prior=prior)
+            storage.assert_root_identity()
+        if (
+            replay.baseline is None
+            or replay.verification is None
+            or replay.verification.valid is not True
+            or replay.manifest.phase
+            not in {BaselinePhaseV1.COMPLETED, BaselinePhaseV1.INCONCLUSIVE}
+            or replay.manifest.terminal_status not in {"COMPLETED", "INCONCLUSIVE"}
+            or replay.manifest.root_hash in roots
+        ):
+            raise EvaluationIntegrityError("BASELINE_RESULT_REQUIRED")
+        roots.add(replay.manifest.root_hash)
+        replays.append(replay)
+        prior = replay
+    return tuple(replays)
+
+
+def _terminal_replay(
+    run_dir: Path,
+    *,
+    prior_ancestry: tuple[Path, ...] = (),
+) -> _Replay:
+    ancestry = _ancestry_paths(prior_ancestry)
+    return _terminal_replay_chain((*ancestry, run_dir))[-1]
+
+
+def _optional_prior_replay(
+    prior_run_dir: Path | None,
+    prior_ancestry: tuple[Path, ...],
+) -> _Replay | None:
+    ancestry = _ancestry_paths(prior_ancestry)
+    if prior_run_dir is None:
+        if ancestry:
+            raise EvaluationIntegrityError("baseline correction ancestry lacks its prior run")
+        return None
+    return _terminal_replay(prior_run_dir, prior_ancestry=ancestry)
 
 
 def initialize_corrected_baseline_storage_v1(
     prior_run_dir: Path,
     run_dir: Path,
     correction: BaselineCorrectionRecordV1,
+    *,
+    prior_ancestry: tuple[Path, ...] = (),
 ) -> BaselineManifestV1:
-    """Create one corrected sibling from an actual verified terminal prior run."""
+    """Create a corrected sibling using oldest-to-newest explicit prior ancestry."""
     try:
         prior_parent = os.stat(_run_lock_parent(prior_run_dir), follow_symlinks=False)
         successor_parent = os.stat(_run_lock_parent(run_dir), follow_symlinks=False)
@@ -1499,7 +1543,10 @@ def initialize_corrected_baseline_storage_v1(
     if os.path.lexists(run_dir):
         raise EvaluationIntegrityError("baseline correction must create a new sibling")
 
-    prior = _terminal_replay(prior_run_dir)
+    ancestry = _ancestry_paths(prior_ancestry)
+    prior_chain = _terminal_replay_chain((*ancestry, prior_run_dir))
+    prior = prior_chain[-1]
+    prior_roots = tuple(item.manifest.root_hash for item in prior_chain)
     assert prior.baseline is not None
     if (
         correction.prior_baseline_root != prior.manifest.root_hash
@@ -1552,8 +1599,8 @@ def initialize_corrected_baseline_storage_v1(
             successor,
             prior_replay=prior,
         )
-    observed_prior = _terminal_replay(prior_run_dir)
-    if observed_prior.manifest.root_hash != prior.manifest.root_hash:
+    observed_chain = _terminal_replay_chain((*ancestry, prior_run_dir))
+    if tuple(item.manifest.root_hash for item in observed_chain) != prior_roots:
         raise EvaluationIntegrityError("BASELINE_CORRECTION_PRIOR_CHANGED")
     return committed
 
@@ -1609,10 +1656,11 @@ def verify_baseline_run(
     run_dir: Path,
     *,
     prior_run_dir: Path | None = None,
+    prior_ancestry: tuple[Path, ...] = (),
 ) -> BaselineVerificationV1:
     """Return only bounded diagnostics after exact inventory and semantic replay."""
     try:
-        prior = None if prior_run_dir is None else _terminal_replay(prior_run_dir)
+        prior = _optional_prior_replay(prior_run_dir, prior_ancestry)
         with _open_locked_storage(run_dir, exclusive=False) as storage:
             replay = _verify_or_raise(storage, prior=prior)
             storage.assert_root_identity()
@@ -1635,9 +1683,10 @@ def load_verified_baseline_run(
     run_dir: Path,
     *,
     prior_run_dir: Path | None = None,
+    prior_ancestry: tuple[Path, ...] = (),
 ) -> VerifiedBaselineContextV1:
     """Load the exact four-field baseline context from one complete verified replay."""
-    prior = None if prior_run_dir is None else _terminal_replay(prior_run_dir)
+    prior = _optional_prior_replay(prior_run_dir, prior_ancestry)
     with _open_locked_storage(run_dir, exclusive=False) as storage:
         replay = _verify_or_raise(storage, prior=prior)
         storage.assert_root_identity()

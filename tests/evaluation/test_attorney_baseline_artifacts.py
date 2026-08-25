@@ -1158,6 +1158,36 @@ def _correction(
     return BaselineCorrectionRecordV1.model_validate(payload)
 
 
+def _removal_correction(
+    prior_root: str,
+    prior_fingerprint: str,
+    requirement_id: str,
+) -> BaselineCorrectionRecordV1:
+    payload: dict[str, object] = {
+        "schema_version": "baseline-correction-v1",
+        "prior_baseline_root": prior_root,
+        "prior_baseline_fingerprint": prior_fingerprint,
+        "correction_id": "CORR-0002",
+        "actions": (
+            {"action": "remove_requirement", "requirement_id": requirement_id},
+        ),
+        "reason": "The second requirement needs a separate attorney-approved baseline revision.",
+        "attorney_approval": {
+            "approved_by": "Fictional Reviewing Attorney",
+            "approved_at": "2026-08-24T20:30:00-07:00",
+            "approval_statement": "I approve this source-bound baseline correction.",
+        },
+        "correction_fingerprint": "0" * 64,
+    }
+    provisional = BaselineCorrectionRecordV1.model_validate(payload)
+    payload["correction_fingerprint"] = sha256_digest(
+        canonical_json_bytes(
+            provisional.model_dump(mode="json", exclude={"correction_fingerprint"})
+        )
+    )
+    return BaselineCorrectionRecordV1.model_validate(payload)
+
+
 def test_verified_prior_creates_new_sibling_correction_without_mutation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1351,6 +1381,105 @@ def test_correction_accepts_an_authentic_verified_inconclusive_prior(
         .manifest.prior_baseline_root
         == prior.manifest.root_hash
     )
+
+
+def test_two_hop_correction_chain_requires_explicit_verified_ancestry(
+    tmp_path: Path,
+) -> None:
+    baseline_input, files_by_path, manifest = _complete_graph()
+    p0_dir = tmp_path / "p0"
+    initialize_baseline_storage_v1(p0_dir, manifest, files_by_path)
+    p0 = load_verified_baseline_run(p0_dir)
+    p0_before = _snapshot(p0_dir)
+
+    text = baseline_input.sources[0].normalized_text
+    quote = "must identify the operator"
+    start = text.find(quote)
+    added = BaselineRequirementV1(
+        requirement_id="REQ-9999",
+        canonical_order=999,
+        statement="The notice must identify the operator.",
+        kind="obligation",
+        importance="material",
+        importance_basis=("attorney_briefing",),
+        importance_rationale="The detail is necessary for a competent attorney briefing.",
+        passages=(
+            {
+                "source_id": "rule-1",
+                "quote": quote,
+                "start_char": start,
+                "end_char": start + len(quote),
+            },
+        ),
+        confidence="clear",
+        substantive_rationale="The source expressly identifies the required content.",
+    )
+    first_correction = _correction(
+        p0.manifest.root_hash,
+        p0.baseline.baseline_fingerprint,
+        added,
+    )
+    p1_dir = tmp_path / "p1"
+    baseline_artifacts.initialize_corrected_baseline_storage_v1(
+        p0_dir,
+        p1_dir,
+        first_correction,
+    )
+    p1 = load_verified_baseline_run(p1_dir, prior_run_dir=p0_dir)
+    p1_before = _snapshot(p1_dir)
+    second_correction = _removal_correction(
+        p1.manifest.root_hash,
+        p1.baseline.baseline_fingerprint,
+        "REQ-0002",
+    )
+    wrong_ancestor_dir = tmp_path / "wrong-ancestor"
+    initialize_baseline_storage_v1(
+        wrong_ancestor_dir,
+        _manifest(
+            baseline_input,
+            BaselinePhaseV1.INCONCLUSIVE,
+            baseline_fingerprint=p0.baseline.baseline_fingerprint,
+            terminal_status="INCONCLUSIVE",
+        ),
+        files_by_path,
+    )
+    p2_dir = tmp_path / "p2"
+
+    baseline_artifacts.initialize_corrected_baseline_storage_v1(
+        p1_dir,
+        p2_dir,
+        second_correction,
+        prior_ancestry=(p0_dir,),
+    )
+
+    assert not verify_baseline_run(p2_dir, prior_run_dir=p1_dir).valid
+    with pytest.raises(EvaluationIntegrityError):
+        load_verified_baseline_run(p2_dir, prior_run_dir=p1_dir)
+    assert not verify_baseline_run(
+        p2_dir,
+        prior_run_dir=p1_dir,
+        prior_ancestry=(wrong_ancestor_dir,),
+    ).valid
+    with pytest.raises(EvaluationIntegrityError):
+        load_verified_baseline_run(
+            p2_dir,
+            prior_run_dir=p1_dir,
+            prior_ancestry=(wrong_ancestor_dir,),
+        )
+    assert verify_baseline_run(
+        p2_dir,
+        prior_run_dir=p1_dir,
+        prior_ancestry=(p0_dir,),
+    ).valid
+    p2 = load_verified_baseline_run(
+        p2_dir,
+        prior_run_dir=p1_dir,
+        prior_ancestry=(p0_dir,),
+    )
+    assert len(p2.baseline.requirements) == 1
+    assert p2.manifest.prior_baseline_root == p1.manifest.root_hash
+    assert _snapshot(p0_dir) == p0_before
+    assert _snapshot(p1_dir) == p1_before
 
 
 def test_unexpected_or_noncanonical_artifact_is_refused(tmp_path: Path) -> None:
