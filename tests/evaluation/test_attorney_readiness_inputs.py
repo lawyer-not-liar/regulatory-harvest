@@ -1151,7 +1151,11 @@ def _qualification_limits_with_text(
         authorities[0] = replace(authorities[0], title=value)
         return replace(limits, requested_authorities=tuple(authorities))
     treatments = list(limits.language_treatments)  # type: ignore[attr-defined]
-    if surface == "language-method":
+    if surface == "source-language":
+        sources = list(treatments[0].sources)
+        sources[0] = replace(sources[0], language=value)
+        treatments[0] = replace(treatments[0], sources=tuple(sources))
+    elif surface == "language-method":
         treatments[0] = replace(treatments[0], method=value)
     elif surface == "language-rationale":
         treatments[0] = replace(treatments[0], rationale=value)
@@ -1164,7 +1168,7 @@ def _qualification_limits_with_text(
     return replace(limits, language_treatments=tuple(treatments))
 
 
-_QUALIFICATION_PUBLIC_TEXT_SURFACES = (
+_QUALIFICATION_PUBLIC_PROSE_SURFACES = (
     "check-rationale",
     "issue-message",
     "receipt-rationale",
@@ -1172,6 +1176,10 @@ _QUALIFICATION_PUBLIC_TEXT_SURFACES = (
     "language-method",
     "language-rationale",
     "language-limitations",
+)
+_QUALIFICATION_PUBLIC_TEXT_SURFACES = (
+    *_QUALIFICATION_PUBLIC_PROSE_SURFACES,
+    "source-language",
 )
 
 
@@ -1222,7 +1230,7 @@ def test_qualification_public_text_rejects_private_paths_and_complete_payload_du
         build_verified_readiness_input_v1(**verified_inputs.without_history())
 
 
-@pytest.mark.parametrize("surface", _QUALIFICATION_PUBLIC_TEXT_SURFACES)
+@pytest.mark.parametrize("surface", _QUALIFICATION_PUBLIC_PROSE_SURFACES)
 def test_qualification_public_text_preserves_safe_routes_and_partial_payload_bytes(
     verified_inputs: VerifiedInputsFixture,
     monkeypatch: pytest.MonkeyPatch,
@@ -1249,10 +1257,48 @@ def test_qualification_public_text_preserves_safe_routes_and_partial_payload_byt
 
 @pytest.mark.parametrize("surface", _QUALIFICATION_PUBLIC_TEXT_SURFACES)
 @pytest.mark.parametrize(
+    "local_path",
+    [
+        "/Applications/Private.app/client.json",
+        "/Library/Application Support/client.json",
+        "/System/Library/client.json",
+        "/Users/private/client.json",
+        "/Volumes/private/client.json",
+        "/etc/client.conf",
+        "/home/private/client.json",
+        "/opt/private/client.json",
+        "/private/client.json",
+        "/tmp/client.json",
+        "/usr/local/private/client.json",
+        "/var/client/run.json",
+    ],
+)
+def test_qualification_public_text_rejects_canonical_local_posix_roots(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    local_path: str,
+) -> None:
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    limits = _qualification_limits_with_text(
+        admitted.qualification_limits,
+        surface=surface,
+        value=f"Inspect {local_path} for support.",
+    )
+    monkeypatch.setattr(inputs_module, "_load_qualification_limits", lambda *_: limits)
+
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+@pytest.mark.parametrize("surface", _QUALIFICATION_PUBLIC_TEXT_SURFACES)
+@pytest.mark.parametrize(
     "unsafe_uri",
     [
         "file:/Users/private/client-matter.json",
         "file://private-host/share/client-matter.json",
+        "FILE:///etc/client.conf",
+        "https://public.example/search?next=FiLe:/opt/private/client.json",
     ],
 )
 def test_qualification_public_text_rejects_every_local_file_uri_form(
@@ -1271,6 +1317,54 @@ def test_qualification_public_text_rejects_every_local_file_uri_form(
 
     with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
         build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+@pytest.mark.parametrize("surface", _QUALIFICATION_PUBLIC_PROSE_SURFACES)
+@pytest.mark.parametrize(
+    "safe_text",
+    [
+        "The record uses the ordinary label file: without a URI payload.",
+        "The record uses file: /regulations/title-12 with a whitespace gap.",
+        "Review https://public.example/search?term=file: for the public index.",
+        "Review https://public.example/search?term=file:value for the public index.",
+    ],
+)
+def test_qualification_public_text_allows_non_uri_file_prose_exactly(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    safe_text: str,
+) -> None:
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    limits = _qualification_limits_with_text(
+        admitted.qualification_limits,
+        surface=surface,
+        value=safe_text,
+    )
+    monkeypatch.setattr(inputs_module, "_load_qualification_limits", lambda *_: limits)
+
+    rebuilt = build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+    assert rebuilt.qualification_limits == limits
+
+
+@pytest.mark.parametrize("language", ["en", "pt-BR", "zh-Hant", "EN-us"])
+def test_qualification_source_language_preserves_legitimate_labels_exactly(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    language: str,
+) -> None:
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    limits = _qualification_limits_with_text(
+        admitted.qualification_limits,
+        surface="source-language",
+        value=language,
+    )
+    monkeypatch.setattr(inputs_module, "_load_qualification_limits", lambda *_: limits)
+
+    rebuilt = build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+    assert rebuilt.qualification_limits == limits
 
 
 @pytest.mark.parametrize(
@@ -1298,9 +1392,11 @@ def test_qualification_public_text_rejects_cross_platform_absolute_paths(
         build_verified_readiness_input_v1(**verified_inputs.without_history())
 
 
+@pytest.mark.parametrize("surface", ["receipt-rationale", "source-language"])
 def test_qualification_public_text_rejects_non_native_and_oversize_values(
     verified_inputs: VerifiedInputsFixture,
     monkeypatch: pytest.MonkeyPatch,
+    surface: str,
 ) -> None:
     class TextSubclass(str):
         pass
@@ -1309,7 +1405,7 @@ def test_qualification_public_text_rejects_non_native_and_oversize_values(
     for value in (TextSubclass("apparently safe"), "x" * (64 * 1024 + 1)):
         limits = _qualification_limits_with_text(
             admitted.qualification_limits,
-            surface="receipt-rationale",
+            surface=surface,
             value=value,
         )
         monkeypatch.setattr(

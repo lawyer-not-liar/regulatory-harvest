@@ -85,15 +85,15 @@ _MAX_QUALIFICATION_PUBLIC_TEXT_FIELDS = 8192
 _MAX_QUALIFICATION_FORBIDDEN_PATTERN_BYTES = 1024 * 1024
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _POSIX_PRIVATE_ROOT_RE = re.compile(
-    r"(?<![A-Za-z0-9:/])/(?:Users|home|private|tmp|Volumes)(?:/|(?=[\s,.;:!?)]|$))"
-    r"|(?<![A-Za-z0-9:/])/var/folders(?:/|(?=[\s,.;:!?)]|$))"
+    r"(?<![A-Za-z0-9:/])/(?:Applications|Library|System|Users|Volumes|etc|home|opt|"
+    r"private|tmp|usr|var)(?:/|(?=[\s,.;:!?)]|$))"
 )
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9])[A-Z]:[\\/][^\s\x00\"'<>|?*]+")
 _WINDOWS_UNC_PATH_RE = re.compile(
     r"(?<![\\A-Za-z0-9])\\\\[^\\/\s\x00\"'<>|?*]+[\\/]"
     r"[^\s\x00\"'<>|?*]+"
 )
-_FILE_URI_RE = re.compile(r"(?i)(?<![A-Za-z0-9+.-])file:")
+_FILE_URI_RE = re.compile(r"(?i)(?<![A-Za-z0-9+.-])file:/+[^\s/\x00\"'<>][^\s\x00\"'<>]*")
 _DOSSIER_NAME = "agent-dossier.json"
 _DOSSIER_FIELDS = {
     "coverage_contract_version",
@@ -669,7 +669,7 @@ def _validate_qualification_public_projection(
                     raise TypeError("qualification language source projection is invalid")
                 native_text(source.source_id)
                 _hash(source.content_hash, code=code)
-                native_text(source.language)
+                public_text(source.language)
             public_text(treatment.method)
             public_text(treatment.rationale)
             if type(treatment.limitation_status) is not str:
