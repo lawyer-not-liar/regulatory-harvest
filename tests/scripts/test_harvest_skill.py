@@ -19,6 +19,12 @@ from regulatory_harvest.analysis import (
     evaluate_atomic_coverage,
 )
 from regulatory_harvest.evaluation import attorney_generation, attorney_workflow
+from regulatory_harvest.evaluation.attorney_baseline_artifacts import (
+    load_verified_baseline_run,
+)
+from regulatory_harvest.evaluation.attorney_baseline_models import (
+    BaselineCorrectionRecordV1,
+)
 from regulatory_harvest.evaluation.attorney_cli import _case_and_capsules_from_fixture
 from regulatory_harvest.evaluation.attorney_v2_workflow import initialize_evaluation_v2
 from regulatory_harvest.evaluation.attorney_v21_workflow import initialize_evaluation_v21
@@ -2463,6 +2469,92 @@ def test_baseline_full_runner_exposes_exact_commands_safe_status_and_exit_mappin
         "ok": True,
         "protocol_version": "evaluation-baseline-v1",
     }
+
+    prior = load_verified_baseline_run(run)
+    existing_requirement = prior.baseline.requirements[0]
+    replacement = existing_requirement.model_copy(
+        update={"statement": "The covered operator must file a notice."}
+    )
+    correction_payload: dict[str, object] = {
+        "schema_version": "baseline-correction-v1",
+        "prior_baseline_root": prior.manifest.root_hash,
+        "prior_baseline_fingerprint": prior.baseline.baseline_fingerprint,
+        "correction_id": "CORR-0001",
+        "actions": [
+            {
+                "action": "replace_requirement",
+                "requirement_id": existing_requirement.requirement_id,
+                "requirement": replacement.model_dump(mode="json"),
+            }
+        ],
+        "reason": "The attorney approved a source-bound wording correction.",
+        "attorney_approval": {
+            "approved_by": "Fictional Reviewing Attorney",
+            "approved_at": "2026-08-24T20:00:00-07:00",
+            "approval_statement": "I approve this source-bound baseline correction.",
+        },
+        "correction_fingerprint": "0" * 64,
+    }
+    provisional = BaselineCorrectionRecordV1.model_validate(correction_payload)
+    correction_payload["correction_fingerprint"] = hashlib.sha256(
+        _canonical_bytes(
+            provisional.model_dump(
+                mode="json", exclude={"correction_fingerprint"}
+            )
+        )
+    ).hexdigest()
+    correction = tmp_path / "baseline-correction.json"
+    correction.write_bytes(_canonical_bytes(correction_payload))
+    corrected_run = tmp_path / "baseline-corrected"
+    corrected_init = _run_runner(
+        SKILL_RUNNER,
+        "eval-baseline-init",
+        "--input",
+        str(tmp_path / "baseline-control.json"),
+        "--run",
+        str(corrected_run),
+        "--nonce-hex",
+        "3" * 64,
+        "--prior-baseline",
+        str(run),
+        "--correction",
+        str(correction),
+    )
+    assert corrected_init.returncode == 0, corrected_init.stderr
+
+    corrected_next = _run_runner(
+        SKILL_RUNNER, "eval-baseline-next", "--run", str(corrected_run)
+    )
+    corrected_status = _run_runner(
+        SKILL_RUNNER, "eval-baseline-status", "--run", str(corrected_run)
+    )
+    corrected_verify = _run_runner(
+        SKILL_RUNNER, "eval-baseline-verify", "--run", str(corrected_run)
+    )
+    assert (
+        corrected_next.returncode
+        == corrected_status.returncode
+        == corrected_verify.returncode
+        == 0
+    )
+    assert json.loads(corrected_next.stdout) is None
+    corrected_status_payload = json.loads(corrected_status.stdout)
+    assert set(corrected_status_payload) == set(status_payload)
+    assert corrected_status_payload["phase"] == "completed"
+    assert corrected_status_payload["pending_operation"] is None
+    assert json.loads(corrected_verify.stdout) == {
+        "issues": [],
+        "ok": True,
+        "protocol_version": "evaluation-baseline-v1",
+    }
+    safe_output = (
+        corrected_init.stdout
+        + corrected_next.stdout
+        + corrected_status.stdout
+        + corrected_verify.stdout
+    )
+    assert str(tmp_path) not in safe_output
+    assert "presentará aviso" not in safe_output
 
 
 def test_controller_stops_on_integrity_failure_without_consuming_response(

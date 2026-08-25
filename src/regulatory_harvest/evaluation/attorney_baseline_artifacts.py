@@ -41,6 +41,9 @@ from .attorney_baseline_models import (
     BaselineAuditAggregateV1,
     BaselineAuditFragmentV1,
     BaselineCallRecordV1,
+    BaselineCorrectionProofArtifactV1,
+    BaselineCorrectionProofNodeV1,
+    BaselineCorrectionProofV1,
     BaselineCorrectionRecordV1,
     BaselineDisputeV1,
     BaselineEvaluatorRequestV1,
@@ -72,6 +75,7 @@ BASELINE_AUDIT_PATH = "source-audit.json"
 BASELINE_REFEREES_PATH = "source-referees.json"
 CANONICAL_BASELINE_PATH = "canonical-baseline.json"
 BASELINE_CORRECTION_PATH = "baseline-correction.json"
+BASELINE_CORRECTION_PROOF_PATH = "correction-proof.json"
 BASELINE_VERIFICATION_PATH = "baseline-verification.json"
 
 BASELINE_SAFE_ISSUE_CODES = frozenset(
@@ -102,6 +106,7 @@ _REFEREE_RESPONSE_RE = re.compile(
 _ModelT = TypeVar("_ModelT", bound=BaselineStrictModel)
 _LOCKS_GUARD = threading.Lock()
 _RUN_LOCKS: dict[tuple[int, int], threading.RLock] = {}
+BaselineRootIdentityV1 = tuple[int, int]
 
 
 class _FrozenList(list[str]):
@@ -166,6 +171,13 @@ class _Replay:
     baseline_input: BaselineInputV1
     baseline: CanonicalBaselineV1 | None
     verification: BaselineVerificationV1 | None
+
+
+@dataclass(frozen=True)
+class _ReplaySnapshot:
+    replay: _Replay
+    manifest_bytes: bytes
+    files: Mapping[str, bytes]
 
 
 def _frozen_artifact_record(value: ArtifactRecord) -> ArtifactRecord:
@@ -274,6 +286,18 @@ def _lock_storage_descriptor(storage: RunStorage, *, exclusive: bool) -> None:
         ) from error
 
 
+def _storage_root_identity_v1(storage: RunStorage) -> BaselineRootIdentityV1:
+    """Return the physical identity of the descriptor used for baseline replay."""
+    descriptor = getattr(storage, "_root_descriptor", None)
+    if os.name != "posix" or type(descriptor) is not int:
+        raise EvaluationIntegrityError("BASELINE_STORAGE_UNSAFE")
+    try:
+        metadata = os.fstat(descriptor)
+    except (NotImplementedError, OSError, TypeError, ValueError) as error:
+        raise EvaluationIntegrityError("BASELINE_STORAGE_UNSAFE") from error
+    return metadata.st_dev, metadata.st_ino
+
+
 def _error(code: str) -> EvaluationIntegrityError:
     return EvaluationIntegrityError(f"BASELINE_ARTIFACT_{code}")
 
@@ -374,6 +398,58 @@ def _canonical_model_bytes(value: _ModelT, model_type: type[_ModelT]) -> tuple[_
     except (TypeError, ValidationError, ValueError, RecursionError) as error:
         raise _error(f"MODEL_INVALID:{model_type.__name__}") from error
     return round_tripped, data
+
+
+def _correction_proof_from_nodes(
+    nodes: tuple[BaselineCorrectionProofNodeV1, ...],
+) -> tuple[BaselineCorrectionProofV1, bytes]:
+    unsigned = {
+        "schema_version": "baseline-correction-proof-v1",
+        "nodes": [node.model_dump(mode="json", warnings="error") for node in nodes],
+    }
+    proof = BaselineCorrectionProofV1.model_validate(
+        {
+            **unsigned,
+            "proof_fingerprint": sha256_digest(canonical_json_bytes(unsigned)),
+        }
+    )
+    return _canonical_model_bytes(proof, BaselineCorrectionProofV1)
+
+
+def _proof_node_from_snapshot(snapshot: _ReplaySnapshot) -> BaselineCorrectionProofNodeV1:
+    artifacts = []
+    for path, data in sorted(snapshot.files.items()):
+        if path == BASELINE_CORRECTION_PROOF_PATH:
+            continue
+        try:
+            artifact_json = data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise _error("CORRECTION_PROOF_UTF8") from error
+        artifacts.append(
+            BaselineCorrectionProofArtifactV1(
+                artifact_path=path,
+                artifact_hash=sha256_digest(data),
+                artifact_json=artifact_json,
+            )
+        )
+    try:
+        manifest_json = snapshot.manifest_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise _error("CORRECTION_PROOF_UTF8") from error
+    return BaselineCorrectionProofNodeV1(
+        manifest_json=manifest_json,
+        artifacts=tuple(artifacts),
+    )
+
+
+def _correction_proof_from_snapshots(
+    snapshots: tuple[_ReplaySnapshot, ...],
+) -> tuple[BaselineCorrectionProofV1, bytes]:
+    if not snapshots or len(snapshots) > _MAX_CORRECTION_CHAIN:
+        raise _error("CORRECTION_PROOF_CHAIN")
+    return _correction_proof_from_nodes(
+        tuple(_proof_node_from_snapshot(snapshot) for snapshot in snapshots)
+    )
 
 
 def _artifact_record(path: str, data: bytes) -> ArtifactRecord:
@@ -548,6 +624,15 @@ def _derived_manifest_bindings(files: Mapping[str, bytes]) -> dict[str, object]:
             location=BASELINE_CORRECTION_PATH,
         )
     )
+    correction_proof = (
+        None
+        if BASELINE_CORRECTION_PROOF_PATH not in files
+        else _model_from_file(
+            files[BASELINE_CORRECTION_PROOF_PATH],
+            BaselineCorrectionProofV1,
+            location=BASELINE_CORRECTION_PROOF_PATH,
+        )
+    )
     provenance = None if baseline is None else baseline.provenance
     return {
         "pending_call": pending,
@@ -584,6 +669,9 @@ def _derived_manifest_bindings(files: Mapping[str, bytes]) -> dict[str, object]:
         ),
         "correction_record_fingerprint": (
             None if correction is None else correction.correction_fingerprint
+        ),
+        "correction_proof_fingerprint": (
+            None if correction_proof is None else correction_proof.proof_fingerprint
         ),
     }
 
@@ -1027,11 +1115,86 @@ def _phase_requires(
         raise _error("PHASE_INVENTORY")
 
 
+def _is_verified_terminal_replay(replay: _Replay) -> bool:
+    return (
+        replay.baseline is not None
+        and replay.verification is not None
+        and replay.verification.valid is True
+        and replay.manifest.phase
+        in {BaselinePhaseV1.COMPLETED, BaselinePhaseV1.INCONCLUSIVE}
+        and replay.manifest.terminal_status in {"COMPLETED", "INCONCLUSIVE"}
+    )
+
+
+def _proof_node_files(
+    node: BaselineCorrectionProofNodeV1,
+    manifest: BaselineManifestV1,
+    prefix_nodes: tuple[BaselineCorrectionProofNodeV1, ...],
+) -> dict[str, bytes]:
+    files = {
+        artifact.artifact_path: artifact.artifact_json.encode("utf-8")
+        for artifact in node.artifacts
+    }
+    proof_binding = manifest.correction_proof_fingerprint
+    if proof_binding is not None:
+        if not prefix_nodes:
+            raise _error("CORRECTION_PROOF_PREFIX")
+        prefix_proof, prefix_bytes = _correction_proof_from_nodes(prefix_nodes)
+        if prefix_proof.proof_fingerprint != proof_binding:
+            raise _error("CORRECTION_PROOF_PREFIX")
+        files[BASELINE_CORRECTION_PROOF_PATH] = prefix_bytes
+    expected = {artifact.artifact_path: artifact.artifact_hash for artifact in manifest.artifacts}
+    if set(files) != set(expected) or any(
+        sha256_digest(data) != expected[path] for path, data in files.items()
+    ):
+        raise _error("CORRECTION_PROOF_INVENTORY")
+    return files
+
+
+def _replay_correction_proof_v1(proof: BaselineCorrectionProofV1) -> _Replay:
+    prior: _Replay | None = None
+    prefix_nodes: list[BaselineCorrectionProofNodeV1] = []
+    roots: set[str] = set()
+    for node in proof.nodes:
+        try:
+            manifest_bytes = node.manifest_json.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise _error("CORRECTION_PROOF_UTF8") from error
+        manifest = _manifest_from_bytes(manifest_bytes)
+        files = _proof_node_files(node, manifest, tuple(prefix_nodes))
+        replay = _verify_baseline_snapshot(
+            manifest,
+            files,
+            prior=prior,
+            proof_prior_verified=True,
+        )
+        linked_to_prior = prior is None or (
+            prior.baseline is not None
+            and replay.manifest.prior_baseline_root == prior.manifest.root_hash
+            and replay.manifest.prior_baseline_fingerprint
+            == prior.baseline.baseline_fingerprint
+            and replay.manifest.correction_record_fingerprint is not None
+        )
+        if (
+            not _is_verified_terminal_replay(replay)
+            or replay.manifest.root_hash in roots
+            or not linked_to_prior
+        ):
+            raise _error("CORRECTION_PROOF_CHAIN")
+        roots.add(replay.manifest.root_hash)
+        prefix_nodes.append(node)
+        prior = replay
+    if prior is None:
+        raise _error("CORRECTION_PROOF_CHAIN")
+    return prior
+
+
 def _verify_baseline_snapshot(
     manifest: BaselineManifestV1,
     files: Mapping[str, bytes],
     *,
     prior: _Replay | None = None,
+    proof_prior_verified: bool = False,
 ) -> _Replay:
     try:
         baseline_input = _model_from_file(
@@ -1052,8 +1215,28 @@ def _verify_baseline_snapshot(
     referees: BaselineRefereeAggregateV1 | None = None
     referee_pending = False
     is_correction = BASELINE_CORRECTION_PATH in files
+    correction_proof = (
+        None
+        if BASELINE_CORRECTION_PROOF_PATH not in files
+        else _model_from_file(
+            files[BASELINE_CORRECTION_PROOF_PATH],
+            BaselineCorrectionProofV1,
+            location=BASELINE_CORRECTION_PROOF_PATH,
+        )
+    )
     compiled: CanonicalBaselineV1 | None = None
     if is_correction:
+        if correction_proof is not None:
+            if manifest.correction_proof_fingerprint != correction_proof.proof_fingerprint:
+                raise _error("CORRECTION_PROOF_BINDING")
+            bound.add(BASELINE_CORRECTION_PROOF_PATH)
+            if not proof_prior_verified:
+                proved_prior = _replay_correction_proof_v1(correction_proof)
+                if prior is not None and prior != proved_prior:
+                    raise _error("CORRECTION_PROOF_PRIOR")
+                prior = proved_prior
+        elif manifest.correction_proof_fingerprint is not None:
+            raise _error("CORRECTION_PROOF_REQUIRED")
         if (
             prior is None
             or prior.baseline is None
@@ -1475,15 +1658,35 @@ def _ancestry_paths(prior_ancestry: tuple[Path, ...]) -> tuple[Path, ...]:
     return prior_ancestry
 
 
-def _terminal_replay_chain(run_dirs: tuple[Path, ...]) -> tuple[_Replay, ...]:
+def _terminal_snapshot_chain(run_dirs: tuple[Path, ...]) -> tuple[_ReplaySnapshot, ...]:
     if not run_dirs or len(run_dirs) > _MAX_CORRECTION_CHAIN:
         raise EvaluationIntegrityError("baseline correction ancestry is invalid")
-    replays: list[_Replay] = []
+    snapshots: list[_ReplaySnapshot] = []
     prior: _Replay | None = None
     roots: set[str] = set()
     for run_dir in run_dirs:
         with _open_locked_storage(run_dir, exclusive=False) as storage:
             replay = _verify_or_raise(storage, prior=prior)
+            manifest_bytes = storage.read_artifact(
+                BASELINE_MANIFEST_PATH, max_bytes=_MAX_JSON_BYTES
+            )
+            files = {
+                artifact.artifact_path: storage.read_artifact(
+                    artifact.artifact_path, max_bytes=_MAX_JSON_BYTES
+                )
+                for artifact in replay.manifest.artifacts
+            }
+            captured = _verify_baseline_snapshot(replay.manifest, files, prior=prior)
+            if (
+                captured != replay
+                or _manifest_from_bytes(manifest_bytes) != replay.manifest
+                or any(
+                    sha256_digest(files[artifact.artifact_path])
+                    != artifact.artifact_hash
+                    for artifact in replay.manifest.artifacts
+                )
+            ):
+                raise EvaluationIntegrityError("BASELINE_CORRECTION_PRIOR_CHANGED")
             storage.assert_root_identity()
         linked_to_prior = True
         if prior is not None:
@@ -1496,20 +1699,25 @@ def _terminal_replay_chain(run_dirs: tuple[Path, ...]) -> tuple[_Replay, ...]:
                 and replay.manifest.correction_record_fingerprint is not None
             )
         if (
-            replay.baseline is None
-            or replay.verification is None
-            or replay.verification.valid is not True
-            or replay.manifest.phase
-            not in {BaselinePhaseV1.COMPLETED, BaselinePhaseV1.INCONCLUSIVE}
-            or replay.manifest.terminal_status not in {"COMPLETED", "INCONCLUSIVE"}
+            not _is_verified_terminal_replay(replay)
             or replay.manifest.root_hash in roots
             or not linked_to_prior
         ):
             raise EvaluationIntegrityError("BASELINE_RESULT_REQUIRED")
         roots.add(replay.manifest.root_hash)
-        replays.append(replay)
+        snapshots.append(
+            _ReplaySnapshot(
+                replay=replay,
+                manifest_bytes=manifest_bytes,
+                files=files,
+            )
+        )
         prior = replay
-    return tuple(replays)
+    return tuple(snapshots)
+
+
+def _terminal_replay_chain(run_dirs: tuple[Path, ...]) -> tuple[_Replay, ...]:
+    return tuple(snapshot.replay for snapshot in _terminal_snapshot_chain(run_dirs))
 
 
 def _terminal_replay(
@@ -1555,9 +1763,23 @@ def initialize_corrected_baseline_storage_v1(
         raise EvaluationIntegrityError("baseline correction must create a new sibling")
 
     ancestry = _ancestry_paths(prior_ancestry)
-    prior_chain = _terminal_replay_chain((*ancestry, prior_run_dir))
-    prior = prior_chain[-1]
-    prior_roots = tuple(item.manifest.root_hash for item in prior_chain)
+    prior_snapshots = _terminal_snapshot_chain((*ancestry, prior_run_dir))
+    prior = prior_snapshots[-1].replay
+    prior_roots = tuple(item.replay.manifest.root_hash for item in prior_snapshots)
+    prior_proof_bytes = prior_snapshots[-1].files.get(BASELINE_CORRECTION_PROOF_PATH)
+    if prior_proof_bytes is not None:
+        prior_proof = _model_from_file(
+            prior_proof_bytes,
+            BaselineCorrectionProofV1,
+            location=BASELINE_CORRECTION_PROOF_PATH,
+        )
+        actual_ancestor_nodes = tuple(
+            _proof_node_from_snapshot(snapshot) for snapshot in prior_snapshots[:-1]
+        )
+        if prior_proof.nodes != actual_ancestor_nodes:
+            raise EvaluationIntegrityError(
+                "BASELINE_CORRECTION_PRIOR_ANCESTRY_REQUIRED"
+            )
     assert prior.baseline is not None
     if (
         correction.prior_baseline_root != prior.manifest.root_hash
@@ -1581,11 +1803,13 @@ def initialize_corrected_baseline_storage_v1(
         _, verification_bytes = _canonical_model_bytes(
             verification, BaselineVerificationV1
         )
+        proof, proof_bytes = _correction_proof_from_snapshots(prior_snapshots)
     except (BaselineCompilationError, TypeError, ValidationError, ValueError) as error:
         raise EvaluationIntegrityError("BASELINE_CORRECTION_INVALID") from error
     files = {
         BASELINE_INPUT_PATH: input_bytes,
         BASELINE_CORRECTION_PATH: correction_bytes,
+        BASELINE_CORRECTION_PROOF_PATH: proof_bytes,
         CANONICAL_BASELINE_PATH: baseline_bytes,
         BASELINE_VERIFICATION_PATH: verification_bytes,
     }
@@ -1597,6 +1821,7 @@ def initialize_corrected_baseline_storage_v1(
         prior_baseline_root=prior.manifest.root_hash,
         prior_baseline_fingerprint=prior.baseline.baseline_fingerprint,
         correction_record_fingerprint=checked_correction.correction_fingerprint,
+        correction_proof_fingerprint=proof.proof_fingerprint,
         artifacts=(),
         root_hash="0" * 64,
         manifest_fingerprint="0" * 64,
@@ -1621,9 +1846,16 @@ def commit_baseline_transition_v1(
     expected_manifest_fingerprint: str,
     files: Mapping[str, bytes],
     successor: BaselineManifestV1,
+    *,
+    expected_root_identity: BaselineRootIdentityV1 | None = None,
 ) -> None:
     """Commit one immutable successor iff the verified current root still matches."""
     with _open_locked_storage(run_dir, exclusive=True) as storage:
+        if (
+            expected_root_identity is not None
+            and _storage_root_identity_v1(storage) != expected_root_identity
+        ):
+            raise EvaluationIntegrityError("BASELINE_STORAGE_UNSAFE")
         current = _verify_or_raise(storage).manifest
         if current.manifest_fingerprint != expected_manifest_fingerprint:
             raise EvaluationIntegrityError("BASELINE_STALE_TRANSITION")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -77,6 +78,7 @@ _REVIEW_REQUEST = "requests/source-review-0001.json"
 _REVIEW_RESPONSE = "responses/source-review-0001.json"
 _AUDIT_REQUEST = "requests/source-audit-0001.json"
 _AUDIT_RESPONSE = "responses/source-audit-0001.json"
+_CORRECTION_PROOF = "correction-proof.json"
 
 
 def _baseline_input() -> BaselineInputV1:
@@ -440,6 +442,74 @@ def _reseal_manifest(run_dir: Path, mutate: Mapping[str, bytes]) -> None:
     )
     manifest_path.chmod(0o600)
     manifest_path.write_bytes(canonical_json_bytes(raw))
+
+
+def _proof_fingerprint(payload: dict[str, object]) -> str:
+    unsigned = dict(payload)
+    unsigned.pop("proof_fingerprint", None)
+    return sha256_digest(canonical_json_bytes(unsigned))
+
+
+def _proof_node_from_run(run_dir: Path) -> dict[str, object]:
+    manifest_bytes = (run_dir / BASELINE_MANIFEST_PATH).read_bytes()
+    manifest = json.loads(manifest_bytes)
+    artifacts = []
+    for record in manifest["artifacts"]:
+        path = record["artifact_path"]
+        if path == _CORRECTION_PROOF:
+            continue
+        data = (run_dir / path).read_bytes()
+        artifacts.append(
+            {
+                "artifact_hash": sha256_digest(data),
+                "artifact_json": data.decode("utf-8"),
+                "artifact_path": path,
+            }
+        )
+    return {
+        "artifacts": artifacts,
+        "manifest_json": manifest_bytes.decode("utf-8"),
+    }
+
+
+def _rewrite_correction_proof_and_reseal(
+    run_dir: Path,
+    proof: dict[str, object] | None,
+) -> None:
+    manifest_path = run_dir / BASELINE_MANIFEST_PATH
+    manifest = json.loads(manifest_path.read_bytes())
+    records = {
+        item["artifact_path"]: item for item in manifest["artifacts"]
+    }
+    proof_path = run_dir / _CORRECTION_PROOF
+    if proof is None:
+        proof_path.unlink()
+        records.pop(_CORRECTION_PROOF)
+        manifest["correction_proof_fingerprint"] = None
+    else:
+        proof["proof_fingerprint"] = _proof_fingerprint(proof)
+        proof_bytes = canonical_json_bytes(proof)
+        proof_path.chmod(0o600)
+        proof_path.write_bytes(proof_bytes)
+        records[_CORRECTION_PROOF]["artifact_hash"] = sha256_digest(proof_bytes)
+        manifest["correction_proof_fingerprint"] = proof["proof_fingerprint"]
+    manifest["artifacts"] = [records[path] for path in sorted(records)]
+    manifest["manifest_fingerprint"] = "0" * 64
+    manifest["root_hash"] = "0" * 64
+    provisional = BaselineManifestV1.model_validate(manifest)
+    manifest["manifest_fingerprint"] = sha256_digest(
+        canonical_json_bytes(
+            provisional.model_dump(
+                mode="json", exclude={"manifest_fingerprint", "root_hash"}
+            )
+        )
+    )
+    bound = BaselineManifestV1.model_validate(manifest)
+    manifest["root_hash"] = sha256_digest(
+        canonical_json_bytes(bound.model_dump(mode="json", exclude={"root_hash"}))
+    )
+    manifest_path.chmod(0o600)
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
 
 
 def test_terminal_inventory_and_verified_context_are_exact(tmp_path: Path) -> None:
@@ -1245,6 +1315,7 @@ def test_verified_prior_creates_new_sibling_correction_without_mutation(
         BASELINE_MANIFEST_PATH,
         BASELINE_INPUT_PATH,
         BASELINE_CORRECTION_PATH,
+        _CORRECTION_PROOF,
         CANONICAL_BASELINE_PATH,
         BASELINE_VERIFICATION_PATH,
     }
@@ -1274,7 +1345,7 @@ def test_verified_prior_creates_new_sibling_correction_without_mutation(
     assert _snapshot(prior_dir) == before
 
 
-def test_correction_requires_the_exact_verified_prior_sibling(tmp_path: Path) -> None:
+def test_correction_embeds_a_standalone_verified_prior_proof(tmp_path: Path) -> None:
     baseline_input, files_by_path, manifest = _complete_graph()
     prior_dir = tmp_path / "prior"
     initialize_baseline_storage_v1(prior_dir, manifest, files_by_path)
@@ -1309,9 +1380,12 @@ def test_correction_requires_the_exact_verified_prior_sibling(tmp_path: Path) ->
         correction,
     )
 
-    assert not verify_baseline_run(sibling_dir).valid
-    with pytest.raises(EvaluationIntegrityError):
-        load_verified_baseline_run(sibling_dir)
+    assert verify_baseline_run(sibling_dir).valid
+    standalone = load_verified_baseline_run(sibling_dir)
+    assert standalone.baseline.prior_baseline_fingerprint == (
+        prior.baseline.baseline_fingerprint
+    )
+    assert _CORRECTION_PROOF in _snapshot(sibling_dir)
     missing = tmp_path / "missing-prior"
     assert not verify_baseline_run(sibling_dir, prior_run_dir=missing).valid
     with pytest.raises(EvaluationIntegrityError):
@@ -1445,6 +1519,15 @@ def test_two_hop_correction_chain_requires_explicit_verified_ancestry(
     )
     p2_dir = tmp_path / "p2"
 
+    omitted_ancestry = tmp_path / "p2-without-actual-ancestry"
+    with pytest.raises(EvaluationIntegrityError):
+        baseline_artifacts.initialize_corrected_baseline_storage_v1(
+            p1_dir,
+            omitted_ancestry,
+            second_correction,
+        )
+    assert not omitted_ancestry.exists()
+
     baseline_artifacts.initialize_corrected_baseline_storage_v1(
         p1_dir,
         p2_dir,
@@ -1452,9 +1535,13 @@ def test_two_hop_correction_chain_requires_explicit_verified_ancestry(
         prior_ancestry=(p0_dir,),
     )
 
-    assert not verify_baseline_run(p2_dir, prior_run_dir=p1_dir).valid
-    with pytest.raises(EvaluationIntegrityError):
-        load_verified_baseline_run(p2_dir, prior_run_dir=p1_dir)
+    assert verify_baseline_run(p2_dir).valid
+    standalone_p2 = load_verified_baseline_run(p2_dir)
+    assert len(standalone_p2.baseline.requirements) == 1
+    assert verify_baseline_run(p2_dir, prior_run_dir=p1_dir).valid
+    assert len(
+        load_verified_baseline_run(p2_dir, prior_run_dir=p1_dir).baseline.requirements
+    ) == 1
     assert not verify_baseline_run(
         p2_dir,
         prior_run_dir=p1_dir,
@@ -1480,6 +1567,32 @@ def test_two_hop_correction_chain_requires_explicit_verified_ancestry(
     assert p2.manifest.prior_baseline_root == p1.manifest.root_hash
     assert _snapshot(p0_dir) == p0_before
     assert _snapshot(p1_dir) == p1_before
+
+    proof = json.loads((p2_dir / _CORRECTION_PROOF).read_bytes())
+    assert len(proof["nodes"]) == 2
+    for attack in ("tampered", "truncated", "reordered", "disconnected", "omitted"):
+        attacked = tmp_path / f"proof-{attack}"
+        shutil.copytree(p2_dir, attacked)
+        if attack == "omitted":
+            _rewrite_correction_proof_and_reseal(attacked, None)
+        else:
+            changed = json.loads(json.dumps(proof))
+            if attack == "tampered":
+                artifact = changed["nodes"][0]["artifacts"][0]
+                artifact["artifact_json"] = "{}"
+                artifact["artifact_hash"] = sha256_digest(b"{}")
+            elif attack == "truncated":
+                changed["nodes"] = changed["nodes"][1:]
+            elif attack == "reordered":
+                changed["nodes"] = list(reversed(changed["nodes"]))
+            else:
+                changed["nodes"][0] = _proof_node_from_run(wrong_ancestor_dir)
+            _rewrite_correction_proof_and_reseal(attacked, changed)
+        result = verify_baseline_run(attacked)
+        assert not result.valid, attack
+        assert set(result.issues) <= BASELINE_SAFE_ISSUE_CODES
+        with pytest.raises(EvaluationIntegrityError):
+            load_verified_baseline_run(attacked)
 
 
 def test_correction_ancestry_rejects_an_ordinary_terminal_reset(

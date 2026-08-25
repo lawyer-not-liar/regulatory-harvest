@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 from datetime import date
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+from regulatory_harvest.evaluation import attorney_baseline_artifacts as baseline_artifacts
+from regulatory_harvest.evaluation.attorney_artifacts import EvaluationIntegrityError
 from regulatory_harvest.evaluation.attorney_baseline_artifacts import (
     BASELINE_MANIFEST_PATH,
     load_verified_baseline_run,
@@ -386,6 +390,42 @@ def test_incomplete_audit_and_invalid_payload_are_write_free_with_one_safe_code(
     assert not incomplete.accepted
     assert incomplete.issue_codes == (BASELINE_EXTERNAL_RESPONSE_INVALID,)
     assert _snapshot(run) == before_incomplete
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX root replacement proof")
+def test_guarded_submit_never_advances_a_byte_identical_replacement_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Replacing the replayed physical root before commit must be write-free."""
+    run = tmp_path / "baseline"
+    initialize_baseline_v1(_control(tmp_path), run, nonce_hex="2" * 64)
+    before = _snapshot(run)
+    parked = tmp_path / "parked-original"
+    replacement = tmp_path / "replacement"
+    original_commit = baseline_artifacts.commit_baseline_transition_v1
+    swapped = False
+
+    def replace_then_commit(*args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        shutil.copytree(run, replacement)
+        run.rename(parked)
+        replacement.rename(run)
+        swapped = True
+        original_commit(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        baseline_artifacts,
+        "commit_baseline_transition_v1",
+        replace_then_commit,
+    )
+
+    with pytest.raises(EvaluationIntegrityError, match=r"STORAGE_UNSAFE|identity"):
+        _submit(run, _review_payload())
+
+    assert swapped
+    assert _snapshot(parked) == before
+    assert _snapshot(run) == before
 
 
 class _DraftEvaluator:

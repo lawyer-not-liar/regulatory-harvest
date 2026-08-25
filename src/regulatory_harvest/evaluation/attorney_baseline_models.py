@@ -33,6 +33,8 @@ _RELATIONSHIP_REF_PATTERN = r"^REL-[0-9]{4}$"
 _MAX_FRAGMENT_ITEMS = 5
 _MAX_FRAGMENTS = 128
 _MAX_COMPILED_ITEMS = 640
+_MAX_PROOF_JSON_CHARACTERS = 16 * 1024 * 1024
+_MAX_PROOF_ARTIFACTS_PER_NODE = 2048
 _GENERIC_RATIONALES = frozenset(
     {"critical", "material", "supporting", "important", "self evident", "as labeled"}
 )
@@ -1111,6 +1113,77 @@ class BaselineCorrectionRecordV1(BaselineStrictModel):
         return value
 
 
+class BaselineCorrectionProofArtifactV1(BaselineStrictModel):
+    """One exact canonical ancestor artifact without a filesystem run path."""
+
+    artifact_path: str = Field(strict=True)
+    artifact_hash: Hash
+    artifact_json: str = Field(
+        strict=True,
+        max_length=_MAX_PROOF_JSON_CHARACTERS,
+    )
+
+    @model_validator(mode="after")
+    def validate_artifact(self) -> Self:
+        try:
+            ArtifactRecord(
+                artifact_path=self.artifact_path,
+                artifact_hash=self.artifact_hash,
+            )
+            data = self.artifact_json.encode("utf-8")
+        except (TypeError, UnicodeEncodeError, ValidationError, ValueError) as error:
+            raise ValueError("correction proof artifact is invalid") from error
+        if self.artifact_hash != sha256_digest(data):
+            raise ValueError("correction proof artifact hash is invalid")
+        return self
+
+
+class BaselineCorrectionProofNodeV1(BaselineStrictModel):
+    """One exact ancestor manifest and its non-proof artifact bytes."""
+
+    manifest_json: str = Field(
+        strict=True,
+        max_length=_MAX_PROOF_JSON_CHARACTERS,
+    )
+    artifacts: tuple[BaselineCorrectionProofArtifactV1, ...] = Field(
+        min_length=1,
+        max_length=_MAX_PROOF_ARTIFACTS_PER_NODE,
+    )
+
+    @model_validator(mode="after")
+    def validate_node(self) -> Self:
+        paths = tuple(item.artifact_path for item in self.artifacts)
+        if paths != tuple(sorted(set(paths))):
+            raise ValueError("correction proof artifact paths must be sorted and unique")
+        if "correction-proof.json" in paths:
+            raise ValueError("correction proof nodes must use the flat proof chain")
+        return self
+
+
+class BaselineCorrectionProofV1(BaselineStrictModel):
+    """Bounded oldest-to-newest semantic replay proof for one corrected sibling."""
+
+    schema_version: Literal["baseline-correction-proof-v1"] = (
+        "baseline-correction-proof-v1"
+    )
+    nodes: tuple[BaselineCorrectionProofNodeV1, ...] = Field(
+        min_length=1,
+        max_length=_MAX_FRAGMENTS,
+    )
+    proof_fingerprint: Hash
+
+    @model_validator(mode="after")
+    def validate_fingerprint(self) -> Self:
+        unsigned = self.model_dump(
+            mode="json",
+            exclude={"proof_fingerprint"},
+            warnings="error",
+        )
+        if self.proof_fingerprint != sha256_digest(canonical_json_bytes(unsigned)):
+            raise ValueError("correction proof fingerprint must match its exact nodes")
+        return self
+
+
 class BaselineCallRecordV1(BaselineStrictModel):
     """One exact report-blind evaluator request and its optional accepted response."""
 
@@ -1186,6 +1259,10 @@ class BaselineManifestV1(BaselineStrictModel):
     prior_baseline_root: Hash | None = None
     prior_baseline_fingerprint: Hash | None = None
     correction_record_fingerprint: Hash | None = None
+    correction_proof_fingerprint: Hash | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     artifacts: tuple[ArtifactRecord, ...]
     root_hash: Hash = "0" * 64
     manifest_fingerprint: Hash
@@ -1222,6 +1299,8 @@ class BaselineManifestV1(BaselineStrictModel):
             raise ValueError("baseline correction bindings must be complete")
         if correction[0] is not None and terminal is None:
             raise ValueError("baseline corrections must be terminal")
+        if self.correction_proof_fingerprint is not None and correction[0] is None:
+            raise ValueError("baseline correction proof requires correction bindings")
         return self
 
 

@@ -108,6 +108,7 @@ class _VerifiedWorkflowContextV1:
     baseline: CanonicalBaselineV1 | None
     verification: BaselineVerificationV1 | None
     files: Mapping[str, bytes]
+    root_identity: baseline_artifacts.BaselineRootIdentityV1
 
 
 def _model_bytes(value: object) -> bytes:
@@ -147,6 +148,7 @@ def _load_verified_baseline_context_v1(run_dir: Path) -> _VerifiedWorkflowContex
     with baseline_artifacts._open_locked_storage(
         run_dir, exclusive=False
     ) as storage:
+        root_identity = baseline_artifacts._storage_root_identity_v1(storage)
         replay = baseline_artifacts._verify_or_raise(storage)
         files = {
             artifact.artifact_path: storage.read_artifact(
@@ -161,6 +163,7 @@ def _load_verified_baseline_context_v1(run_dir: Path) -> _VerifiedWorkflowContex
         baseline=replay.baseline,
         verification=replay.verification,
         files=files,
+        root_identity=root_identity,
     )
 
 
@@ -323,6 +326,7 @@ def _complete_sealed_baseline_v1(
         context.manifest.manifest_fingerprint,
         {baseline_artifacts.BASELINE_VERIFICATION_PATH: _model_bytes(verification)},
         successor,
+        expected_root_identity=context.root_identity,
     )
     return _state_from_manifest_v1(_load_verified_baseline_context_v1(run_dir).manifest)
 
@@ -615,6 +619,7 @@ def _advance_baseline_response_v1(
         context.manifest.manifest_fingerprint,
         files,
         successor,
+        expected_root_identity=context.root_identity,
     )
     updated = _load_verified_baseline_context_v1(run_dir)
     return _complete_sealed_baseline_v1(run_dir, updated)
