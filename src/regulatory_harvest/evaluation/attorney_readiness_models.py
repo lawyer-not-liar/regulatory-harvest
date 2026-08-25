@@ -41,7 +41,7 @@ READINESS_PROTOCOL_V1: Literal["delivery-readiness-v1"] = "delivery-readiness-v1
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _REQUIREMENT_REF_PATTERN = r"^REQ-[0-9]{4}$"
 _BATCH_REF_PATTERN = r"^GB-[12]-[0-9]{4}$"
-_CONTESTED_REF_PATTERN = r"^CT-[0-9]{4}$"
+_CONTESTED_REF_PATTERN = r"^CONT-[0-9]{4}$"
 _GAP_CANDIDATE_PATTERN = r"^GC-[0-9]{4}$"
 _SAFETY_DISPUTE_PATTERN = r"^SD-[0-9]{4}$"
 _GAP_REF_PATTERN = r"^GAP-[0-9]{4}$"
@@ -79,6 +79,32 @@ def _unique_nonblank(values: tuple[str, ...], *, location: str) -> tuple[str, ..
     if len(checked) != len(set(checked)):
         raise ValueError(f"{location} must be unique")
     return checked
+
+
+def _strict_lane(value: object) -> object:
+    if type(value) is not int or value not in {1, 2}:
+        raise ValueError("lane must be the native integer 1 or 2")
+    return value
+
+
+def _strict_attempt(value: object) -> object:
+    if type(value) is not int or value not in {1, 2}:
+        raise ValueError("attempt must be the native integer 1 or 2")
+    return value
+
+
+def _safe_call_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    patterns = (
+        r"grade-lane-([12])-GB-\1-[0-9]{4}",
+        r"contested-grade-lane-[12]-CONT-[0-9]{4}",
+        r"safety-lane-[12]",
+        r"safety-referee-SD-[0-9]{4}",
+    )
+    if not any(re.fullmatch(pattern, value) is not None for pattern in patterns):
+        raise ValueError("current call ID must use the closed readiness identifier grammar")
+    return value
 
 
 def _wire_snapshot_inner(
@@ -119,7 +145,7 @@ def _wire_snapshot_inner(
                     active,
                     budget=budget,
                     depth=depth + 1,
-                    thaw_model_state=True,
+                    thaw_model_state=type(value).__module__ != __name__,
                 )
                 for key, item in dict.items(state)
             }
@@ -141,7 +167,8 @@ def _wire_snapshot_inner(
                 )
                 for item in tuple.__iter__(cast(tuple[object, ...], value))
             )
-            return list(values) if thaw_model_state else values
+            should_thaw = thaw_model_state or isinstance(value, _FrozenJsonList)
+            return list(values) if should_thaw else values
         finally:
             active.remove(identity)
     if isinstance(value, list):
@@ -223,11 +250,15 @@ class _FrozenDict(dict[str, object]):
     update = _immutable
 
 
+class _FrozenJsonList(tuple[object, ...]):
+    """Marker distinguishing internally frozen JSON arrays from raw tuples."""
+
+
 def _deep_freeze(value: object) -> object:
     if type(value) is dict:
         return _FrozenDict({key: _deep_freeze(item) for key, item in value.items()})
     if type(value) is list:
-        return tuple(_deep_freeze(item) for item in cast(list[object], value))
+        return _FrozenJsonList(_deep_freeze(item) for item in cast(list[object], value))
     if type(value) is tuple:
         return tuple(_deep_freeze(item) for item in cast(tuple[object, ...], value))
     return value
@@ -271,11 +302,7 @@ def _same_wire_value(raw: object, checked: object, serialized: object) -> bool:
             _same_wire_value(left, middle, right)
             for left, middle, right in zip(raw, checked, serialized, strict=True)
         )
-    if (
-        isinstance(raw, tuple)
-        and isinstance(checked, tuple)
-        and isinstance(serialized, list)
-    ):
+    if isinstance(raw, tuple) and isinstance(checked, tuple) and isinstance(serialized, list):
         return len(raw) == len(checked) == len(serialized) and all(
             _same_wire_value(left, middle, right)
             for left, middle, right in zip(raw, checked, serialized, strict=True)
@@ -706,6 +733,8 @@ class BaselineLockedGradeBatchV1(ReadinessStrictModelV1):
         max_length=_MAX_FRAGMENT_ITEMS,
     )
 
+    _validate_lane = field_validator("lane", mode="before")(_strict_lane)
+
     @model_validator(mode="after")
     def validate_batch(self) -> Self:
         if len(self.requirement_ids) != len(set(self.requirement_ids)):
@@ -731,6 +760,7 @@ class BaselineLockedGradeFragmentV1(ReadinessStrictModelV1):
     rationale: str = Field(strict=True)
     fragment_fingerprint: Hash
 
+    _validate_lane = field_validator("lane", mode="before")(_strict_lane)
     _validate_rationale = field_validator("rationale")(_nonblank)
 
     @model_validator(mode="after")
@@ -766,6 +796,7 @@ class BaselineLockedContestedGradeV1(ReadinessStrictModelV1):
     rationale: str = Field(strict=True)
     grade_fingerprint: Hash
 
+    _validate_lane = field_validator("lane", mode="before")(_strict_lane)
     _validate_text = field_validator(
         "reviewer_rationale",
         "auditor_rationale",
@@ -795,12 +826,48 @@ class BaselineLockedGraderAggregateV1(ReadinessStrictModelV1):
     requirement_grades: tuple[RequirementGradeV2, ...] = Field(max_length=_MAX_COMPILED_ITEMS)
     aggregate_fingerprint: Hash
 
+    _validate_lane = field_validator("lane", mode="before")(_strict_lane)
+
     @model_validator(mode="after")
     def validate_aggregate(self) -> Self:
-        if any(item.lane != self.lane for item in self.ordinary_fragments) or any(
-            item.lane != self.lane for item in self.contested_grades
+        expected_bindings = (
+            self.lane,
+            self.grade_target_fingerprint,
+            self.baseline_fingerprint,
+            self.report_hash,
+            self.strict_equivalent_scoring_contract_fingerprint,
+        )
+
+        def bindings(
+            item: BaselineLockedGradeFragmentV1 | BaselineLockedContestedGradeV1,
+        ) -> tuple[int, str, str, str, str]:
+            return (
+                item.lane,
+                item.grade_target_fingerprint,
+                item.baseline_fingerprint,
+                item.report_hash,
+                item.strict_equivalent_scoring_contract_fingerprint,
+            )
+
+        if any(bindings(item) != expected_bindings for item in self.ordinary_fragments) or any(
+            bindings(item) != expected_bindings for item in self.contested_grades
         ):
-            raise ValueError("grader aggregate fragments must match its lane")
+            raise ValueError("grader aggregate fragment bindings must match exactly")
+        batch_refs = tuple(item.batch_ref for item in self.ordinary_fragments)
+        expected_batches = tuple(
+            f"GB-{self.lane}-{index:04d}" for index in range(1, len(batch_refs) + 1)
+        )
+        contested_ids = tuple(item.contested_requirement_id for item in self.contested_grades)
+        expected_contested = tuple(
+            f"CONT-{index:04d}" for index in range(1, len(contested_ids) + 1)
+        )
+        if batch_refs != expected_batches or contested_ids != expected_contested:
+            raise ValueError("grader aggregate fragments must use exact controller order")
+        flattened = tuple(
+            grade for fragment in self.ordinary_fragments for grade in fragment.requirement_grades
+        )
+        if self.requirement_grades != flattened:
+            raise ValueError("grader aggregate flattened requirement grades must match fragments")
         ids = tuple(item.requirement_id for item in self.requirement_grades)
         if len(ids) != len(set(ids)):
             raise ValueError("grader aggregate requirement IDs must be unique")
@@ -940,6 +1007,8 @@ class SafetyLaneResponseV1(ReadinessStrictModelV1):
     lane: Literal[1, 2]
     candidate_assessments: tuple[SafetyGapAssessmentV1, ...] = Field(max_length=_MAX_FINDINGS)
     finding_proposals: tuple[SafetyFindingProposalV1, ...] = Field(max_length=_MAX_FINDINGS)
+
+    _validate_lane = field_validator("lane", mode="before")(_strict_lane)
 
     @model_validator(mode="after")
     def validate_candidate_coverage_shape(self) -> Self:
@@ -1203,6 +1272,10 @@ class ReadinessCallRecordV1(ReadinessStrictModelV1):
     judge_isolation: Literal["fresh_context", "scripted_fixture"] | None = None
     dispute_id: SafetyDisputeRef | None = None
 
+    _validate_attempt = field_validator("attempt", mode="before")(_strict_attempt)
+    _validate_lane = field_validator("lane", mode="before")(
+        lambda value: None if value is None else _strict_lane(value)
+    )
     _validate_required_text = field_validator("call_id", "request_artifact_path")(_nonblank)
     _validate_optional_text = field_validator(
         "response_artifact_path",
@@ -1232,7 +1305,7 @@ class ReadinessCallRecordV1(ReadinessStrictModelV1):
             ):
                 raise ValueError("ordinary grade calls must bind one lane and batch")
         elif self.operation is ReadinessOperationV1.BASELINE_LOCKED_CONTESTED_GRADE:
-            expected = rf"contested-grade-lane-{self.lane}-CT-[0-9]{{4}}"
+            expected = rf"contested-grade-lane-{self.lane}-CONT-[0-9]{{4}}"
             if (
                 self.lane is None
                 or self.dispute_id is not None
@@ -1261,6 +1334,17 @@ class ReadinessCallRecordV1(ReadinessStrictModelV1):
         return self
 
 
+class _ImmutableArtifactRecordV1(ArtifactRecord):
+    """Wire-compatible detached artifact record owned by a readiness manifest."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    @model_validator(mode="before")
+    @classmethod
+    def snapshot_artifact(cls, value: object) -> object:
+        return _wire_snapshot(value)
+
+
 class ReadinessManifestV1(ReadinessStrictModelV1):
     protocol_version: Literal["delivery-readiness-v1"] = READINESS_PROTOCOL_V1
     grade_target_fingerprint: Hash
@@ -1277,7 +1361,7 @@ class ReadinessManifestV1(ReadinessStrictModelV1):
     requirement_matrix_fingerprint: Hash | None = None
     gap_matrix_fingerprint: Hash | None = None
     result_fingerprint: Hash | None = None
-    artifacts: tuple[ArtifactRecord, ...]
+    artifacts: tuple[_ImmutableArtifactRecordV1, ...]
     root_hash: Hash
     manifest_fingerprint: Hash
 
@@ -1314,7 +1398,7 @@ class ReadinessRunStateV1(ReadinessStrictModelV1):
     terminal_status: Literal["COMPLETED", "INCONCLUSIVE"] | None = None
     manifest_fingerprint: Hash | None = None
 
-    _validate_call = field_validator("current_call_id")(_optional_nonblank)
+    _validate_call = field_validator("current_call_id")(_safe_call_id)
 
     @model_validator(mode="after")
     def validate_terminal_state(self) -> Self:
@@ -1332,7 +1416,23 @@ class ReadinessRunStateV1(ReadinessStrictModelV1):
 class ReadinessVerificationV1(ReadinessStrictModelV1):
     protocol_version: Literal["delivery-readiness-v1"] = READINESS_PROTOCOL_V1
     valid: bool = Field(strict=True)
-    checks: dict[str, Annotated[bool, Field(strict=True)]] = {}
+    checks: dict[
+        Literal[
+            "baseline_valid",
+            "evaluation_valid",
+            "full_parity_valid",
+            "generation_valid",
+            "integrity_valid",
+            "parity_contract_valid",
+            "portable_parity_valid",
+            "provenance_valid",
+            "qualification_valid",
+            "readiness_valid",
+            "replay_valid",
+            "storage_valid",
+        ],
+        Annotated[bool, Field(strict=True)],
+    ] = {}
     issues: tuple[str, ...] = ()
     graph_fingerprint: Hash | None = None
     verification_fingerprint: Hash | None = None
@@ -1352,6 +1452,8 @@ class ReadinessVerificationV1(ReadinessStrictModelV1):
     @classmethod
     def validate_issues(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         checked = tuple(_nonblank(value) for value in values)
+        if any(re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", value) is None for value in checked):
+            raise ValueError("readiness verification issues must use bounded public codes")
         if checked != tuple(sorted(set(checked))):
             raise ValueError("readiness verification issues must be sorted and unique")
         return checked
