@@ -167,6 +167,18 @@ _LANGUAGE_TREATMENT_KEYS = frozenset(
     {"sources", "method", "rationale", "limitation_status", "limitation_text"}
 )
 _LANGUAGE_SOURCE_KEYS = frozenset({"source_id", "content_hash", "language"})
+_GENERATION_VALIDATION_KEYS = frozenset(
+    {
+        "receipt_hash",
+        "report_hash",
+        "bundle_hash",
+        "coverage_review_hash",
+        "status",
+        "evidence_precision_valid",
+        "proposition_coverage_valid",
+        "provision_recall_valid",
+    }
+)
 _NORMALIZED_DUPLICATES = "DRAFT_NORMALIZED_DUPLICATES"
 
 
@@ -586,6 +598,7 @@ def _exact_payload_keys(operation: ReadinessOperationV1) -> frozenset[str]:
         "baseline_fingerprint",
         "report_text",
         "report_hash",
+        "generation_validation",
         "report_passage_allowlist",
         "retained_scoring_contract",
         "retained_scoring_contract_fingerprint",
@@ -630,6 +643,7 @@ def _exact_payload_keys(operation: ReadinessOperationV1) -> frozenset[str]:
             "grade_target_fingerprint",
             "baseline_fingerprint",
             "report_hash",
+            "generation_validation",
             "disputed_report_passages",
             "evidence_handles",
         }
@@ -1035,14 +1049,6 @@ def _validate_safety_evidence_packet(
         expected_handles
     ):
         raise _ControllerInvariant("safety evidence-handle inventory is invalid")
-    try:
-        generation = GenerationValidationBindingV1.model_validate(
-            payload.get("generation_validation")
-        )
-    except (TypeError, ValidationError, ValueError) as error:
-        raise _ControllerInvariant("safety generation validation is invalid") from error
-    if generation.report_hash != report_hash:
-        raise _ControllerInvariant("safety generation validation is invalid")
     if canonical_json_bytes(payload.get("readiness_rubric")) != canonical_json_bytes(
         load_readiness_rubric_v1().model_dump(mode="json")
     ):
@@ -1172,6 +1178,37 @@ def _validate_exact_safety_candidates(
         raise _ControllerInvariant("safety candidate inventory is invalid")
 
 
+def _validate_generation_validation(value: object, *, report_hash: str) -> None:
+    if type(value) is not dict:
+        raise _ControllerInvariant("request generation validation is invalid")
+    raw = cast(dict[str, object], value)
+    if (
+        set(raw) != _GENERATION_VALIDATION_KEYS
+        or raw.get("status") != "completed"
+        or any(
+            type(raw.get(field)) is not str or _HASH_RE.fullmatch(cast(str, raw.get(field))) is None
+            for field in ("receipt_hash", "report_hash", "bundle_hash", "coverage_review_hash")
+        )
+        or any(
+            type(raw.get(field)) is not bool or raw.get(field) is not True
+            for field in (
+                "evidence_precision_valid",
+                "proposition_coverage_valid",
+                "provision_recall_valid",
+            )
+        )
+    ):
+        raise _ControllerInvariant("request generation validation is invalid")
+    try:
+        checked = GenerationValidationBindingV1.model_validate(raw)
+        if canonical_json_bytes(checked.model_dump(mode="json")) != canonical_json_bytes(raw):
+            raise ValueError
+    except (TypeError, ValidationError, ValueError) as error:
+        raise _ControllerInvariant("request generation validation is invalid") from error
+    if checked.report_hash != report_hash:
+        raise _ControllerInvariant("request generation validation is invalid")
+
+
 def _validate_common_request_bindings(
     operation: ReadinessOperationV1,
     payload: dict[str, object],
@@ -1185,6 +1222,10 @@ def _validate_common_request_bindings(
             value = payload.get(field)
             if type(value) is not str or _HASH_RE.fullmatch(value) is None:
                 raise _ControllerInvariant("referee request binding is invalid")
+        _validate_generation_validation(
+            payload.get("generation_validation"),
+            report_hash=cast(str, payload["report_hash"]),
+        )
         dispute_id = payload.get("dispute_id")
         order = payload.get("canonical_order")
         if (
@@ -1206,6 +1247,10 @@ def _validate_common_request_bindings(
         or type(cast(dict[str, object], baseline_raw).get("binding")) is not dict
     ):
         raise _ControllerInvariant("request report or baseline binding is invalid")
+    _validate_generation_validation(
+        payload.get("generation_validation"),
+        report_hash=report_hash,
+    )
     baseline = _verified_baseline(payload)
     if baseline.binding.grade_target_fingerprint != payload.get(
         "grade_target_fingerprint"

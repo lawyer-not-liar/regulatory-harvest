@@ -165,6 +165,22 @@ def referee_request(safety_inputs: VerifiedReadinessInputsV1) -> ReadinessEvalua
     return build_safety_referee_request_v1(safety_inputs, dispute)
 
 
+@pytest.fixture(params=("ordinary", "contested", "safety", "referee"))
+def every_operation_request(
+    request: pytest.FixtureRequest,
+    ordinary_request: ReadinessEvaluatorRequestV1,
+    contested_request: ReadinessEvaluatorRequestV1,
+    safety_request: ReadinessEvaluatorRequestV1,
+    referee_request: ReadinessEvaluatorRequestV1,
+) -> ReadinessEvaluatorRequestV1:
+    return {
+        "ordinary": ordinary_request,
+        "contested": contested_request,
+        "safety": safety_request,
+        "referee": referee_request,
+    }[cast(str, request.param)]
+
+
 def _provenance() -> ReadinessEvaluatorProvenanceV1:
     return ReadinessEvaluatorProvenanceV1(
         provider_name="public-test-provider",
@@ -1037,6 +1053,51 @@ def _reseal_request(raw: dict[str, object]) -> ReadinessEvaluatorRequestV1:
     descriptor = {key: value for key, value in raw.items() if key != "request_fingerprint"}
     descriptor["request_fingerprint"] = sha256_digest(canonical_json_bytes(descriptor))
     return ReadinessEvaluatorRequestV1.model_validate(descriptor)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing",
+        "extra",
+        "non_object",
+        "false_boolean",
+        "integer_boolean",
+        "bad_status",
+        "bad_hash",
+        "report_hash_mismatch",
+    ),
+)
+def test_every_operation_strictly_validates_exact_generation_binding_shape(
+    every_operation_request: ReadinessEvaluatorRequestV1,
+    mutation: str,
+) -> None:
+    raw = every_operation_request.model_dump(mode="json")
+    payload = cast(dict[str, object], raw["payload"])
+    if mutation == "missing":
+        payload.pop("generation_validation")
+    elif mutation == "non_object":
+        payload["generation_validation"] = []
+    else:
+        generation = cast(dict[str, object], payload["generation_validation"])
+        if mutation == "extra":
+            generation["unsealed_extra"] = "attacker-controlled"
+        elif mutation == "false_boolean":
+            generation["evidence_precision_valid"] = False
+        elif mutation == "integer_boolean":
+            generation["evidence_precision_valid"] = 1
+        elif mutation == "bad_status":
+            generation["status"] = "pending"
+        elif mutation == "bad_hash":
+            generation["receipt_hash"] = "not-a-hash"
+        else:
+            generation["report_hash"] = "f" * 64
+    resealed = _reseal_request(raw)
+    assert compile_readiness_draft_v1(
+        resealed,
+        {},
+        _provenance(),
+    ) == ReadinessEngineDefectV1("READINESS_COMPILER_INVARIANT")
 
 
 def test_resealed_ambiguous_controller_passage_inventory_is_an_engine_defect(
