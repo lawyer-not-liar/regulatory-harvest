@@ -15,8 +15,19 @@ from typing import Literal, Protocol, cast
 
 from pydantic import BaseModel, ValidationError
 
+from regulatory_harvest.analysis import (
+    ATOMIC_COVERAGE_CONTRACT_VERSION,
+    COVERAGE_CONTRACT_VERSION,
+    AnalysisDraft,
+    build_analysis,
+    build_evidence_inventory,
+    build_source_unit_inventory,
+    evaluate_atomic_coverage,
+    evaluate_coverage_closure,
+)
 from regulatory_harvest.analysis.report import render_markdown
-from regulatory_harvest.models import ResearchBundle
+from regulatory_harvest.combine.stages import note_stage
+from regulatory_harvest.models import Gap, ResearchBundle, ResearchRequest, SourceRecord
 from regulatory_harvest.storage import (
     calculate_bundle_hash,
     canonical_json_bytes,
@@ -53,6 +64,17 @@ from .attorney_v22_artifacts import load_verified_v22_context
 _MAX_JSON_BYTES = 16 * 1024 * 1024
 _MAX_REPORT_BYTES = 64 * 1024 * 1024
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_DOSSIER_NAME = "agent-dossier.json"
+_DOSSIER_FIELDS = {
+    "coverage_contract_version",
+    "evidence_inventory",
+    "gaps",
+    "request",
+    "schema_version",
+    "source_mode",
+    "source_unit_inventory",
+    "sources",
+}
 _VALIDATION_RECEIPT_NAME = "validation-receipt.json"
 _VALIDATION_RECEIPT_FIELDS = {
     "analysis_draft",
@@ -565,19 +587,139 @@ def _coverage_issue_count(value: dict[str, object]) -> int:
     raise ValueError("coverage review issue inventory is invalid")
 
 
+def _verified_coverage_inputs(
+    *,
+    draft_data: bytes,
+    dossier_data: bytes,
+    code: str,
+) -> tuple[
+    str,
+    AnalysisDraft,
+    dict[str, object],
+    dict[str, object],
+    ResearchRequest,
+    tuple[SourceRecord, ...],
+]:
+    draft_raw = _canonical_file_object(draft_data, code=code)
+    draft = AnalysisDraft.model_validate(draft_raw)
+    if canonical_json_bytes(draft.model_dump(mode="json")) + b"\n" != draft_data:
+        raise _fail(code)
+
+    dossier = _canonical_file_object(dossier_data, code=code)
+    if set(dossier) != _DOSSIER_FIELDS or dossier.get("schema_version") != "1.0":
+        raise _fail(code)
+    contract_version = dossier.get("coverage_contract_version")
+    if contract_version not in {
+        COVERAGE_CONTRACT_VERSION,
+        ATOMIC_COVERAGE_CONTRACT_VERSION,
+    }:
+        raise _fail(code)
+    raw_sources = dossier.get("sources")
+    raw_gaps = dossier.get("gaps")
+    if type(raw_sources) is not list or type(raw_gaps) is not list:
+        raise _fail(code)
+    request = ResearchRequest.model_validate(dossier.get("request"))
+    sources = tuple(SourceRecord.model_validate(item) for item in raw_sources)
+    gaps = tuple(Gap.model_validate(item) for item in raw_gaps)
+    evidence_inventory = build_evidence_inventory(
+        [source.model_dump(mode="json") for source in sources]
+    )
+    source_unit_inventory = build_source_unit_inventory(
+        [source.model_dump(mode="json") for source in sources]
+    )
+    expected_dossier = {
+        "schema_version": "1.0",
+        "coverage_contract_version": contract_version,
+        "source_mode": request.source_mode,
+        "request": request.model_dump(mode="json"),
+        "sources": [source.model_dump(mode="json") for source in sources],
+        "gaps": [gap.model_dump(mode="json") for gap in gaps],
+        "evidence_inventory": evidence_inventory,
+        "source_unit_inventory": source_unit_inventory,
+    }
+    if (
+        dossier.get("source_mode") != request.source_mode
+        or dossier.get("evidence_inventory") != evidence_inventory
+        or dossier.get("source_unit_inventory") != source_unit_inventory
+        or canonical_json_bytes(expected_dossier) + b"\n" != dossier_data
+    ):
+        raise _fail(code)
+    return (
+        contract_version,
+        draft,
+        evidence_inventory,
+        source_unit_inventory,
+        request,
+        sources,
+    )
+
+
 def _verify_coverage_review(
     data: bytes,
     *,
+    draft_data: bytes,
+    dossier_data: bytes,
+    bundle: ResearchBundle,
     receipt_hash: object,
     receipt_issue_count: int,
     code: str,
 ) -> None:
     coverage = _canonical_file_object(data, code=code)
-    declared_hash = _hash(coverage.get("coverage_review_hash"), code=code)
-    unsigned = dict(coverage)
-    unsigned.pop("coverage_review_hash")
+    contract, draft, evidence_inventory, source_unit_inventory, request, sources = (
+        _verified_coverage_inputs(
+            draft_data=draft_data,
+            dossier_data=dossier_data,
+            code=code,
+        )
+    )
+    built = build_analysis(draft, list(sources))
+    replayed = note_stage(
+        bundle.model_copy(
+            deep=True,
+            update={
+                "issues": built.issues,
+                "findings": built.findings,
+                "citations": built.citations,
+                "gaps": built.gaps,
+                "review_items": built.review_items,
+                "brief": built.brief,
+                "validation": None,
+                "bundle_hash": None,
+            },
+        )
+    ).bundle
     if (
-        declared_hash != sha256_digest(canonical_json_bytes(unsigned))
+        bundle.request != request
+        or tuple(bundle.sources) != sources
+        or bundle.issues != replayed.issues
+        or bundle.findings != replayed.findings
+        or bundle.citations != replayed.citations
+        or bundle.gaps != replayed.gaps
+        or bundle.review_items != replayed.review_items
+        or bundle.brief != replayed.brief
+    ):
+        raise _fail(code)
+    if contract == ATOMIC_COVERAGE_CONTRACT_VERSION:
+        expected = evaluate_atomic_coverage(
+            source_unit_inventory,
+            evidence_inventory,
+            draft,
+            sources,
+        )
+    else:
+        coverage_draft = draft
+        if draft.coverage_contract_version != COVERAGE_CONTRACT_VERSION:
+            coverage_draft = draft.model_copy(update={"coverage_contract_version": None})
+        expected = evaluate_coverage_closure(
+            evidence_inventory,
+            source_unit_inventory,
+            coverage_draft,
+            sources,
+        )
+    expected_bytes = canonical_json_bytes(expected) + b"\n"
+    declared_hash = _hash(coverage.get("coverage_review_hash"), code=code)
+    if (
+        data != expected_bytes
         or declared_hash != _hash(receipt_hash, code=code)
         or coverage.get("valid") is not True
         or _coverage_issue_count(coverage) != receipt_issue_count
@@ -592,7 +734,7 @@ def _verify_bundle_bytes(
     expected_blocking_review_count: int,
     expected_validation_issue_count: int,
     report_bytes: bytes,
-) -> None:
+) -> ResearchBundle:
     raw = _canonical_document_object(data, code=code)
     bundle = ResearchBundle.model_validate(raw)
     if canonical_json_bytes(bundle.model_dump(mode="json")) != data:
@@ -614,6 +756,7 @@ def _verify_bundle_bytes(
         or render_markdown(bundle).encode("utf-8") != report_bytes
     ):
         raise _fail(code)
+    return bundle
 
 
 def _load_generation_validation(
@@ -653,6 +796,14 @@ def _load_generation_validation(
                 paths["coverage_review"],
                 max_bytes=_MAX_JSON_BYTES,
             )
+            draft_bytes = storage.read_artifact(
+                paths["analysis_draft"],
+                max_bytes=_MAX_JSON_BYTES,
+            )
+            dossier_bytes = storage.read_artifact(
+                _DOSSIER_NAME,
+                max_bytes=_MAX_JSON_BYTES,
+            )
             storage.assert_root_identity()
         blocking_count = _native_count(receipt["blocking_review_count"], code=code)
         coverage_issue_count = _native_count(receipt["coverage_issue_count"], code=code)
@@ -667,7 +818,7 @@ def _load_generation_validation(
             or report_bytes != generation_report_bytes
         ):
             raise ValueError("generation validation is not deterministically complete")
-        _verify_bundle_bytes(
+        bundle = _verify_bundle_bytes(
             bundle_bytes,
             code=code,
             expected_blocking_review_count=blocking_count,
@@ -676,6 +827,9 @@ def _load_generation_validation(
         )
         _verify_coverage_review(
             coverage_bytes,
+            draft_data=draft_bytes,
+            dossier_data=dossier_bytes,
+            bundle=bundle,
             receipt_hash=receipt["coverage_review_hash"],
             receipt_issue_count=coverage_issue_count,
             code=code,
@@ -731,6 +885,8 @@ def _requirement_projection(value: object, *, stable: bool) -> dict[str, object]
         "statement": _field(value, "statement"),
         "kind": _wire(_field(value, "kind")),
         "importance": _wire(_field(value, "importance")),
+        "importance_basis": _wire(_field(value, "importance_basis")),
+        "importance_rationale": _field(value, "importance_rationale"),
         "passages": _wire(_field(value, "passages")),
         "dependency": _wire(_field(value, "dependency")),
         "confidence": _field(value, "confidence"),
@@ -753,6 +909,9 @@ def _contest_projection(value: object, *, stable: bool) -> dict[str, object]:
             None if auditor is None else _requirement_projection(auditor, stable=stable)
         ),
         "unresolved_reason": _wire(_field(value, "unresolved_reason")),
+        "importance": _wire(_field(value, "importance")),
+        "importance_basis": _wire(_field(value, "importance_basis")),
+        "importance_rationale": _field(value, "importance_rationale"),
         "rationale": _field(
             value,
             "substantive_rationale" if stable else "rationale",
@@ -764,22 +923,54 @@ def _contest_projection(value: object, *, stable: bool) -> dict[str, object]:
     }
 
 
-def _semantic_baseline_projection(value: object, *, stable: bool) -> bytes:
-    raw = {
-        "requirements": [
-            _requirement_projection(item, stable=stable)
-            for item in cast(tuple[object, ...], _field(value, "requirements"))
-        ],
-        "relationships": _wire(_field(value, "relationships")),
-        "contested_requirements": [
-            _contest_projection(item, stable=stable)
-            for item in cast(
-                tuple[object, ...],
-                _field(value, "contested_requirements"),
-            )
-        ],
-    }
-    return canonical_json_bytes(raw)
+def _semantic_baseline_projection(value: object, *, stable: bool) -> bytes | None:
+    try:
+        raw = {
+            "requirements": [
+                _requirement_projection(item, stable=stable)
+                for item in cast(tuple[object, ...], _field(value, "requirements"))
+            ],
+            "relationships": _wire(_field(value, "relationships")),
+            "contested_requirements": [
+                _contest_projection(item, stable=stable)
+                for item in cast(
+                    tuple[object, ...],
+                    _field(value, "contested_requirements"),
+                )
+            ],
+        }
+        return canonical_json_bytes(raw)
+    except (AttributeError, RecursionError, TypeError, ValueError):
+        return None
+
+
+def _historical_legal_input_comparable(
+    context: object,
+    baseline_context: VerifiedBaselineContextV1,
+) -> bool:
+    try:
+        loader = _field(context, "load_case_envelope")
+        if not callable(loader):
+            return False
+        case = _field(loader(), "case")
+        stable = baseline_context.baseline_input
+        historical_as_of = _field(case, "as_of")
+        if hasattr(historical_as_of, "isoformat"):
+            historical_as_of = historical_as_of.isoformat()
+        rubric_bytes = canonical_json_bytes(_wire(_field(context, "rubric")))
+        return (
+            _field(case, "question") == stable.question
+            and _field(case, "jurisdiction") == stable.jurisdiction
+            and historical_as_of == stable.as_of
+            and canonical_json_bytes(_wire(_field(case, "sources")))
+            == canonical_json_bytes(_wire(stable.sources))
+            and canonical_json_bytes(_wire(_field(case, "requested_authorities")))
+            == canonical_json_bytes(_wire(stable.requested_authorities))
+            and _field(case, "client_facts") == stable.client_facts
+            and rubric_bytes == stable.evaluation_rubric_bytes
+        )
+    except (AttributeError, RecursionError, TypeError, ValueError):
+        return False
 
 
 def _enum_text(value: object) -> str:
@@ -838,10 +1029,16 @@ def _load_historical_v22(
             _enum_text(report.sensitivity.absolute_disposition)
         )
         reason_codes = tuple(report.sensitivity.reason_codes)
-        baseline_comparable = _semantic_baseline_projection(
+        stable_semantics = _semantic_baseline_projection(
             baseline_context.baseline,
             stable=True,
-        ) == _semantic_baseline_projection(baseline, stable=False)
+        )
+        historical_semantics = _semantic_baseline_projection(baseline, stable=False)
+        baseline_comparable = (
+            _historical_legal_input_comparable(context, baseline_context)
+            and stable_semantics is not None
+            and stable_semantics == historical_semantics
+        )
         return HistoricalV22CrossCheckV1(
             report_hash=historical_report_hash,
             strict_disposition=strict_disposition,
@@ -890,6 +1087,8 @@ def build_verified_readiness_input_v1(
     historical_anonymous_label: Literal["A", "B"] | None = None,
 ) -> VerifiedReadinessInputsV1:
     """Verify and bind all readiness inputs without creating or modifying a run."""
+    baseline_context, projection = _load_verified_baseline(baseline_run_dir)
+
     history_supplied = historical_v22_run_dir is not None
     label_supplied = historical_anonymous_label is not None
     if history_supplied != label_supplied:
@@ -897,7 +1096,6 @@ def build_verified_readiness_input_v1(
     if label_supplied and historical_anonymous_label not in {"A", "B"}:
         raise _fail("READINESS_HISTORICAL_ARGUMENTS_INVALID")
 
-    baseline_context, projection = _load_verified_baseline(baseline_run_dir)
     report_text, report_bytes, generation_binding = _load_verified_generation(
         generation_run_dir,
         projection,

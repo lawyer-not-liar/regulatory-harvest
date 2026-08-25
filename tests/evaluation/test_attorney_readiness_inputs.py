@@ -17,7 +17,15 @@ import pytest
 from test_attorney_baseline_artifacts import _complete_graph
 
 import regulatory_harvest.evaluation.attorney_readiness_inputs as inputs_module
+from regulatory_harvest.analysis import (
+    AnalysisDraft,
+    build_analysis,
+    build_evidence_inventory,
+    build_source_unit_inventory,
+    evaluate_atomic_coverage,
+)
 from regulatory_harvest.analysis.report import render_markdown
+from regulatory_harvest.combine.stages import note_stage
 from regulatory_harvest.evaluation.attorney_artifacts import (
     EvaluationIntegrityError,
 )
@@ -265,6 +273,244 @@ def _validation_bundle(context: VerifiedBaselineContextV1) -> ResearchBundle:
     return bundle
 
 
+def _coverage_artifacts(
+    bundle: ResearchBundle,
+) -> tuple[AnalysisDraft, dict[str, object], dict[str, object]]:
+    source_payloads = [source.model_dump(mode="json") for source in bundle.sources]
+    evidence_inventory = build_evidence_inventory(source_payloads)
+    source_unit_inventory = build_source_unit_inventory(source_payloads)
+    quote = bundle.sources[0].normalized_text
+    dimensions: dict[str, object] = {
+        name: {"disposition": "not_present"}
+        for name in (
+            "authority_status_timing",
+            "actors_scope_activities",
+            "definitions_categories",
+            "duties_rights_prohibitions",
+            "triggers_thresholds",
+            "conditions_exceptions_defenses",
+            "deadlines_transitions",
+            "enforcement_remedies_consequences",
+            "cross_references_dependencies",
+        )
+    }
+    dimensions["actors_scope_activities"] = {
+        "disposition": "mapped",
+        "atom_ids": ["atom-duty"],
+    }
+    dimensions["duties_rights_prohibitions"] = {
+        "disposition": "mapped",
+        "atom_ids": ["atom-duty"],
+    }
+    elements: dict[str, object] = {
+        name: {"status": "not_applicable"}
+        for name in (
+            "actor",
+            "modality",
+            "operative_action",
+            "object",
+            "trigger",
+            "threshold",
+            "condition",
+            "exception",
+            "timing",
+            "authority",
+            "route",
+            "consequence",
+            "defined_term",
+            "defined_meaning",
+        )
+    }
+    for name, text in (
+        ("actor", "covered operator"),
+        ("modality", "must"),
+        ("operative_action", "file"),
+        ("object", "a notice"),
+    ):
+        elements[name] = {
+            "status": "stated",
+            "text": text,
+            "claim_ids": ["claim-1"],
+        }
+    unit_ids = [cast(str, row["unit_id"]) for row in source_unit_inventory["units"]]
+    leads = cast(list[dict[str, object]], evidence_inventory["leads"])
+    requirement_lead_ids = [
+        cast(str, row["lead_id"]) for row in leads if row["issue_category"] == "requirements"
+    ]
+    draft = AnalysisDraft.model_validate(
+        {
+            "coverage_contract_version": "proposition-coverage-v2",
+            "issues": [
+                {
+                    "issue_id": "issue-1",
+                    "title": "Notice duties",
+                    "category": "requirements",
+                    "jurisdictions": [bundle.request.jurisdictions[0]],
+                }
+            ],
+            "findings": [
+                {
+                    "finding_id": "finding-1",
+                    "issue_id": "issue-1",
+                    "title": "Notice duties",
+                    "jurisdiction": bundle.request.jurisdictions[0],
+                    "authority": bundle.sources[0].display_name,
+                    "severity": "info",
+                    "practical_implication": "File and identify the notice.",
+                    "claims": [
+                        {
+                            "claim_id": "claim-1",
+                            "text": quote,
+                            "kind": "source_supported",
+                            "proposed_citations": [
+                                {
+                                    "source_id": bundle.sources[0].source_id,
+                                    "quote": quote,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "gaps": [],
+            "unit_reviews": [
+                {"unit_id": unit_id, "dimensions": dimensions} for unit_id in unit_ids
+            ],
+            "lead_dispositions_v2": [
+                (
+                    {
+                        "lead_id": row["lead_id"],
+                        "disposition": "mapped",
+                        "atom_ids": ["atom-duty"],
+                    }
+                    if row["issue_category"] == "requirements"
+                    else {
+                        "lead_id": row["lead_id"],
+                        "disposition": "not_material",
+                        "rationale": "The lead is context for the notice duty.",
+                    }
+                )
+                for row in leads
+            ],
+            "rule_atoms": [
+                {
+                    "atom_id": "atom-duty",
+                    "unit_ids": unit_ids,
+                    "lead_ids": requirement_lead_ids,
+                    "category": "requirements",
+                    "proposition_type": "duty",
+                    "materiality": "critical",
+                    "elements": elements,
+                    "omission_rationale": "Omission would hide the notice duty.",
+                }
+            ],
+            "rule_relationships": [],
+            "brief": {
+                "structure_profile": "regulatory-walk-v1",
+                "executive_summary": [
+                    {
+                        "kind": "paragraph",
+                        "purpose": "legal_analysis",
+                        "text": quote,
+                        "finding_ids": ["finding-1"],
+                        "claim_ids": ["claim-1"],
+                        "atom_ids": ["atom-duty"],
+                    }
+                ],
+                "sections": [
+                    {
+                        "section_id": "key-requirements",
+                        "title": "Key Requirements",
+                        "role": "key_requirements",
+                        "blocks": [
+                            {
+                                "kind": "bullet_list",
+                                "purpose": "legal_analysis",
+                                "items": [
+                                    {
+                                        "text": quote,
+                                        "finding_ids": ["finding-1"],
+                                        "claim_ids": ["claim-1"],
+                                        "atom_ids": ["atom-duty"],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "section_id": "penalties-and-enforcement",
+                        "title": "Penalties and Enforcement",
+                        "role": "penalties_enforcement",
+                        "blocks": [
+                            {
+                                "kind": "paragraph",
+                                "purpose": "limitation",
+                                "text": "Not established: no penalties are retained.",
+                            }
+                        ],
+                    },
+                    {
+                        "section_id": "implementation-workplan",
+                        "title": "Implementation Workplan",
+                        "role": "implementation",
+                        "blocks": [
+                            {
+                                "kind": "paragraph",
+                                "purpose": "application",
+                                "text": "Assign ownership for the notice duty.",
+                                "finding_ids": ["finding-1"],
+                            }
+                        ],
+                    },
+                ],
+            },
+        }
+    )
+    dossier: dict[str, object] = {
+        "schema_version": "1.0",
+        "coverage_contract_version": "proposition-coverage-v2",
+        "source_mode": bundle.request.source_mode,
+        "request": bundle.request.model_dump(mode="json"),
+        "sources": [source.model_dump(mode="json") for source in bundle.sources],
+        "gaps": [gap.model_dump(mode="json") for gap in bundle.gaps],
+        "evidence_inventory": evidence_inventory,
+        "source_unit_inventory": source_unit_inventory,
+    }
+    review = evaluate_atomic_coverage(
+        source_unit_inventory,
+        evidence_inventory,
+        draft,
+        bundle.sources,
+    )
+    assert review["valid"] is True
+    return draft, dossier, review
+
+
+def _bind_bundle_to_draft(
+    bundle: ResearchBundle,
+    draft: AnalysisDraft,
+) -> ResearchBundle:
+    built = build_analysis(draft, bundle.sources)
+    bound = bundle.model_copy(
+        update={
+            "issues": built.issues,
+            "findings": built.findings,
+            "citations": built.citations,
+            "gaps": built.gaps,
+            "review_items": built.review_items,
+            "brief": built.brief,
+            "validation": None,
+            "bundle_hash": None,
+        },
+    )
+    bound = note_stage(bound).bundle
+    assert bound.validation is not None
+    assert bound.validation.valid is True
+    bound.bundle_hash = calculate_bundle_hash(bound)
+    assert validate_bundle(bound, require_bundle_hash=True).valid is True
+    return bound
+
+
 def _write_validation_matter(
     root: Path,
     context: VerifiedBaselineContextV1,
@@ -273,29 +519,22 @@ def _write_validation_matter(
     run = matter / "runs" / "synthetic-run"
     run.mkdir(parents=True)
     bundle = _validation_bundle(context)
+    draft, dossier, coverage = _coverage_artifacts(bundle)
+    bundle = _bind_bundle_to_draft(bundle, draft)
     report_text = render_markdown(bundle)
     report_path = run / "report.md"
     report_path.write_bytes(report_text.encode("utf-8"))
     bundle_path = run / "bundle.json"
     bundle_path.write_bytes(canonical_json_bytes(bundle.model_dump(mode="json")))
-    coverage_without_hash: dict[str, object] = {
-        "schema_version": "3.0",
-        "coverage_contract_version": "proposition-coverage-v2",
-        "valid": True,
-        "target_review": {},
-        "rule_graph": {},
-        "counts": {},
-        "issues": [],
-    }
-    coverage_hash = sha256_digest(canonical_json_bytes(coverage_without_hash))
+    dossier_path = matter / "agent-dossier.json"
+    dossier_path.write_bytes(_canonical_file(dossier))
+    coverage_hash = cast(str, coverage["coverage_review_hash"])
     coverage_path = matter / "coverage-review.json"
-    coverage_path.write_bytes(
-        _canonical_file({**coverage_without_hash, "coverage_review_hash": coverage_hash})
-    )
+    coverage_path.write_bytes(_canonical_file(coverage))
     audit_path = run / "audit.md"
     audit_path.write_text("# Synthetic audit\n", encoding="utf-8")
     draft_path = matter / "analysis-draft.json"
-    draft_path.write_bytes(_canonical_file({"fixture": "synthetic-draft"}))
+    draft_path.write_bytes(_canonical_file(draft.model_dump(mode="json")))
     receipt_path = matter / "validation-receipt.json"
     receipt_path.write_bytes(
         _canonical_file(
@@ -359,6 +598,8 @@ def _historical_context(
             statement=field(value, "statement"),
             kind=field(value, "kind"),
             importance=field(value, "importance"),
+            importance_basis=field(value, "importance_basis"),
+            importance_rationale=field(value, "importance_rationale"),
             passages=field(value, "passages"),
             dependency=field(value, "dependency"),
             confidence=field(value, "confidence"),
@@ -388,6 +629,9 @@ def _historical_context(
                 None if item.auditor_alternative is None else requirement(item.auditor_alternative)
             ),
             unresolved_reason=item.unresolved_reason,
+            importance=item.importance,
+            importance_basis=item.importance_basis,
+            importance_rationale=item.importance_rationale,
             rationale=item.substantive_rationale,
             referee_fragment_fingerprint=item.referee_fragment_fingerprint,
         )
@@ -420,6 +664,15 @@ def _historical_context(
         contested_requirements=contests,
         baseline_fingerprint="6" * 64,
     )
+    case = SimpleNamespace(
+        question=fixture.baseline_context.baseline_input.question,
+        jurisdiction=fixture.baseline_context.baseline_input.jurisdiction,
+        as_of=date.fromisoformat(fixture.baseline_context.baseline_input.as_of),
+        sources=fixture.baseline_context.baseline_input.sources,
+        requested_authorities=fixture.baseline_context.baseline_input.requested_authorities,
+        client_facts=fixture.baseline_context.baseline_input.client_facts,
+    )
+    case_envelope = SimpleNamespace(case=case)
     return SimpleNamespace(
         manifest=SimpleNamespace(
             manifest_fingerprint="7" * 64,
@@ -429,16 +682,10 @@ def _historical_context(
         ),
         result=result,
         baseline=baseline,
-        load_case_envelope=lambda: SimpleNamespace(
-            case=SimpleNamespace(
-                question=fixture.baseline_context.baseline_input.question,
-                jurisdiction=fixture.baseline_context.baseline_input.jurisdiction,
-                as_of=fixture.baseline_context.baseline_input.as_of,
-                sources=fixture.baseline_context.baseline_input.sources,
-                requested_authorities=fixture.baseline_context.baseline_input.requested_authorities,
-                client_facts=fixture.baseline_context.baseline_input.client_facts,
-            )
+        rubric=json.loads(
+            fixture.baseline_context.baseline_input.evaluation_rubric_bytes.decode("utf-8")
         ),
+        load_case_envelope=lambda: case_envelope,
     )
 
 
@@ -611,6 +858,143 @@ def test_validation_receipt_rejects_coverage_review_hash_mismatch(
         build_verified_readiness_input_v1(**verified_inputs.without_history())
 
 
+@pytest.mark.parametrize("mutation", ["extra", "missing", "type", "version", "hash"])
+def test_coverage_review_requires_exact_supported_versioned_replay(
+    verified_inputs: VerifiedInputsFixture,
+    mutation: str,
+) -> None:
+    receipt = verified_inputs.receipt()
+    coverage_path = Path(cast(str, receipt["coverage_review"]))
+    coverage = cast(
+        dict[str, object],
+        json.loads(coverage_path.read_text(encoding="utf-8")),
+    )
+    if mutation == "extra":
+        coverage["untrusted_extension"] = {}
+    elif mutation == "missing":
+        coverage.pop("target_review")
+    elif mutation == "type":
+        coverage["schema_version"] = ["3.0"]
+    elif mutation == "version":
+        coverage["coverage_contract_version"] = "proposition-coverage-v999"
+    else:
+        coverage["coverage_review_hash"] = "0" * 64
+        coverage_path.write_bytes(_canonical_file(coverage))
+        verified_inputs.update_receipt("coverage_review_hash", "0" * 64)
+        with pytest.raises(
+            ReadinessInputError,
+            match="READINESS_VALIDATION_RECEIPT_INVALID",
+        ):
+            build_verified_readiness_input_v1(**verified_inputs.without_history())
+        return
+    coverage.pop("coverage_review_hash")
+    coverage_hash = sha256_digest(canonical_json_bytes(coverage))
+    coverage["coverage_review_hash"] = coverage_hash
+    coverage_path.write_bytes(_canonical_file(coverage))
+    verified_inputs.update_receipt("coverage_review_hash", coverage_hash)
+
+    with pytest.raises(ReadinessInputError, match="READINESS_VALIDATION_RECEIPT_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+def test_coverage_review_rejects_duplicate_keys(
+    verified_inputs: VerifiedInputsFixture,
+) -> None:
+    receipt = verified_inputs.receipt()
+    coverage_path = Path(cast(str, receipt["coverage_review"]))
+    canonical = coverage_path.read_bytes()
+    coverage_path.write_bytes(
+        canonical.replace(
+            b'{"coverage_contract_version":',
+            b'{"valid":true,"coverage_contract_version":',
+            1,
+        )
+    )
+
+    with pytest.raises(ReadinessInputError, match="READINESS_VALIDATION_RECEIPT_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+@pytest.mark.parametrize("artifact", ["analysis-draft.json", "agent-dossier.json"])
+def test_coverage_replay_rejects_tampered_typed_inputs(
+    verified_inputs: VerifiedInputsFixture,
+    artifact: str,
+) -> None:
+    path = verified_inputs.validation_receipt_path.parent / artifact
+    payload = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+    payload["untrusted_extension"] = True
+    path.write_bytes(_canonical_file(payload))
+
+    with pytest.raises(ReadinessInputError, match="READINESS_VALIDATION_RECEIPT_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+def test_coverage_replay_rejects_a_different_legal_input_transplant(
+    verified_inputs: VerifiedInputsFixture,
+) -> None:
+    bundle = _validation_bundle(verified_inputs.baseline_context)
+    request_payload = bundle.request.model_dump(mode="json")
+    request_payload["question"] = "What different duty applies?"
+    source_payload = bundle.sources[0].model_dump(mode="json")
+    source_payload["normalized_text"] = (
+        "Section 1. A different entity must keep a record. "
+        "Section 2. The record must identify the entity."
+    )
+    source_payload["content_hash"] = sha256_digest(
+        cast(str, source_payload["normalized_text"]).encode("utf-8")
+    )
+    transplanted_bundle = bundle.model_copy(
+        update={
+            "request": ResearchRequest.model_validate(request_payload),
+            "sources": [SourceRecord.model_validate(source_payload)],
+        },
+    )
+    draft, dossier, coverage = _coverage_artifacts(transplanted_bundle)
+    matter = verified_inputs.validation_receipt_path.parent
+    (matter / "analysis-draft.json").write_bytes(_canonical_file(draft.model_dump(mode="json")))
+    (matter / "agent-dossier.json").write_bytes(_canonical_file(dossier))
+    (matter / "coverage-review.json").write_bytes(_canonical_file(coverage))
+    verified_inputs.update_receipt(
+        "coverage_review_hash",
+        coverage["coverage_review_hash"],
+    )
+
+    with pytest.raises(ReadinessInputError, match="READINESS_VALIDATION_RECEIPT_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+def test_coverage_replay_rejects_a_different_draft_transplant(
+    verified_inputs: VerifiedInputsFixture,
+) -> None:
+    bundle = _validation_bundle(verified_inputs.baseline_context)
+    draft, dossier, _ = _coverage_artifacts(bundle)
+    draft_payload = draft.model_dump(mode="json")
+    brief = cast(dict[str, object], draft_payload["brief"])
+    sections = cast(list[dict[str, object]], brief["sections"])
+    blocks = cast(list[dict[str, object]], sections[-1]["blocks"])
+    blocks[0]["text"] = "Use a different implementation plan."
+    transplanted_draft = AnalysisDraft.model_validate(draft_payload)
+    coverage = evaluate_atomic_coverage(
+        cast(dict[str, object], dossier["source_unit_inventory"]),
+        cast(dict[str, object], dossier["evidence_inventory"]),
+        transplanted_draft,
+        bundle.sources,
+    )
+    assert coverage["valid"] is True
+    matter = verified_inputs.validation_receipt_path.parent
+    (matter / "analysis-draft.json").write_bytes(
+        _canonical_file(transplanted_draft.model_dump(mode="json"))
+    )
+    (matter / "coverage-review.json").write_bytes(_canonical_file(coverage))
+    verified_inputs.update_receipt(
+        "coverage_review_hash",
+        coverage["coverage_review_hash"],
+    )
+
+    with pytest.raises(ReadinessInputError, match="READINESS_VALIDATION_RECEIPT_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
 def test_validation_receipt_counts_must_match_replayed_artifacts(
     verified_inputs: VerifiedInputsFixture,
 ) -> None:
@@ -764,6 +1148,42 @@ def test_optional_history_requires_both_arguments_or_neither(
         build_verified_readiness_input_v1(**kwargs)
 
 
+def test_baseline_projection_precedes_optional_history_argument_rejection(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    real_load = inputs_module.load_verified_baseline_run
+    real_project = inputs_module.project_gradeable_baseline_v1
+    real_verify = inputs_module.verify_gradeable_baseline_projection_v1
+
+    def load(path: Path):
+        calls.append("load")
+        return real_load(path)
+
+    def project(context: VerifiedBaselineContextV1):
+        calls.append("project")
+        return real_project(context)
+
+    def verify(context: VerifiedBaselineContextV1, candidate: object):
+        calls.append("verify")
+        return real_verify(context, candidate)
+
+    monkeypatch.setattr(inputs_module, "load_verified_baseline_run", load)
+    monkeypatch.setattr(inputs_module, "project_gradeable_baseline_v1", project)
+    monkeypatch.setattr(
+        inputs_module,
+        "verify_gradeable_baseline_projection_v1",
+        verify,
+    )
+    with pytest.raises(ReadinessInputError, match="READINESS_HISTORICAL_ARGUMENTS_INVALID"):
+        build_verified_readiness_input_v1(
+            **verified_inputs.without_history(),
+            historical_v22_run_dir=Path("history"),
+        )
+    assert calls == ["load", "project", "verify"]
+
+
 def _admit_history(
     verified_inputs: VerifiedInputsFixture,
     monkeypatch: pytest.MonkeyPatch,
@@ -874,6 +1294,65 @@ def test_changed_historical_baseline_is_preserved_without_crosswalk(
     assert admitted.historical_v22 is not None
     assert admitted.historical_v22.baseline_comparable is False
     assert admitted.historical_v22.report_comparable is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("question", "A different question"),
+        ("jurisdiction", "Different"),
+        ("as_of", date(2025, 1, 1)),
+        ("requested_authorities", ()),
+        ("client_facts", "Different facts"),
+    ],
+)
+def test_different_historical_legal_input_is_not_baseline_comparable(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    context = _historical_context(verified_inputs)
+    setattr(context.load_case_envelope().case, field, value)
+    admitted = _admit_history(verified_inputs, monkeypatch, context)
+    assert admitted.historical_v22 is not None
+    assert admitted.historical_v22.baseline_comparable is False
+
+
+def test_unproved_stable_importance_basis_is_not_baseline_comparable(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _historical_context(verified_inputs)
+    del context.baseline.requirements[0].importance_basis
+    admitted = _admit_history(verified_inputs, monkeypatch, context)
+    assert admitted.historical_v22 is not None
+    assert admitted.historical_v22.baseline_comparable is False
+
+
+def test_different_historical_rubric_is_not_baseline_comparable(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _historical_context(verified_inputs)
+    context.rubric = {**context.rubric, "version": "different-rubric"}
+    admitted = _admit_history(verified_inputs, monkeypatch, context)
+    assert admitted.historical_v22 is not None
+    assert admitted.historical_v22.baseline_comparable is False
+
+
+def test_different_historical_source_record_is_not_baseline_comparable(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _historical_context(verified_inputs)
+    case = context.load_case_envelope().case
+    sources = list(case.sources)
+    sources[0] = sources[0].model_copy(update={"title": "Different authority"})
+    case.sources = tuple(sources)
+    admitted = _admit_history(verified_inputs, monkeypatch, context)
+    assert admitted.historical_v22 is not None
+    assert admitted.historical_v22.baseline_comparable is False
 
 
 @pytest.mark.parametrize("disposition", ["PASS", "FAIL", "INCONCLUSIVE"])
