@@ -12,8 +12,12 @@ from regulatory_harvest.evaluation.attorney_baseline_artifacts import (
     initialize_baseline_storage_v1,
     load_verified_baseline_run,
 )
+from regulatory_harvest.evaluation.attorney_baseline_models import (
+    GradeableBaselineProjectionV1,
+)
 from regulatory_harvest.evaluation.attorney_baseline_projection import (
     project_gradeable_baseline_v1,
+    verify_gradeable_baseline_projection_v1,
 )
 from regulatory_harvest.evaluation.attorney_models import ArtifactRecord
 from regulatory_harvest.evaluation.attorney_readiness_models import (
@@ -204,14 +208,6 @@ def valid_grade(requirement_id: str = "REQ-0001") -> dict[str, object]:
         "rationale": "The cited passage addresses the requirement.",
         "omission": None,
     }
-
-
-def native_python_wire(value: object) -> object:
-    if isinstance(value, dict):
-        return {key: native_python_wire(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [native_python_wire(item) for item in value]
-    return value
 
 
 def valid_fragment(**updates: object) -> dict[str, object]:
@@ -789,33 +785,46 @@ def test_input_detaches_and_rehydrates_verified_projection_alias(tmp_path: Path)
     _, files_by_path, manifest = _complete_graph()
     run_dir = tmp_path / "verified-baseline"
     initialize_baseline_storage_v1(run_dir, manifest, files_by_path)
-    projection = project_gradeable_baseline_v1(load_verified_baseline_run(run_dir))
+    context = load_verified_baseline_run(run_dir)
+    projection = project_gradeable_baseline_v1(context)
+    projection = verify_gradeable_baseline_projection_v1(context, projection)
     expected_grade_target = projection.binding.grade_target_fingerprint
-    value = ReadinessInputV1.model_validate(
-        {
-            "protocol_version": "delivery-readiness-v1",
-            "gradeable_baseline": native_python_wire(
-                projection.model_dump(mode="python", warnings="error")
-            ),
-            "grade_target_fingerprint": expected_grade_target,
-            "report_text": "A report.",
+    input_wire: dict[str, object] = {
+        "protocol_version": "delivery-readiness-v1",
+        "gradeable_baseline": projection,
+        "grade_target_fingerprint": expected_grade_target,
+        "report_text": "A report.",
+        "report_hash": HASH,
+        "generation_capsule_root": "b" * 64,
+        "generation_validation": {
+            "receipt_hash": "c" * 64,
             "report_hash": HASH,
-            "generation_capsule_root": "b" * 64,
-            "generation_validation": {
-                "receipt_hash": "c" * 64,
-                "report_hash": HASH,
-                "bundle_hash": "d" * 64,
-                "coverage_review_hash": "e" * 64,
-                "status": "completed",
-                "evidence_precision_valid": True,
-                "proposition_coverage_valid": True,
-                "provision_recall_valid": True,
-            },
-            "readiness_rubric_fingerprint": "f" * 64,
-            "strict_equivalent_scoring_contract_fingerprint": "0" * 64,
-            "historical_v22_cross_check": None,
-        }
-    )
+            "bundle_hash": "d" * 64,
+            "coverage_review_hash": "e" * 64,
+            "status": "completed",
+            "evidence_precision_valid": True,
+            "proposition_coverage_valid": True,
+            "provision_recall_valid": True,
+        },
+        "readiness_rubric_fingerprint": "f" * 64,
+        "strict_equivalent_scoring_contract_fingerprint": "0" * 64,
+        "historical_v22_cross_check": None,
+    }
+    value = ReadinessInputV1.model_validate(input_wire)
     checked = validate_readiness_input_v1(value)
+    forged = GradeableBaselineProjectionV1.model_construct(
+        **projection.model_dump(mode="python", warnings="error")
+    )
+
+    class ExternalProjection(GradeableBaselineProjectionV1):
+        pass
+
+    external = ExternalProjection.model_construct(**dict(projection.__dict__))
+    transplanted = GradeableBaselineProjectionV1.model_construct(
+        **dict(value.gradeable_baseline.__dict__)
+    )
+    for candidate in (forged, external, transplanted):
+        with pytest.raises(ValidationError):
+            ReadinessInputV1.model_validate(input_wire | {"gradeable_baseline": candidate})
     object.__setattr__(value.gradeable_baseline.binding, "grade_target_fingerprint", "9" * 64)
     assert checked.gradeable_baseline.binding.grade_target_fingerprint == expected_grade_target

@@ -11,7 +11,7 @@ import json
 import math
 import re
 import warnings
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import date, datetime, time
 from enum import Enum, StrEnum
 from pathlib import Path
@@ -51,6 +51,7 @@ _MAX_FINDINGS = 640
 _MAX_WIRE_BYTES = 16 * 1024 * 1024
 _MAX_WIRE_DEPTH = 64
 _MAX_WIRE_NODES = 100_000
+_READINESS_PROJECTION_ATTESTATION = object()
 
 Hash = Annotated[str, Field(pattern=_HASH_PATTERN, strict=True)]
 RequirementRef = Annotated[str, Field(pattern=_REQUIREMENT_REF_PATTERN, strict=True)]
@@ -107,6 +108,35 @@ def _safe_call_id(value: str | None) -> str | None:
     return value
 
 
+def _exact_gradeable_projection_wire(value: object) -> dict[str, object]:
+    """Reconstruct the exact stable projection through its prerequisite proof model."""
+    if type(value) is not GradeableBaselineProjectionV1:
+        raise ValueError("gradeable projection handoff must use the exact stable class")
+    projection = value
+    if _contains_readiness_wire_marker(projection) and not _projection_is_attested(projection):
+        raise ValueError("gradeable projection handoff has transplanted readiness state")
+    serialized = projection.model_dump(mode="json", warnings="error")
+    raw = dict(cast(dict[str, object], serialized))
+    baseline_value = raw.get("baseline_input")
+    if type(baseline_value) is not dict:
+        raise ValueError("gradeable projection handoff has invalid baseline input")
+    baseline_raw = dict(cast(dict[str, object], baseline_value))
+    compiler_contract = baseline_raw.get("compiler_contract")
+    baseline_raw["compiler_contract"] = json.loads(canonical_json_bytes(compiler_contract))
+    for field_name in ("evaluation_rubric_bytes", "importance_policy_bytes"):
+        field_value = baseline_raw.get(field_name)
+        if type(field_value) is not str:
+            raise ValueError("gradeable projection handoff has invalid policy bytes")
+        baseline_raw[field_name] = field_value.encode("utf-8")
+    raw["baseline_input"] = baseline_raw
+    checked = GradeableBaselineProjectionV1.model_validate(raw)
+    if canonical_json_bytes(checked.model_dump(mode="json", warnings="error")) != (
+        canonical_json_bytes(serialized)
+    ):
+        raise ValueError("gradeable projection handoff failed exact reconstruction")
+    return raw
+
+
 def _wire_snapshot_inner(
     value: object,
     active: set[int],
@@ -128,6 +158,13 @@ def _wire_snapshot_inner(
         raise ValueError("readiness model wire snapshot exceeds resource limits")
     if isinstance(value, Mapping) and not isinstance(value, dict):
         raise ValueError("readiness model wire snapshot requires a built-in mapping")
+    if type(value) is GradeableBaselineProjectionV1:
+        return _wire_snapshot_inner(
+            _exact_gradeable_projection_wire(value),
+            active,
+            budget=budget,
+            depth=depth + 1,
+        )
     if isinstance(value, BaseModel):
         identity = id(value)
         if identity in active:
@@ -268,6 +305,61 @@ class _FrozenJsonList(list[object]):
     remove = _immutable
     reverse = _immutable
     sort = _immutable
+
+
+def _contains_readiness_wire_marker(
+    value: object,
+    active: set[int] | None = None,
+    *,
+    budget: list[int] | None = None,
+    depth: int = 1,
+) -> bool:
+    checked_active = set() if active is None else active
+    checked_budget = [0] if budget is None else budget
+    checked_budget[0] += 1
+    if checked_budget[0] > _MAX_WIRE_NODES or depth > _MAX_WIRE_DEPTH:
+        raise ValueError("gradeable projection marker scan exceeds resource limits")
+    if isinstance(value, (_FrozenDict, _FrozenWireTuple, _FrozenJsonList)):
+        return True
+    children: Iterable[object]
+    if isinstance(value, BaseModel):
+        children = dict(object.__getattribute__(value, "__dict__")).values()
+    elif isinstance(value, dict):
+        children = dict.values(value)
+    elif isinstance(value, (list, tuple)):
+        children = value
+    else:
+        return False
+    identity = id(value)
+    if identity in checked_active:
+        raise ValueError("gradeable projection marker scan contains a cycle")
+    checked_active.add(identity)
+    try:
+        return any(
+            _contains_readiness_wire_marker(
+                item,
+                checked_active,
+                budget=checked_budget,
+                depth=depth + 1,
+            )
+            for item in children
+        )
+    finally:
+        checked_active.remove(identity)
+
+
+def _projection_is_attested(value: GradeableBaselineProjectionV1) -> bool:
+    private = object.__getattribute__(value, "__pydantic_private__")
+    return isinstance(private, dict) and (
+        private.get("_readiness_projection_attestation") is _READINESS_PROJECTION_ATTESTATION
+    )
+
+
+def _attest_projection(value: GradeableBaselineProjectionV1) -> None:
+    private = object.__getattribute__(value, "__pydantic_private__")
+    checked = {} if private is None else dict(private)
+    checked["_readiness_projection_attestation"] = _READINESS_PROJECTION_ATTESTATION
+    object.__setattr__(value, "__pydantic_private__", checked)
 
 
 def _json_key(value: object) -> object:
@@ -789,6 +881,7 @@ class ReadinessInputV1(ReadinessStrictModelV1):
             raise ValueError("readiness input grade target must match its verified projection")
         if self.report_hash != self.generation_validation.report_hash:
             raise ValueError("readiness input report hash must match generation validation")
+        _attest_projection(self.gradeable_baseline)
         return self
 
 
