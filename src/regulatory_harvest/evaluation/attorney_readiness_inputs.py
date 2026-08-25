@@ -50,7 +50,20 @@ from .attorney_generation import (
     GenerationIntegrityError,
     load_completed_generation_capsule_context,
 )
-from .attorney_models import EvaluationSource
+from .attorney_models import (
+    CaseAdmissionJudgment,
+    EvaluationSource,
+    JudgeOperation,
+    JudgeResponse,
+    QualificationCase,
+    QualificationManifest,
+    QualificationReceipt,
+    model_fingerprint,
+)
+from .attorney_qualification import (
+    VerifiedQualificationContext,
+    load_verified_qualification_context,
+)
 from .attorney_readiness_models import (
     GenerationValidationBindingV1,
     HistoricalV22CrossCheckV1,
@@ -290,6 +303,93 @@ class QualificationReadinessBindingV1:
 
 
 @dataclass(frozen=True)
+class QualificationRequestedAuthorityV1:
+    """Path-free authority scope copied from the verified qualification case."""
+
+    authority_id: str
+    title: str
+    jurisdiction: str
+    authority_type: str
+    source_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class QualificationAdmissionCheckV1:
+    """One exact supported admission check from the replayed judgment."""
+
+    code: Literal[
+        "AUTHORITY_ALIGNMENT",
+        "OPERATIVE_TEXT",
+        "CURRENTNESS_EVIDENCE",
+        "LANGUAGE_RESOLUTION",
+        "SOURCE_PARITY",
+    ]
+    satisfied: bool
+    material: bool
+    rationale: str
+    source_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class QualificationAdmissionIssueV1:
+    """One exact issue from the replayed qualification judgment."""
+
+    code: str
+    severity: Literal["error", "warning", "info"]
+    message: str
+    related_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class QualificationReceiptReadinessV1:
+    """Exact receipt readiness evidence, without inventing a new finding."""
+
+    status: Literal["ADMITTED"]
+    issue_codes: tuple[str, ...]
+    rationale: str
+
+
+@dataclass(frozen=True)
+class QualificationLanguageSourceV1:
+    """Minimal source identity needed to bind a language treatment."""
+
+    source_id: str
+    content_hash: str
+    language: str
+
+
+@dataclass(frozen=True)
+class QualificationLanguageTreatmentV1:
+    """Exact declared treatment and its source bindings."""
+
+    sources: tuple[QualificationLanguageSourceV1, ...]
+    method: str
+    rationale: str
+    limitation_status: Literal["DECLARED", "NOT_DECLARED"]
+    limitation_text: str | None
+
+
+@dataclass(frozen=True)
+class QualificationLimitsV1:
+    """Detached, immutable qualification evidence for readiness safety review."""
+
+    case_schema_version: Literal["1.1"]
+    admission_status: Literal["qualified"]
+    qualification_readiness: Literal["ADMITTED"]
+    qualification_root: str
+    qualification_receipt_fingerprint: str
+    case_fingerprint: str
+    source_record_fingerprint: str
+    request_fingerprint: str
+    judgment_fingerprint: str
+    requested_authorities: tuple[QualificationRequestedAuthorityV1, ...]
+    admission_checks: tuple[QualificationAdmissionCheckV1, ...]
+    admission_issues: tuple[QualificationAdmissionIssueV1, ...]
+    receipt_readiness: QualificationReceiptReadinessV1
+    language_treatments: tuple[QualificationLanguageTreatmentV1, ...]
+
+
+@dataclass(frozen=True)
 class GenerationCapsuleBindingV1:
     """Path-free generation provenance without duplicated report/source bytes."""
 
@@ -314,6 +414,7 @@ class VerifiedReadinessInputsV1:
     report_hash: str
     source_record: tuple[EvaluationSource, ...]
     qualification_binding: QualificationReadinessBindingV1
+    qualification_limits: QualificationLimitsV1
     generation_binding: GenerationCapsuleBindingV1
     generation_validation: GenerationValidationBindingV1
     readiness_rubric: ReadinessRubricV1
@@ -443,6 +544,210 @@ def _load_verified_baseline(
     except (
         AttributeError,
         EvaluationIntegrityError,
+        OSError,
+        RecursionError,
+        TypeError,
+        ValidationError,
+        ValueError,
+    ) as error:
+        raise _fail(code, error) from error
+
+
+_ADMISSION_CHECK_CODES = {
+    "AUTHORITY_ALIGNMENT",
+    "OPERATIVE_TEXT",
+    "CURRENTNESS_EVIDENCE",
+    "LANGUAGE_RESOLUTION",
+    "SOURCE_PARITY",
+}
+
+
+def _same_model_sequence(left: object, right: object) -> bool:
+    try:
+        return canonical_json_bytes(_wire(left)) == canonical_json_bytes(_wire(right))
+    except (AttributeError, RecursionError, TypeError, ValueError):
+        return False
+
+
+def _load_qualification_limits(
+    qualification_run_dir: Path,
+    projection: GradeableBaselineProjectionV1,
+) -> QualificationLimitsV1:
+    code = "READINESS_QUALIFICATION_INVALID"
+    try:
+        context = load_verified_qualification_context(qualification_run_dir)
+        if type(context) is not VerifiedQualificationContext:
+            raise TypeError("qualification loader returned an unexpected type")
+        manifest = QualificationManifest.model_validate(
+            context.manifest.model_dump(mode="python", warnings="error"),
+            strict=True,
+        )
+        receipt = QualificationReceipt.model_validate(
+            context.receipt.model_dump(mode="python", warnings="error"),
+            strict=True,
+        )
+        baseline = projection.baseline_input
+        case = QualificationCase.model_validate(
+            context.case.model_dump(mode="python", warnings="error"),
+            strict=True,
+        )
+        case_bytes = context.artifact_bytes.get("qualification-case.json")
+        response_bytes = context.artifact_bytes.get("admission-response.json")
+        receipt_bytes = context.artifact_bytes.get("qualification-receipt.json")
+        manifest_bytes = context.artifact_bytes.get("manifest.json")
+        if (
+            type(case_bytes) is not bytes
+            or type(response_bytes) is not bytes
+            or type(receipt_bytes) is not bytes
+            or type(manifest_bytes) is not bytes
+        ):
+            raise TypeError("qualification artifacts are incomplete")
+        if (
+            canonical_json_bytes(case.model_dump(mode="json", warnings="error")) != case_bytes
+            or canonical_json_bytes(receipt.model_dump(mode="json", warnings="error"))
+            != receipt_bytes
+            or canonical_json_bytes(manifest.model_dump(mode="json", warnings="error"))
+            != manifest_bytes
+            or model_fingerprint(case) != manifest.case_fingerprint
+        ):
+            raise ValueError("qualification case is not exact")
+        if (
+            case.schema_version != "1.1"
+            or manifest.status != "qualified"
+            or receipt.readiness.status.value != "ADMITTED"
+            or baseline.qualification_readiness != "ADMITTED"
+            or manifest.root_hash != baseline.qualification_root
+            or manifest.receipt_fingerprint != receipt.receipt_fingerprint
+            or receipt.receipt_fingerprint != baseline.qualification_receipt_fingerprint
+            or manifest.case_fingerprint != receipt.case_fingerprint
+            or manifest.source_record_fingerprint != receipt.source_record_fingerprint
+            or receipt.source_record_fingerprint != baseline.source_record_fingerprint
+            or receipt.readiness.case_fingerprint != receipt.case_fingerprint
+            or receipt.readiness.judgment_fingerprint != receipt.judgment_fingerprint
+            or case.question != baseline.question
+            or case.jurisdiction != baseline.jurisdiction
+            or case.as_of.isoformat() != baseline.as_of
+            or not _same_model_sequence(
+                case.requested_authorities,
+                baseline.requested_authorities,
+            )
+            or not _same_model_sequence(case.sources, baseline.sources)
+        ):
+            raise ValueError("qualification does not bind the verified baseline")
+
+        response_raw = _canonical_document_object(response_bytes, code=code)
+        response = JudgeResponse.model_validate(response_raw)
+        if canonical_json_bytes(response.model_dump(mode="json", warnings="error")) != (
+            response_bytes
+        ):
+            raise ValueError("qualification response is not exact")
+        judgment = CaseAdmissionJudgment.model_validate(response.payload)
+        if canonical_json_bytes(
+            judgment.model_dump(mode="json", warnings="error")
+        ) != canonical_json_bytes(response.payload):
+            raise ValueError("qualification judgment is not exact")
+        checks = tuple(judgment.checks)
+        check_codes = [check.code for check in checks]
+        source_ids = {source.source_id for source in case.sources}
+        if (
+            response.operation is not JudgeOperation.ADMIT_CASE
+            or response.request_fingerprint != receipt.request_fingerprint
+            or judgment.request_fingerprint != receipt.request_fingerprint
+            or model_fingerprint(judgment) != receipt.judgment_fingerprint
+            or manifest.call.request_fingerprint != receipt.request_fingerprint
+            or manifest.call.judgment_fingerprint != receipt.judgment_fingerprint
+            or len(check_codes) != len(_ADMISSION_CHECK_CODES)
+            or set(check_codes) != _ADMISSION_CHECK_CODES
+            or any(
+                type(check.satisfied) is not bool
+                or type(check.material) is not bool
+                or not set(check.source_ids).issubset(source_ids)
+                for check in checks
+            )
+        ):
+            raise ValueError("qualification admission evidence is invalid")
+
+        sources_by_id = {source.source_id: source for source in case.sources}
+        observed_treatment_ids: list[str] = []
+        treatments: list[QualificationLanguageTreatmentV1] = []
+        for treatment in case.language_treatments:
+            observed_treatment_ids.extend(treatment.source_ids)
+            treatment_sources = tuple(
+                QualificationLanguageSourceV1(
+                    source_id=sources_by_id[source_id].source_id,
+                    content_hash=sources_by_id[source_id].content_hash,
+                    language=sources_by_id[source_id].language,
+                )
+                for source_id in treatment.source_ids
+            )
+            limitations = treatment.limitations
+            treatments.append(
+                QualificationLanguageTreatmentV1(
+                    sources=treatment_sources,
+                    method=treatment.method,
+                    rationale=treatment.rationale,
+                    limitation_status=("NOT_DECLARED" if limitations is None else "DECLARED"),
+                    limitation_text=limitations,
+                )
+            )
+        expected_source_ids = [source.source_id for source in case.sources]
+        if len(observed_treatment_ids) != len(set(observed_treatment_ids)) or set(
+            observed_treatment_ids
+        ) != set(expected_source_ids):
+            raise ValueError("qualification language treatment coverage is invalid")
+
+        return QualificationLimitsV1(
+            case_schema_version="1.1",
+            admission_status="qualified",
+            qualification_readiness="ADMITTED",
+            qualification_root=manifest.root_hash,
+            qualification_receipt_fingerprint=receipt.receipt_fingerprint,
+            case_fingerprint=receipt.case_fingerprint,
+            source_record_fingerprint=receipt.source_record_fingerprint,
+            request_fingerprint=receipt.request_fingerprint,
+            judgment_fingerprint=receipt.judgment_fingerprint,
+            requested_authorities=tuple(
+                QualificationRequestedAuthorityV1(
+                    authority_id=authority.authority_id,
+                    title=authority.title,
+                    jurisdiction=authority.jurisdiction,
+                    authority_type=authority.authority_type,
+                    source_ids=tuple(authority.source_ids),
+                )
+                for authority in case.requested_authorities
+            ),
+            admission_checks=tuple(
+                QualificationAdmissionCheckV1(
+                    code=check.code,
+                    satisfied=check.satisfied,
+                    material=check.material,
+                    rationale=check.rationale,
+                    source_ids=tuple(check.source_ids),
+                )
+                for check in checks
+            ),
+            admission_issues=tuple(
+                QualificationAdmissionIssueV1(
+                    code=issue.code,
+                    severity=issue.severity.value,
+                    message=issue.message,
+                    related_ids=tuple(issue.related_ids),
+                )
+                for issue in judgment.issues
+            ),
+            receipt_readiness=QualificationReceiptReadinessV1(
+                status="ADMITTED",
+                issue_codes=tuple(receipt.readiness.issue_codes),
+                rationale=receipt.readiness.rationale,
+            ),
+            language_treatments=tuple(treatments),
+        )
+    except ReadinessInputError:
+        raise
+    except (
+        AttributeError,
+        EvaluationIntegrityError,
+        KeyError,
         OSError,
         RecursionError,
         TypeError,
@@ -1081,6 +1386,7 @@ def _load_rubric_and_bytes() -> tuple[ReadinessRubricV1, bytes]:
 def build_verified_readiness_input_v1(
     *,
     baseline_run_dir: Path,
+    qualification_run_dir: Path,
     generation_run_dir: Path,
     validation_receipt_path: Path,
     historical_v22_run_dir: Path | None = None,
@@ -1088,6 +1394,10 @@ def build_verified_readiness_input_v1(
 ) -> VerifiedReadinessInputsV1:
     """Verify and bind all readiness inputs without creating or modifying a run."""
     baseline_context, projection = _load_verified_baseline(baseline_run_dir)
+    qualification_limits = _load_qualification_limits(
+        qualification_run_dir,
+        projection,
+    )
 
     history_supplied = historical_v22_run_dir is not None
     label_supplied = historical_anonymous_label is not None
@@ -1122,10 +1432,8 @@ def build_verified_readiness_input_v1(
     if sha256_digest(scoring_bytes) != projection.binding.evaluation_rubric_fingerprint:
         raise _fail("READINESS_RUBRIC_INVALID")
     qualification_binding = QualificationReadinessBindingV1(
-        qualification_root=projection.baseline_input.qualification_root,
-        qualification_receipt_fingerprint=(
-            projection.baseline_input.qualification_receipt_fingerprint
-        ),
+        qualification_root=qualification_limits.qualification_root,
+        qualification_receipt_fingerprint=(qualification_limits.qualification_receipt_fingerprint),
         qualification_readiness="ADMITTED",
     )
     readiness_input = ReadinessInputV1(
@@ -1148,6 +1456,7 @@ def build_verified_readiness_input_v1(
         report_hash=report_hash,
         source_record=projection.baseline_input.sources,
         qualification_binding=qualification_binding,
+        qualification_limits=qualification_limits,
         generation_binding=generation_binding,
         generation_validation=readiness_input.generation_validation,
         readiness_rubric=rubric,
@@ -1159,7 +1468,14 @@ def build_verified_readiness_input_v1(
 
 __all__ = [
     "GenerationCapsuleBindingV1",
+    "QualificationAdmissionCheckV1",
+    "QualificationAdmissionIssueV1",
+    "QualificationLanguageSourceV1",
+    "QualificationLanguageTreatmentV1",
+    "QualificationLimitsV1",
     "QualificationReadinessBindingV1",
+    "QualificationReceiptReadinessV1",
+    "QualificationRequestedAuthorityV1",
     "ReadinessInputError",
     "VerifiedReadinessInputsV1",
     "build_verified_readiness_input_v1",

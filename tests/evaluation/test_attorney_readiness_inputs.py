@@ -7,14 +7,15 @@ import os
 import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
 
 import pytest
-from test_attorney_baseline_artifacts import _complete_graph
+import test_attorney_baseline_artifacts as baseline_artifact_tests
+from test_attorney_baseline_artifacts import _baseline_input, _complete_graph
 
 import regulatory_harvest.evaluation.attorney_readiness_inputs as inputs_module
 from regulatory_harvest.analysis import (
@@ -45,6 +46,22 @@ from regulatory_harvest.evaluation.attorney_generation import (
     load_completed_generation_capsule_context,
     next_generation_request,
     submit_generation_response,
+)
+from regulatory_harvest.evaluation.attorney_models import (
+    AdmissionCheck,
+    CaseAdmissionJudgment,
+    EvaluationMode,
+    JudgeIsolation,
+    JudgeOperation,
+    JudgeResponse,
+    QualificationCase,
+    QualificationLanguageTreatment,
+)
+from regulatory_harvest.evaluation.attorney_qualification import (
+    initialize_case_qualification,
+    load_verified_qualification_context,
+    next_qualification_request,
+    submit_case_qualification,
 )
 from regulatory_harvest.evaluation.attorney_readiness_inputs import (
     ReadinessInputError,
@@ -82,16 +99,107 @@ def _tree(root: Path) -> dict[str, bytes]:
     }
 
 
+_DECLARED_LIMITATION = "Review was limited to the retained fictional English text."
+
+
+def _write_qualification(
+    run_dir: Path,
+    *,
+    language: str = "en",
+    limitations: str | None = _DECLARED_LIMITATION,
+) -> BaselineInputV1:
+    seed = _baseline_input()
+    source_payloads = [source.model_dump(mode="json") for source in seed.sources]
+    for source in source_payloads:
+        source["language"] = language
+        source["version"] = "2026-08-24"
+    case = QualificationCase.model_validate(
+        {
+            "schema_version": "1.1",
+            "case_id": "synthetic-readiness-qualification",
+            "mode": EvaluationMode.CURRENT_LAW,
+            "question": seed.question,
+            "jurisdiction": seed.jurisdiction,
+            "as_of": seed.as_of,
+            "requested_authorities": [
+                item.model_dump(mode="json") for item in seed.requested_authorities
+            ],
+            "sources": source_payloads,
+            "build_binding": {
+                "commit": "a" * 40,
+                "archive_sha256": "b" * 64,
+            },
+            "language_treatments": [
+                {
+                    "source_ids": [cast(str, source["source_id"]) for source in source_payloads],
+                    "method": f"Original-language review of the fictional {language} source.",
+                    "rationale": f"The retained fictional source declares language {language}.",
+                    "limitations": limitations,
+                }
+            ],
+        }
+    )
+    initialize_case_qualification(case, run_dir, nonce_hex="1" * 64)
+    request = next_qualification_request(run_dir)
+    assert request is not None
+    source_ids = [source.source_id for source in case.sources]
+    checks = [
+        AdmissionCheck(
+            code=code,
+            satisfied=True,
+            material=True,
+            rationale=f"The retained sources satisfy {code} for this fictional case.",
+            source_ids=source_ids,
+        )
+        for code in (
+            "AUTHORITY_ALIGNMENT",
+            "OPERATIVE_TEXT",
+            "CURRENTNESS_EVIDENCE",
+            "LANGUAGE_RESOLUTION",
+            "SOURCE_PARITY",
+        )
+    ]
+    judgment = CaseAdmissionJudgment(
+        request_fingerprint=request.request_fingerprint,
+        checks=checks,
+        issues=[],
+    )
+    submit_case_qualification(
+        run_dir,
+        JudgeResponse(
+            operation=JudgeOperation.ADMIT_CASE,
+            request_fingerprint=request.request_fingerprint,
+            provider_name="private-fixture-provider",
+            model_name="private-fixture-model",
+            judge_isolation=JudgeIsolation.FRESH_CONTEXT,
+            payload=judgment.model_dump(mode="json"),
+        ),
+    )
+    qualification = load_verified_qualification_context(run_dir)
+    assert qualification.receipt.readiness.status.value == "ADMITTED", (
+        qualification.receipt.readiness.issue_codes
+    )
+    return BaselineInputV1.from_verified_qualification(
+        qualification,
+        client_facts=seed.client_facts,
+        compiler_contract=seed.compiler_contract,
+        evaluation_rubric=seed.evaluation_rubric_bytes,
+        importance_policy=seed.importance_policy_bytes,
+    )
+
+
 class VerifiedInputsFixture:
     def __init__(
         self,
         *,
+        qualification_run_dir: Path,
         baseline_run_dir: Path,
         generation_run_dir: Path,
         validation_receipt_path: Path,
         baseline_context: VerifiedBaselineContextV1,
         report_text: str,
     ) -> None:
+        self.qualification_run_dir = qualification_run_dir
         self.baseline_run_dir = baseline_run_dir
         self.generation_run_dir = generation_run_dir
         self.validation_receipt_path = validation_receipt_path
@@ -100,6 +208,7 @@ class VerifiedInputsFixture:
 
     def without_history(self) -> dict[str, object]:
         return {
+            "qualification_run_dir": self.qualification_run_dir,
             "baseline_run_dir": self.baseline_run_dir,
             "generation_run_dir": self.generation_run_dir,
             "validation_receipt_path": self.validation_receipt_path,
@@ -561,21 +670,42 @@ def _write_validation_matter(
     return receipt_path, report_text
 
 
-@pytest.fixture
-def verified_inputs(tmp_path: Path) -> VerifiedInputsFixture:
-    _, files_by_path, manifest = _complete_graph()
-    baseline_run = tmp_path / "baseline-run"
+def _make_verified_inputs(
+    root: Path,
+    *,
+    language: str = "en",
+    limitations: str | None = _DECLARED_LIMITATION,
+) -> VerifiedInputsFixture:
+    qualification_run = root / "qualification-run"
+    baseline_input = _write_qualification(
+        qualification_run,
+        language=language,
+        limitations=limitations,
+    )
+    original = baseline_artifact_tests._baseline_input
+    baseline_artifact_tests._baseline_input = lambda: baseline_input
+    try:
+        _, files_by_path, manifest = _complete_graph()
+    finally:
+        baseline_artifact_tests._baseline_input = original
+    baseline_run = root / "baseline-run"
     initialize_baseline_storage_v1(baseline_run, manifest, files_by_path)
     context = load_verified_baseline_run(baseline_run)
-    receipt_path, report_text = _write_validation_matter(tmp_path, context)
-    generation_run = _write_generation_capsule(tmp_path, context, report_text)
+    receipt_path, report_text = _write_validation_matter(root, context)
+    generation_run = _write_generation_capsule(root, context, report_text)
     return VerifiedInputsFixture(
+        qualification_run_dir=qualification_run,
         baseline_run_dir=baseline_run,
         generation_run_dir=generation_run,
         validation_receipt_path=receipt_path,
         baseline_context=context,
         report_text=report_text,
     )
+
+
+@pytest.fixture
+def verified_inputs(tmp_path: Path) -> VerifiedInputsFixture:
+    return _make_verified_inputs(tmp_path)
 
 
 def _historical_context(
@@ -712,6 +842,286 @@ def test_valid_admission_preserves_exact_verified_objects_and_bindings(
     assert admitted.readiness_input.generation_validation.status == "completed"
     assert not hasattr(admitted, "grader_lanes")
     assert _tree(verified_inputs.baseline_run_dir.parent) == before
+
+
+def test_qualification_limits_preserve_checks_receipt_and_declared_language_limit(
+    verified_inputs: VerifiedInputsFixture,
+) -> None:
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    limits = admitted.qualification_limits
+    qualification = load_verified_qualification_context(verified_inputs.qualification_run_dir)
+    baseline_input = verified_inputs.baseline_context.baseline_input
+
+    assert limits.qualification_readiness == "ADMITTED"
+    assert limits.qualification_root == qualification.manifest.root_hash
+    assert limits.qualification_receipt_fingerprint == (qualification.receipt.receipt_fingerprint)
+    assert limits.source_record_fingerprint == baseline_input.source_record_fingerprint
+    assert limits.request_fingerprint == qualification.receipt.request_fingerprint
+    assert limits.judgment_fingerprint == qualification.receipt.judgment_fingerprint
+    assert [item.code for item in limits.admission_checks] == [
+        "AUTHORITY_ALIGNMENT",
+        "OPERATIVE_TEXT",
+        "CURRENTNESS_EVIDENCE",
+        "LANGUAGE_RESOLUTION",
+        "SOURCE_PARITY",
+    ]
+    assert all(item.satisfied is True and item.material is True for item in limits.admission_checks)
+    assert limits.admission_issues == ()
+    assert limits.receipt_readiness.status == "ADMITTED"
+    assert limits.receipt_readiness.issue_codes == ()
+    assert limits.receipt_readiness.rationale == (qualification.receipt.readiness.rationale)
+    assert not hasattr(limits, "qualification_finding")
+    assert tuple(asdict(item) for item in limits.requested_authorities) == tuple(
+        {
+            "authority_id": item.authority_id,
+            "title": item.title,
+            "jurisdiction": item.jurisdiction,
+            "authority_type": item.authority_type,
+            "source_ids": tuple(item.source_ids),
+        }
+        for item in baseline_input.requested_authorities
+    )
+    assert len(limits.language_treatments) == 1
+    treatment = limits.language_treatments[0]
+    assert treatment.method == "Original-language review of the fictional en source."
+    assert treatment.rationale == "The retained fictional source declares language en."
+    assert treatment.limitation_status == "DECLARED"
+    assert treatment.limitation_text == _DECLARED_LIMITATION
+    assert tuple(
+        (item.source_id, item.content_hash, item.language) for item in treatment.sources
+    ) == (
+        (
+            baseline_input.sources[0].source_id,
+            baseline_input.sources[0].content_hash,
+            "en",
+        ),
+    )
+
+
+def test_non_english_qualification_without_declared_limit_does_not_invent_one(
+    tmp_path: Path,
+) -> None:
+    fixture = _make_verified_inputs(tmp_path, language="fr", limitations=None)
+    admitted = build_verified_readiness_input_v1(**fixture.without_history())
+
+    treatment = admitted.qualification_limits.language_treatments[0]
+    assert treatment.sources[0].language == "fr"
+    assert treatment.limitation_status == "NOT_DECLARED"
+    assert treatment.limitation_text is None
+
+
+def test_resealed_qualification_treatment_change_is_rejected(
+    verified_inputs: VerifiedInputsFixture,
+    tmp_path: Path,
+) -> None:
+    changed_run = tmp_path / "resealed-qualification"
+    _write_qualification(
+        changed_run,
+        limitations="A different declared qualification limitation.",
+    )
+    kwargs = verified_inputs.without_history()
+    kwargs["qualification_run_dir"] = changed_run
+
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**kwargs)
+
+
+def test_missing_or_invalid_qualification_capsule_is_wrapped_and_write_free(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = _tree(verified_inputs.baseline_run_dir.parent)
+
+    def fail(_: Path) -> object:
+        raise EvaluationIntegrityError("qualification capsule is not terminal")
+
+    monkeypatch.setattr(inputs_module, "load_verified_qualification_context", fail)
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+    assert _tree(verified_inputs.baseline_run_dir.parent) == before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "root",
+        "receipt",
+        "readiness",
+        "source-record",
+        "request",
+        "judgment",
+        "question",
+        "jurisdiction",
+        "as-of",
+        "requested-authorities",
+        "sources",
+    ],
+)
+def test_qualification_capsule_must_exactly_bind_verified_baseline(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    context = load_verified_qualification_context(verified_inputs.qualification_run_dir)
+    manifest = context.manifest
+    receipt = context.receipt
+    case = context.case
+    artifacts = dict(context.artifact_bytes)
+    if mutation == "root":
+        manifest = manifest.model_copy(update={"root_hash": "0" * 64})
+    elif mutation == "receipt":
+        receipt = receipt.model_copy(update={"receipt_fingerprint": "0" * 64})
+    elif mutation == "readiness":
+        readiness = receipt.readiness.model_copy(update={"status": "CASE_INVALID"})
+        receipt = receipt.model_copy(update={"readiness": readiness})
+    elif mutation == "source-record":
+        receipt = receipt.model_copy(update={"source_record_fingerprint": "0" * 64})
+    elif mutation == "request":
+        receipt = receipt.model_copy(update={"request_fingerprint": "0" * 64})
+    elif mutation == "judgment":
+        receipt = receipt.model_copy(update={"judgment_fingerprint": "0" * 64})
+    elif mutation == "question":
+        case = case.model_copy(update={"question": "A different legal question?"})
+    elif mutation == "jurisdiction":
+        case = case.model_copy(update={"jurisdiction": "Different"})
+    elif mutation == "as-of":
+        case = case.model_copy(update={"as_of": date(2026, 8, 23)})
+    elif mutation == "requested-authorities":
+        authority = case.requested_authorities[0].model_copy(
+            update={"title": "Different authority"}
+        )
+        case = case.model_copy(update={"requested_authorities": [authority]})
+    else:
+        source = case.sources[0].model_copy(update={"title": "Different source"})
+        case = case.model_copy(update={"sources": [source]})
+    if mutation in {
+        "question",
+        "jurisdiction",
+        "as-of",
+        "requested-authorities",
+        "sources",
+    }:
+        artifacts["qualification-case.json"] = canonical_json_bytes(case.model_dump(mode="json"))
+    changed = replace(
+        context,
+        manifest=manifest,
+        receipt=receipt,
+        case=case,
+        artifact_bytes=artifacts,
+    )
+    monkeypatch.setattr(
+        inputs_module,
+        "load_verified_qualification_context",
+        lambda _: changed,
+    )
+
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+@pytest.mark.parametrize("field", ["method", "rationale", "limitations"])
+def test_tampered_qualification_language_treatment_is_rejected(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    context = load_verified_qualification_context(verified_inputs.qualification_run_dir)
+    treatment = context.case.language_treatments[0].model_copy(
+        update={field: "Tampered treatment evidence."}
+    )
+    changed_case = context.case.model_copy(update={"language_treatments": [treatment]})
+    monkeypatch.setattr(
+        inputs_module,
+        "load_verified_qualification_context",
+        lambda _: replace(context, case=changed_case),
+    )
+
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "native-bool"])
+def test_qualification_admission_checks_are_strict_and_exact(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    context = load_verified_qualification_context(verified_inputs.qualification_run_dir)
+    raw = json.loads(context.artifact_bytes["admission-response.json"])
+    checks = raw["payload"]["checks"]
+    if mutation == "missing":
+        checks.pop()
+    elif mutation == "duplicate":
+        checks[-1] = checks[0]
+    else:
+        checks[0]["satisfied"] = 1
+    artifacts = dict(context.artifact_bytes)
+    artifacts["admission-response.json"] = canonical_json_bytes(raw)
+    monkeypatch.setattr(
+        inputs_module,
+        "load_verified_qualification_context",
+        lambda _: replace(context, artifact_bytes=artifacts),
+    )
+
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate", "wrong-source"])
+def test_qualification_language_treatment_coverage_is_revalidated(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    context = load_verified_qualification_context(verified_inputs.qualification_run_dir)
+    original = context.case.language_treatments[0]
+    wrong = original.model_copy(update={"source_ids": ["wrong-source"]})
+    if mutation == "missing":
+        treatments: list[QualificationLanguageTreatment] = []
+    elif mutation == "extra":
+        treatments = [original, wrong]
+    elif mutation == "duplicate":
+        treatments = [original, original]
+    else:
+        treatments = [wrong]
+    changed_case = context.case.model_copy(update={"language_treatments": treatments})
+    monkeypatch.setattr(
+        inputs_module,
+        "load_verified_qualification_context",
+        lambda _: replace(context, case=changed_case),
+    )
+
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+
+
+def test_qualification_limits_are_detached_immutable_and_path_free(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = load_verified_qualification_context(verified_inputs.qualification_run_dir)
+    monkeypatch.setattr(
+        inputs_module,
+        "load_verified_qualification_context",
+        lambda _: context,
+    )
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    limits = admitted.qualification_limits
+    limitation = limits.language_treatments[0].limitation_text
+    context.case.language_treatments[0].limitations = "Mutated after admission."
+
+    assert limits.language_treatments[0].limitation_text == limitation
+    with pytest.raises(FrozenInstanceError):
+        limits.qualification_root = "0" * 64  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        limits.language_treatments[0].limitation_text = None  # type: ignore[misc]
+    wire = json.dumps(asdict(limits), sort_keys=True).encode("utf-8")
+    assert str(verified_inputs.qualification_run_dir).encode("utf-8") not in wire
+    assert b"private-fixture-provider" not in wire
+    assert b"private-fixture-model" not in wire
+    assert verified_inputs.report_text.encode("utf-8") not in wire
+    for source in verified_inputs.baseline_context.baseline_input.sources:
+        assert source.normalized_text.encode("utf-8") not in wire
 
 
 def test_persistable_input_contains_no_private_path(
@@ -1156,6 +1566,7 @@ def test_baseline_projection_precedes_optional_history_argument_rejection(
     real_load = inputs_module.load_verified_baseline_run
     real_project = inputs_module.project_gradeable_baseline_v1
     real_verify = inputs_module.verify_gradeable_baseline_projection_v1
+    real_qualification = inputs_module.load_verified_qualification_context
 
     def load(path: Path):
         calls.append("load")
@@ -1169,6 +1580,10 @@ def test_baseline_projection_precedes_optional_history_argument_rejection(
         calls.append("verify")
         return real_verify(context, candidate)
 
+    def qualification(path: Path):
+        calls.append("qualification")
+        return real_qualification(path)
+
     monkeypatch.setattr(inputs_module, "load_verified_baseline_run", load)
     monkeypatch.setattr(inputs_module, "project_gradeable_baseline_v1", project)
     monkeypatch.setattr(
@@ -1176,12 +1591,17 @@ def test_baseline_projection_precedes_optional_history_argument_rejection(
         "verify_gradeable_baseline_projection_v1",
         verify,
     )
+    monkeypatch.setattr(
+        inputs_module,
+        "load_verified_qualification_context",
+        qualification,
+    )
     with pytest.raises(ReadinessInputError, match="READINESS_HISTORICAL_ARGUMENTS_INVALID"):
         build_verified_readiness_input_v1(
             **verified_inputs.without_history(),
             historical_v22_run_dir=Path("history"),
         )
-    assert calls == ["load", "project", "verify"]
+    assert calls == ["load", "project", "verify", "qualification"]
 
 
 def _admit_history(
