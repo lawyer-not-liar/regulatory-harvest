@@ -89,22 +89,25 @@ def _unique_nonblank(values: tuple[str, ...], *, location: str) -> tuple[str, ..
 
 
 def _unique_exact_passages(values: object, *, location: str) -> object:
-    if not isinstance(values, (list, tuple)):
-        return values
-    exact_values = tuple(values)
+    if type(values) not in {list, tuple} and type(values) is not _FrozenWireTuple:
+        raise ValueError(f"{location} must use a built-in list or tuple")
+    checked_values = cast(list[object] | tuple[object, ...], values)
+    exact_values: tuple[object, ...] = tuple(checked_values)
     if any(type(value) is not str for value in exact_values):
         raise ValueError(f"{location} must contain native strings")
-    if any(not value.strip() for value in exact_values):
+    exact_strings = cast(tuple[str, ...], exact_values)
+    if any(not value.strip() for value in exact_strings):
         raise ValueError(f"{location} must not contain blank values")
-    if len(exact_values) != len(set(exact_values)):
+    if len(exact_strings) != len(set(exact_strings)):
         raise ValueError(f"{location} must be unique by exact bytes")
     return values
 
 
 def _validate_requirement_grade_passages(values: object) -> object:
-    if not isinstance(values, (list, tuple)):
-        return values
-    for grade in values:
+    if type(values) not in {list, tuple} and type(values) is not _FrozenWireTuple:
+        raise ValueError("requirement grades must use a built-in list or tuple")
+    checked_values = cast(list[object] | tuple[object, ...], values)
+    for grade in checked_values:
         if type(grade) is dict and "report_passages" in grade:
             _unique_exact_passages(
                 grade["report_passages"],
@@ -315,6 +318,10 @@ def _wire_snapshot_inner(
         raise ValueError("readiness model wire snapshot exceeds resource limits")
     if isinstance(value, Mapping) and not isinstance(value, dict):
         raise ValueError("readiness model wire snapshot requires a built-in mapping")
+    if isinstance(value, tuple) and type(value) not in {tuple, _FrozenWireTuple}:
+        raise ValueError("readiness model wire snapshot requires built-in tuples")
+    if isinstance(value, list) and type(value) not in {list, _FrozenJsonList}:
+        raise ValueError("readiness model wire snapshot requires built-in lists")
     if type(value) is GradeableBaselineProjectionV1:
         return _wire_snapshot_inner(
             _exact_gradeable_projection_wire(

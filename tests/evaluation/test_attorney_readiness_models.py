@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from hashlib import sha256
 from pathlib import Path
 from typing import cast
@@ -430,10 +431,10 @@ def test_rationale_normalization_remains_trimmed() -> None:
 
 
 def exact_passage_cases(
-    passages: tuple[object, ...],
+    passages: object,
 ) -> list[tuple[type[BaseModel], dict[str, object], str]]:
     grade = valid_grade()
-    grade["report_passages"] = list(passages)
+    grade["report_passages"] = passages
     return [
         (
             BaselineLockedGradeFragmentV1,
@@ -486,6 +487,89 @@ def passage_case_value(checked: object, field: str) -> tuple[object, ...]:
 
 
 EXACT_EVIDENCE_PASSAGES = ("  Exact report passage.  \n", "Exact report passage.")
+
+
+class PassageListSubclass(list[object]):
+    pass
+
+
+class PassageTupleSubclass(tuple[object, ...]):
+    pass
+
+
+class ExplodingPassageIterable:
+    def __init__(self, iterations: list[str]) -> None:
+        self.iterations = iterations
+
+    def __iter__(self) -> object:
+        self.iterations.append("custom iterable")
+        raise AssertionError("custom passage iterable must not be consumed")
+
+
+def non_native_passage_container(kind: str, iterations: list[str]) -> object:
+    if kind == "set":
+        return {"Exact report passage."}
+    if kind == "deque":
+        return deque(("Exact report passage.",))
+    if kind == "generator":
+
+        def unbounded_generator() -> object:
+            while True:
+                iterations.append("generator")
+                raise AssertionError("unbounded passage generator must not be consumed")
+                yield "Exact report passage."
+
+        return unbounded_generator()
+    if kind == "custom_iterable":
+        return ExplodingPassageIterable(iterations)
+    if kind == "list_subclass":
+        return PassageListSubclass(("Exact report passage.",))
+    if kind == "tuple_subclass":
+        return PassageTupleSubclass(("Exact report passage.",))
+    raise AssertionError(f"unknown test container: {kind}")
+
+
+def non_native_passage_cases(
+    passages: object,
+) -> list[tuple[type[BaseModel], dict[str, object], str]]:
+    cases = exact_passage_cases(passages)
+    flattened_grade = valid_grade()
+    flattened_grade["report_passages"] = passages
+    cases.append(
+        (
+            BaselineLockedGraderAggregateV1,
+            valid_aggregate(requirement_grades=(flattened_grade,)),
+            "aggregate_requirement_grade",
+        )
+    )
+    return cases
+
+
+def non_native_requirement_grades_container(kind: str, iterations: list[str]) -> object:
+    grade = valid_grade()
+    if kind == "set":
+        forged = RequirementGradeV2.model_construct(
+            **(grade | {"report_passages": ("The report addresses the requirement.",)})
+        )
+        return {forged}
+    if kind == "deque":
+        return deque((grade,))
+    if kind == "generator":
+
+        def unbounded_generator() -> object:
+            while True:
+                iterations.append("grade generator")
+                raise AssertionError("unbounded grade generator must not be consumed")
+                yield grade
+
+        return unbounded_generator()
+    if kind == "custom_iterable":
+        return ExplodingPassageIterable(iterations)
+    if kind == "list_subclass":
+        return PassageListSubclass((grade,))
+    if kind == "tuple_subclass":
+        return PassageTupleSubclass((grade,))
+    raise AssertionError(f"unknown test container: {kind}")
 
 
 @pytest.mark.parametrize(
@@ -556,6 +640,82 @@ def test_aggregate_flattened_passages_reject_non_native_string_laundering() -> N
                 requirement_grades=(flattened_grade,),
             )
         )
+
+
+@pytest.mark.parametrize("case_index", range(9))
+@pytest.mark.parametrize(
+    "container_kind",
+    (
+        "set",
+        "deque",
+        "generator",
+        "custom_iterable",
+        "list_subclass",
+        "tuple_subclass",
+    ),
+)
+def test_exact_evidence_passages_reject_non_native_containers_without_iteration(
+    case_index: int,
+    container_kind: str,
+) -> None:
+    iterations: list[str] = []
+    container = non_native_passage_container(container_kind, iterations)
+    model, value, _ = non_native_passage_cases(container)[case_index]
+
+    with pytest.raises(ValidationError):
+        model.model_validate(value)
+    assert iterations == []
+
+
+@pytest.mark.parametrize("case_index", range(8))
+@pytest.mark.parametrize("container", [list(EXACT_EVIDENCE_PASSAGES), EXACT_EVIDENCE_PASSAGES])
+def test_exact_evidence_passages_accept_only_builtin_wire_sequences(
+    case_index: int,
+    container: list[str] | tuple[str, ...],
+) -> None:
+    model, value, field = exact_passage_cases(container)[case_index]
+
+    checked = model.model_validate(value)
+
+    assert passage_case_value(checked, field) == EXACT_EVIDENCE_PASSAGES
+
+
+@pytest.mark.parametrize(
+    "model,value_factory",
+    (
+        (
+            BaselineLockedGradeFragmentV1,
+            lambda grades: valid_fragment(requirement_grades=grades),
+        ),
+        (
+            BaselineLockedGraderAggregateV1,
+            lambda grades: valid_aggregate(requirement_grades=grades),
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "container_kind",
+    (
+        "set",
+        "deque",
+        "generator",
+        "custom_iterable",
+        "list_subclass",
+        "tuple_subclass",
+    ),
+)
+def test_imported_grade_inventory_rejects_non_native_outer_containers_without_iteration(
+    model: type[BaseModel],
+    value_factory: object,
+    container_kind: str,
+) -> None:
+    iterations: list[str] = []
+    grades = non_native_requirement_grades_container(container_kind, iterations)
+    value = value_factory(grades)  # type: ignore[operator]
+
+    with pytest.raises(ValidationError):
+        model.model_validate(value)
+    assert iterations == []
 
 
 def test_readiness_policy_has_exact_canonical_bytes_and_versioned_thresholds() -> None:
