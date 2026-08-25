@@ -84,7 +84,11 @@ def _normalise_statement(value: str) -> str:
 
 def _checked_input(value: BaselineInputV1) -> BaselineInputV1:
     try:
-        checked = _validate_baseline_input(value)
+        rehydrated = cast(
+            BaselineInputV1,
+            strict_baseline_model_v1(BaselineInputV1, value),
+        )
+        checked = _validate_baseline_input(rehydrated)
         if checked.legal_input_fingerprint != legal_input_fingerprint_v1(checked):
             raise ValueError
         return checked
@@ -570,6 +574,15 @@ def aggregate_baseline_referees_v1(
             expected = (correction.importance, correction.importance_basis)
         else:
             expected = None
+        if decision.decision == "unresolved" and dispute.importance_finding is not None:
+            reviewer_importance = _selected_importance(dispute)
+            finding = dispute.importance_finding
+            alternatives = {
+                reviewer_importance,
+                (finding.reviewed_importance, finding.reviewed_importance_basis),
+            }
+            if (decision.importance, decision.importance_basis) not in alternatives:
+                raise BaselineCompilationError("BASELINE_REFEREE_DECISION")
         if decision.decision != "unresolved" and (
             expected is None
             or decision.importance != expected[0]
@@ -642,12 +655,37 @@ def _requirement(
     )
 
 
-def _relationships(
+def _requirement_alternatives(
     requirements: tuple[BaselineRequirementV1, ...],
-) -> tuple[BaselineRelationshipV1, ...]:
-    by_statement = {
-        _normalise_statement(item.statement): item.requirement_id for item in requirements
-    }
+    contested: tuple[ContestedBaselineRequirementV1, ...],
+) -> tuple[BaselineRequirementV1, ...]:
+    return (
+        *requirements,
+        *(
+            alternative
+            for item in contested
+            for alternative in (item.reviewer_alternative, item.auditor_alternative)
+            if alternative is not None
+        ),
+    )
+
+
+def _dependency_edges(
+    requirements: tuple[BaselineRequirementV1, ...],
+    contested: tuple[ContestedBaselineRequirementV1, ...],
+) -> set[
+    tuple[
+        Literal["depends_on", "exception_to", "defines", "enforced_by"],
+        str,
+        str,
+    ]
+]:
+    alternatives = _requirement_alternatives(requirements, contested)
+    by_statement: dict[str, set[str]] = {}
+    for item in alternatives:
+        by_statement.setdefault(_normalise_statement(item.statement), set()).add(
+            item.requirement_id
+        )
     edges: list[
         tuple[
             Literal["depends_on", "exception_to", "defines", "enforced_by"],
@@ -655,17 +693,25 @@ def _relationships(
             str,
         ]
     ] = []
-    for requirement in requirements:
+    for requirement in alternatives:
         dependency = requirement.dependency
         if dependency is None:
             continue
-        target = by_statement.get(_normalise_statement(dependency.target_statement))
-        if target is None:
+        targets = by_statement.get(_normalise_statement(dependency.target_statement), set())
+        if len(targets) != 1:
             raise BaselineCompilationError("BASELINE_RELATIONSHIP_ENDPOINT")
+        target = next(iter(targets))
+        if target == requirement.requirement_id:
+            raise BaselineCompilationError("BASELINE_RELATIONSHIP_SELF_REFERENCE")
         edges.append((dependency.relationship, requirement.requirement_id, target))
-    ordered = sorted(edges)
-    if len(ordered) != len(set(ordered)):
-        raise BaselineCompilationError("BASELINE_RELATIONSHIP_DUPLICATE")
+    return set(edges)
+
+
+def _relationships(
+    requirements: tuple[BaselineRequirementV1, ...],
+    contested: tuple[ContestedBaselineRequirementV1, ...],
+) -> tuple[BaselineRelationshipV1, ...]:
+    ordered = sorted(_dependency_edges(requirements, contested))
     return tuple(
         BaselineRelationshipV1(
             relationship_id=f"REL-{index:04d}",
@@ -675,6 +721,34 @@ def _relationships(
         )
         for index, edge in enumerate(ordered, 1)
     )
+
+
+def _validate_relationship_inventory(
+    requirements: tuple[BaselineRequirementV1, ...],
+    contested: tuple[ContestedBaselineRequirementV1, ...],
+    relationships: tuple[BaselineRelationshipV1, ...],
+) -> None:
+    known = {
+        item.requirement_id
+        for item in _requirement_alternatives(requirements, contested)
+    }
+    actual = {
+        (item.relationship, item.source_requirement_id, item.target_requirement_id)
+        for item in relationships
+    }
+    if len(actual) != len(relationships) or any(
+        item.source_requirement_id not in known
+        or item.target_requirement_id not in known
+        for item in relationships
+    ):
+        raise BaselineCompilationError("BASELINE_RELATIONSHIP_ENDPOINT")
+    if any(
+        item.source_requirement_id == item.target_requirement_id
+        for item in relationships
+    ):
+        raise BaselineCompilationError("BASELINE_RELATIONSHIP_SELF_REFERENCE")
+    if not _dependency_edges(requirements, contested).issubset(actual):
+        raise BaselineCompilationError("BASELINE_RELATIONSHIP_DEPENDENCY")
 
 
 def _contest_requirement(
@@ -850,7 +924,6 @@ def compile_canonical_baseline_v1(
         _requirement(item, requirement_id=f"REQ-{index:04d}", canonical_order=index - 1)
         for index, item in enumerate(ordered, 1)
     )
-    relationships = _relationships(requirements)
     contest_order = sorted(
         contests,
         key=lambda item: canonical_json_bytes(
@@ -874,6 +947,8 @@ def compile_canonical_baseline_v1(
         )
         for index, item in enumerate(contest_order, 1)
     )
+    relationships = _relationships(requirements, contested)
+    _validate_relationship_inventory(requirements, contested, relationships)
     provenance = BaselineProvenanceV1(
         legal_input_fingerprint=checked_input.legal_input_fingerprint,
         source_review_aggregate_fingerprint=checked_review.aggregate_fingerprint,
@@ -927,6 +1002,11 @@ def _checked_prior_baseline(
             ):
                 if alternative is not None:
                     _validate_resolved_passages(source_texts, alternative.passages)
+        _validate_relationship_inventory(
+            checked.requirements,
+            checked.contested_requirements,
+            checked.relationships,
+        )
         return checked
     except BaselineCompilationError:
         raise
@@ -1008,6 +1088,29 @@ def _fresh_requirement(value: BaselineRequirementV1) -> BaselineRequirementV1:
 
 def _fresh_relationship(value: BaselineRelationshipV1) -> BaselineRelationshipV1:
     return BaselineRelationshipV1.model_validate(value.model_dump(mode="json"))
+
+
+def _fresh_contested(
+    value: ContestedBaselineRequirementV1,
+) -> ContestedBaselineRequirementV1:
+    return ContestedBaselineRequirementV1.model_validate(value.model_dump(mode="json"))
+
+
+def _renumber_requirement(
+    value: BaselineRequirementV1 | None,
+    *,
+    requirement_id: str,
+    canonical_order: int,
+) -> BaselineRequirementV1 | None:
+    if value is None:
+        return None
+    return BaselineRequirementV1.model_validate(
+        {
+            **value.model_dump(mode="json"),
+            "requirement_id": requirement_id,
+            "canonical_order": canonical_order,
+        }
+    )
 
 
 def _apply_requirement_actions(
@@ -1116,6 +1219,7 @@ def apply_baseline_correction_v1(
         item.relationship_id: _fresh_relationship(item)
         for item in checked_prior.relationships
     }
+    contested = tuple(_fresh_contested(item) for item in checked_prior.contested_requirements)
     _apply_requirement_actions(requirements, checked_correction.actions)
     _apply_relationship_actions(relationships, checked_correction.actions)
     source_texts = _source_texts(checked_input)
@@ -1126,7 +1230,12 @@ def apply_baseline_correction_v1(
         if identity in statements:
             raise BaselineCompilationError("BASELINE_CORRECTION_REQUIREMENT")
         statements.add(identity)
-    known = set(requirements)
+    known = set(requirements).union(
+        alternative.requirement_id
+        for item in contested
+        for alternative in (item.reviewer_alternative, item.auditor_alternative)
+        if alternative is not None
+    )
     if any(
         relationship.source_requirement_id not in known
         or relationship.target_requirement_id not in known
@@ -1148,6 +1257,39 @@ def apply_baseline_correction_v1(
         )
         for index, item in enumerate(ordered_requirements, 1)
     )
+    canonical_contested: list[ContestedBaselineRequirementV1] = []
+    for index, item in enumerate(contested, 1):
+        alternatives = tuple(
+            alternative
+            for alternative in (item.reviewer_alternative, item.auditor_alternative)
+            if alternative is not None
+        )
+        old_ids = {alternative.requirement_id for alternative in alternatives}
+        if len(old_ids) != 1:
+            raise BaselineCompilationError("BASELINE_CORRECTION_REQUIREMENT")
+        old_id = next(iter(old_ids))
+        new_id = f"REQ-{len(canonical_requirements) + index:04d}"
+        new_order = len(canonical_requirements) + index - 1
+        identifier_map[old_id] = new_id
+
+        canonical_contested.append(
+            ContestedBaselineRequirementV1.model_validate(
+                {
+                    **item.model_dump(mode="json"),
+                    "contested_requirement_id": f"CONT-{index:04d}",
+                    "reviewer_alternative": _renumber_requirement(
+                        item.reviewer_alternative,
+                        requirement_id=new_id,
+                        canonical_order=new_order,
+                    ),
+                    "auditor_alternative": _renumber_requirement(
+                        item.auditor_alternative,
+                        requirement_id=new_id,
+                        canonical_order=new_order,
+                    ),
+                }
+            )
+        )
     edges = sorted(
         (
             item.relationship,
@@ -1167,14 +1309,17 @@ def apply_baseline_correction_v1(
         )
         for index, edge in enumerate(edges, 1)
     )
+    contested_requirements = tuple(canonical_contested)
+    _validate_relationship_inventory(
+        canonical_requirements,
+        contested_requirements,
+        canonical_relationships,
+    )
     provisional = CanonicalBaselineV1(
         legal_input_fingerprint=checked_input.legal_input_fingerprint,
         requirements=canonical_requirements,
         relationships=canonical_relationships,
-        contested_requirements=tuple(
-            ContestedBaselineRequirementV1.model_validate(item.model_dump(mode="json"))
-            for item in checked_prior.contested_requirements
-        ),
+        contested_requirements=contested_requirements,
         provenance=BaselineProvenanceV1.model_validate(
             checked_prior.provenance.model_dump(mode="json")
         ),

@@ -153,12 +153,14 @@ def baseline_input() -> BaselineInputV1:
 def _review(
     baseline_input: BaselineInputV1,
     proposals: tuple[dict[str, object], ...],
+    *,
+    response_fingerprint: str = "1" * 64,
 ):
     request = build_baseline_source_review_request_v1(baseline_input, (), fragment_ordinal=1)
     fragment = AcceptedBaselineReviewFragmentV1(
         fragment_ordinal=1,
         request_fingerprint=request.request_fingerprint,
-        response_fingerprint="1" * 64,
+        response_fingerprint=response_fingerprint,
         payload=BaselineReviewFragmentV1(proposals=proposals, review_complete=True),
     )
     return aggregate_baseline_review_v1(baseline_input, (fragment,))
@@ -254,7 +256,7 @@ def test_compiler_assigns_stable_ids_exact_offsets_and_relationships(
     }
 
 
-def test_canonical_ids_do_not_depend_on_role_response_order(
+def test_response_order_preserves_semantics_but_not_exact_provenance(
     baseline_input: BaselineInputV1,
 ) -> None:
     proposals = (
@@ -262,7 +264,11 @@ def test_canonical_ids_do_not_depend_on_role_response_order(
         _proposal("The notice must identify the operator.", "must identify the operator"),
     )
     left_review = _review(baseline_input, proposals)
-    right_review = _review(baseline_input, tuple(reversed(proposals)))
+    right_review = _review(
+        baseline_input,
+        tuple(reversed(proposals)),
+        response_fingerprint="4" * 64,
+    )
     left_audit = _audit(baseline_input, left_review)
     right_audit = _audit(baseline_input, right_review)
 
@@ -274,6 +280,43 @@ def test_canonical_ids_do_not_depend_on_role_response_order(
     )
     assert left.requirements == right.requirements
     assert left.relationships == right.relationships
+    assert left.contested_requirements == right.contested_requirements
+    assert left.provenance != right.provenance
+    assert left.baseline_fingerprint != right.baseline_fingerprint
+    assert left.model_dump(mode="json") != right.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("construction", ["raw_dict", "model_construct"])
+def test_baseline_input_raw_report_field_bypass_is_refused_before_hashing(
+    baseline_input: BaselineInputV1,
+    construction: str,
+) -> None:
+    if construction == "raw_dict":
+        forged = baseline_input.model_copy()
+        object.__getattribute__(forged, "__dict__")["report_text"] = "forbidden report bytes"
+    else:
+        raw = dict(object.__getattribute__(baseline_input, "__dict__"))
+        forged = BaselineInputV1.model_construct(
+            **raw,
+            report_text="forbidden report bytes",
+        )
+        object.__getattribute__(forged, "__dict__")["report_text"] = "forbidden report bytes"
+    request = build_baseline_source_review_request_v1(
+        baseline_input, (), fragment_ordinal=1
+    )
+    fragment = AcceptedBaselineReviewFragmentV1(
+        fragment_ordinal=1,
+        request_fingerprint=request.request_fingerprint,
+        response_fingerprint="1" * 64,
+        payload=BaselineReviewFragmentV1(
+            proposals=(
+                _proposal("A covered operator must file a notice.", "must file a notice"),
+            ),
+            review_complete=True,
+        ),
+    )
+    with pytest.raises(BaselineCompilationError, match="BASELINE_INPUT_INVALID"):
+        aggregate_baseline_review_v1(forged, (fragment,))
 
 
 @pytest.mark.parametrize(
@@ -509,6 +552,43 @@ def test_unresolved_importance_referee_preserves_both_labels_without_favorable_c
     assert contested.auditor_alternative.importance.value == "material"
 
 
+def test_unresolved_importance_referee_cannot_introduce_a_third_tier(
+    baseline_input: BaselineInputV1,
+) -> None:
+    review = _review(
+        baseline_input,
+        (_proposal("A covered operator must file a notice.", "must file a notice"),),
+    )
+    audit = _audit(
+        baseline_input,
+        review,
+        importance_findings=(
+            _importance(
+                "PR-0001",
+                importance="material",
+                basis=("attorney_briefing",),
+                rationale="The rule is necessary for a competent attorney briefing.",
+                disposition="correct",
+            ),
+        ),
+    )
+    disputes = build_baseline_disputes_v1(baseline_input, review, audit)
+    with pytest.raises(BaselineCompilationError, match="BASELINE_REFEREE_DECISION"):
+        _referees(
+            baseline_input,
+            disputes,
+            lambda dispute: BaselineRefereeDecisionV1(
+                dispute_id=dispute.dispute_id,
+                decision="unresolved",
+                passages=({"source_id": "rule-1", "quote": "must file a notice"},),
+                importance="supporting",
+                importance_basis=("explanatory_context",),
+                importance_rationale="The item supplies explanatory context only.",
+                substantive_rationale="The source does not resolve the disputed importance.",
+            ),
+        )
+
+
 def test_semantic_and_importance_disagreements_each_survive_when_both_are_unresolved(
     baseline_input: BaselineInputV1,
 ) -> None:
@@ -591,6 +671,68 @@ def test_unknown_relationship_target_and_duplicate_edge_fail_closed(
         compile_canonical_baseline_v1(
             baseline_input, review, audit, _empty_referees(baseline_input)
         )
+
+
+@pytest.mark.parametrize(
+    ("dependency", "code"),
+    [
+        (
+            {
+                "relationship": "depends_on",
+                "target_statement": "A covered operator must file a notice.",
+            },
+            "BASELINE_RELATIONSHIP_SELF_REFERENCE",
+        ),
+        (
+            {"relationship": "depends_on", "target_statement": "Missing legal rule."},
+            "BASELINE_RELATIONSHIP_ENDPOINT",
+        ),
+    ],
+)
+def test_unresolved_contested_dependencies_reject_self_or_unknown_targets(
+    baseline_input: BaselineInputV1,
+    dependency: dict[str, str],
+    code: str,
+) -> None:
+    reviewer = _proposal(
+        "A covered operator must file a notice.",
+        "must file a notice",
+        dependency=dependency,
+    )
+    auditor = _proposal(
+        "A covered operator must file an annual notice.",
+        "must file a notice",
+    )
+    review = _review(baseline_input, (reviewer,))
+    audit = _audit(
+        baseline_input,
+        review,
+        concerns=(
+            {
+                "target_proposal_ref": "PR-0001",
+                "concern_type": "incorrect_statement",
+                "passages": ({"source_id": "rule-1", "quote": "must file a notice"},),
+                "explanation": "The source may support a narrower annual obligation.",
+                "correction": auditor,
+            },
+        ),
+    )
+    disputes = build_baseline_disputes_v1(baseline_input, review, audit)
+    referees = _referees(
+        baseline_input,
+        disputes,
+        lambda dispute: BaselineRefereeDecisionV1(
+            dispute_id=dispute.dispute_id,
+            decision="unresolved",
+            passages=({"source_id": "rule-1", "quote": "must file a notice"},),
+            importance="critical",
+            importance_basis=("legal_bottom_line",),
+            importance_rationale="Either alternative could change the legal bottom line.",
+            substantive_rationale="The retained source does not resolve the wording.",
+        ),
+    )
+    with pytest.raises(BaselineCompilationError, match=code):
+        compile_canonical_baseline_v1(baseline_input, review, audit, referees)
 
 
 def test_fingerprints_bind_exact_accepted_bytes_and_provenance(
@@ -710,6 +852,40 @@ def _prior_baseline(baseline_input: BaselineInputV1):
     )
 
 
+def _unresolved_prior_baseline(baseline_input: BaselineInputV1):
+    reviewer = _proposal("A covered operator must file a notice.", "must file a notice")
+    auditor = _proposal("A covered operator must file an annual notice.", "must file a notice")
+    review = _review(baseline_input, (reviewer,))
+    audit = _audit(
+        baseline_input,
+        review,
+        concerns=(
+            {
+                "target_proposal_ref": "PR-0001",
+                "concern_type": "incorrect_statement",
+                "passages": ({"source_id": "rule-1", "quote": "must file a notice"},),
+                "explanation": "The source may support a narrower annual obligation.",
+                "correction": auditor,
+            },
+        ),
+    )
+    disputes = build_baseline_disputes_v1(baseline_input, review, audit)
+    referees = _referees(
+        baseline_input,
+        disputes,
+        lambda dispute: BaselineRefereeDecisionV1(
+            dispute_id=dispute.dispute_id,
+            decision="unresolved",
+            passages=({"source_id": "rule-1", "quote": "must file a notice"},),
+            importance="critical",
+            importance_basis=("legal_bottom_line",),
+            importance_rationale="Either alternative could change the legal bottom line.",
+            substantive_rationale="The retained source does not resolve the wording.",
+        ),
+    )
+    return compile_canonical_baseline_v1(baseline_input, review, audit, referees)
+
+
 def _correction_requirement(
     baseline_input: BaselineInputV1,
     *,
@@ -814,6 +990,54 @@ def test_correction_creates_new_baseline_without_rewriting_prior(
         "source_requirement_id": "REQ-0002",
         "target_requirement_id": "REQ-0001",
     }
+
+
+def test_correction_renumbers_contested_slots_and_relationship_references(
+    baseline_input: BaselineInputV1,
+) -> None:
+    prior = _unresolved_prior_baseline(baseline_input)
+    prior_contest = prior.contested_requirements[0]
+    assert prior_contest.reviewer_alternative is not None
+    prior_contested_id = prior_contest.reviewer_alternative.requirement_id
+    added_raw = _correction_requirement(baseline_input).model_dump(mode="json")
+    added_raw["dependency"] = {
+        "relationship": "depends_on",
+        "target_statement": prior_contest.reviewer_alternative.statement,
+    }
+    added = BaselineRequirementV1.model_validate(added_raw)
+    relationship = BaselineRelationshipV1(
+        relationship_id="REL-9999",
+        relationship="depends_on",
+        source_requirement_id=added.requirement_id,
+        target_requirement_id=prior_contested_id,
+    )
+    correction = _correction(
+        prior,
+        (
+            {"action": "add_requirement", "requirement": added},
+            {"action": "add_relationship", "relationship": relationship},
+        ),
+    )
+
+    corrected = apply_baseline_correction_v1(
+        baseline_input, prior, correction, prior_baseline_root="9" * 64
+    )
+    contest = corrected.contested_requirements[0]
+    assert contest.reviewer_alternative is not None
+    assert contest.auditor_alternative is not None
+    assert [item.requirement_id for item in corrected.requirements] == ["REQ-0001"]
+    assert contest.reviewer_alternative.requirement_id == "REQ-0002"
+    assert contest.auditor_alternative.requirement_id == "REQ-0002"
+    assert contest.reviewer_alternative.canonical_order == 1
+    assert contest.auditor_alternative.canonical_order == 1
+    assert corrected.relationships == (
+        BaselineRelationshipV1(
+            relationship_id="REL-0001",
+            relationship="depends_on",
+            source_requirement_id="REQ-0001",
+            target_requirement_id="REQ-0002",
+        ),
+    )
 
 
 @pytest.mark.parametrize(

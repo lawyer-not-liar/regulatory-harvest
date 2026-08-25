@@ -73,20 +73,32 @@ def _optional_nonblank(value: str | None) -> str | None:
     return None if value is None else _nonblank(value)
 
 
-def _wire_snapshot(value: object) -> object:
+def _wire_snapshot(value: object, *, thaw_model_state: bool = False) -> object:
     """Rebuild raw model state so ``model_construct`` cannot skip validation."""
     if isinstance(value, BaseModel):
         raw = dict(object.__getattribute__(value, "__dict__"))
         extra = object.__getattribute__(value, "__pydantic_extra__")
         if extra:
             raw.update(extra)
-        return {key: _wire_snapshot(item) for key, item in raw.items()}
+        return {
+            key: _wire_snapshot(item, thaw_model_state=False)
+            for key, item in raw.items()
+        }
     if isinstance(value, dict):
-        return {key: _wire_snapshot(item) for key, item in dict.items(value)}
+        thaw_nested = thaw_model_state or isinstance(value, _FrozenDict)
+        return {
+            key: _wire_snapshot(item, thaw_model_state=thaw_nested)
+            for key, item in dict.items(value)
+        }
     if isinstance(value, list):
-        return [_wire_snapshot(item) for item in value]
+        return [
+            _wire_snapshot(item, thaw_model_state=thaw_model_state) for item in value
+        ]
     if type(value) is tuple:
-        return tuple(_wire_snapshot(item) for item in value)
+        snapshot = tuple(
+            _wire_snapshot(item, thaw_model_state=thaw_model_state) for item in value
+        )
+        return list(snapshot) if thaw_model_state else snapshot
     return value
 
 
@@ -746,19 +758,53 @@ class CanonicalBaselineV1(BaselineStrictModel):
     def validate_baseline(self) -> Self:
         requirement_ids = [item.requirement_id for item in self.requirements]
         orders = [item.canonical_order for item in self.requirements]
-        if len(requirement_ids) != len(set(requirement_ids)) or orders != list(range(len(orders))):
+        if requirement_ids != [
+            f"REQ-{index:04d}" for index in range(1, len(requirement_ids) + 1)
+        ] or orders != list(range(len(orders))):
             raise ValueError("canonical requirements must use unique contiguous zero-based order")
+        contested_ids = [
+            item.contested_requirement_id for item in self.contested_requirements
+        ]
+        if contested_ids != [
+            f"CONT-{index:04d}" for index in range(1, len(contested_ids) + 1)
+        ]:
+            raise ValueError("contested requirements must use contiguous CONT IDs in order")
+        known = set(requirement_ids)
+        for offset, contested in enumerate(self.contested_requirements):
+            expected_id = f"REQ-{len(requirement_ids) + offset + 1:04d}"
+            expected_order = len(requirement_ids) + offset
+            alternatives = tuple(
+                item
+                for item in (
+                    contested.reviewer_alternative,
+                    contested.auditor_alternative,
+                )
+                if item is not None
+            )
+            if any(
+                item.requirement_id != expected_id
+                or item.canonical_order != expected_order
+                for item in alternatives
+            ):
+                raise ValueError(
+                    "contested alternatives must use their contiguous canonical slot"
+                )
+            known.add(expected_id)
         relationship_ids = [item.relationship_id for item in self.relationships]
         if relationship_ids != [
             f"REL-{index:04d}" for index in range(1, len(relationship_ids) + 1)
         ]:
             raise ValueError("canonical relationships must use contiguous REL IDs in order")
-        known = set(requirement_ids)
         if any(
             item.source_requirement_id not in known or item.target_requirement_id not in known
             for item in self.relationships
         ):
             raise ValueError("canonical relationships must identify baseline requirements")
+        if any(
+            item.source_requirement_id == item.target_requirement_id
+            for item in self.relationships
+        ):
+            raise ValueError("canonical relationships must not contain self references")
         edges = [
             (item.relationship, item.source_requirement_id, item.target_requirement_id)
             for item in self.relationships
