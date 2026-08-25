@@ -15758,6 +15758,15 @@ def _baseline_guarded_submit_unlocked(
             if checked_payload["dispute_id"] != dispute_id:
                 raise PortableEvaluationInputError("baseline referee response is unbound")
             dispute = by_id[dispute_id]
+            _baseline_resolved_passages(
+                baseline_input, cast(list[JsonObject], checked_payload["passages"])
+            )
+            try:
+                _baseline_validate_referee_choice(dispute, checked_payload)
+            except EvaluationIntegrityError as error:
+                raise PortableEvaluationInputError(
+                    "baseline referee response choice is invalid"
+                ) from error
             referee_history = _baseline_accepted_fragments(
                 manifest, files, "baseline_source_referee"
             )

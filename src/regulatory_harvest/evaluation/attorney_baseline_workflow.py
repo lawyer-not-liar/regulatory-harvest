@@ -21,6 +21,7 @@ from . import attorney_baseline_artifacts as baseline_artifacts
 from .attorney_artifacts import EvaluationIntegrityError, read_evaluation_artifact
 from .attorney_baseline_compiler import (
     BaselineCompilationError,
+    _validate_baseline_referee_choice_v1,
     aggregate_baseline_audit_v1,
     aggregate_baseline_referees_v1,
     aggregate_baseline_review_v1,
@@ -581,6 +582,9 @@ def _advance_baseline_response_v1(
                 strict_baseline_model_v1(
                     BaselineRefereeDecisionV1, response.payload
                 ),
+            )
+            _validate_baseline_referee_choice_v1(
+                baseline_input, by_id[pending.dispute_id], decision
             )
             referee_history = (
                 *_accepted_referee_fragments(context, by_id),

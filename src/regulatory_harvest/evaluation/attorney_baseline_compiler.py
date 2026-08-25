@@ -526,6 +526,39 @@ def _selected_importance(
     return decision
 
 
+def _validate_baseline_referee_choice_v1(
+    baseline_input: BaselineInputV1,
+    dispute: BaselineDisputeV1,
+    decision: BaselineRefereeDecisionV1,
+) -> None:
+    _resolve_passages(_source_texts(baseline_input), decision.passages)
+    if decision.decision == "accept_reviewer":
+        expected = _selected_importance(dispute)
+    elif dispute.importance_finding is not None:
+        finding = dispute.importance_finding
+        expected = (finding.reviewed_importance, finding.reviewed_importance_basis)
+    elif dispute.auditor_concern is not None and dispute.auditor_concern.correction is not None:
+        correction = dispute.auditor_concern.correction
+        expected = (correction.importance, correction.importance_basis)
+    else:
+        expected = None
+    if decision.decision == "unresolved" and dispute.importance_finding is not None:
+        reviewer_importance = _selected_importance(dispute)
+        finding = dispute.importance_finding
+        alternatives = {
+            reviewer_importance,
+            (finding.reviewed_importance, finding.reviewed_importance_basis),
+        }
+        if (decision.importance, decision.importance_basis) not in alternatives:
+            raise BaselineCompilationError("BASELINE_REFEREE_DECISION")
+    if decision.decision != "unresolved" and (
+        expected is None
+        or decision.importance != expected[0]
+        or decision.importance_basis != expected[1]
+    ):
+        raise BaselineCompilationError("BASELINE_REFEREE_DECISION")
+
+
 def aggregate_baseline_referees_v1(
     baseline_input: BaselineInputV1,
     disputes: tuple[BaselineDisputeV1, ...],
@@ -558,37 +591,12 @@ def aggregate_baseline_referees_v1(
     if len(by_id) != len(checked_fragments) or set(by_id) != set(expected_ids):
         raise BaselineCompilationError("BASELINE_REFEREE_COVERAGE")
     ordered = tuple(by_id[item] for item in expected_ids)
-    source_texts = _source_texts(checked_input)
     for dispute, fragment in zip(checked_disputes, ordered, strict=True):
         if fragment.dispute_fingerprint != dispute.dispute_fingerprint:
             raise BaselineCompilationError("BASELINE_REFEREE_FRAGMENT")
-        _resolve_passages(source_texts, fragment.decision.passages)
-        decision = fragment.decision
-        if decision.decision == "accept_reviewer":
-            expected = _selected_importance(dispute)
-        elif dispute.importance_finding is not None:
-            finding = dispute.importance_finding
-            expected = (finding.reviewed_importance, finding.reviewed_importance_basis)
-        elif dispute.auditor_concern is not None and dispute.auditor_concern.correction is not None:
-            correction = dispute.auditor_concern.correction
-            expected = (correction.importance, correction.importance_basis)
-        else:
-            expected = None
-        if decision.decision == "unresolved" and dispute.importance_finding is not None:
-            reviewer_importance = _selected_importance(dispute)
-            finding = dispute.importance_finding
-            alternatives = {
-                reviewer_importance,
-                (finding.reviewed_importance, finding.reviewed_importance_basis),
-            }
-            if (decision.importance, decision.importance_basis) not in alternatives:
-                raise BaselineCompilationError("BASELINE_REFEREE_DECISION")
-        if decision.decision != "unresolved" and (
-            expected is None
-            or decision.importance != expected[0]
-            or decision.importance_basis != expected[1]
-        ):
-            raise BaselineCompilationError("BASELINE_REFEREE_DECISION")
+        _validate_baseline_referee_choice_v1(
+            checked_input, dispute, fragment.decision
+        )
     aggregate_fingerprint = _hash(
         {
             "legal_input_fingerprint": checked_input.legal_input_fingerprint,
