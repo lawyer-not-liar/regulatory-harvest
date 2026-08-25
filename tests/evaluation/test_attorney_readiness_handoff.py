@@ -741,6 +741,24 @@ def test_resealed_scores_cannot_upgrade_below_floor_matrix(
         render_attorney_review_handoff_v1(**{**blocked_case, "result": forged})
 
 
+def test_uncertain_lane_cannot_be_resealed_as_pass_and_high_assurance(
+    tmp_path: Path,
+) -> None:
+    case_path = tmp_path / "uncertain"
+    case_path.mkdir()
+    case = _case(case_path, ("met",) * 9 + ("uncertain",))
+    result = cast(DeliveryReadinessResultV1, case["result"])
+    assert result.baseline_locked_strict_equivalent_disposition == "INCONCLUSIVE"
+    assert result.delivery_readiness == "REVIEW_READY_WITH_GAPS"
+    forged = _reseal_result(
+        result,
+        baseline_locked_strict_equivalent_disposition="PASS",
+        delivery_readiness="HIGH_ASSURANCE",
+    )
+    with pytest.raises(ValueError, match="handoff input is invalid"):
+        render_attorney_review_handoff_v1(**{**case, "result": forged})
+
+
 def test_gap_importance_and_dispositions_are_bound_to_requirement_matrix(
     critical_review_case: dict[str, object],
 ) -> None:

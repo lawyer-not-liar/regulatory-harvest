@@ -390,6 +390,7 @@ def _validate_delivery_semantics(
 
     lane_weighted: list[float] = []
     lane_critical: list[float] = []
+    lane_dispositions: list[AbsoluteDispositionV2] = []
     for lane in (1, 2):
         observations: list[tuple[BaselineImportanceV1, RequirementDispositionV1]] = [
             (
@@ -424,9 +425,36 @@ def _validate_delivery_semantics(
         )
         lane_weighted.append(1.0 if denominator == 0 else numerator / denominator)
         lane_critical.append(1.0 if not critical else critical_numerator / (2 * len(critical)))
+        if any(
+            disposition is RequirementDispositionV1.UNCERTAIN for _, disposition in observations
+        ):
+            lane_dispositions.append(AbsoluteDispositionV2.INCONCLUSIVE)
+        elif critical_numerator != 2 * len(critical) or (
+            denominator and 10 * numerator < 9 * denominator
+        ):
+            lane_dispositions.append(AbsoluteDispositionV2.FAIL)
+        else:
+            lane_dispositions.append(AbsoluteDispositionV2.PASS)
     if result.lane_weighted_coverage != tuple(
         lane_weighted
     ) or result.lane_critical_recall != tuple(lane_critical):
+        raise _invalid()
+
+    ordinary_disposition = (
+        lane_dispositions[0]
+        if lane_dispositions[0] is lane_dispositions[1]
+        else AbsoluteDispositionV2.INCONCLUSIVE
+    )
+    if not contested_rows:
+        disposition_valid = fresh is ordinary_disposition
+    elif ordinary_disposition is AbsoluteDispositionV2.INCONCLUSIVE:
+        disposition_valid = fresh is AbsoluteDispositionV2.INCONCLUSIVE
+    else:
+        disposition_valid = fresh in {
+            ordinary_disposition,
+            AbsoluteDispositionV2.INCONCLUSIVE,
+        }
+    if not disposition_valid:
         raise _invalid()
 
     gap_identities = {(row.origin, row.subject_id) for row in gaps.rows}
