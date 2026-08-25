@@ -12,6 +12,7 @@ from .attorney_baseline_models import (
     BaselineDisputeV1,
     BaselineEvaluatorRequestV1,
     BaselineEvaluatorResponseV1,
+    BaselineGradeTargetBindingV1,
     BaselineImportanceV1,
     BaselineInputV1,
     BaselineManifestV1,
@@ -28,10 +29,17 @@ from .attorney_baseline_models import (
     BaselineVerificationV1,
     CanonicalBaselineV1,
     ContestedBaselineRequirementV1,
+    GradeableBaselineProjectionV1,
+    GradeableContestedRequirementV1,
+    GradeableRequirementV1,
     ImportanceAuditFindingV1,
     ImportanceBasisV1,
     IndexedBaselineProposalV1,
     validate_importance_rationale_v1,
+)
+from .attorney_baseline_projection import (
+    project_gradeable_baseline_v1,
+    verify_gradeable_baseline_projection_v1,
 )
 from .attorney_contract import ResponseContractCode, ResponseContractError, safe_preflight_issue
 from .attorney_ledger import ledger_disputes, ledger_findings
@@ -281,6 +289,7 @@ __all__ = [
     "BaselineDisputeV1",
     "BaselineEvaluatorRequestV1",
     "BaselineEvaluatorResponseV1",
+    "BaselineGradeTargetBindingV1",
     "BaselineImportanceV1",
     "BaselineInputV1",
     "BaselineManifestV1",
@@ -364,6 +373,9 @@ __all__ = [
     "GradeAlternative",
     "GradeDispute",
     "GradeResponseV2",
+    "GradeableBaselineProjectionV1",
+    "GradeableContestedRequirementV1",
+    "GradeableRequirementV1",
     "GraderAggregateV21",
     "GraderAggregateV22",
     "GuardedSubmissionResult",
@@ -465,6 +477,7 @@ __all__ = [
     "preflight_evaluator_response_v2",
     "preflight_evaluator_response_v21",
     "preflight_evaluator_response_v22",
+    "project_gradeable_baseline_v1",
     "resume_case_qualification",
     "resume_evaluation_v2",
     "resume_evaluation_v21",
@@ -485,4 +498,5 @@ __all__ = [
     "validate_importance_rationale_v1",
     "validate_prediction_spans",
     "verify_case_qualification",
+    "verify_gradeable_baseline_projection_v1",
 ]

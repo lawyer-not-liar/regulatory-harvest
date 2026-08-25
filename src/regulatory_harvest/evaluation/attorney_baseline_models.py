@@ -816,6 +816,149 @@ class CanonicalBaselineV1(BaselineStrictModel):
         return self
 
 
+def _semantic_identity_fingerprint_v1(value: BaselineStrictModel) -> str:
+    return sha256_digest(
+        canonical_json_bytes(value.model_dump(mode="json", warnings="error"))
+    )
+
+
+class GradeableRequirementV1(BaselineStrictModel):
+    """One ordinary requirement with its report- and lane-independent identity."""
+
+    requirement: BaselineRequirementV1
+    semantic_identity_fingerprint: Hash
+
+    @model_validator(mode="after")
+    def validate_semantic_identity(self) -> Self:
+        if self.semantic_identity_fingerprint != _semantic_identity_fingerprint_v1(
+            self.requirement
+        ):
+            raise ValueError("gradeable requirement fingerprint must match its requirement")
+        return self
+
+
+class GradeableContestedRequirementV1(BaselineStrictModel):
+    """One unresolved contest with exact nullable alternative identities."""
+
+    contested_requirement: ContestedBaselineRequirementV1
+    reviewer_identity_fingerprint: Hash | None = None
+    auditor_identity_fingerprint: Hash | None = None
+    semantic_identity_fingerprint: Hash
+
+    @model_validator(mode="after")
+    def validate_semantic_identities(self) -> Self:
+        reviewer = self.contested_requirement.reviewer_alternative
+        auditor = self.contested_requirement.auditor_alternative
+        expected_reviewer = (
+            None if reviewer is None else _semantic_identity_fingerprint_v1(reviewer)
+        )
+        expected_auditor = (
+            None if auditor is None else _semantic_identity_fingerprint_v1(auditor)
+        )
+        if (
+            self.reviewer_identity_fingerprint != expected_reviewer
+            or self.auditor_identity_fingerprint != expected_auditor
+            or self.semantic_identity_fingerprint
+            != _semantic_identity_fingerprint_v1(self.contested_requirement)
+        ):
+            raise ValueError("gradeable contest fingerprints must match exact alternatives")
+        return self
+
+
+def _gradeable_semantic_inventory_v1(
+    requirements: tuple[GradeableRequirementV1, ...],
+    relationships: tuple[BaselineRelationshipV1, ...],
+    contested_requirements: tuple[GradeableContestedRequirementV1, ...],
+) -> dict[str, object]:
+    return {
+        "requirements": [
+            item.model_dump(mode="json", warnings="error") for item in requirements
+        ],
+        "relationships": [
+            item.model_dump(mode="json", warnings="error") for item in relationships
+        ],
+        "contested_requirements": [
+            item.model_dump(mode="json", warnings="error")
+            for item in contested_requirements
+        ],
+    }
+
+
+class BaselineGradeTargetBindingV1(BaselineStrictModel):
+    """Exact stable-baseline identities every readiness grade must retain."""
+
+    schema_version: Literal["baseline-grade-target-v1"]
+    legal_input_fingerprint: Hash
+    baseline_fingerprint: Hash
+    source_record_fingerprint: Hash
+    semantic_inventory_fingerprint: Hash
+    evaluation_rubric_fingerprint: Hash
+    importance_policy_fingerprint: Hash
+    compiler_contract_fingerprint: Hash
+    grade_target_fingerprint: Hash
+
+    @model_validator(mode="after")
+    def validate_grade_target_fingerprint(self) -> Self:
+        raw = self.model_dump(
+            mode="json", exclude={"grade_target_fingerprint"}, warnings="error"
+        )
+        if self.grade_target_fingerprint != sha256_digest(canonical_json_bytes(raw)):
+            raise ValueError("grade target fingerprint must match its exact binding")
+        return self
+
+
+class GradeableBaselineProjectionV1(BaselineStrictModel):
+    """Complete report-free handoff to a readiness-owned fresh grading protocol."""
+
+    schema_version: Literal["baseline-gradeable-projection-v1"]
+    baseline_protocol_version: Literal["evaluation-baseline-v1"]
+    binding: BaselineGradeTargetBindingV1
+    baseline_input: BaselineInputV1
+    requirements: tuple[GradeableRequirementV1, ...]
+    relationships: tuple[BaselineRelationshipV1, ...]
+    contested_requirements: tuple[GradeableContestedRequirementV1, ...]
+    baseline_provenance: BaselineProvenanceV1
+    projection_fingerprint: Hash
+
+    @model_validator(mode="after")
+    def validate_projection_bindings(self) -> Self:
+        input_value = self.baseline_input
+        provenance = self.baseline_provenance
+        if (
+            self.binding.legal_input_fingerprint != input_value.legal_input_fingerprint
+            or self.binding.source_record_fingerprint
+            != input_value.source_record_fingerprint
+            or self.binding.evaluation_rubric_fingerprint
+            != input_value.evaluation_rubric_fingerprint
+            or self.binding.importance_policy_fingerprint
+            != input_value.importance_policy_fingerprint
+            or self.binding.compiler_contract_fingerprint
+            != input_value.compiler_contract_fingerprint
+            or provenance.legal_input_fingerprint
+            != self.binding.legal_input_fingerprint
+            or provenance.importance_policy_fingerprint
+            != self.binding.importance_policy_fingerprint
+            or provenance.compiler_contract_fingerprint
+            != self.binding.compiler_contract_fingerprint
+        ):
+            raise ValueError("gradeable projection bindings are inconsistent")
+        semantic_inventory = _gradeable_semantic_inventory_v1(
+            self.requirements,
+            self.relationships,
+            self.contested_requirements,
+        )
+        if self.binding.semantic_inventory_fingerprint != sha256_digest(
+            canonical_json_bytes(semantic_inventory)
+        ):
+            raise ValueError("semantic inventory fingerprint must match the exact projection")
+        raw = self.model_dump(
+            mode="json", exclude={"projection_fingerprint"}, warnings="error"
+        )
+        if self.projection_fingerprint != sha256_digest(canonical_json_bytes(raw)):
+            raise ValueError("projection fingerprint must match the exact projection")
+        return self
+
+
 class BaselineCorrectionActionV1(BaselineStrictModel):
     action: Literal[
         "add_requirement",
