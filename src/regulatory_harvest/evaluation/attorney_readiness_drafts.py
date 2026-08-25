@@ -25,6 +25,12 @@ from .attorney_baseline_models import (
     BaselineImportanceV1,
     GradeableBaselineProjectionV1,
 )
+from .attorney_models import (
+    CaseAdmissionJudgment,
+    CaseReadiness,
+    QualificationReceipt,
+    model_fingerprint,
+)
 from .attorney_readiness_models import (
     BaselineLockedContestedGradeV1,
     BaselineLockedGradeFragmentV1,
@@ -55,9 +61,9 @@ _MAX_DRAFT_ITEMS = 640
 _MAX_PROVENANCE_TEXT = 128
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _EVIDENCE_TOKEN_RE = re.compile(
-    r"(?:SOURCE-[0-9]{6}|BASELINE-(?:REQ|CONT)-[0-9]{4}|"
+    r"(?<![A-Za-z0-9._:\-])(?:SOURCE-[0-9]{6}|BASELINE-(?:REQ|CONT)-[0-9]{4}|"
     r"PREREQUISITE-(?:CURRENTNESS|COMPLETENESS|LANGUAGE)-"
-    r"[A-Za-z0-9][A-Za-z0-9._:-]*|PREREQUISITE-CLIENT-FACTS)"
+    r"[A-Za-z0-9][A-Za-z0-9._:-]*|PREREQUISITE-CLIENT-FACTS)(?![A-Za-z0-9._:\-])"
 )
 _PRIVATE_PATH_RE = re.compile(
     r"(?i)(?:file:/|[A-Z]:[\\/]|\\\\|/(?:Applications|Library|System|Users|Volumes|"
@@ -121,6 +127,21 @@ _REPORT_CONTENT_FINDINGS = frozenset(
         SafetyFindingKindV1.MISLEADING_CURRENTNESS_OR_AUTHORITY,
     }
 )
+_FINDING_EVIDENCE_PREFIXES = {
+    SafetyFindingKindV1.MATERIAL_UNSUPPORTED_ASSERTION: ("SOURCE-",),
+    SafetyFindingKindV1.BASELINE_CONTRADICTION: ("BASELINE-",),
+    SafetyFindingKindV1.HIDDEN_OR_UNDERSTATED_LIMITATION: (
+        "SOURCE-",
+        "PREREQUISITE-",
+    ),
+    SafetyFindingKindV1.UNDISCLOSED_DISPOSITIVE_CLIENT_FACT: ("PREREQUISITE-CLIENT-FACTS",),
+    SafetyFindingKindV1.MISLEADING_CURRENTNESS_OR_AUTHORITY: (
+        "SOURCE-",
+        "PREREQUISITE-CURRENTNESS-",
+        "PREREQUISITE-COMPLETENESS-",
+    ),
+    SafetyFindingKindV1.UNDISCLOSED_GRADER_GAP: ("BASELINE-",),
+}
 _NORMALIZED_DUPLICATES = "DRAFT_NORMALIZED_DUPLICATES"
 
 
@@ -788,7 +809,22 @@ def _validate_safety_evidence_packet(
     if type(qualification) is not dict:
         raise _ControllerInvariant("safety qualification evidence is invalid")
     limits = cast(dict[str, object], qualification)
-    if limits.get("source_record_fingerprint") != (baseline.binding.source_record_fingerprint):
+    baseline_input = baseline.baseline_input
+    requested_authorities = limits.get("requested_authorities")
+    if (
+        limits.get("case_schema_version") != "1.1"
+        or limits.get("admission_status") != "qualified"
+        or limits.get("qualification_readiness") != "ADMITTED"
+        or limits.get("qualification_root") != baseline_input.qualification_root
+        or limits.get("qualification_receipt_fingerprint")
+        != baseline_input.qualification_receipt_fingerprint
+        or limits.get("source_record_fingerprint") != baseline.binding.source_record_fingerprint
+        or type(requested_authorities) is not list
+        or canonical_json_bytes(requested_authorities)
+        != canonical_json_bytes(
+            [item.model_dump(mode="json") for item in baseline_input.requested_authorities]
+        )
+    ):
         raise _ControllerInvariant("safety qualification evidence is invalid")
     grouped: dict[tuple[str, str], list[tuple[str, object, bool]]] = {}
     prerequisites: list[tuple[str, str, tuple[str, ...]]] = []
@@ -820,6 +856,45 @@ def _validate_safety_evidence_packet(
                 grouped.setdefault((kind, source_id), []).append(
                     ("qualification_admission_check", check, material)
                 )
+    issues = limits.get("admission_issues")
+    receipt_readiness = limits.get("receipt_readiness")
+    if type(issues) is not list or type(receipt_readiness) is not dict:
+        raise _ControllerInvariant("safety qualification evidence is invalid")
+    try:
+        judgment = CaseAdmissionJudgment.model_validate(
+            {
+                "request_fingerprint": limits.get("request_fingerprint"),
+                "checks": checks,
+                "issues": issues,
+            }
+        )
+        if model_fingerprint(judgment) != limits.get("judgment_fingerprint"):
+            raise ValueError
+        readiness_raw = cast(dict[str, object], receipt_readiness)
+        readiness = CaseReadiness.model_validate(
+            {
+                "status": readiness_raw.get("status"),
+                "case_fingerprint": limits.get("case_fingerprint"),
+                "judgment_fingerprint": limits.get("judgment_fingerprint"),
+                "issue_codes": readiness_raw.get("issue_codes"),
+                "rationale": readiness_raw.get("rationale"),
+            }
+        )
+        receipt = QualificationReceipt.model_validate(
+            {
+                "schema_version": "1.0",
+                "case_fingerprint": limits.get("case_fingerprint"),
+                "source_record_fingerprint": limits.get("source_record_fingerprint"),
+                "request_fingerprint": limits.get("request_fingerprint"),
+                "judgment_fingerprint": limits.get("judgment_fingerprint"),
+                "readiness": readiness.model_dump(mode="json"),
+                "receipt_fingerprint": limits.get("qualification_receipt_fingerprint"),
+            }
+        )
+        if receipt.receipt_fingerprint != baseline_input.qualification_receipt_fingerprint:
+            raise ValueError
+    except (TypeError, ValidationError, ValueError) as error:
+        raise _ControllerInvariant("safety qualification evidence is invalid") from error
     treatments = limits.get("language_treatments")
     if type(treatments) is not list:
         raise _ControllerInvariant("safety qualification evidence is invalid")
@@ -1624,6 +1699,18 @@ def _validate_rationale_evidence_kind(
         raise _Clarification(ReadinessDraftReasonCodeV1.RATIONALE_EVIDENCE_UNBOUND)
 
 
+def _validate_finding_evidence_kind(
+    finding_kind: SafetyFindingKindV1,
+    evidence_refs: tuple[str, ...],
+    mentioned_refs: tuple[str, ...],
+) -> None:
+    required_prefixes = _FINDING_EVIDENCE_PREFIXES[finding_kind]
+    if not any(
+        ref in mentioned_refs and ref.startswith(required_prefixes) for ref in evidence_refs
+    ):
+        raise _Clarification(ReadinessDraftReasonCodeV1.RATIONALE_EVIDENCE_UNBOUND)
+
+
 def _compile_assessment(
     item: _SafetyGapAssessmentDraftV1,
     candidate: SafetyGapCandidateV1,
@@ -1713,6 +1800,7 @@ def _compile_finding(
         refs,
         mentioned_refs=mentioned_refs,
     )
+    _validate_finding_evidence_kind(finding_kind, refs, mentioned_refs)
     if (
         item.blocking_code is not None
         and item.blocking_code not in load_readiness_rubric_v1().blocking_codes

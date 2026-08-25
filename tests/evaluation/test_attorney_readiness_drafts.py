@@ -9,10 +9,11 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from test_attorney_readiness_inputs import _make_verified_inputs
 from test_attorney_readiness_requests import (
+    _all_met_grader_lanes,
     _assessment,
     _finding,
-    _grader_lanes,
 )
 from test_attorney_readiness_requests import (
     inputs as _request_inputs_fixture,
@@ -29,11 +30,17 @@ from regulatory_harvest.evaluation.attorney_readiness_drafts import (
     ReadinessEvaluatorProvenanceV1,
     compile_readiness_draft_v1,
 )
-from regulatory_harvest.evaluation.attorney_readiness_inputs import VerifiedReadinessInputsV1
+from regulatory_harvest.evaluation.attorney_readiness_inputs import (
+    VerifiedReadinessInputsV1,
+    build_verified_readiness_input_v1,
+)
 from regulatory_harvest.evaluation.attorney_readiness_models import (
     BaselineLockedContestedGradeV1,
     BaselineLockedGradeFragmentV1,
+    BaselineLockedGraderAggregateV1,
     ReadinessEvaluatorRequestV1,
+    SafetyGapAssessmentV1,
+    SafetyGapCandidateV1,
     SafetyLaneResponseV1,
     SafetyRefereeDecisionV1,
 )
@@ -54,6 +61,43 @@ def inputs(tmp_path: Path) -> VerifiedReadinessInputsV1:
     return _request_inputs_fixture.__wrapped__(tmp_path)
 
 
+@pytest.fixture(scope="module")
+def safety_inputs(tmp_path_factory: pytest.TempPathFactory) -> VerifiedReadinessInputsV1:
+    fixture = _make_verified_inputs(tmp_path_factory.mktemp("task-4-verified-inputs"))
+    return build_verified_readiness_input_v1(
+        baseline_run_dir=fixture.baseline_run_dir,
+        qualification_run_dir=fixture.qualification_run_dir,
+        generation_run_dir=fixture.generation_run_dir,
+        validation_receipt_path=fixture.validation_receipt_path,
+    )
+
+
+def _verified_grader_lanes(
+    inputs: VerifiedReadinessInputsV1,
+) -> tuple[BaselineLockedGraderAggregateV1, BaselineLockedGraderAggregateV1]:
+    def partial(aggregate: BaselineLockedGraderAggregateV1) -> BaselineLockedGraderAggregateV1:
+        raw = aggregate.model_dump(mode="json")
+        fragments = cast(list[dict[str, object]], raw["ordinary_fragments"])
+        flattened = cast(list[dict[str, object]], raw["requirement_grades"])
+        for grade in (
+            cast(list[dict[str, object]], fragments[0]["requirement_grades"])[0],
+            flattened[0],
+        ):
+            grade["disposition"] = "partially_met"
+            grade["omission"] = "The report does not supply the complete required treatment."
+        fragment = fragments[0]
+        fragment_descriptor = {
+            key: value for key, value in fragment.items() if key != "fragment_fingerprint"
+        }
+        fragment["fragment_fingerprint"] = sha256_digest(canonical_json_bytes(fragment_descriptor))
+        descriptor = {key: value for key, value in raw.items() if key != "aggregate_fingerprint"}
+        raw["aggregate_fingerprint"] = sha256_digest(canonical_json_bytes(descriptor))
+        return BaselineLockedGraderAggregateV1.model_validate(raw)
+
+    first, second = _all_met_grader_lanes(inputs)
+    return partial(first), partial(second)
+
+
 @pytest.fixture
 def ordinary_request(inputs: VerifiedReadinessInputsV1) -> ReadinessEvaluatorRequestV1:
     batch = build_baseline_locked_grade_batches_v1(inputs.gradeable_baseline, lane=1)[0]
@@ -70,22 +114,41 @@ def contested_request(inputs: VerifiedReadinessInputsV1) -> ReadinessEvaluatorRe
 
 
 @pytest.fixture
-def safety_request(inputs: VerifiedReadinessInputsV1) -> ReadinessEvaluatorRequestV1:
-    lanes = _grader_lanes(inputs)
-    candidates = build_gap_candidate_inventory_v1(inputs, lanes)
-    return build_safety_lane_request_v1(inputs, lanes, candidates, lane=1)
+def safety_request(safety_inputs: VerifiedReadinessInputsV1) -> ReadinessEvaluatorRequestV1:
+    lanes = _verified_grader_lanes(safety_inputs)
+    candidates = build_gap_candidate_inventory_v1(safety_inputs, lanes)
+    return build_safety_lane_request_v1(safety_inputs, lanes, candidates, lane=1)
 
 
 @pytest.fixture
-def referee_request(inputs: VerifiedReadinessInputsV1) -> ReadinessEvaluatorRequestV1:
-    lanes = _grader_lanes(inputs)
-    candidates = build_gap_candidate_inventory_v1(inputs, lanes)
-    first_assessments = tuple(_assessment(item) for item in candidates)
-    second_assessments = tuple(_assessment(item) for item in candidates)
+def referee_request(safety_inputs: VerifiedReadinessInputsV1) -> ReadinessEvaluatorRequestV1:
+    lanes = _verified_grader_lanes(safety_inputs)
+    candidates = build_gap_candidate_inventory_v1(safety_inputs, lanes)
+    preliminary = build_safety_lane_request_v1(safety_inputs, lanes, candidates, lane=1)
+    passage = _passage(preliminary)
+
+    def lane_assessment(candidate: SafetyGapCandidateV1) -> SafetyGapAssessmentV1:
+        assessment = _assessment(candidate)
+        raw = assessment.model_dump(mode="json")
+        raw["report_passages"] = [passage]
+        return SafetyGapAssessmentV1.model_validate(raw)
+
+    first_assessments = tuple(lane_assessment(item) for item in candidates)
+    second_assessments = tuple(lane_assessment(item) for item in candidates)
+    finding = _finding(rationale="The exact source does not support the claim.")
+    finding_raw = finding.model_dump(mode="json")
+    handle_refs = [
+        cast(str, item["evidence_ref"])
+        for item in cast(tuple[dict[str, object], ...], preliminary.payload["evidence_handles"])
+    ]
+    finding_raw["subject_id"] = candidates[0].subject_id
+    finding_raw["report_passages"] = [passage]
+    finding_raw["evidence_refs"] = [next(ref for ref in handle_refs if ref.startswith("SOURCE-"))]
+    exact_finding = type(finding).model_validate(finding_raw)
     first = SafetyLaneResponseV1(
         lane=1,
         candidate_assessments=first_assessments,
-        finding_proposals=(_finding(rationale="The exact source does not support the claim."),),
+        finding_proposals=(exact_finding,),
     )
     changed = type(second_assessments[0]).model_validate(
         {
@@ -96,10 +159,10 @@ def referee_request(inputs: VerifiedReadinessInputsV1) -> ReadinessEvaluatorRequ
     second = SafetyLaneResponseV1(
         lane=2,
         candidate_assessments=(changed, *second_assessments[1:]),
-        finding_proposals=(_finding(rationale="The exact source does not support the claim."),),
+        finding_proposals=(exact_finding,),
     )
-    dispute = build_safety_disputes_v1(inputs, first, second)[0]
-    return build_safety_referee_request_v1(inputs, dispute)
+    dispute = build_safety_disputes_v1(safety_inputs, first, second)[0]
+    return build_safety_referee_request_v1(safety_inputs, dispute)
 
 
 def _provenance() -> ReadinessEvaluatorProvenanceV1:
@@ -151,7 +214,7 @@ def _contested_draft(request: ReadinessEvaluatorRequestV1) -> dict[str, object]:
     }
 
 
-def _assessment_draft(candidate: dict[str, object]) -> dict[str, object]:
+def _assessment_draft(candidate: dict[str, object], *, passage: str) -> dict[str, object]:
     refs = cast(tuple[str, ...], candidate["evidence_refs"])
     importance = candidate["importance"]
     origin = candidate["origin"]
@@ -194,7 +257,7 @@ def _assessment_draft(candidate: dict[str, object]) -> dict[str, object]:
             f"legal_conclusion: {evidence_ref} leaves the scoped answer incomplete."
         ),
         "evidence_refs": [evidence_ref],
-        "report_passages": ["Currentness remains to be confirmed."],
+        "report_passages": [passage],
         "disclosure_location": "Limitations",
         "visibility": "prominent" if importance == "critical" else "visible",
         "blocking_code": None,
@@ -204,16 +267,22 @@ def _assessment_draft(candidate: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _finding_draft() -> dict[str, object]:
+def _finding_draft(request: ReadinessEvaluatorRequestV1) -> dict[str, object]:
+    handles = cast(tuple[dict[str, object], ...], request.payload["evidence_handles"])
+    source_ref = next(
+        cast(str, item["evidence_ref"])
+        for item in handles
+        if cast(str, item["evidence_ref"]).startswith("SOURCE-")
+    )
     return {
         "finding_kind": "MATERIAL_UNSUPPORTED_ASSERTION",
         "subject_id": "report-assertion-1",
-        "report_passages": ["The report partially addresses operator identification."],
+        "report_passages": [_passage(request)],
         "shortfall_description": "The report assertion exceeds the cited authority.",
         "rationale_kind": "UNSUPPORTED_ASSERTION",
         "why_unresolved": "The cited source does not support the report assertion.",
-        "why_it_matters": ("legal_conclusion: SOURCE-000001 could change the scoped answer."),
-        "evidence_refs": ["SOURCE-000001", "BASELINE-REQ-0003"],
+        "why_it_matters": (f"legal_conclusion: {source_ref} could change the scoped answer."),
+        "evidence_refs": [source_ref],
         "disclosure_location": "Limitations",
         "visibility": "prominent",
         "blocking_code": "MATERIAL_UNSUPPORTED_ASSERTION",
@@ -226,8 +295,10 @@ def _finding_draft() -> dict[str, object]:
 def _safety_draft(request: ReadinessEvaluatorRequestV1) -> dict[str, object]:
     candidates = cast(tuple[dict[str, object], ...], request.payload["gap_candidates"])
     return {
-        "candidate_assessments": [_assessment_draft(item) for item in candidates],
-        "finding_proposals": [_finding_draft()],
+        "candidate_assessments": [
+            _assessment_draft(item, passage=_passage(request)) for item in candidates
+        ],
+        "finding_proposals": [_finding_draft(request)],
     }
 
 
@@ -496,6 +567,10 @@ def test_accepted_rationale_bytes_are_preserved_exactly(
             "legal_conclusion: SOURCE-999999 changes the answer.",
             ReadinessDraftReasonCodeV1.REFERENCE_UNKNOWN,
         ),
+        (
+            "legal_conclusion: SOURCE-000001suffix changes the scoped answer.",
+            ReadinessDraftReasonCodeV1.RATIONALE_EVIDENCE_UNBOUND,
+        ),
     ],
 )
 def test_why_it_matters_binds_fixed_consequence_and_exact_evidence(
@@ -608,6 +683,29 @@ def test_finding_rationale_uses_the_same_semantic_evidence_binding(
     )
 
 
+def test_finding_kind_cannot_bypass_semantic_evidence_with_generic_rationale_kind(
+    safety_request: ReadinessEvaluatorRequestV1,
+) -> None:
+    draft = _safety_draft(safety_request)
+    finding = cast(dict[str, object], draft["finding_proposals"][0])
+    handles = cast(tuple[dict[str, object], ...], safety_request.payload["evidence_handles"])
+    baseline_ref = next(
+        cast(str, item["evidence_ref"])
+        for item in handles
+        if cast(str, item["evidence_ref"]).startswith("BASELINE-REQ-")
+    )
+    finding["finding_kind"] = "MISLEADING_CURRENTNESS_OR_AUTHORITY"
+    finding["rationale_kind"] = "SAFETY_REVIEW_FINDING"
+    finding["evidence_refs"] = [baseline_ref]
+    finding["why_it_matters"] = (
+        f"legal_conclusion: {baseline_ref} leaves the scoped answer incomplete."
+    )
+    _assert_clarification(
+        compile_readiness_draft_v1(safety_request, draft, _provenance()),
+        ReadinessDraftReasonCodeV1.RATIONALE_EVIDENCE_UNBOUND,
+    )
+
+
 def test_known_but_unrelated_candidate_evidence_is_refused(
     safety_request: ReadinessEvaluatorRequestV1,
 ) -> None:
@@ -642,12 +740,12 @@ def test_semantic_evidence_and_candidate_membership_cannot_be_split_across_refs(
     foreign_ref = next(
         cast(str, item["evidence_ref"])
         for item in handles
-        if cast(str, item["evidence_ref"]).startswith("PREREQUISITE-CURRENTNESS-")
+        if cast(str, item["evidence_ref"]).startswith("PREREQUISITE-LANGUAGE-")
         and item["evidence_ref"] not in candidate_refs
     )
     assessment = cast(dict[str, object], draft["candidate_assessments"][0])
-    assessment["rationale_kind"] = "CURRENTNESS_NOT_ESTABLISHED"
-    assessment["follow_up_code"] = "CONFIRM_CURRENTNESS"
+    assessment["rationale_kind"] = "LANGUAGE_LIMITATION"
+    assessment["follow_up_code"] = "RESOLVE_LANGUAGE_LIMITATION"
     assessment["evidence_refs"] = [local_ref, foreign_ref]
     assessment["why_it_matters"] = (
         f"legal_conclusion: {local_ref} leaves the scoped answer incomplete."
@@ -683,8 +781,8 @@ def test_why_it_matters_must_cite_the_exact_semantic_evidence_handle(
     "rationale_kind,follow_up_code,candidate_origin",
     [
         ("SOURCE_ABSENT", "VERIFY_PRIMARY_AUTHORITY", "requirement"),
-        ("CURRENTNESS_NOT_ESTABLISHED", "CONFIRM_CURRENTNESS", "baseline_gap"),
-        ("LANGUAGE_LIMITATION", "RESOLVE_LANGUAGE_LIMITATION", "baseline_gap"),
+        ("CURRENTNESS_NOT_ESTABLISHED", "CONFIRM_CURRENTNESS", "requirement"),
+        ("LANGUAGE_LIMITATION", "RESOLVE_LANGUAGE_LIMITATION", "requirement"),
     ],
 )
 def test_source_currentness_and_language_assertions_require_exact_evidence_kind(
@@ -1008,7 +1106,16 @@ def test_resealed_safety_source_and_handle_content_must_match_stable_baseline(
 
 @pytest.mark.parametrize(
     "target",
-    ["candidate", "client_fact_boundary", "generation_validation", "readiness_rubric"],
+    [
+        "candidate",
+        "client_fact_boundary",
+        "generation_validation",
+        "readiness_rubric",
+        "qualification_root",
+        "requested_authority",
+        "admission_issue",
+        "receipt_readiness",
+    ],
 )
 def test_resealed_safety_packet_must_reconstruct_every_controller_binding(
     safety_request: ReadinessEvaluatorRequestV1,
@@ -1031,9 +1138,28 @@ def test_resealed_safety_packet_must_reconstruct_every_controller_binding(
     elif target == "generation_validation":
         generation = cast(dict[str, object], payload[target])
         generation["report_hash"] = "f" * 64
-    else:
+    elif target == "readiness_rubric":
         rubric = cast(dict[str, object], payload[target])
         cast(list[str], rubric["generic_rationales"]).append("resealed rationale")
+    else:
+        limits = cast(dict[str, object], payload["qualification_limits"])
+        if target == "qualification_root":
+            limits["qualification_root"] = "f" * 64
+        elif target == "requested_authority":
+            authority = cast(list[dict[str, object]], limits["requested_authorities"])[0]
+            authority["title"] = "Resealed authority"
+        elif target == "admission_issue":
+            cast(list[dict[str, object]], limits["admission_issues"]).append(
+                {
+                    "code": "AUTHORITY_ALIGNMENT",
+                    "severity": "warning",
+                    "message": "Resealed issue",
+                    "related_ids": [],
+                }
+            )
+        else:
+            readiness = cast(dict[str, object], limits["receipt_readiness"])
+            readiness["rationale"] = "Resealed receipt rationale"
     resealed = _reseal_request(raw)
     assert compile_readiness_draft_v1(
         resealed,
