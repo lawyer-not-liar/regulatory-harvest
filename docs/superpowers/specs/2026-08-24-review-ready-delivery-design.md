@@ -85,7 +85,8 @@ only while all legal-input bindings remain identical.
 
 A partial, missing, uncertain, contested, or safety-related shortfall that is
 stated in the attorney-facing report, represented in the gap matrix, and paired
-with a concrete follow-up owner and action.
+with a concrete follow-up owner and action. It also states why the shortfall
+exists, why it matters, and what evidence or decision would resolve or narrow it.
 
 ### Blocking defect
 
@@ -99,6 +100,9 @@ client-fact dependency.
 - Preserve strict `PASS` as the high-assurance tier.
 - Deliver useful reports that honestly identify material gaps.
 - Make each known gap actionable for the reviewing attorney or outside counsel.
+- Require an evidence-grounded, plain-language rationale for every gap; a code,
+  label, score, or generic statement that more research is needed is
+  insufficient.
 - Reserve nondelivery for unsafe, misleading, invalid, or insufficient work.
 - Stabilize the source-derived requirement baseline across report revisions.
 - Define `critical`, `material`, and `supporting` operationally.
@@ -316,10 +320,16 @@ Each row contains:
 - conservative disposition;
 - exact report passages when present;
 - nonblank omission or uncertainty description;
+- `rationale_kind` from the fixed inventory below;
+- plain-language `why_unresolved`;
+- evidence-grounded `why_it_matters`;
 - report location where the gap is disclosed;
 - `visibility`;
 - `blocking_code` when applicable;
 - deterministic `follow_up_code`;
+- plain-language `resolution_test` describing the evidence, fact, legal
+  judgment, or report correction that would resolve or materially narrow the
+  gap;
 - `owner_role` of `reviewing_attorney`, `outside_counsel`, or
   `research_operator`; and
 - `status` of `open` or `resolved`.
@@ -327,6 +337,49 @@ Each row contains:
 A partial, missing, or uncertain row without an exact report binding when
 content is present, a nonblank shortfall description, a visible disclosure, and
 a follow-up code is a blocking hidden gap.
+
+## Gap-rationale contract
+
+Every matrix row must articulate the reason for the gap rather than merely name
+it. `rationale_kind` is exactly one of:
+
+- `REPORT_OMISSION`
+- `REPORT_PARTIAL_TREATMENT`
+- `SOURCE_ABSENT`
+- `SOURCE_AMBIGUOUS`
+- `SOURCE_CONFLICT`
+- `CURRENTNESS_NOT_ESTABLISHED`
+- `APPLICABILITY_FACT_MISSING`
+- `LANGUAGE_LIMITATION`
+- `CONTESTED_INTERPRETATION`
+- `UNSUPPORTED_ASSERTION`
+- `SAFETY_REVIEW_FINDING`
+
+The evaluator or safety reviewer supplies the substantive components in its
+bounded response. The controller validates and compiles them; it never invents a
+legal rationale from a score or reason code.
+
+`why_unresolved` must identify the concrete missing treatment, evidence limit,
+fact, conflict, or interpretive question. `why_it_matters` must connect that
+shortfall to the scoped legal conclusion, applicability analysis, implementation
+decision, deadline, enforcement exposure, or attorney follow-up. `resolution_test`
+must state what observable evidence or correction would close or materially
+narrow the row.
+
+The following are invalid on their own:
+
+- `more research needed`;
+- `insufficient information`;
+- `requirement partially met`;
+- a repeated disposition or reason code;
+- a score without an explanation; or
+- a conclusion that the gap is material without explaining the consequence.
+
+The compiler rejects a missing, blank, generic, internally contradictory, or
+evidence-unbound rationale. When available evidence cannot support a more
+specific explanation, the row becomes blocking rather than permitting the
+controller to fabricate one. The attorney-facing handoff renders the rationale
+as `What is missing`, `Why it matters`, `How to resolve it`, and `Owner`.
 
 ### Follow-up codes
 
@@ -374,6 +427,7 @@ All of the following are required:
   `met=1.0`, `partially_met=0.5`, and `not_met` or `uncertain=0.0`, is at least
   `0.70`;
 - every non-met requirement is represented in the gap matrix;
+- every gap satisfies the gap-rationale contract;
 - every critical shortfall is prominently disclosed in the Executive Summary
   or the report's consolidated limitations section and assigned to a reviewing
   attorney or outside counsel;
@@ -400,7 +454,8 @@ This is the fail-closed default when neither higher tier applies, including:
 - an undisclosed dispositive applicability dependency;
 - an unresolved authority, operative-text, currentness, source-parity, or
   language defect that the report presents as resolved; or
-- a missing required follow-up row.
+- a missing required follow-up row; or
+- a missing, generic, contradictory, or evidence-unbound gap rationale.
 
 `NOT_DELIVERABLE` does not delete the report. It suppresses ordinary delivery and
 returns the blocking matrix to the operator for correction or escalation.
@@ -412,7 +467,8 @@ For `HIGH_ASSURANCE`, deliver:
 - the report;
 - the strict evaluation disposition;
 - the requirement matrix;
-- the empty or resolved gap matrix; and
+- the complete gap matrix, including any nonblocking shortfall permitted by the
+  strict rubric; and
 - the attorney-review warning.
 
 For `REVIEW_READY_WITH_GAPS`, deliver:
@@ -557,6 +613,8 @@ runtime module, template, documentation, or test fixture is omitted.
 - strict `0.90` high-assurance boundary;
 - worst-lane score reconciliation;
 - critical partial, critical missing, material missing, and uncertainty cases;
+- every gap-rationale kind, required rationale component, and generic-rationale
+  refusal;
 - hidden-gap and unsupported-assertion blocker precedence;
 - deterministic matrix ordering, fingerprints, and follow-up codes; and
 - mutation tests proving each blocker and threshold matters.
@@ -575,6 +633,8 @@ runtime module, template, documentation, or test fixture is omitted.
 ### Safety and delivery
 
 - visible partial and missing requirements become review-ready rows;
+- mutation-sensitive tests delete or genericize each rationale component and
+  prove that readiness becomes `NOT_DELIVERABLE`;
 - critical gaps require prominent disclosure and outside-counsel or attorney
   ownership;
 - an undisclosed gap, unsupported assertion, contradiction, or client-fact
