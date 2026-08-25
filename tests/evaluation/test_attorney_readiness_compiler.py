@@ -539,6 +539,58 @@ def test_requirement_matrix_is_complete_conservative_and_stably_fingerprinted(
     )
 
 
+def test_downstream_interfaces_reject_resealed_noncanonical_fragment_partition(
+    inputs: VerifiedReadinessInputsV1,
+) -> None:
+    exact = _with_requirements(inputs, count=6, importance="supporting")
+    lanes = _lanes(exact, ("met",) * 6)
+    first = lanes[0]
+    grades = first.requirement_grades
+    fragment_1 = cast(
+        BaselineLockedGradeFragmentV1,
+        _sealed_model(
+            BaselineLockedGradeFragmentV1,
+            "fragment_fingerprint",
+            **first.ordinary_fragments[0].model_dump(
+                mode="json",
+                exclude={"fragment_fingerprint", "requirement_grades"},
+            ),
+            requirement_grades=(grades[0].model_dump(mode="json"),),
+        ),
+    )
+    fragment_2 = cast(
+        BaselineLockedGradeFragmentV1,
+        _sealed_model(
+            BaselineLockedGradeFragmentV1,
+            "fragment_fingerprint",
+            **first.ordinary_fragments[1].model_dump(
+                mode="json",
+                exclude={"fragment_fingerprint", "requirement_grades"},
+            ),
+            requirement_grades=tuple(grade.model_dump(mode="json") for grade in grades[1:]),
+        ),
+    )
+    descriptor = first.model_dump(mode="json", exclude={"aggregate_fingerprint"})
+    descriptor["ordinary_fragments"] = [
+        fragment_1.model_dump(mode="json"),
+        fragment_2.model_dump(mode="json"),
+    ]
+    forged = BaselineLockedGraderAggregateV1.model_validate(
+        {
+            **descriptor,
+            "aggregate_fingerprint": sha256_digest(canonical_json_bytes(descriptor)),
+        }
+    )
+
+    with pytest.raises(ValueError, match="grader aggregate is invalid"):
+        derive_baseline_locked_strict_equivalent_v1(
+            exact.gradeable_baseline,
+            forged,
+            lanes[1],
+            exact.readiness_rubric,
+        )
+
+
 def test_safety_reconciliation_requires_exact_dispute_and_referee_coverage(
     inputs: VerifiedReadinessInputsV1,
 ) -> None:
@@ -1191,6 +1243,93 @@ def test_resealed_safety_cannot_delete_unresolved_referee_blocker(
             forged,
         )
 
+    descriptor["blocking_codes"] = ["UNKNOWN_NONEMPTY_BLOCKER"]
+    forged_unknown = ReconciledSafetyReviewV1.model_validate(
+        {
+            **descriptor,
+            "safety_review_fingerprint": sha256_digest(canonical_json_bytes(descriptor)),
+        }
+    )
+    with pytest.raises(ValueError, match="reconciled safety review is invalid"):
+        derive_delivery_readiness_v1(
+            exact,
+            strict,
+            requirement,
+            gap,
+            forged_unknown,
+        )
+
+    descriptor["blocking_codes"] = []
+    descriptor["referee_decisions"] = []
+    forged_removed_decision = ReconciledSafetyReviewV1.model_validate(
+        {
+            **descriptor,
+            "safety_review_fingerprint": sha256_digest(canonical_json_bytes(descriptor)),
+        }
+    )
+    removed_result = derive_delivery_readiness_v1(
+        exact,
+        strict,
+        requirement,
+        gap,
+        forged_removed_decision,
+    )
+    assert removed_result.delivery_readiness == "NOT_DELIVERABLE"
+    assert "CRITICAL_DISCLOSURE_INVALID" in removed_result.blocking_codes
+
+
+def test_resealed_gap_metadata_cannot_downgrade_critical_partial_shortfall(
+    inputs: VerifiedReadinessInputsV1,
+) -> None:
+    exact = _with_requirements(inputs, count=10, importance="critical")
+    lanes = _lanes(exact, ("met",) * 9 + ("partially_met",))
+    strict, requirement, gap, safety, _ = _compile(exact, lanes)
+    row = next(
+        item for item in gap.rows if item.origin == "requirement" and item.subject_id == "REQ-0010"
+    )
+    row_descriptor = row.model_dump(mode="json", exclude={"row_fingerprint"})
+    row_descriptor.update(
+        {
+            "kind": "arbitrary",
+            "importance": "supporting",
+            "importance_basis": ["implementation_detail"],
+            "importance_rationale": "The point supplies useful implementation detail.",
+            "lane_1_disposition": "met",
+            "lane_2_disposition": "met",
+            "conservative_disposition": "met",
+        }
+    )
+    changed = GapFollowUpRowV1.model_validate(
+        {
+            **row_descriptor,
+            "row_fingerprint": sha256_digest(canonical_json_bytes(row_descriptor)),
+        }
+    )
+    matrix_descriptor = gap.model_dump(mode="json", exclude={"matrix_fingerprint"})
+    matrix_descriptor["rows"] = [
+        changed.model_dump(mode="json")
+        if item.gap_id == row.gap_id
+        else item.model_dump(mode="json")
+        for item in gap.rows
+    ]
+    forged = GapFollowUpMatrixV1.model_validate(
+        {
+            **matrix_descriptor,
+            "matrix_fingerprint": sha256_digest(canonical_json_bytes(matrix_descriptor)),
+        }
+    )
+
+    result = derive_delivery_readiness_v1(
+        exact,
+        strict,
+        requirement,
+        forged,
+        safety,
+    )
+
+    assert result.delivery_readiness == "NOT_DELIVERABLE"
+    assert "INTEGRITY_OR_PROVENANCE_INVALID" in result.blocking_codes
+
 
 def test_false_resolution_hidden_critical_and_missing_evidence_fail_closed(
     inputs: VerifiedReadinessInputsV1,
@@ -1249,13 +1388,21 @@ def test_false_resolution_hidden_critical_and_missing_evidence_fail_closed(
         assert code in result.blocking_codes
 
 
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "The report is complete and accurate.",
+        "This report comprehensively resolves every material issue and limitation.",
+    ],
+)
 def test_completeness_claim_contradicted_by_visible_gap_fails_closed(
     inputs: VerifiedReadinessInputsV1,
+    claim: str,
 ) -> None:
     exact = _with_requirements(inputs, count=10, importance="supporting")
     exact = _with_report(
         exact,
-        f"{exact.report_text}\n\nThe report is complete and accurate.",
+        f"{exact.report_text}\n\n{claim}",
     )
     lanes = _lanes(exact, ("met",) * 9 + ("partially_met",))
     *_, result = _compile(exact, lanes)
@@ -1279,6 +1426,19 @@ class _GuardedIterator:
     def __next__(self) -> object:
         self.consumed = True
         raise StopIteration
+
+
+class _FrozenWireTuple(tuple[object, ...]):
+    __module__ = "regulatory_harvest.evaluation.attorney_readiness_models"
+
+    def __new__(cls) -> _FrozenWireTuple:
+        value = super().__new__(cls)
+        value.consumed = False
+        return value
+
+    def __iter__(self):
+        self.consumed = True
+        raise RuntimeError("hostile iterator was consumed")
 
 
 def test_public_inventory_boundaries_reject_subclasses_and_iterators_without_consumption(
@@ -1325,6 +1485,19 @@ def test_constructed_cycles_depth_nodes_and_bytes_fail_before_compilation(
         dispositions=("met",) * 7,
         contested=(("met", "met"),),
     )
+    spoofed = _FrozenWireTuple()
+    raw = ordinary[0].model_dump(mode="python")
+    raw["requirement_grades"] = spoofed
+    forged_spoof = BaselineLockedGradeFragmentV1.model_construct(**raw)
+    with pytest.raises(ValueError, match="grade fragments are invalid"):
+        aggregate_baseline_locked_grader_lane_v1(
+            inputs,
+            lane=1,
+            ordinary_fragments=(forged_spoof, *ordinary[1:]),
+            contested_grades=contested,
+        )
+    assert spoofed.consumed is False
+
     cycle: list[object] = []
     cycle.append(cycle)
     raw = ordinary[0].model_dump(mode="python")

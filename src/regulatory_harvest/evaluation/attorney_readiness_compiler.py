@@ -18,6 +18,8 @@ from pydantic import BaseModel, ValidationError
 
 from regulatory_harvest.storage import canonical_json_bytes, sha256_digest
 
+from . import attorney_baseline_models as _baseline_models
+from . import attorney_readiness_models as _models
 from . import attorney_readiness_requests as _requests
 from .attorney_baseline_models import (
     BaselineImportanceV1,
@@ -118,6 +120,19 @@ _COMPLETENESS_CLAIM = re.compile(
     r"(?:accurate|current)|all issues (?:are )?resolved)\b",
     re.IGNORECASE,
 )
+_TRUSTED_CONTAINER_TYPES = frozenset(
+    {
+        tuple,
+        list,
+        dict,
+        _models._FrozenWireTuple,
+        _models._FrozenJsonList,
+        _models._FrozenDict,
+        _baseline_models._FrozenStringList,
+        _baseline_models._FrozenDict,
+    }
+)
+_BLOCKING_CODES = frozenset(load_readiness_rubric_v1().blocking_codes)
 
 
 def _fingerprint(value: object) -> str:
@@ -125,17 +140,7 @@ def _fingerprint(value: object) -> str:
 
 
 def _accepted_container(value: object) -> bool:
-    if type(value) in {tuple, list, dict}:
-        return True
-    return type(value).__module__ in {
-        "regulatory_harvest.evaluation.attorney_readiness_models",
-        "regulatory_harvest.evaluation.attorney_baseline_models",
-    } and type(value).__name__ in {
-        "_FrozenWireTuple",
-        "_FrozenJsonList",
-        "_FrozenDict",
-        "_FrozenStringList",
-    }
+    return type(value) in _TRUSTED_CONTAINER_TYPES
 
 
 def _preflight_model(value: BaseModel) -> None:
@@ -431,6 +436,7 @@ def _strict_aggregate_for_projection(
         item.contested_requirement.contested_requirement_id
         for item in baseline.contested_requirements
     )
+    expected_batches = build_baseline_locked_grade_batches_v1(baseline, lane=lane)
     if (
         aggregate.lane != lane
         or aggregate.grade_target_fingerprint != baseline.binding.grade_target_fingerprint
@@ -440,6 +446,14 @@ def _strict_aggregate_for_projection(
         or tuple(item.requirement_id for item in aggregate.requirement_grades) != expected_ids
         or tuple(item.contested_requirement_id for item in aggregate.contested_grades)
         != expected_contests
+        or tuple(
+            (
+                fragment.batch_ref,
+                tuple(grade.requirement_id for grade in fragment.requirement_grades),
+            )
+            for fragment in aggregate.ordinary_fragments
+        )
+        != tuple((batch.batch_ref, batch.requirement_ids) for batch in expected_batches)
         or aggregate.aggregate_fingerprint
         != _fingerprint(aggregate.model_dump(mode="json", exclude={"aggregate_fingerprint"}))
     ):
@@ -757,11 +771,19 @@ def reconcile_safety_lanes_v1(
         first_record = first_assessments.get(identity) or first_findings.get(identity)
         second_record = second_assessments.get(identity) or second_findings.get(identity)
         if decision.disposition in {"blocking", "unresolved"}:
-            unresolved_blockers.extend(
-                _unresolved_dispute_blockers(dispute, first_record, second_record)
+            dispute_blockers = _unresolved_dispute_blockers(
+                dispute,
+                first_record,
+                second_record,
             )
+            unresolved_blockers.extend(dispute_blockers)
             if identity not in reconciled and second_record is not None:
                 reconciled[identity] = second_record
+            current = reconciled.get(identity)
+            if current is not None and current.blocking_code is None:
+                raw = current.model_dump(mode="json")
+                raw["blocking_code"] = dispute_blockers[0]
+                reconciled[identity] = type(current).model_validate(raw)
             continue
         chosen = first_record if decision.disposition == "lane_1" else second_record
         if dispute.dispute_kind == "finding_existence":
@@ -897,14 +919,17 @@ def _strict_equivalent_for_inputs(
 
 def _strict_safety(value: object) -> ReconciledSafetyReviewV1:
     checked = _strict_model(ReconciledSafetyReviewV1, value, label="reconciled safety review")
-    if checked.safety_review_fingerprint != _fingerprint(
-        checked.model_dump(mode="json", exclude={"safety_review_fingerprint"})
-    ) or (
-        any(
-            decision.disposition in {"blocking", "unresolved"}
-            for decision in checked.referee_decisions
+    if (
+        checked.safety_review_fingerprint
+        != _fingerprint(checked.model_dump(mode="json", exclude={"safety_review_fingerprint"}))
+        or any(code not in _BLOCKING_CODES for code in checked.blocking_codes)
+        or (
+            any(
+                decision.disposition in {"blocking", "unresolved"}
+                for decision in checked.referee_decisions
+            )
+            and not checked.blocking_codes
         )
-        and not checked.blocking_codes
     ):
         raise ValueError("reconciled safety review is invalid")
     return checked
@@ -1183,6 +1208,60 @@ def _generic(value: str) -> bool:
     return bool(_GENERIC_ONLY.fullmatch(normalized))
 
 
+def _contradictory_completeness_claim(value: str) -> bool:
+    if _COMPLETENESS_CLAIM.search(value):
+        return True
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    tokens = "".join(character if character.isalnum() else " " for character in normalized).split()
+    quantifiers = {
+        "all",
+        "each",
+        "every",
+        "exhaustive",
+        "exhaustively",
+        "fully",
+        "nothing",
+    }
+    completion = {
+        "address",
+        "addressed",
+        "addresses",
+        "comprehensive",
+        "comprehensively",
+        "cover",
+        "covered",
+        "covers",
+        "resolve",
+        "resolved",
+        "resolves",
+    }
+    shortfalls = {
+        "caveat",
+        "caveats",
+        "gap",
+        "gaps",
+        "issue",
+        "issues",
+        "limitation",
+        "limitations",
+        "omission",
+        "omissions",
+        "shortfall",
+        "shortfalls",
+        "uncertainties",
+        "uncertainty",
+    }
+    quantifier_positions = [index for index, token in enumerate(tokens) if token in quantifiers]
+    completion_positions = [index for index, token in enumerate(tokens) if token in completion]
+    shortfall_positions = [index for index, token in enumerate(tokens) if token in shortfalls]
+    return any(
+        abs(quantifier - shortfall) <= 8 and abs(done - shortfall) <= 8
+        for shortfall in shortfall_positions
+        for quantifier in quantifier_positions
+        for done in completion_positions
+    )
+
+
 def _gap_blockers(
     inputs: VerifiedReadinessInputsV1,
     requirement_matrix: RequirementMatrixV1,
@@ -1218,6 +1297,56 @@ def _gap_blockers(
             for finding in safety.finding_proposals
         }
     )
+    expected_metadata: dict[tuple[GapOriginV1, str, str], tuple[object, ...]] = {}
+    for candidate in expected_candidates:
+        importance, basis, importance_rationale = _importance_contract(
+            inputs,
+            candidate.subject_id,
+            candidate.importance,
+        )
+        dispositions = tuple(
+            disposition
+            for disposition in (
+                candidate.lane_1_disposition,
+                candidate.lane_2_disposition,
+            )
+            if disposition is not None
+        )
+        content = assessments[candidate.candidate_id]
+        expected_metadata[(candidate.origin, candidate.subject_id, "")] = (
+            _candidate_kind(inputs, candidate),
+            importance,
+            basis,
+            importance_rationale,
+            candidate.lane_1_disposition,
+            candidate.lane_2_disposition,
+            None if not dispositions else _conservative(dispositions),
+            content.blocking_code,
+            None,
+        )
+    for finding in safety.finding_proposals:
+        importance, basis, importance_rationale = _importance_contract(
+            inputs,
+            finding.subject_id,
+            BaselineImportanceV1.MATERIAL,
+        )
+        expected_metadata[
+            (
+                GapOriginV1.SAFETY_FINDING,
+                finding.subject_id,
+                finding.finding_kind.value,
+            )
+        ] = (
+            finding.finding_kind.value,
+            importance,
+            basis,
+            importance_rationale,
+            None,
+            None,
+            None,
+            finding.blocking_code,
+            None,
+        )
     actual_content = {
         (
             row.origin,
@@ -1230,13 +1359,13 @@ def _gap_blockers(
         blockers.append("MISSING_REQUIRED_FOLLOW_UP")
 
     for row in gap_matrix.rows:
-        expected = expected_content.get(
-            (
-                row.origin,
-                row.subject_id,
-                row.kind if row.origin is GapOriginV1.SAFETY_FINDING else "",
-            )
+        identity = (
+            row.origin,
+            row.subject_id,
+            row.kind if row.origin is GapOriginV1.SAFETY_FINDING else "",
         )
+        expected = expected_content.get(identity)
+        metadata = expected_metadata.get(identity)
         if row.status != "open":
             blockers.append("FALSE_RESOLUTION")
         if row.blocking_code is not None:
@@ -1269,6 +1398,22 @@ def _gap_blockers(
             blockers.append("CRITICAL_DISCLOSURE_INVALID")
         if expected is None:
             continue
+        if (
+            metadata is None
+            or (
+                row.kind,
+                row.importance,
+                row.importance_basis,
+                row.importance_rationale,
+                row.lane_1_disposition,
+                row.lane_2_disposition,
+                row.conservative_disposition,
+                row.blocking_code,
+                row.referee_dispute_id,
+            )
+            != metadata
+        ):
+            blockers.append("INTEGRITY_OR_PROVENANCE_INVALID")
         if (
             row.shortfall_description != expected.shortfall_description
             or row.rationale_kind is not expected.rationale_kind
@@ -1306,7 +1451,7 @@ def _gap_blockers(
             blockers.append("MISSING_REQUIRED_FOLLOW_UP")
     if strict.outcome_determinative_contested_ids:
         blockers.append("OUTCOME_DETERMINATIVE_CONTEST")
-    if gap_matrix.rows and _COMPLETENESS_CLAIM.search(inputs.report_text):
+    if gap_matrix.rows and _contradictory_completeness_claim(inputs.report_text):
         blockers.append("HIDDEN_MATERIAL_GAP")
     return tuple(blockers)
 
