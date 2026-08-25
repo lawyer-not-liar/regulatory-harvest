@@ -88,6 +88,31 @@ def _unique_nonblank(values: tuple[str, ...], *, location: str) -> tuple[str, ..
     return checked
 
 
+def _unique_exact_passages(values: object, *, location: str) -> object:
+    if not isinstance(values, (list, tuple)):
+        return values
+    exact_values = tuple(values)
+    if any(type(value) is not str for value in exact_values):
+        raise ValueError(f"{location} must contain native strings")
+    if any(not value.strip() for value in exact_values):
+        raise ValueError(f"{location} must not contain blank values")
+    if len(exact_values) != len(set(exact_values)):
+        raise ValueError(f"{location} must be unique by exact bytes")
+    return values
+
+
+def _validate_requirement_grade_passages(values: object) -> object:
+    if not isinstance(values, (list, tuple)):
+        return values
+    for grade in values:
+        if type(grade) is dict and "report_passages" in grade:
+            _unique_exact_passages(
+                grade["report_passages"],
+                location="requirement grade report passages",
+            )
+    return values
+
+
 def _strict_lane(value: object) -> object:
     if type(value) is not int or value not in {1, 2}:
         raise ValueError("lane must be the native integer 1 or 2")
@@ -1090,6 +1115,9 @@ class BaselineLockedGradeFragmentV1(ReadinessStrictModelV1):
     fragment_fingerprint: Hash
 
     _validate_lane = field_validator("lane", mode="before")(_strict_lane)
+    _validate_passages = field_validator("requirement_grades", mode="before")(
+        _validate_requirement_grade_passages
+    )
     _validate_rationale = field_validator("rationale")(_nonblank)
 
     @model_validator(mode="after")
@@ -1131,11 +1159,17 @@ class BaselineLockedContestedGradeV1(ReadinessStrictModelV1):
         "auditor_rationale",
         "rationale",
     )(_nonblank)
-    _validate_reviewer_passages = field_validator("reviewer_report_passages")(
-        lambda values: _unique_nonblank(values, location="reviewer report passages")
+    _validate_reviewer_passages = field_validator("reviewer_report_passages", mode="before")(
+        lambda values: _unique_exact_passages(
+            values,
+            location="reviewer report passages",
+        )
     )
-    _validate_auditor_passages = field_validator("auditor_report_passages")(
-        lambda values: _unique_nonblank(values, location="auditor report passages")
+    _validate_auditor_passages = field_validator("auditor_report_passages", mode="before")(
+        lambda values: _unique_exact_passages(
+            values,
+            location="auditor report passages",
+        )
     )
 
 
@@ -1156,6 +1190,9 @@ class BaselineLockedGraderAggregateV1(ReadinessStrictModelV1):
     aggregate_fingerprint: Hash
 
     _validate_lane = field_validator("lane", mode="before")(_strict_lane)
+    _validate_passages = field_validator("requirement_grades", mode="before")(
+        _validate_requirement_grade_passages
+    )
 
     @model_validator(mode="after")
     def validate_aggregate(self) -> Self:
@@ -1291,8 +1328,11 @@ class SafetyGapAssessmentV1(ReadinessStrictModelV1):
     _validate_evidence = field_validator("evidence_refs")(
         lambda values: _unique_nonblank(values, location="assessment evidence references")
     )
-    _validate_passages = field_validator("report_passages")(
-        lambda values: _unique_nonblank(values, location="assessment report passages")
+    _validate_passages = field_validator("report_passages", mode="before")(
+        lambda values: _unique_exact_passages(
+            values,
+            location="assessment report passages",
+        )
     )
 
 
@@ -1325,8 +1365,11 @@ class SafetyFindingProposalV1(ReadinessStrictModelV1):
     _validate_evidence = field_validator("evidence_refs")(
         lambda values: _unique_nonblank(values, location="finding evidence references")
     )
-    _validate_passages = field_validator("report_passages")(
-        lambda values: _unique_nonblank(values, location="finding report passages")
+    _validate_passages = field_validator("report_passages", mode="before")(
+        lambda values: _unique_exact_passages(
+            values,
+            location="finding report passages",
+        )
     )
 
 
@@ -1430,6 +1473,16 @@ class RequirementMatrixRowV1(ReadinessStrictModelV1):
     row_fingerprint: Hash
 
     _validate_text = field_validator("statement", "kind")(_nonblank)
+    _validate_passages = field_validator(
+        "lane_1_report_passages",
+        "lane_2_report_passages",
+        mode="before",
+    )(
+        lambda values: _unique_exact_passages(
+            values,
+            location="requirement matrix report passages",
+        )
+    )
 
     @model_validator(mode="after")
     def validate_importance_contract(self) -> Self:
@@ -1498,8 +1551,11 @@ class GapFollowUpRowV1(ReadinessStrictModelV1):
         "blocking_code",
         "referee_dispute_id",
     )(_optional_nonblank)
-    _validate_passages = field_validator("report_passages")(
-        lambda values: _unique_nonblank(values, location="gap report passages")
+    _validate_passages = field_validator("report_passages", mode="before")(
+        lambda values: _unique_exact_passages(
+            values,
+            location="gap report passages",
+        )
     )
     _validate_evidence = field_validator("evidence_refs")(
         lambda values: _unique_nonblank(values, location="gap evidence references")

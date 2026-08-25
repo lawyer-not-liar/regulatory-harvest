@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from hashlib import sha256
 from pathlib import Path
+from typing import cast
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from test_attorney_baseline_artifacts import _complete_graph
 
 import regulatory_harvest.evaluation.attorney_baseline_models as baseline_models_module
@@ -48,7 +49,10 @@ from regulatory_harvest.evaluation.attorney_readiness_models import (
     ReadinessRunStateV1,
     ReadinessVerificationV1,
     RequirementDispositionV1,
+    RequirementMatrixRowV1,
     SafetyFindingKindV1,
+    SafetyFindingProposalV1,
+    SafetyGapAssessmentV1,
     SafetyLaneResponseV1,
     load_readiness_rubric_v1,
     validate_readiness_evaluator_response_v1,
@@ -232,6 +236,67 @@ def valid_fragment(**updates: object) -> dict[str, object]:
     return value
 
 
+def valid_safety_assessment(**updates: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "candidate_id": "GC-0001",
+        "shortfall_description": "The report omits the filing deadline.",
+        "rationale_kind": "REPORT_OMISSION",
+        "why_unresolved": "No report passage supplies the deadline.",
+        "why_it_matters": "The deadline affects implementation.",
+        "evidence_refs": ("REQ-0001",),
+        "report_passages": (),
+        "disclosure_location": None,
+        "visibility": "prominent",
+        "blocking_code": None,
+        "follow_up_code": "VERIFY_PRIMARY_AUTHORITY",
+        "resolution_test": "Add and verify the deadline.",
+        "owner_role": "reviewing_attorney",
+    }
+    value.update(updates)
+    return value
+
+
+def valid_finding_proposal(**updates: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "finding_kind": "MATERIAL_UNSUPPORTED_ASSERTION",
+        "subject_id": "REQ-0001",
+        "report_passages": (),
+        "shortfall_description": "The report overstates the available evidence.",
+        "rationale_kind": "UNSUPPORTED_ASSERTION",
+        "why_unresolved": "The cited evidence does not support the assertion.",
+        "why_it_matters": "The assertion could change the legal conclusion.",
+        "evidence_refs": ("REQ-0001",),
+        "disclosure_location": None,
+        "visibility": "prominent",
+        "blocking_code": "MATERIAL_UNSUPPORTED_ASSERTION",
+        "follow_up_code": "CORRECT_UNSUPPORTED_ASSERTION",
+        "resolution_test": "Correct or support the assertion.",
+        "owner_role": "reviewing_attorney",
+    }
+    value.update(updates)
+    return value
+
+
+def valid_requirement_matrix_row(**updates: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "requirement_id": "REQ-0001",
+        "canonical_order": 0,
+        "statement": "The filer must act by the statutory deadline.",
+        "kind": "obligation",
+        "importance": "critical",
+        "importance_basis": ("legal_bottom_line",),
+        "importance_rationale": "Omission could change the legal bottom line.",
+        "lane_1_disposition": "met",
+        "lane_2_disposition": "partially_met",
+        "conservative_disposition": "partially_met",
+        "lane_1_report_passages": (),
+        "lane_2_report_passages": (),
+        "row_fingerprint": "e" * 64,
+    }
+    value.update(updates)
+    return value
+
+
 def valid_contested_grade(**updates: object) -> dict[str, object]:
     value: dict[str, object] = {
         "protocol_version": "delivery-readiness-v1",
@@ -362,6 +427,135 @@ def test_rationale_normalization_remains_trimmed() -> None:
     )
 
     assert checked.rationale == "Evidence-bound rationale."
+
+
+def exact_passage_cases(
+    passages: tuple[object, ...],
+) -> list[tuple[type[BaseModel], dict[str, object], str]]:
+    grade = valid_grade()
+    grade["report_passages"] = list(passages)
+    return [
+        (
+            BaselineLockedGradeFragmentV1,
+            valid_fragment(requirement_grades=(grade,)),
+            "requirement_grade",
+        ),
+        (
+            BaselineLockedContestedGradeV1,
+            valid_contested_grade(reviewer_report_passages=passages),
+            "reviewer_report_passages",
+        ),
+        (
+            BaselineLockedContestedGradeV1,
+            valid_contested_grade(auditor_report_passages=passages),
+            "auditor_report_passages",
+        ),
+        (
+            SafetyGapAssessmentV1,
+            valid_safety_assessment(report_passages=passages),
+            "report_passages",
+        ),
+        (
+            SafetyFindingProposalV1,
+            valid_finding_proposal(report_passages=passages),
+            "report_passages",
+        ),
+        (
+            GapFollowUpRowV1,
+            valid_gap_row(report_passages=passages),
+            "report_passages",
+        ),
+        (
+            RequirementMatrixRowV1,
+            valid_requirement_matrix_row(lane_1_report_passages=passages),
+            "lane_1_report_passages",
+        ),
+        (
+            RequirementMatrixRowV1,
+            valid_requirement_matrix_row(lane_2_report_passages=passages),
+            "lane_2_report_passages",
+        ),
+    ]
+
+
+def passage_case_value(checked: object, field: str) -> tuple[object, ...]:
+    if field == "requirement_grade":
+        fragment = cast(BaselineLockedGradeFragmentV1, checked)
+        return tuple(fragment.requirement_grades[0].report_passages)
+    return tuple(getattr(checked, field))
+
+
+EXACT_EVIDENCE_PASSAGES = ("  Exact report passage.  \n", "Exact report passage.")
+
+
+@pytest.mark.parametrize(
+    ("model", "value", "field"),
+    exact_passage_cases(EXACT_EVIDENCE_PASSAGES),
+)
+def test_exact_evidence_passages_preserve_bytes_order_and_exact_uniqueness(
+    model: type[BaseModel],
+    value: dict[str, object],
+    field: str,
+) -> None:
+    checked = model.model_validate(value)
+
+    assert passage_case_value(checked, field) == EXACT_EVIDENCE_PASSAGES
+
+
+@pytest.mark.parametrize(
+    ("model", "value", "field"),
+    exact_passage_cases((" \n\t",)),
+)
+def test_exact_evidence_passages_reject_whitespace_only(
+    model: type[BaseModel],
+    value: dict[str, object],
+    field: str,
+) -> None:
+    del field
+    with pytest.raises(ValidationError, match="blank"):
+        model.model_validate(value)
+
+
+@pytest.mark.parametrize(
+    ("model", "value", "field"),
+    exact_passage_cases(("Exact duplicate.", "Exact duplicate.")),
+)
+def test_exact_evidence_passages_reject_exact_duplicates(
+    model: type[BaseModel],
+    value: dict[str, object],
+    field: str,
+) -> None:
+    del field
+    with pytest.raises(ValidationError, match="unique"):
+        model.model_validate(value)
+
+
+@pytest.mark.parametrize(
+    ("model", "value", "field"),
+    exact_passage_cases((b"not a native string",)),
+)
+def test_exact_evidence_passages_reject_non_native_strings(
+    model: type[BaseModel],
+    value: dict[str, object],
+    field: str,
+) -> None:
+    del field
+    with pytest.raises(ValidationError, match="native strings"):
+        model.model_validate(value)
+
+
+def test_aggregate_flattened_passages_reject_non_native_string_laundering() -> None:
+    fragment_grade = valid_grade()
+    flattened_grade = valid_grade()
+    flattened_grade["report_passages"] = [b"The report addresses the requirement."]
+
+    with pytest.raises(ValidationError, match="native strings"):
+        BaselineLockedGraderAggregateV1.model_validate(
+            valid_aggregate(
+                ordinary_fragments=(valid_fragment(requirement_grades=(fragment_grade,)),),
+                requirement_grades=(flattened_grade,),
+            )
+        )
 
 
 def test_readiness_policy_has_exact_canonical_bytes_and_versioned_thresholds() -> None:
