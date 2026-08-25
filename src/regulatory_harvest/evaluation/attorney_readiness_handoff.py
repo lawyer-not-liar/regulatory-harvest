@@ -336,6 +336,30 @@ def _validate_delivery_semantics(
     if result.minimum_lane_weighted_coverage < rubric.review_ready_weighted_coverage_floor:
         raise _invalid()
 
+    def lane_disposition(
+        observations: Sequence[tuple[BaselineImportanceV1, RequirementDispositionV1]],
+    ) -> AbsoluteDispositionV2:
+        if any(
+            disposition is RequirementDispositionV1.UNCERTAIN for _, disposition in observations
+        ):
+            return AbsoluteDispositionV2.INCONCLUSIVE
+        denominator = 2 * sum(
+            rubric.strict_importance_weights[importance] for importance, _ in observations
+        )
+        numerator = sum(
+            rubric.strict_importance_weights[importance]
+            * (2 if disposition is RequirementDispositionV1.MET else 1)
+            for importance, disposition in observations
+            if disposition in {RequirementDispositionV1.MET, RequirementDispositionV1.PARTIALLY_MET}
+        )
+        if any(
+            disposition is not RequirementDispositionV1.MET
+            for importance, disposition in observations
+            if importance is BaselineImportanceV1.CRITICAL
+        ) or (denominator and 10 * numerator < 9 * denominator):
+            return AbsoluteDispositionV2.FAIL
+        return AbsoluteDispositionV2.PASS
+
     requirement_by_id = {row.requirement_id: row for row in requirements.rows}
     contested_rows = tuple(
         row for row in gaps.rows if row.origin is GapOriginV1.CONTESTED_REQUIREMENT
@@ -390,7 +414,8 @@ def _validate_delivery_semantics(
 
     lane_weighted: list[float] = []
     lane_critical: list[float] = []
-    lane_dispositions: list[AbsoluteDispositionV2] = []
+    ordinary_lane_dispositions: list[AbsoluteDispositionV2] = []
+    combined_lane_dispositions: list[AbsoluteDispositionV2] = []
     for lane in (1, 2):
         observations: list[tuple[BaselineImportanceV1, RequirementDispositionV1]] = [
             (
@@ -399,11 +424,13 @@ def _validate_delivery_semantics(
             )
             for row in requirements.rows
         ]
+        ordinary_lane_dispositions.append(lane_disposition(observations))
         for row in contested_rows:
             disposition = row.lane_1_disposition if lane == 1 else row.lane_2_disposition
             if disposition is None:
                 raise _invalid()
             observations.append((row.importance, disposition))
+        combined_lane_dispositions.append(lane_disposition(observations))
         denominator = 2 * sum(
             rubric.strict_importance_weights[importance] for importance, _ in observations
         )
@@ -425,33 +452,29 @@ def _validate_delivery_semantics(
         )
         lane_weighted.append(1.0 if denominator == 0 else numerator / denominator)
         lane_critical.append(1.0 if not critical else critical_numerator / (2 * len(critical)))
-        if any(
-            disposition is RequirementDispositionV1.UNCERTAIN for _, disposition in observations
-        ):
-            lane_dispositions.append(AbsoluteDispositionV2.INCONCLUSIVE)
-        elif critical_numerator != 2 * len(critical) or (
-            denominator and 10 * numerator < 9 * denominator
-        ):
-            lane_dispositions.append(AbsoluteDispositionV2.FAIL)
-        else:
-            lane_dispositions.append(AbsoluteDispositionV2.PASS)
     if result.lane_weighted_coverage != tuple(
         lane_weighted
     ) or result.lane_critical_recall != tuple(lane_critical):
         raise _invalid()
 
     ordinary_disposition = (
-        lane_dispositions[0]
-        if lane_dispositions[0] is lane_dispositions[1]
+        ordinary_lane_dispositions[0]
+        if ordinary_lane_dispositions[0] is ordinary_lane_dispositions[1]
         else AbsoluteDispositionV2.INCONCLUSIVE
     )
-    if not contested_rows:
-        disposition_valid = fresh is ordinary_disposition
-    elif ordinary_disposition is AbsoluteDispositionV2.INCONCLUSIVE:
+    combined_disposition = (
+        combined_lane_dispositions[0]
+        if combined_lane_dispositions[0] is combined_lane_dispositions[1]
+        else AbsoluteDispositionV2.INCONCLUSIVE
+    )
+    if ordinary_disposition is AbsoluteDispositionV2.INCONCLUSIVE:
         disposition_valid = fresh is AbsoluteDispositionV2.INCONCLUSIVE
+    elif not contested_rows:
+        disposition_valid = fresh is ordinary_disposition
     else:
         disposition_valid = fresh in {
             ordinary_disposition,
+            combined_disposition,
             AbsoluteDispositionV2.INCONCLUSIVE,
         }
     if not disposition_valid:

@@ -759,6 +759,39 @@ def test_uncertain_lane_cannot_be_resealed_as_pass_and_high_assurance(
         render_attorney_review_handoff_v1(**{**case, "result": forged})
 
 
+def test_contested_rows_cannot_mask_ordinary_lane_disagreement(tmp_path: Path) -> None:
+    inputs = _request_inputs_fixture.__wrapped__(tmp_path)
+    exact = _clean_qualification(
+        _with_requirements(inputs, count=7, importance="critical", contested=True)
+    )
+    lanes = _lanes(
+        exact,
+        ("met",) * 7,
+        ("met",) * 6 + ("not_met",),
+        contested_1=(("not_met", "not_met"),),
+    )
+    _, requirement_matrix, gap_matrix, _, result = _compile(exact, lanes)
+    assert result.baseline_locked_strict_equivalent_disposition == "INCONCLUSIVE"
+    assert result.delivery_readiness == "REVIEW_READY_WITH_GAPS"
+    render_attorney_review_handoff_v1(
+        report_text=exact.report_text,
+        requirement_matrix=requirement_matrix,
+        gap_matrix=gap_matrix,
+        result=result,
+    )
+    forged = _reseal_result(
+        result,
+        baseline_locked_strict_equivalent_disposition="FAIL",
+    )
+    with pytest.raises(ValueError, match="handoff input is invalid"):
+        render_attorney_review_handoff_v1(
+            report_text=exact.report_text,
+            requirement_matrix=requirement_matrix,
+            gap_matrix=gap_matrix,
+            result=forged,
+        )
+
+
 def test_gap_importance_and_dispositions_are_bound_to_requirement_matrix(
     critical_review_case: dict[str, object],
 ) -> None:
