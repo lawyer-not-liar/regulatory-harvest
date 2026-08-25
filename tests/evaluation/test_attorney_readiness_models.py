@@ -490,7 +490,7 @@ def test_contested_grade_rejects_removed_lane_proposed_ambiguity_inventory(
 
 
 def safety_evidence_cases(
-    evidence_refs: tuple[object, ...],
+    evidence_refs: object,
 ) -> list[tuple[type[BaseModel], dict[str, object]]]:
     return [
         (
@@ -590,6 +590,65 @@ def test_safety_evidence_refs_reject_more_than_bounded_count(
 
     with pytest.raises(ValidationError):
         model.model_validate(value | {"evidence_refs": evidence_refs})
+
+
+@pytest.mark.parametrize("case_index", range(4))
+@pytest.mark.parametrize(
+    "container_kind",
+    (
+        "set",
+        "deque",
+        "generator",
+        "custom_iterable",
+        "list_subclass",
+        "tuple_subclass",
+    ),
+)
+def test_safety_evidence_refs_reject_non_native_containers_without_iteration(
+    case_index: int,
+    container_kind: str,
+) -> None:
+    iterations: list[str] = []
+    container = non_native_passage_container(container_kind, iterations)
+    model, value = safety_evidence_cases(container)[case_index]
+
+    with pytest.raises(ValidationError):
+        model.model_validate(value)
+    assert iterations == []
+
+
+@pytest.mark.parametrize("case_index", range(4))
+@pytest.mark.parametrize(
+    "container",
+    [
+        ["SOURCE-000001", "BASELINE-REQ-0001"],
+        ("SOURCE-000001", "BASELINE-REQ-0001"),
+    ],
+)
+def test_safety_evidence_refs_accept_only_builtin_wire_sequences(
+    case_index: int,
+    container: list[str] | tuple[str, ...],
+) -> None:
+    model, value = safety_evidence_cases(container)[case_index]
+
+    checked = model.model_validate(value)
+
+    assert checked.evidence_refs == (  # type: ignore[attr-defined]
+        "SOURCE-000001",
+        "BASELINE-REQ-0001",
+    )
+
+
+@pytest.mark.parametrize("model,value", safety_evidence_cases(("SOURCE-000001",)))
+def test_safety_evidence_refs_rehydrate_validated_frozen_tuples(
+    model: type[BaseModel],
+    value: dict[str, object],
+) -> None:
+    first = model.model_validate(value)
+
+    checked = model.model_validate(first)
+
+    assert checked.model_dump(mode="json") == first.model_dump(mode="json")
 
 
 def exact_passage_cases(

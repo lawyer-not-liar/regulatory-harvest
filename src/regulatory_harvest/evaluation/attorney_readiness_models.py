@@ -105,18 +105,24 @@ def _unique_nonblank(values: tuple[str, ...], *, location: str) -> tuple[str, ..
 
 
 def _unique_evidence_refs(
-    values: tuple[EvidenceRefV1, ...],
+    values: object,
     *,
     location: str,
-) -> tuple[EvidenceRefV1, ...]:
+) -> object:
+    if type(values) not in {list, tuple} and type(values) is not _FrozenWireTuple:
+        raise ValueError(f"{location} must use a built-in list or tuple")
+    checked_values = cast(list[object] | tuple[object, ...], values)
+    if len(checked_values) > _MAX_FINDINGS:
+        raise ValueError(f"{location} exceeds the bounded inventory count")
     if any(
         type(value) is not str
         or len(value) > _MAX_EVIDENCE_REF_LENGTH
         or re.fullmatch(_EVIDENCE_REF_PATTERN, value) is None
-        for value in values
+        for value in checked_values
     ):
         raise ValueError(f"{location} contains an invalid controller evidence handle")
-    if len(values) != len(set(values)):
+    checked_refs = cast(list[str] | tuple[str, ...], checked_values)
+    if len(checked_refs) != len(set(checked_refs)):
         raise ValueError(f"{location} must be unique")
     return values
 
@@ -1331,7 +1337,7 @@ class SafetyGapCandidateV1(ReadinessStrictModelV1):
     candidate_fingerprint: Hash
 
     _validate_subject = field_validator("subject_id")(_nonblank)
-    _validate_evidence = field_validator("evidence_refs")(
+    _validate_evidence = field_validator("evidence_refs", mode="before")(
         lambda values: _unique_evidence_refs(values, location="candidate evidence references")
     )
 
@@ -1360,7 +1366,7 @@ class SafetyGapAssessmentV1(ReadinessStrictModelV1):
     _validate_optional_text = field_validator("disclosure_location", "blocking_code")(
         _optional_nonblank
     )
-    _validate_evidence = field_validator("evidence_refs")(
+    _validate_evidence = field_validator("evidence_refs", mode="before")(
         lambda values: _unique_evidence_refs(values, location="assessment evidence references")
     )
     _validate_passages = field_validator("report_passages", mode="before")(
@@ -1397,7 +1403,7 @@ class SafetyFindingProposalV1(ReadinessStrictModelV1):
     _validate_optional_text = field_validator("disclosure_location", "blocking_code")(
         _optional_nonblank
     )
-    _validate_evidence = field_validator("evidence_refs")(
+    _validate_evidence = field_validator("evidence_refs", mode="before")(
         lambda values: _unique_evidence_refs(values, location="finding evidence references")
     )
     _validate_passages = field_validator("report_passages", mode="before")(
@@ -1467,7 +1473,7 @@ class SafetyRefereeDecisionV1(ReadinessStrictModelV1):
     evidence_refs: tuple[EvidenceRefV1, ...] = Field(max_length=_MAX_FINDINGS)
 
     _validate_rationale = field_validator("rationale")(_nonblank)
-    _validate_evidence = field_validator("evidence_refs")(
+    _validate_evidence = field_validator("evidence_refs", mode="before")(
         lambda values: _unique_evidence_refs(values, location="referee evidence references")
     )
 
