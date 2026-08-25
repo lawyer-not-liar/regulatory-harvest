@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from enum import Enum
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 
 import pytest
 from test_attorney_baseline_projection import _resealed_context
@@ -275,7 +276,12 @@ def _safety(
     findings_2: tuple[SafetyFindingProposalV1, ...] | None = None,
     mutate_second: tuple[str, object] | None = None,
     decisions: tuple[SafetyRefereeDecisionV1, ...] | None = None,
-) -> tuple[tuple[SafetyGapCandidateV1, ...], ReconciledSafetyReviewV1]:
+) -> tuple[
+    tuple[SafetyGapCandidateV1, ...],
+    ReconciledSafetyReviewV1,
+    SafetyLaneResponseV1,
+    SafetyLaneResponseV1,
+]:
     candidates = build_gap_candidate_inventory_v1(inputs, lanes)
     first_assessments = tuple(_assessment(item) for item in candidates)
     second_assessments = list(first_assessments)
@@ -305,12 +311,34 @@ def _safety(
             )
             for item in disputes
         )
-    return candidates, reconcile_safety_lanes_v1(
-        inputs,
+    return (
         candidates,
+        reconcile_safety_lanes_v1(
+            inputs,
+            candidates,
+            lane_1,
+            lane_2,
+            decisions,
+        ),
         lane_1,
         lane_2,
-        decisions,
+    )
+
+
+def _matching_safety_lanes(
+    safety: ReconciledSafetyReviewV1,
+) -> tuple[SafetyLaneResponseV1, SafetyLaneResponseV1]:
+    return (
+        SafetyLaneResponseV1(
+            lane=1,
+            candidate_assessments=safety.candidate_assessments,
+            finding_proposals=safety.finding_proposals,
+        ),
+        SafetyLaneResponseV1(
+            lane=2,
+            candidate_assessments=safety.candidate_assessments,
+            finding_proposals=safety.finding_proposals,
+        ),
     )
 
 
@@ -333,7 +361,11 @@ def _compile(
         inputs.readiness_rubric,
     )
     requirement_matrix = compile_requirement_matrix_v1(inputs, lanes)
-    candidates, safety = _safety(inputs, lanes, findings_1=findings)
+    candidates, safety, safety_lane_1, safety_lane_2 = _safety(
+        inputs,
+        lanes,
+        findings_1=findings,
+    )
     gap_matrix = compile_gap_follow_up_matrix_v1(inputs, strict, candidates, safety)
     result = derive_delivery_readiness_v1(
         inputs,
@@ -341,6 +373,8 @@ def _compile(
         requirement_matrix,
         gap_matrix,
         safety,
+        safety_lane_1,
+        safety_lane_2,
     )
     return strict, requirement_matrix, gap_matrix, safety, result
 
@@ -589,6 +623,8 @@ def test_downstream_interfaces_reject_resealed_noncanonical_fragment_partition(
             lanes[1],
             exact.readiness_rubric,
         )
+    with pytest.raises(ValueError, match="grader aggregate is invalid"):
+        compile_requirement_matrix_v1(exact, (forged, lanes[1]))
 
 
 def test_safety_reconciliation_requires_exact_dispute_and_referee_coverage(
@@ -680,6 +716,38 @@ def test_safety_referee_decisions_require_exact_canonical_order(
         )
 
 
+def test_unknown_blocker_codes_are_rejected_on_safety_record_surfaces(
+    inputs: VerifiedReadinessInputsV1,
+) -> None:
+    exact = _clean_qualification(_with_requirements(inputs, count=10, importance="supporting"))
+    lanes = _lanes(exact, ("met",) * 9 + ("not_met",))
+    candidates = build_gap_candidate_inventory_v1(exact, lanes)
+    assessments = tuple(_assessment(candidate) for candidate in candidates)
+    first_raw = assessments[0].model_dump(mode="json")
+    first_raw["blocking_code"] = "UNKNOWN_NONEMPTY_BLOCKER"
+    forged_first = type(assessments[0]).model_validate(first_raw)
+    forged_assessments = (forged_first, *assessments[1:])
+    lane_1 = SafetyLaneResponseV1(
+        lane=1,
+        candidate_assessments=forged_assessments,
+        finding_proposals=(),
+    )
+    lane_2 = SafetyLaneResponseV1(
+        lane=2,
+        candidate_assessments=forged_assessments,
+        finding_proposals=(),
+    )
+
+    with pytest.raises(ValueError, match="safety blocking code is invalid"):
+        reconcile_safety_lanes_v1(
+            exact,
+            candidates,
+            lane_1,
+            lane_2,
+            (),
+        )
+
+
 def test_gap_matrix_has_one_open_row_per_candidate_and_finding_in_stable_order(
     inputs: VerifiedReadinessInputsV1,
 ) -> None:
@@ -692,7 +760,7 @@ def test_gap_matrix_has_one_open_row_per_candidate_and_finding_in_stable_order(
         inputs.gradeable_baseline, *lanes, inputs.readiness_rubric
     )
     finding = _finding(rationale="The cited source does not support the report statement.")
-    candidates, safety = _safety(inputs, lanes, findings_1=(finding,))
+    candidates, safety, _, _ = _safety(inputs, lanes, findings_1=(finding,))
     matrix = compile_gap_follow_up_matrix_v1(inputs, strict, candidates, safety)
     assert len(matrix.rows) == len(candidates) + 1
     assert tuple(row.gap_id for row in matrix.rows) == tuple(
@@ -728,7 +796,7 @@ def test_gap_matrix_covers_every_origin_and_rejects_truncated_candidate_inventor
         rationale="The cited evidence establishes the report-wide safety defect.",
         subject_id="REQ-0003",
     )
-    candidates, safety = _safety(exact, lanes, findings_1=(finding,))
+    candidates, safety, _, _ = _safety(exact, lanes, findings_1=(finding,))
     matrix = compile_gap_follow_up_matrix_v1(exact, strict, candidates, safety)
 
     assert {row.origin.value for row in matrix.rows} == {
@@ -914,7 +982,14 @@ def test_historical_disposition_is_attached_after_tier_without_seeding_it(
         ),
         historical_v22=historical,
     )
-    attached = derive_delivery_readiness_v1(with_history, strict, requirement, gap, safety)
+    attached = derive_delivery_readiness_v1(
+        with_history,
+        strict,
+        requirement,
+        gap,
+        safety,
+        *_matching_safety_lanes(safety),
+    )
     assert attached.delivery_readiness == without.delivery_readiness
     assert attached.blocking_codes == without.blocking_codes
     assert attached.historical_v22_strict_disposition == "FAIL"
@@ -965,6 +1040,7 @@ def test_historical_cross_product_changes_only_labeled_historical_fields(
             requirement,
             gap,
             safety,
+            *_matching_safety_lanes(safety),
         )
 
     assert attached.delivery_readiness == without.delivery_readiness
@@ -1013,6 +1089,77 @@ def test_each_safety_finding_kind_blocks_in_rubric_order(
     assert blocking_code in result.blocking_codes
 
 
+def test_safety_finding_kind_rederives_blocker_after_coordinated_field_reseal(
+    inputs: VerifiedReadinessInputsV1,
+) -> None:
+    exact = _clean_qualification(_with_requirements(inputs, count=10, importance="supporting"))
+    lanes = _lanes(exact, ("met",) * 10)
+    finding = _finding(
+        rationale="The exact evidence does not support the material assertion.",
+        subject_id="REQ-0003",
+        kind="MATERIAL_UNSUPPORTED_ASSERTION",
+    )
+    strict, requirement, gap, safety, original = _compile(
+        exact,
+        lanes,
+        findings=(finding,),
+    )
+    assert original.delivery_readiness == "NOT_DELIVERABLE"
+
+    finding_raw = safety.finding_proposals[0].model_dump(mode="json")
+    finding_raw["blocking_code"] = None
+    changed_finding = SafetyFindingProposalV1.model_validate(finding_raw)
+    safety_descriptor = safety.model_dump(
+        mode="json",
+        exclude={"safety_review_fingerprint"},
+    )
+    safety_descriptor["finding_proposals"] = [changed_finding.model_dump(mode="json")]
+    safety_descriptor["blocking_codes"] = []
+    forged_safety = ReconciledSafetyReviewV1.model_validate(
+        {
+            **safety_descriptor,
+            "safety_review_fingerprint": sha256_digest(canonical_json_bytes(safety_descriptor)),
+        }
+    )
+
+    changed_rows: list[GapFollowUpRowV1] = []
+    for row in gap.rows:
+        descriptor = row.model_dump(mode="json", exclude={"row_fingerprint"})
+        if row.origin == "safety_finding":
+            descriptor["blocking_code"] = None
+        changed_rows.append(
+            GapFollowUpRowV1.model_validate(
+                {
+                    **descriptor,
+                    "row_fingerprint": sha256_digest(canonical_json_bytes(descriptor)),
+                }
+            )
+        )
+    matrix_descriptor = gap.model_dump(
+        mode="json",
+        exclude={"matrix_fingerprint"},
+    )
+    matrix_descriptor["rows"] = [row.model_dump(mode="json") for row in changed_rows]
+    forged_gap = GapFollowUpMatrixV1.model_validate(
+        {
+            **matrix_descriptor,
+            "matrix_fingerprint": sha256_digest(canonical_json_bytes(matrix_descriptor)),
+        }
+    )
+
+    result = derive_delivery_readiness_v1(
+        exact,
+        strict,
+        requirement,
+        forged_gap,
+        forged_safety,
+        *_matching_safety_lanes(safety),
+    )
+
+    assert result.delivery_readiness == "NOT_DELIVERABLE"
+    assert "MATERIAL_UNSUPPORTED_ASSERTION" in result.blocking_codes
+
+
 def test_blocker_precedence_is_stable_and_independent_of_row_order(
     inputs: VerifiedReadinessInputsV1,
 ) -> None:
@@ -1033,7 +1180,14 @@ def test_blocker_precedence_is_stable_and_independent_of_row_order(
     forged_safety = forged_safety.model_copy(
         update={"safety_review_fingerprint": sha256_digest(canonical_json_bytes(descriptor))}
     )
-    result = derive_delivery_readiness_v1(exact, strict, requirement, gap, forged_safety)
+    result = derive_delivery_readiness_v1(
+        exact,
+        strict,
+        requirement,
+        gap,
+        forged_safety,
+        *_matching_safety_lanes(safety),
+    )
     assert result.blocking_codes == (
         "INTEGRITY_OR_PROVENANCE_INVALID",
         "MATERIAL_UNSUPPORTED_ASSERTION",
@@ -1119,6 +1273,7 @@ def test_missing_required_gap_row_returns_blocker_not_silent_review_readiness(
         requirement,
         missing,
         safety,
+        *_matching_safety_lanes(safety),
     )
 
     assert result.delivery_readiness == "NOT_DELIVERABLE"
@@ -1222,6 +1377,8 @@ def test_resealed_safety_cannot_delete_unresolved_referee_blocker(
         requirement,
         gap,
         safety,
+        lane_1,
+        lane_2,
     )
     assert original.delivery_readiness == "NOT_DELIVERABLE"
     assert "CRITICAL_DISCLOSURE_INVALID" in original.blocking_codes
@@ -1241,6 +1398,8 @@ def test_resealed_safety_cannot_delete_unresolved_referee_blocker(
             requirement,
             gap,
             forged,
+            lane_1,
+            lane_2,
         )
 
     descriptor["blocking_codes"] = ["UNKNOWN_NONEMPTY_BLOCKER"]
@@ -1257,6 +1416,8 @@ def test_resealed_safety_cannot_delete_unresolved_referee_blocker(
             requirement,
             gap,
             forged_unknown,
+            lane_1,
+            lane_2,
         )
 
     descriptor["blocking_codes"] = []
@@ -1273,9 +1434,71 @@ def test_resealed_safety_cannot_delete_unresolved_referee_blocker(
         requirement,
         gap,
         forged_removed_decision,
+        lane_1,
+        lane_2,
     )
     assert removed_result.delivery_readiness == "NOT_DELIVERABLE"
     assert "CRITICAL_DISCLOSURE_INVALID" in removed_result.blocking_codes
+
+    assessment_raw = safety.candidate_assessments[0].model_dump(mode="json")
+    assessment_raw["blocking_code"] = None
+    coordinated_assessment = type(safety.candidate_assessments[0]).model_validate(assessment_raw)
+    coordinated_safety_descriptor = safety.model_dump(
+        mode="json",
+        exclude={"safety_review_fingerprint"},
+    )
+    coordinated_safety_descriptor.update(
+        {
+            "candidate_assessments": [coordinated_assessment.model_dump(mode="json")],
+            "referee_decisions": [],
+            "blocking_codes": [],
+        }
+    )
+    coordinated_safety = ReconciledSafetyReviewV1.model_validate(
+        {
+            **coordinated_safety_descriptor,
+            "safety_review_fingerprint": sha256_digest(
+                canonical_json_bytes(coordinated_safety_descriptor)
+            ),
+        }
+    )
+    coordinated_rows: list[GapFollowUpRowV1] = []
+    for row in gap.rows:
+        row_descriptor = row.model_dump(
+            mode="json",
+            exclude={"row_fingerprint"},
+        )
+        row_descriptor["blocking_code"] = None
+        coordinated_rows.append(
+            GapFollowUpRowV1.model_validate(
+                {
+                    **row_descriptor,
+                    "row_fingerprint": sha256_digest(canonical_json_bytes(row_descriptor)),
+                }
+            )
+        )
+    coordinated_gap_descriptor = gap.model_dump(
+        mode="json",
+        exclude={"matrix_fingerprint"},
+    )
+    coordinated_gap_descriptor["rows"] = [row.model_dump(mode="json") for row in coordinated_rows]
+    coordinated_gap = GapFollowUpMatrixV1.model_validate(
+        {
+            **coordinated_gap_descriptor,
+            "matrix_fingerprint": sha256_digest(canonical_json_bytes(coordinated_gap_descriptor)),
+        }
+    )
+    coordinated_result = derive_delivery_readiness_v1(
+        exact,
+        strict,
+        requirement,
+        coordinated_gap,
+        coordinated_safety,
+        lane_1,
+        lane_2,
+    )
+    assert coordinated_result.delivery_readiness == "NOT_DELIVERABLE"
+    assert "INTEGRITY_OR_PROVENANCE_INVALID" in coordinated_result.blocking_codes
 
 
 def test_resealed_gap_metadata_cannot_downgrade_critical_partial_shortfall(
@@ -1325,6 +1548,58 @@ def test_resealed_gap_metadata_cannot_downgrade_critical_partial_shortfall(
         requirement,
         forged,
         safety,
+        *_matching_safety_lanes(safety),
+    )
+
+    assert result.delivery_readiness == "NOT_DELIVERABLE"
+    assert "INTEGRITY_OR_PROVENANCE_INVALID" in result.blocking_codes
+
+
+def test_resealed_gap_rows_cannot_swap_canonical_semantic_order(
+    inputs: VerifiedReadinessInputsV1,
+) -> None:
+    exact = _clean_qualification(_with_requirements(inputs, count=10, importance="supporting"))
+    lanes = _lanes(exact, ("met",) * 8 + ("partially_met",) * 2)
+    strict, requirement, gap, safety, original = _compile(exact, lanes)
+    assert original.delivery_readiness == "HIGH_ASSURANCE"
+    assert len(gap.rows) == 2
+
+    swapped: list[GapFollowUpRowV1] = []
+    for index, row in enumerate(reversed(gap.rows), 1):
+        descriptor = row.model_dump(mode="json", exclude={"row_fingerprint"})
+        descriptor.update(
+            {
+                "gap_id": f"GAP-{index:04d}",
+                "canonical_order": index - 1,
+            }
+        )
+        swapped.append(
+            GapFollowUpRowV1.model_validate(
+                {
+                    **descriptor,
+                    "row_fingerprint": sha256_digest(canonical_json_bytes(descriptor)),
+                }
+            )
+        )
+    matrix_descriptor = gap.model_dump(
+        mode="json",
+        exclude={"matrix_fingerprint"},
+    )
+    matrix_descriptor["rows"] = [row.model_dump(mode="json") for row in swapped]
+    forged = GapFollowUpMatrixV1.model_validate(
+        {
+            **matrix_descriptor,
+            "matrix_fingerprint": sha256_digest(canonical_json_bytes(matrix_descriptor)),
+        }
+    )
+
+    result = derive_delivery_readiness_v1(
+        exact,
+        strict,
+        requirement,
+        forged,
+        safety,
+        *_matching_safety_lanes(safety),
     )
 
     assert result.delivery_readiness == "NOT_DELIVERABLE"
@@ -1383,7 +1658,14 @@ def test_false_resolution_hidden_critical_and_missing_evidence_fail_closed(
                 "matrix_fingerprint": sha256_digest(canonical_json_bytes(matrix_descriptor)),
             }
         )
-        result = derive_delivery_readiness_v1(exact, strict, requirement, mutated, safety)
+        result = derive_delivery_readiness_v1(
+            exact,
+            strict,
+            requirement,
+            mutated,
+            safety,
+            *_matching_safety_lanes(safety),
+        )
         assert result.delivery_readiness == "NOT_DELIVERABLE"
         assert code in result.blocking_codes
 
@@ -1393,6 +1675,9 @@ def test_false_resolution_hidden_critical_and_missing_evidence_fail_closed(
     [
         "The report is complete and accurate.",
         "This report comprehensively resolves every material issue and limitation.",
+        "There are zero outstanding caveats or uncertainties.",
+        "The analysis settles the entire universe of material questions and caveats.",
+        "The treatment is definitive on every legally significant question.",
     ],
 )
 def test_completeness_claim_contradicted_by_visible_gap_fails_closed(
@@ -1439,6 +1724,29 @@ class _FrozenWireTuple(tuple[object, ...]):
     def __iter__(self):
         self.consumed = True
         raise RuntimeError("hostile iterator was consumed")
+
+
+class _HostileRequirementGrade(RequirementGradeV2):
+    consumed: ClassVar[list[str]] = []
+
+    def __getattribute__(self, name: str):
+        if name in type(self).model_fields:
+            type(self).consumed.append(name)
+            raise RuntimeError("hostile model attribute was consumed")
+        return super().__getattribute__(name)
+
+
+_HOSTILE_ENUM_CONSUMED: list[str] = []
+
+
+class _HostileEnum(Enum):
+    TRAP = "hostile"
+
+    def __getattribute__(self, name: str):
+        if name == "value":
+            _HOSTILE_ENUM_CONSUMED.append(name)
+            raise RuntimeError("hostile enum value was consumed")
+        return super().__getattribute__(name)
 
 
 def test_public_inventory_boundaries_reject_subclasses_and_iterators_without_consumption(
@@ -1497,6 +1805,37 @@ def test_constructed_cycles_depth_nodes_and_bytes_fail_before_compilation(
             contested_grades=contested,
         )
     assert spoofed.consumed is False
+
+    grade_raw = ordinary[0].requirement_grades[0].model_dump(mode="python")
+    hostile_grade = _HostileRequirementGrade.model_construct(**grade_raw)
+    raw = ordinary[0].model_dump(mode="python")
+    raw["requirement_grades"] = (
+        hostile_grade,
+        *ordinary[0].requirement_grades[1:],
+    )
+    forged_hostile = BaselineLockedGradeFragmentV1.model_construct(**raw)
+    _HostileRequirementGrade.consumed.clear()
+    with pytest.raises(ValueError, match="grade fragments are invalid"):
+        aggregate_baseline_locked_grader_lane_v1(
+            inputs,
+            lane=1,
+            ordinary_fragments=(forged_hostile, *ordinary[1:]),
+            contested_grades=contested,
+        )
+    assert _HostileRequirementGrade.consumed == []
+
+    raw = ordinary[0].model_dump(mode="python")
+    raw["rationale"] = _HostileEnum.TRAP
+    forged_enum = BaselineLockedGradeFragmentV1.model_construct(**raw)
+    _HOSTILE_ENUM_CONSUMED.clear()
+    with pytest.raises(ValueError, match="grade fragments are invalid"):
+        aggregate_baseline_locked_grader_lane_v1(
+            inputs,
+            lane=1,
+            ordinary_fragments=(forged_enum, *ordinary[1:]),
+            contested_grades=contested,
+        )
+    assert _HOSTILE_ENUM_CONSUMED == []
 
     cycle: list[object] = []
     cycle.append(cycle)

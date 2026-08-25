@@ -16,11 +16,13 @@ from typing import Literal, TypeVar, cast
 
 from pydantic import BaseModel, ValidationError
 
+from regulatory_harvest.models import enums as _public_enums
 from regulatory_harvest.storage import canonical_json_bytes, sha256_digest
 
 from . import attorney_baseline_models as _baseline_models
 from . import attorney_readiness_models as _models
 from . import attorney_readiness_requests as _requests
+from . import attorney_v2_models as _v2_models
 from .attorney_baseline_models import (
     BaselineImportanceV1,
     GradeableBaselineProjectionV1,
@@ -132,6 +134,18 @@ _TRUSTED_CONTAINER_TYPES = frozenset(
         _baseline_models._FrozenDict,
     }
 )
+_TRUSTED_MODEL_TYPES = frozenset(
+    value
+    for module in (_models, _baseline_models, _v2_models)
+    for value in vars(module).values()
+    if isinstance(value, type) and issubclass(value, BaseModel)
+)
+_TRUSTED_ENUM_TYPES = frozenset(
+    value
+    for module in (_models, _baseline_models, _v2_models, _public_enums)
+    for value in vars(module).values()
+    if isinstance(value, type) and issubclass(value, Enum)
+)
 _BLOCKING_CODES = frozenset(load_readiness_rubric_v1().blocking_codes)
 
 
@@ -175,9 +189,13 @@ def _preflight_model(value: BaseModel) -> None:
             add(bytes_=len(item))
             return
         if isinstance(item, Enum):
+            if type(item) not in _TRUSTED_ENUM_TYPES:
+                raise ValueError("readiness compiler input contains an unsafe enum type")
             visit(item.value, depth + 1)
             return
         if isinstance(item, BaseModel):
+            if type(item) not in _TRUSTED_MODEL_TYPES:
+                raise ValueError("readiness compiler input contains an unsafe model type")
             identity = id(item)
             if identity in active:
                 raise ValueError("readiness compiler input contains a cycle")
@@ -669,6 +687,19 @@ def _strict_candidate(
     return candidate
 
 
+def _has_unknown_record_blocker(
+    assessments: Sequence[SafetyGapAssessmentV1],
+    findings: Sequence[SafetyFindingProposalV1],
+) -> bool:
+    return any(
+        item.blocking_code is not None and item.blocking_code not in _BLOCKING_CODES
+        for item in assessments
+    ) or any(
+        item.blocking_code is not None and item.blocking_code not in _BLOCKING_CODES
+        for item in findings
+    )
+
+
 def _record_identity(
     record: SafetyGapAssessmentV1 | SafetyFindingProposalV1,
 ) -> str:
@@ -736,6 +767,14 @@ def reconcile_safety_lanes_v1(
     )
     first = _strict_model(SafetyLaneResponseV1, lane_1, label="safety lane")
     second = _strict_model(SafetyLaneResponseV1, lane_2, label="safety lane")
+    if any(
+        _has_unknown_record_blocker(
+            response.candidate_assessments,
+            response.finding_proposals,
+        )
+        for response in (first, second)
+    ):
+        raise ValueError("safety blocking code is invalid")
     disputes = build_safety_disputes_v1(checked, first, second)
     expected_ids = tuple(item.candidate_id for item in exact_candidates)
     if (
@@ -843,7 +882,11 @@ def _strict_lanes_for_inputs(
     inputs: VerifiedReadinessInputsV1,
     lanes: object,
 ) -> tuple[BaselineLockedGraderAggregateV1, BaselineLockedGraderAggregateV1]:
-    return _requests._validate_grade_lanes(inputs, lanes)
+    first, second = _requests._validate_grade_lanes(inputs, lanes)
+    return (
+        _strict_aggregate_for_projection(inputs.gradeable_baseline, first, 1),
+        _strict_aggregate_for_projection(inputs.gradeable_baseline, second, 2),
+    )
 
 
 def compile_requirement_matrix_v1(
@@ -923,6 +966,10 @@ def _strict_safety(value: object) -> ReconciledSafetyReviewV1:
         checked.safety_review_fingerprint
         != _fingerprint(checked.model_dump(mode="json", exclude={"safety_review_fingerprint"}))
         or any(code not in _BLOCKING_CODES for code in checked.blocking_codes)
+        or _has_unknown_record_blocker(
+            checked.candidate_assessments,
+            checked.finding_proposals,
+        )
         or (
             any(
                 decision.disposition in {"blocking", "unresolved"}
@@ -1216,11 +1263,13 @@ def _contradictory_completeness_claim(value: str) -> bool:
     quantifiers = {
         "all",
         "each",
+        "entire",
         "every",
         "exhaustive",
         "exhaustively",
         "fully",
         "nothing",
+        "zero",
     }
     completion = {
         "address",
@@ -1231,9 +1280,14 @@ def _contradictory_completeness_claim(value: str) -> bool:
         "cover",
         "covered",
         "covers",
+        "definitive",
+        "outstanding",
         "resolve",
         "resolved",
         "resolves",
+        "settle",
+        "settled",
+        "settles",
     }
     shortfalls = {
         "caveat",
@@ -1246,6 +1300,8 @@ def _contradictory_completeness_claim(value: str) -> bool:
         "limitations",
         "omission",
         "omissions",
+        "question",
+        "questions",
         "shortfall",
         "shortfalls",
         "uncertainties",
@@ -1270,6 +1326,7 @@ def _gap_blockers(
     safety: ReconciledSafetyReviewV1,
 ) -> tuple[str, ...]:
     blockers: list[str] = []
+    blockers.extend(_FINDING_BLOCKER[finding.finding_kind] for finding in safety.finding_proposals)
     allowed_refs = {
         cast(str, handle["evidence_ref"]) for handle in _requests._evidence_handles(inputs)
     }
@@ -1283,6 +1340,32 @@ def _gap_blockers(
             tuple(strict.grader_lanes),
         ),
     )
+    expected_matrix = compile_gap_follow_up_matrix_v1(
+        inputs,
+        strict,
+        expected_candidates,
+        safety,
+    )
+    if tuple(
+        (
+            row.gap_id,
+            row.canonical_order,
+            row.origin,
+            row.subject_id,
+            row.kind,
+        )
+        for row in gap_matrix.rows
+    ) != tuple(
+        (
+            row.gap_id,
+            row.canonical_order,
+            row.origin,
+            row.subject_id,
+            row.kind,
+        )
+        for row in expected_matrix.rows
+    ):
+        blockers.append("INTEGRITY_OR_PROVENANCE_INVALID")
     assessments = {item.candidate_id: item for item in safety.candidate_assessments}
     expected_content: dict[
         tuple[GapOriginV1, str, str],
@@ -1368,8 +1451,10 @@ def _gap_blockers(
         metadata = expected_metadata.get(identity)
         if row.status != "open":
             blockers.append("FALSE_RESOLUTION")
-        if row.blocking_code is not None:
+        if row.blocking_code is not None and row.blocking_code in _BLOCKING_CODES:
             blockers.append(row.blocking_code)
+        elif row.blocking_code is not None:
+            blockers.append("INTEGRITY_OR_PROVENANCE_INVALID")
         prose = (
             row.shortfall_description,
             row.why_unresolved,
@@ -1503,6 +1588,8 @@ def derive_delivery_readiness_v1(
     requirement_matrix: RequirementMatrixV1,
     gap_matrix: GapFollowUpMatrixV1,
     safety: ReconciledSafetyReviewV1,
+    safety_lane_1: SafetyLaneResponseV1,
+    safety_lane_2: SafetyLaneResponseV1,
 ) -> DeliveryReadinessResultV1:
     """Derive the fail-closed tier, then attach optional historical context."""
     checked = _strict_inputs(inputs)
@@ -1545,6 +1632,22 @@ def derive_delivery_readiness_v1(
         item.candidate_id for item in expected_candidates
     ):
         raise ValueError("reconciled safety candidate coverage is invalid")
+    safety_replay_valid = False
+    try:
+        replayed_safety = reconcile_safety_lanes_v1(
+            checked,
+            expected_candidates,
+            safety_lane_1,
+            safety_lane_2,
+            tuple(exact_safety.referee_decisions),
+        )
+        safety_replay_valid = canonical_json_bytes(replayed_safety) == canonical_json_bytes(
+            exact_safety
+        )
+    except ValueError:
+        pass
+    if not safety_replay_valid:
+        blockers.append("INTEGRITY_OR_PROVENANCE_INVALID")
     blockers.extend(_gap_blockers(checked, requirements, gaps, strict, exact_safety))
     if not coverage_floor_met:
         blockers.append("MINIMUM_LANE_COVERAGE_BELOW_FLOOR")
