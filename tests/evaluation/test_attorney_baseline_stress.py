@@ -28,6 +28,7 @@ from test_attorney_baseline_compiler import (
 )
 
 import regulatory_harvest.evaluation.attorney_baseline_artifacts as baseline_artifacts
+import regulatory_harvest.evaluation.attorney_baseline_requests as baseline_requests
 from regulatory_harvest.evaluation.attorney_baseline_artifacts import (
     load_verified_baseline_run,
     verify_baseline_run,
@@ -219,7 +220,7 @@ def _control_input(tmp_path: Path, fact_mode: int) -> Path:
             request_fingerprint=request.request_fingerprint,
             provider_name="fictional-provider",
             model_name="fictional-model",
-            judge_isolation=JudgeIsolation.FRESH_CONTEXT,
+            judge_isolation=JudgeIsolation.SCRIPTED_FIXTURE,
             response_id="fictional-task-10-qualification-response",
             usage={"input_tokens": 101, "output_tokens": 202},
             payload=judgment.model_dump(mode="json"),
@@ -503,6 +504,140 @@ def test_combined_dispute_malformed_choices_fail_closed(mutation: str) -> None:
         portable._baseline_validate_referee_choice(dispute, decision)
 
 
+def test_combined_referee_choices_validate_before_each_public_commit(
+    tmp_path: Path,
+) -> None:
+    """Invalid first and final dispute choices are write-free in both public runners."""
+    portable = _load_portable()
+    control = _control_input(tmp_path, 0)
+    full_run = tmp_path / "full-combined-referee"
+    portable_run = tmp_path / "portable-combined-referee"
+    initialize_baseline_v1(control, full_run, nonce_hex="b" * 64)
+    portable.initialize_baseline_v1(control, portable_run, nonce_hex="b" * 64)
+    transcript: list[object] = []
+    proposal = _proposal(0, 0)
+    _submit_pair(
+        portable,
+        full_run,
+        portable_run,
+        {"proposals": [proposal], "review_complete": True},
+        transcript,
+    )
+    _submit_pair(
+        portable,
+        full_run,
+        portable_run,
+        {
+            "concerns": [
+                {
+                    "target_proposal_ref": "PR-0001",
+                    "concern_type": "incorrect_statement",
+                    "passages": proposal["passages"],
+                    "explanation": "The fictional source supports a bounded correction.",
+                    "correction": _semantic_correction(proposal),
+                }
+            ],
+            "importance_findings": [
+                _importance_finding("PR-0001", 1, disposition="correct")
+            ],
+            "audit_complete": True,
+        },
+        transcript,
+    )
+
+    first = next_baseline_request_v1(full_run)
+    assert _wire(first) == _wire(portable.next_baseline_request_v1(portable_run))
+    assert first is not None
+    first_wire = cast(dict[str, object], _wire(first))
+    first_dispute = cast(dict[str, object], first_wire["payload"])["dispute"]
+    assert isinstance(first_dispute, dict)
+    assert first_dispute["auditor_concern"] is None
+    assert first_dispute["importance_finding"] is not None
+    invalid_first = _referee_payload(first_wire, "accept_reviewer")
+    invalid_first.update(
+        {
+            "importance": "material",
+            "importance_basis": ["attorney_briefing"],
+            "importance_rationale": (
+                "The rule is necessary for a competent fictional attorney briefing."
+            ),
+        }
+    )
+    before = _tree_bytes(full_run)
+    full_invalid = guarded_submit_baseline_response_v1(
+        full_run,
+        invalid_first,
+        provider_name="fictional-provider",
+        model_name="fictional-model",
+        judge_isolation="scripted_fixture",
+    )
+    portable_invalid = portable.guarded_submit_baseline_response_v1(
+        portable_run,
+        invalid_first,
+        provider_name="fictional-provider",
+        model_name="fictional-model",
+        judge_isolation="scripted_fixture",
+    )
+    assert _wire(full_invalid) == {
+        "accepted": False,
+        "issue_codes": ["BASELINE_EXTERNAL_RESPONSE_INVALID"],
+        "state": None,
+    }
+    assert portable_invalid == {
+        "accepted": False,
+        "diagnostics": ["BASELINE_EXTERNAL_RESPONSE_INVALID"],
+        "state": None,
+    }
+    assert _tree_bytes(full_run) == _tree_bytes(portable_run) == before
+
+    _submit_pair(
+        portable,
+        full_run,
+        portable_run,
+        _referee_payload(first_wire, "accept_reviewer"),
+        transcript,
+    )
+    second = next_baseline_request_v1(full_run)
+    assert _wire(second) == _wire(portable.next_baseline_request_v1(portable_run))
+    assert second is not None
+    second_wire = cast(dict[str, object], _wire(second))
+    second_dispute = cast(dict[str, object], second_wire["payload"])["dispute"]
+    assert isinstance(second_dispute, dict)
+    assert second_dispute["auditor_concern"] is not None
+    invalid_second = _referee_payload(second_wire, "accept_auditor")
+    invalid_second.update(
+        {
+            "importance": "supporting",
+            "importance_basis": ["implementation_detail"],
+            "importance_rationale": "The rule is only fictional implementation detail.",
+        }
+    )
+    before_second = _tree_bytes(full_run)
+    _submit_pair(
+        portable,
+        full_run,
+        portable_run,
+        invalid_second,
+        transcript,
+    )
+    assert transcript[-1] == {
+        "accepted": False,
+        "issue_codes": ["BASELINE_EXTERNAL_RESPONSE_INVALID"],
+        "state": None,
+    }
+    assert _tree_bytes(full_run) == _tree_bytes(portable_run) == before_second
+    _submit_pair(
+        portable,
+        full_run,
+        portable_run,
+        _referee_payload(second_wire, "accept_auditor"),
+        transcript,
+    )
+    assert next_baseline_request_v1(full_run) is None
+    assert portable.next_baseline_request_v1(portable_run) is None
+    assert _tree_bytes(full_run) == _tree_bytes(portable_run)
+
+
 @pytest.mark.parametrize("seed", range(100))
 def test_seeded_public_lifecycle_is_deterministic_report_blind_and_portable(
     seed: int,
@@ -688,7 +823,9 @@ def _boundary_proposal(index: int) -> dict[str, object]:
     }
 
 
-def test_fragment_and_compiled_item_boundaries_are_exact_and_mutation_sensitive() -> None:
+def test_fragment_and_compiled_item_boundaries_are_exact_and_mutation_sensitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Changing any 5/128/640 controller limit makes one literal boundary assertion fail."""
     baseline_input = _baseline_input()
     histories: dict[int, tuple[AcceptedBaselineReviewFragmentV1, ...]] = {0: ()}
@@ -725,7 +862,36 @@ def test_fragment_and_compiled_item_boundaries_are_exact_and_mutation_sensitive(
         assert request.payload["max_new_items"] == 5
 
     assert sum(len(item.payload.proposals) for item in histories[128]) == 640
-    assert 640 + 1 > 640
+    oversized_payload = BaselineReviewFragmentV1.model_construct(
+        proposals=(*histories[128][-1].payload.proposals, _boundary_proposal(6)),
+        review_complete=False,
+    )
+    oversized_fragment = AcceptedBaselineReviewFragmentV1.model_construct(
+        fragment_ordinal=128,
+        request_fingerprint=histories[128][-1].request_fingerprint,
+        response_fingerprint=histories[128][-1].response_fingerprint,
+        payload=oversized_payload,
+    )
+    history_641 = (*histories[128][:-1], oversized_fragment)
+    assert sum(len(item.payload.proposals) for item in history_641) == 641
+    strict_model = baseline_requests.strict_baseline_model_v1
+
+    def bypass_only_oversized_fragment(model: object, value: object) -> object:
+        if model is AcceptedBaselineReviewFragmentV1 and value is oversized_fragment:
+            return value
+        return strict_model(model, value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        baseline_requests,
+        "strict_baseline_model_v1",
+        bypass_only_oversized_fragment,
+    )
+    with pytest.raises(ValueError, match="accepted history exceeds controller bounds"):
+        build_baseline_source_review_request_v1(
+            baseline_input,
+            history_641,
+            fragment_ordinal=129,
+        )
     with pytest.raises(ValueError, match="ordinal"):
         build_baseline_source_review_request_v1(
             baseline_input,
