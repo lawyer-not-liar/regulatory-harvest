@@ -486,13 +486,21 @@ All of the following are required:
   or the report's consolidated limitations section and assigned to a reviewing
   attorney or outside counsel;
 - every other gap is visibly disclosed and has a deterministic follow-up;
-- the report does not claim completeness or certainty contradicted by the
-  matrix;
+- the mandatory replayed safety lanes, including any required referee, do not
+  establish that the report claims completeness or certainty contradicted by
+  the matrix;
 - neither safety lane, nor a safety referee, establishes a blocking defect; and
 - no gap is hidden, unbound, or falsely marked resolved.
 
 This tier is ready for qualified-attorney review. It is not ready for unreviewed
 client delivery and is not a finding that the legal analysis is correct.
+
+The report-wide safety review is the semantic control for paraphrased
+completeness, certainty, and candor claims. Deterministic phrase checks may add
+defense in depth for known formulations, but no finite lexical inventory is
+treated as complete. A visible, actionable gap is not itself a blocker: making
+every disclosed gap nondeliverable would defeat this tier's attorney-review
+purpose.
 
 ### `NOT_DELIVERABLE`
 
