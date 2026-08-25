@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from enum import Enum
 from typing import TypeVar, cast
@@ -96,24 +99,48 @@ _REMEDIATION_CLASS = {
     "CRITICAL_DISCLOSURE_INVALID": "critical_disclosure_correction",
     "FALSE_RESOLUTION": "resolution_status_correction",
 }
+_GENERIC_ONLY = re.compile(
+    r"^(?:more research (?:is )?needed|insufficient information|requirement partially met|"
+    r"partially met|partially_met|not met|not_met|uncertain|met|[01](?:\.0|\.5)?)$"
+)
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
-def _invalid(error: BaseException | None = None) -> ValueError:
-    failure = ValueError("attorney readiness handoff input is invalid")
-    if error is not None:
-        failure.__cause__ = error
-    return failure
+def _invalid() -> ValueError:
+    return ValueError("attorney readiness handoff input is invalid")
+
+
+def _charge_amount(amount: int, budget: list[int]) -> None:
+    budget[1] += amount
+    if budget[1] > _MAX_BYTES:
+        raise _invalid()
 
 
 def _charge_text(value: str, budget: list[int]) -> None:
     if "\r" in value or len(value) > _MAX_BYTES:
         raise _invalid()
-    encoded = value.encode("utf-8")
-    budget[1] += len(encoded)
-    if budget[1] > _MAX_BYTES:
-        raise _invalid()
+    # Match or conservatively exceed ensure_ascii=False JSON string encoding
+    # without allocating the escaped representation.
+    cost = 2
+    remaining = _MAX_BYTES - budget[1]
+    for character in value:
+        codepoint = ord(character)
+        if codepoint < 0x20:
+            cost += 6
+        elif character in {'"', "\\"}:
+            cost += 2
+        elif codepoint < 0x80:
+            cost += 1
+        elif codepoint < 0x800:
+            cost += 2
+        elif codepoint < 0x10000:
+            cost += 3
+        else:
+            cost += 4
+        if cost > remaining:
+            raise _invalid()
+    _charge_amount(cost, budget)
 
 
 def _preflight(value: object, *, budget: list[int] | None = None) -> None:
@@ -125,7 +152,24 @@ def _preflight(value: object, *, budget: list[int] | None = None) -> None:
         current_budget[0] += 1
         if current_budget[0] > _MAX_NODES or depth > _MAX_DEPTH:
             raise _invalid()
-        if item is None or type(item) in {bool, int, float}:
+        if item is None:
+            _charge_amount(4, current_budget)
+            return
+        if type(item) is bool:
+            _charge_amount(5, current_budget)
+            return
+        if type(item) is int:
+            integer = item
+            bits = abs(integer).bit_length()
+            if bits > 4096:
+                raise _invalid()
+            decimal_digits = max(1, (bits * 30103) // 100000 + 1)
+            _charge_amount(decimal_digits + (1 if integer < 0 else 0), current_budget)
+            return
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise _invalid()
+            _charge_amount(32, current_budget)
             return
         if type(item) is str:
             _charge_text(item, current_budget)
@@ -149,6 +193,7 @@ def _preflight(value: object, *, budget: list[int] | None = None) -> None:
                 state = item.__dict__
                 if type(state) is not dict:
                     raise _invalid()
+                _charge_amount(2 + 2 * len(state), current_budget)
                 for key, nested in state.items():
                     if type(key) is not str:
                         raise _invalid()
@@ -164,7 +209,9 @@ def _preflight(value: object, *, budget: list[int] | None = None) -> None:
                 raise _invalid()
             active.add(identity)
             try:
-                for map_key, nested in cast(Mapping[object, object], item).items():
+                mapping = cast(Mapping[object, object], item)
+                _charge_amount(2 + 2 * len(mapping), current_budget)
+                for map_key, nested in mapping.items():
                     if type(map_key) is not str:
                         raise _invalid()
                     _charge_text(map_key, current_budget)
@@ -178,7 +225,9 @@ def _preflight(value: object, *, budget: list[int] | None = None) -> None:
                 raise _invalid()
             active.add(identity)
             try:
-                for nested in cast(Sequence[object], item):
+                sequence = cast(Sequence[object], item)
+                _charge_amount(2 + len(sequence), current_budget)
+                for nested in sequence:
                     visit(nested, depth + 1)
             finally:
                 active.remove(identity)
@@ -238,17 +287,125 @@ def _strict_model(model_type: type[_ModelT], value: object) -> _ModelT:
         UnicodeError,
         ValidationError,
         ValueError,
-    ) as error:
-        if (
-            isinstance(error, ValueError)
-            and str(error) == "attorney readiness handoff input is invalid"
-        ):
-            raise
-        raise _invalid(error) from error
+    ):
+        raise _invalid() from None
 
 
 def _fingerprint(model: BaseModel, field: str) -> str:
     return sha256_digest(canonical_json_bytes(model.model_dump(mode="json", exclude={field})))
+
+
+def _generic(value: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = " ".join(
+        "".join(
+            character if character.isalnum() or character in {"_", "."} else " "
+            for character in normalized
+        ).split()
+    )
+    return bool(_GENERIC_ONLY.fullmatch(normalized))
+
+
+def _validate_delivery_semantics(
+    report: str,
+    requirements: RequirementMatrixV1,
+    gaps: GapFollowUpMatrixV1,
+    result: DeliveryReadinessResultV1,
+) -> None:
+    rubric = load_readiness_rubric_v1()
+    ordered_blockers = tuple(
+        code for code in rubric.blocking_codes if code in set(result.blocking_codes)
+    )
+    if result.blocking_codes != ordered_blockers:
+        raise _invalid()
+
+    historical = result.historical_v22_strict_disposition
+    status = result.historical_v22_cross_check_status
+    fresh = result.baseline_locked_strict_equivalent_disposition
+    if (status is HistoricalV22CrossCheckStatusV1.MATCH and historical is not fresh) or (
+        status is HistoricalV22CrossCheckStatusV1.DISPOSITION_DIFFERS and historical is fresh
+    ):
+        raise _invalid()
+
+    if result.delivery_readiness is DeliveryReadinessTierV1.NOT_DELIVERABLE:
+        return
+    if result.minimum_lane_weighted_coverage < rubric.review_ready_weighted_coverage_floor:
+        raise _invalid()
+
+    for gap_row in gaps.rows:
+        prose = (
+            gap_row.shortfall_description,
+            gap_row.why_unresolved,
+            gap_row.why_it_matters,
+            gap_row.resolution_test,
+        )
+        if (
+            any(_generic(item) for item in prose)
+            or not gap_row.evidence_refs
+            or gap_row.visibility is GapVisibilityV1.HIDDEN
+            or gap_row.disclosure_location is None
+            or not gap_row.report_passages
+            or any(report.count(passage) != 1 for passage in gap_row.report_passages)
+            or gap_row.blocking_code is not None
+        ):
+            raise _invalid()
+        if gap_row.importance is BaselineImportanceV1.CRITICAL and (
+            gap_row.visibility is not GapVisibilityV1.PROMINENT
+            or gap_row.owner_role
+            not in {OwnerRoleV1.REVIEWING_ATTORNEY, OwnerRoleV1.OUTSIDE_COUNSEL}
+        ):
+            raise _invalid()
+
+    gap_identities = {(row.origin, row.subject_id) for row in gaps.rows}
+    for requirement_row in requirements.rows:
+        if (
+            requirement_row.conservative_disposition is not RequirementDispositionV1.MET
+            and (
+                GapOriginV1.REQUIREMENT,
+                requirement_row.requirement_id,
+            )
+            not in gap_identities
+        ):
+            raise _invalid()
+        if (
+            requirement_row.kind == "gap"
+            and (
+                GapOriginV1.BASELINE_GAP,
+                requirement_row.requirement_id,
+            )
+            not in gap_identities
+        ):
+            raise _invalid()
+
+    high_disqualifying_gap = any(
+        row.origin
+        in {
+            GapOriginV1.BASELINE_GAP,
+            GapOriginV1.CONTESTED_REQUIREMENT,
+            GapOriginV1.PREREQUISITE,
+            GapOriginV1.SAFETY_FINDING,
+        }
+        for row in gaps.rows
+    )
+    high_eligible = (
+        fresh is AbsoluteDispositionV2.PASS
+        and all(
+            score >= rubric.high_assurance_weighted_coverage_floor
+            for score in result.lane_weighted_coverage
+        )
+        and all(
+            score >= rubric.high_assurance_critical_recall_floor
+            for score in result.lane_critical_recall
+        )
+        and not high_disqualifying_gap
+    )
+    expected = (
+        DeliveryReadinessTierV1.HIGH_ASSURANCE
+        if high_eligible
+        else DeliveryReadinessTierV1.REVIEW_READY_WITH_GAPS
+    )
+    if result.delivery_readiness is not expected:
+        raise _invalid()
 
 
 def _validate_bindings(
@@ -324,8 +481,9 @@ def _validate_bindings(
                 raise _invalid()
         elif gap_row.conservative_disposition is not None:
             raise _invalid()
-        if any(passage not in report for passage in gap_row.report_passages):
+        if any(report.count(passage) != 1 for passage in gap_row.report_passages):
             raise _invalid()
+    _validate_delivery_semantics(report, requirements, gaps, checked_result)
     return report, requirements, gaps, checked_result
 
 
@@ -491,6 +649,20 @@ def _evaluation_context(result: DeliveryReadinessResultV1) -> str:
     return "\n".join(lines)
 
 
+def _report_markdown(report: str) -> str:
+    longest = 0
+    current = 0
+    for character in report:
+        if character == "`":
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    fence = "`" * max(3, longest + 1)
+    delimiter = "" if report.endswith("\n") else "\n"
+    return f"## Report\n\n{fence}markdown\n{report}{delimiter}{fence}"
+
+
 def _nondelivery(result: DeliveryReadinessResultV1) -> bytes:
     lines = [
         "# Attorney Review Handoff",
@@ -545,7 +717,7 @@ def render_attorney_review_handoff_v1(
             else ""
         ),
         _evaluation_context(checked_result),
-        "## Report\n\n" + report,
+        _report_markdown(report),
         _requirement_matrix_markdown(requirements),
     ]
     if checked_result.delivery_readiness is DeliveryReadinessTierV1.REVIEW_READY_WITH_GAPS:
