@@ -943,10 +943,10 @@ requests/grade-lane-1-GB-1-####.json
 responses/grade-lane-1-GB-1-####.json
 requests/grade-lane-2-GB-2-####.json
 responses/grade-lane-2-GB-2-####.json
-requests/contested-grade-lane-1-CT-####.json       # zero or more
-responses/contested-grade-lane-1-CT-####.json      # zero or more
-requests/contested-grade-lane-2-CT-####.json       # zero or more
-responses/contested-grade-lane-2-CT-####.json      # zero or more
+requests/contested-grade-lane-1-CONT-####.json     # zero or more
+responses/contested-grade-lane-1-CONT-####.json    # zero or more
+requests/contested-grade-lane-2-CONT-####.json     # zero or more
+responses/contested-grade-lane-2-CONT-####.json    # zero or more
 aggregates/grader-lane-1.json
 aggregates/grader-lane-2.json
 baseline-locked-strict-equivalent.json
@@ -999,7 +999,7 @@ def load_verified_readiness_context_v1(
 ) -> VerifiedReadinessContextV1: ...
 ```
 
-Replay must reconstruct every fresh grade and safety request from `readiness-input.json`, the verified gradeable-baseline projection, rubric/scoring-contract bytes, prior accepted responses, and controller rules; recompile both grader aggregates, strict-equivalent result, safety aggregate, matrices, tier, and handoff; compare exact bytes; and verify the exact relative inventory and artifact hashes. `readiness-verification.json` binds a deterministic pre-manifest graph fingerprint and allowlisted check booleans; the terminal manifest binds its exact bytes without a circular manifest-root reference.
+Replay must reconstruct every fresh grade and safety request from `readiness-input.json`, the verified gradeable-baseline projection, rubric/scoring-contract bytes, prior accepted responses, and controller rules; recompile both grader aggregates, strict-equivalent result, safety aggregate, matrices, tier, and handoff; compare exact bytes; and verify the exact relative inventory and artifact hashes. In particular, it must rebuild Task 3 requests from the exact admitted readiness input so mutations to generation-validation receipt, bundle, or coverage hashes cannot survive by merely resealing the request and outer manifest. `readiness-verification.json` binds a deterministic pre-manifest graph fingerprint and allowlisted check booleans; the terminal manifest binds its exact bytes without a circular manifest-root reference.
 
 - [ ] **Step 4: Reuse hardened storage without weakening it**
 
