@@ -8,11 +8,14 @@ import pytest
 from pydantic import ValidationError
 from test_attorney_baseline_artifacts import _complete_graph
 
+import regulatory_harvest.evaluation.attorney_baseline_models as baseline_models_module
+import regulatory_harvest.evaluation.attorney_readiness_models as readiness_models_module
 from regulatory_harvest.evaluation.attorney_baseline_artifacts import (
     initialize_baseline_storage_v1,
     load_verified_baseline_run,
 )
 from regulatory_harvest.evaluation.attorney_baseline_models import (
+    BaselineInputV1,
     GradeableBaselineProjectionV1,
 )
 from regulatory_harvest.evaluation.attorney_baseline_projection import (
@@ -266,6 +269,40 @@ def valid_aggregate(**updates: object) -> dict[str, object]:
     }
     value.update(updates)
     return value
+
+
+def verified_projection_input(
+    tmp_path: Path,
+) -> tuple[GradeableBaselineProjectionV1, dict[str, object]]:
+    _, files_by_path, manifest = _complete_graph()
+    run_dir = tmp_path / "verified-baseline"
+    initialize_baseline_storage_v1(run_dir, manifest, files_by_path)
+    context = load_verified_baseline_run(run_dir)
+    projection = verify_gradeable_baseline_projection_v1(
+        context,
+        project_gradeable_baseline_v1(context),
+    )
+    return projection, {
+        "protocol_version": "delivery-readiness-v1",
+        "gradeable_baseline": projection,
+        "grade_target_fingerprint": projection.binding.grade_target_fingerprint,
+        "report_text": "A report.",
+        "report_hash": HASH,
+        "generation_capsule_root": "b" * 64,
+        "generation_validation": {
+            "receipt_hash": "c" * 64,
+            "report_hash": HASH,
+            "bundle_hash": "d" * 64,
+            "coverage_review_hash": "e" * 64,
+            "status": "completed",
+            "evidence_precision_valid": True,
+            "proposition_coverage_valid": True,
+            "provision_recall_valid": True,
+        },
+        "readiness_rubric_fingerprint": "f" * 64,
+        "strict_equivalent_scoring_contract_fingerprint": "0" * 64,
+        "historical_v22_cross_check": None,
+    }
 
 
 def test_readiness_policy_has_exact_canonical_bytes_and_versioned_thresholds() -> None:
@@ -782,34 +819,8 @@ def test_fragment_detaches_imported_requirement_grade_aliases() -> None:
 
 
 def test_input_detaches_and_rehydrates_verified_projection_alias(tmp_path: Path) -> None:
-    _, files_by_path, manifest = _complete_graph()
-    run_dir = tmp_path / "verified-baseline"
-    initialize_baseline_storage_v1(run_dir, manifest, files_by_path)
-    context = load_verified_baseline_run(run_dir)
-    projection = project_gradeable_baseline_v1(context)
-    projection = verify_gradeable_baseline_projection_v1(context, projection)
+    projection, input_wire = verified_projection_input(tmp_path)
     expected_grade_target = projection.binding.grade_target_fingerprint
-    input_wire: dict[str, object] = {
-        "protocol_version": "delivery-readiness-v1",
-        "gradeable_baseline": projection,
-        "grade_target_fingerprint": expected_grade_target,
-        "report_text": "A report.",
-        "report_hash": HASH,
-        "generation_capsule_root": "b" * 64,
-        "generation_validation": {
-            "receipt_hash": "c" * 64,
-            "report_hash": HASH,
-            "bundle_hash": "d" * 64,
-            "coverage_review_hash": "e" * 64,
-            "status": "completed",
-            "evidence_precision_valid": True,
-            "proposition_coverage_valid": True,
-            "provision_recall_valid": True,
-        },
-        "readiness_rubric_fingerprint": "f" * 64,
-        "strict_equivalent_scoring_contract_fingerprint": "0" * 64,
-        "historical_v22_cross_check": None,
-    }
     value = ReadinessInputV1.model_validate(input_wire)
     checked = validate_readiness_input_v1(value)
     forged = GradeableBaselineProjectionV1.model_construct(
@@ -828,3 +839,52 @@ def test_input_detaches_and_rehydrates_verified_projection_alias(tmp_path: Path)
             ReadinessInputV1.model_validate(input_wire | {"gradeable_baseline": candidate})
     object.__setattr__(value.gradeable_baseline.binding, "grade_target_fingerprint", "9" * 64)
     assert checked.gradeable_baseline.binding.grade_target_fingerprint == expected_grade_target
+
+
+@pytest.mark.parametrize("oversize_kind", ["single-scalar", "many-small-scalars"])
+def test_oversized_typed_projection_fails_before_serialization_or_reconstruction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    oversize_kind: str,
+) -> None:
+    projection, input_wire = verified_projection_input(tmp_path)
+    projection_state = dict(projection.__dict__)
+    if oversize_kind == "single-scalar":
+        projection_state["projection_fingerprint"] = "x" * (16 * 1024 * 1024 + 1)
+    else:
+        baseline_state = dict(projection.baseline_input.__dict__)
+        baseline_state["compiler_contract"] = {"many": ["x" * 255 for _ in range(66_000)]}
+        projection_state["baseline_input"] = BaselineInputV1.model_construct(**baseline_state)
+    oversized = GradeableBaselineProjectionV1.model_construct(**projection_state)
+    forbidden_calls: list[str] = []
+
+    def forbid(name: str):
+        def forbidden(*_: object, **__: object) -> object:
+            forbidden_calls.append(name)
+            raise AssertionError(f"{name} ran before the projection budget gate")
+
+        return forbidden
+
+    monkeypatch.setattr(
+        readiness_models_module,
+        "canonical_json_bytes",
+        forbid("canonical_json_bytes"),
+    )
+    monkeypatch.setattr(
+        GradeableBaselineProjectionV1,
+        "model_dump",
+        forbid("projection.model_dump"),
+    )
+    monkeypatch.setattr(
+        GradeableBaselineProjectionV1,
+        "model_validate",
+        forbid("projection.model_validate"),
+    )
+    monkeypatch.setattr(
+        baseline_models_module,
+        "sha256_digest",
+        forbid("projection hash"),
+    )
+    with pytest.raises(ValidationError, match="wire snapshot is invalid"):
+        ReadinessInputV1.model_validate(input_wire | {"gradeable_baseline": oversized})
+    assert forbidden_calls == []

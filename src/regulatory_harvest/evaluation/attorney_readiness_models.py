@@ -108,11 +108,137 @@ def _safe_call_id(value: str | None) -> str | None:
     return value
 
 
-def _exact_gradeable_projection_wire(value: object) -> dict[str, object]:
+def _add_projection_wire_cost(budget: list[int], amount: int) -> None:
+    budget[1] += amount
+    if budget[1] > _MAX_WIRE_BYTES:
+        raise ValueError("gradeable projection exceeds readiness wire limits")
+
+
+def _add_projection_text_cost(value: str, budget: list[int]) -> None:
+    _add_projection_wire_cost(budget, len(value) + 2)
+    for character in value:
+        codepoint = ord(character)
+        if character in {'"', "\\"}:
+            extra = 1
+        elif codepoint < 0x20:
+            extra = 5
+        elif codepoint < 0x80:
+            extra = 0
+        elif codepoint < 0x800:
+            extra = 1
+        elif codepoint < 0x10000:
+            extra = 2
+        else:
+            extra = 3
+        if extra:
+            _add_projection_wire_cost(budget, extra)
+
+
+def _preflight_projection_native_state(
+    value: object,
+    active: set[int],
+    *,
+    budget: list[int],
+    depth: int,
+) -> None:
+    """Bound exact projection native state without serializing or hashing it."""
+    budget[0] += 1
+    if budget[0] > _MAX_WIRE_NODES or depth > _MAX_WIRE_DEPTH:
+        raise ValueError("gradeable projection exceeds readiness wire limits")
+    if type(value) is str:
+        _add_projection_text_cost(value, budget)
+        return
+    if type(value) is bytes:
+        _add_projection_wire_cost(budget, len(value) + 2)
+        for item in value:
+            extra = 5 if item < 0x20 else 1 if item in {0x22, 0x5C} else 0
+            if extra:
+                _add_projection_wire_cost(budget, extra)
+        return
+    if value is None or type(value) is bool:
+        _add_projection_wire_cost(budget, 5)
+        return
+    if type(value) is int:
+        _add_projection_wire_cost(budget, max(1, value.bit_length() + 1))
+        return
+    if type(value) is float:
+        _add_projection_wire_cost(budget, 32)
+        return
+    if isinstance(value, Enum):
+        _preflight_projection_native_state(
+            value.value,
+            active,
+            budget=budget,
+            depth=depth + 1,
+        )
+        return
+    if isinstance(value, (datetime, date, time)):
+        _add_projection_text_cost(value.isoformat(), budget)
+        return
+    if isinstance(value, Mapping) and not isinstance(value, dict):
+        raise ValueError("gradeable projection requires built-in mappings")
+    if isinstance(value, BaseModel):
+        children: object = dict(object.__getattribute__(value, "__dict__"))
+    else:
+        children = value
+    if isinstance(children, dict):
+        identity = id(value)
+        if identity in active:
+            raise ValueError("gradeable projection contains a cycle")
+        active.add(identity)
+        try:
+            _add_projection_wire_cost(budget, 2)
+            for key, item in dict.items(children):
+                if type(key) is not str:
+                    raise ValueError("gradeable projection keys must be strings")
+                _add_projection_text_cost(key, budget)
+                _add_projection_wire_cost(budget, 2)
+                _preflight_projection_native_state(
+                    item,
+                    active,
+                    budget=budget,
+                    depth=depth + 1,
+                )
+            return
+        finally:
+            active.remove(identity)
+    if isinstance(children, (list, tuple)):
+        identity = id(value)
+        if identity in active:
+            raise ValueError("gradeable projection contains a cycle")
+        active.add(identity)
+        try:
+            _add_projection_wire_cost(budget, len(children) + 2)
+            for item in children:
+                _preflight_projection_native_state(
+                    item,
+                    active,
+                    budget=budget,
+                    depth=depth + 1,
+                )
+            return
+        finally:
+            active.remove(identity)
+    raise ValueError("gradeable projection contains unsupported native state")
+
+
+def _exact_gradeable_projection_wire(
+    value: object,
+    *,
+    prior_budget: list[int],
+    depth: int,
+) -> dict[str, object]:
     """Reconstruct the exact stable projection through its prerequisite proof model."""
     if type(value) is not GradeableBaselineProjectionV1:
         raise ValueError("gradeable projection handoff must use the exact stable class")
     projection = value
+    preflight_budget = list(prior_budget)
+    _preflight_projection_native_state(
+        projection,
+        set(),
+        budget=preflight_budget,
+        depth=depth,
+    )
     if _contains_readiness_wire_marker(projection) and not _projection_is_attested(projection):
         raise ValueError("gradeable projection handoff has transplanted readiness state")
     serialized = projection.model_dump(mode="json", warnings="error")
@@ -160,7 +286,11 @@ def _wire_snapshot_inner(
         raise ValueError("readiness model wire snapshot requires a built-in mapping")
     if type(value) is GradeableBaselineProjectionV1:
         return _wire_snapshot_inner(
-            _exact_gradeable_projection_wire(value),
+            _exact_gradeable_projection_wire(
+                value,
+                prior_budget=budget,
+                depth=depth,
+            ),
             active,
             budget=budget,
             depth=depth + 1,
