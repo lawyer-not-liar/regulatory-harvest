@@ -1680,7 +1680,7 @@ def test_false_resolution_hidden_critical_and_missing_evidence_fail_closed(
         "The treatment is definitive on every legally significant question.",
     ],
 )
-def test_completeness_claim_contradicted_by_visible_gap_fails_closed(
+def test_known_completeness_claim_is_blocked_as_lexical_defense_in_depth(
     inputs: VerifiedReadinessInputsV1,
     claim: str,
 ) -> None:
@@ -1691,6 +1691,60 @@ def test_completeness_claim_contradicted_by_visible_gap_fails_closed(
     )
     lanes = _lanes(exact, ("met",) * 9 + ("partially_met",))
     *_, result = _compile(exact, lanes)
+
+    assert result.delivery_readiness == "NOT_DELIVERABLE"
+    assert "HIDDEN_MATERIAL_GAP" in result.blocking_codes
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "This report is exhaustive.",
+        "The analysis is conclusive on the issues presented.",
+        "No material deficiencies remain.",
+        "The report leaves no stone unturned.",
+    ],
+)
+def test_finite_lexicon_does_not_claim_semantic_absence_without_safety_finding(
+    inputs: VerifiedReadinessInputsV1,
+    claim: str,
+) -> None:
+    exact = _clean_qualification(_with_requirements(inputs, count=10, importance="supporting"))
+    exact = _with_report(exact, f"{exact.report_text}\n\n{claim}")
+    lanes = _lanes(exact, ("met",) * 9 + ("partially_met",))
+    *_, result = _compile(exact, lanes)
+
+    assert result.delivery_readiness == "HIGH_ASSURANCE"
+    assert result.blocking_codes == ()
+
+
+def test_replayed_safety_finding_authoritatively_blocks_semantic_completeness_claim(
+    inputs: VerifiedReadinessInputsV1,
+) -> None:
+    claim = "This report is exhaustive."
+    exact = _clean_qualification(_with_requirements(inputs, count=10, importance="supporting"))
+    exact = _with_report(exact, f"{exact.report_text}\n\n{claim}")
+    lanes = _lanes(exact, ("met",) * 9 + ("partially_met",))
+    finding = _finding(
+        rationale=("The report-wide certainty claim conflicts with the visible partial treatment."),
+        subject_id="REQ-0010",
+        kind="HIDDEN_OR_UNDERSTATED_LIMITATION",
+    )
+    finding_raw = finding.model_dump(mode="json")
+    finding_raw.update(
+        {
+            "report_passages": (claim,),
+            "shortfall_description": (
+                "The exhaustive-report claim understates the disclosed open gap."
+            ),
+            "rationale_kind": "SAFETY_REVIEW_FINDING",
+            "blocking_code": "HIDDEN_MATERIAL_GAP",
+            "follow_up_code": "EXPAND_REQUIREMENT_ANALYSIS",
+        }
+    )
+    authoritative = SafetyFindingProposalV1.model_validate(finding_raw)
+
+    *_, result = _compile(exact, lanes, findings=(authoritative,))
 
     assert result.delivery_readiness == "NOT_DELIVERABLE"
     assert "HIDDEN_MATERIAL_GAP" in result.blocking_codes
