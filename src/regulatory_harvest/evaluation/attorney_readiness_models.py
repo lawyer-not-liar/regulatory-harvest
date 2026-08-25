@@ -71,6 +71,12 @@ def _nonblank(value: str) -> str:
     return checked
 
 
+def _preserve_nonblank(value: str) -> str:
+    if not value.strip():
+        raise ValueError("value must not be blank")
+    return value
+
+
 def _optional_nonblank(value: str | None) -> str | None:
     return None if value is None else _nonblank(value)
 
@@ -1000,7 +1006,7 @@ class ReadinessInputV1(ReadinessStrictModelV1):
     strict_equivalent_scoring_contract_fingerprint: Hash
     historical_v22_cross_check: HistoricalV22CrossCheckV1 | None = None
 
-    _validate_report = field_validator("report_text")(_nonblank)
+    _validate_report = field_validator("report_text")(_preserve_nonblank)
 
     @model_validator(mode="after")
     def validate_input_bindings(self) -> Self:
@@ -1023,7 +1029,7 @@ class ReadinessEvaluatorRequestV1(ReadinessStrictModelV1):
     json_schema: dict[str, object]
     payload: dict[str, object]
 
-    _validate_instructions = field_validator("system_instructions")(_nonblank)
+    _validate_instructions = field_validator("system_instructions")(_preserve_nonblank)
 
     @field_validator("json_schema", "payload", mode="before")
     @classmethod

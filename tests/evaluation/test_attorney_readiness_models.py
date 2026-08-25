@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,7 @@ from regulatory_harvest.evaluation.attorney_readiness_models import (
     OwnerRoleV1,
     RationaleKindV1,
     ReadinessCallRecordV1,
+    ReadinessEvaluatorRequestV1,
     ReadinessEvaluatorResponseV1,
     ReadinessInputV1,
     ReadinessManifestV1,
@@ -303,6 +305,63 @@ def verified_projection_input(
         "strict_equivalent_scoring_contract_fingerprint": "0" * 64,
         "historical_v22_cross_check": None,
     }
+
+
+def test_readiness_input_preserves_exact_nonblank_report_text_and_hash(
+    tmp_path: Path,
+) -> None:
+    _, input_wire = verified_projection_input(tmp_path)
+    report_text = "  Exact report body.  \n"
+    report_hash = sha256(report_text.encode("utf-8")).hexdigest()
+    generation_validation = dict(input_wire["generation_validation"])
+    generation_validation["report_hash"] = report_hash
+
+    checked = ReadinessInputV1.model_validate(
+        input_wire
+        | {
+            "report_text": report_text,
+            "report_hash": report_hash,
+            "generation_validation": generation_validation,
+        }
+    )
+
+    assert checked.report_text == report_text
+    assert sha256(checked.report_text.encode("utf-8")).hexdigest() == checked.report_hash
+
+
+@pytest.mark.parametrize("report_text", ["", "   ", "\n\t"])
+def test_readiness_input_rejects_all_whitespace_report_text(
+    tmp_path: Path,
+    report_text: str,
+) -> None:
+    _, input_wire = verified_projection_input(tmp_path)
+
+    with pytest.raises(ValidationError, match="blank"):
+        ReadinessInputV1.model_validate(input_wire | {"report_text": report_text})
+
+
+def test_evaluator_request_preserves_exact_nonblank_system_instructions() -> None:
+    system_instructions = "  Grade only against the supplied evidence.  \n"
+
+    checked = ReadinessEvaluatorRequestV1.model_validate(
+        {
+            "operation": "safety_review",
+            "request_fingerprint": HASH,
+            "system_instructions": system_instructions,
+            "json_schema": {},
+            "payload": {},
+        }
+    )
+
+    assert checked.system_instructions == system_instructions
+
+
+def test_rationale_normalization_remains_trimmed() -> None:
+    checked = BaselineLockedGradeFragmentV1.model_validate(
+        valid_fragment(rationale="  Evidence-bound rationale.  \n")
+    )
+
+    assert checked.rationale == "Evidence-bound rationale."
 
 
 def test_readiness_policy_has_exact_canonical_bytes_and_versioned_thresholds() -> None:
