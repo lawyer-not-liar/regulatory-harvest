@@ -1116,6 +1116,8 @@ def _renumber_requirement(
 def _apply_requirement_actions(
     requirements: dict[str, BaselineRequirementV1],
     actions: tuple[BaselineCorrectionActionV1, ...],
+    *,
+    reserved_requirement_ids: set[str],
 ) -> None:
     touched: set[str] = set()
     for action in actions:
@@ -1129,7 +1131,11 @@ def _apply_requirement_actions(
         if action.action == "add_requirement":
             assert replacement is not None
             identifier = replacement.requirement_id
-            if identifier in requirements or identifier in touched:
+            if (
+                identifier in requirements
+                or identifier in reserved_requirement_ids
+                or identifier in touched
+            ):
                 raise BaselineCompilationError("BASELINE_CORRECTION_REQUIREMENT")
             requirements[identifier] = _fresh_requirement(replacement)
             touched.add(identifier)
@@ -1220,7 +1226,17 @@ def apply_baseline_correction_v1(
         for item in checked_prior.relationships
     }
     contested = tuple(_fresh_contested(item) for item in checked_prior.contested_requirements)
-    _apply_requirement_actions(requirements, checked_correction.actions)
+    contested_requirement_ids = {
+        alternative.requirement_id
+        for item in contested
+        for alternative in (item.reviewer_alternative, item.auditor_alternative)
+        if alternative is not None
+    }
+    _apply_requirement_actions(
+        requirements,
+        checked_correction.actions,
+        reserved_requirement_ids=contested_requirement_ids,
+    )
     _apply_relationship_actions(relationships, checked_correction.actions)
     source_texts = _source_texts(checked_input)
     statements: set[str] = set()

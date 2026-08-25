@@ -886,6 +886,45 @@ def _unresolved_prior_baseline(baseline_input: BaselineInputV1):
     return compile_canonical_baseline_v1(baseline_input, review, audit, referees)
 
 
+def _ordinary_and_unresolved_prior_baseline(baseline_input: BaselineInputV1):
+    ordinary = _proposal(
+        "The notice must identify the operator.", "must identify the operator"
+    )
+    reviewer = _proposal("A covered operator must file a notice.", "must file a notice")
+    auditor = _proposal(
+        "A covered operator must file an annual notice.", "must file a notice"
+    )
+    review = _review(baseline_input, (ordinary, reviewer))
+    audit = _audit(
+        baseline_input,
+        review,
+        concerns=(
+            {
+                "target_proposal_ref": "PR-0002",
+                "concern_type": "incorrect_statement",
+                "passages": ({"source_id": "rule-1", "quote": "must file a notice"},),
+                "explanation": "The source may support a narrower annual obligation.",
+                "correction": auditor,
+            },
+        ),
+    )
+    disputes = build_baseline_disputes_v1(baseline_input, review, audit)
+    referees = _referees(
+        baseline_input,
+        disputes,
+        lambda dispute: BaselineRefereeDecisionV1(
+            dispute_id=dispute.dispute_id,
+            decision="unresolved",
+            passages=({"source_id": "rule-1", "quote": "must file a notice"},),
+            importance="critical",
+            importance_basis=("legal_bottom_line",),
+            importance_rationale="Either alternative could change the legal bottom line.",
+            substantive_rationale="The retained source does not resolve the wording.",
+        ),
+    )
+    return compile_canonical_baseline_v1(baseline_input, review, audit, referees)
+
+
 def _correction_requirement(
     baseline_input: BaselineInputV1,
     *,
@@ -1038,6 +1077,39 @@ def test_correction_renumbers_contested_slots_and_relationship_references(
             target_requirement_id="REQ-0002",
         ),
     )
+
+
+def test_correction_rejects_added_requirement_id_colliding_with_contested_slot(
+    baseline_input: BaselineInputV1,
+) -> None:
+    prior = _ordinary_and_unresolved_prior_baseline(baseline_input)
+    contest = prior.contested_requirements[0]
+    assert [item.requirement_id for item in prior.requirements] == ["REQ-0001"]
+    assert contest.reviewer_alternative is not None
+    assert contest.reviewer_alternative.requirement_id == "REQ-0002"
+    added = _correction_requirement(
+        baseline_input,
+        requirement_id="REQ-0002",
+        statement="The operator must be identified in the notice.",
+    )
+    relationship = BaselineRelationshipV1(
+        relationship_id="REL-9999",
+        relationship="depends_on",
+        source_requirement_id="REQ-0002",
+        target_requirement_id="REQ-0001",
+    )
+    correction = _correction(
+        prior,
+        (
+            {"action": "add_requirement", "requirement": added},
+            {"action": "add_relationship", "relationship": relationship},
+        ),
+    )
+
+    with pytest.raises(BaselineCompilationError, match="BASELINE_CORRECTION_REQUIREMENT"):
+        apply_baseline_correction_v1(
+            baseline_input, prior, correction, prior_baseline_root="9" * 64
+        )
 
 
 @pytest.mark.parametrize(
