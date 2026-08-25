@@ -51,6 +51,7 @@ from regulatory_harvest.evaluation.attorney_readiness_models import (
     ReadinessVerificationV1,
     RequirementDispositionV1,
     RequirementMatrixRowV1,
+    SafetyDisputeV1,
     SafetyFindingKindV1,
     SafetyFindingProposalV1,
     SafetyGapAssessmentV1,
@@ -304,6 +305,75 @@ def valid_safety_referee_decision(**updates: object) -> dict[str, object]:
         "disposition": "lane_1",
         "rationale": "Lane 1 is supported by the issued evidence.",
         "evidence_refs": ("SOURCE-000001",),
+    }
+    value.update(updates)
+    return value
+
+
+SCOPED_DISPUTE_CHOICES: dict[str, tuple[dict[str, object] | None, dict[str, object] | None]] = {
+    "finding_existence": ({"present": True}, None),
+    "rationale": (
+        {
+            "shortfall_description": "The deadline is omitted.",
+            "rationale_kind": "REPORT_OMISSION",
+            "why_unresolved": "No passage supplies the deadline.",
+            "why_it_matters": "The deadline affects implementation.",
+        },
+        {
+            "shortfall_description": "The deadline is incomplete.",
+            "rationale_kind": "REPORT_PARTIAL_TREATMENT",
+            "why_unresolved": "The passage omits the triggering event.",
+            "why_it_matters": "The trigger changes the deadline.",
+        },
+    ),
+    "evidence_binding": (
+        {
+            "evidence_refs": ["SOURCE-000001"],
+            "report_passages": ["  Exact lane 1 passage.  \n"],
+        },
+        {
+            "evidence_refs": ["BASELINE-REQ-0001"],
+            "report_passages": ["Exact lane 2 passage."],
+        },
+    ),
+    "visibility": (
+        {"disclosure_location": "Limitations", "visibility": "prominent"},
+        {"disclosure_location": None, "visibility": "hidden"},
+    ),
+    "blocker": (
+        {"blocking_code": "MATERIAL_UNSUPPORTED_ASSERTION"},
+        {"blocking_code": None},
+    ),
+    "follow_up": (
+        {"follow_up_code": "VERIFY_PRIMARY_AUTHORITY"},
+        {"follow_up_code": "CONFIRM_CURRENTNESS"},
+    ),
+    "owner": (
+        {"owner_role": "reviewing_attorney"},
+        {"owner_role": "outside_counsel"},
+    ),
+    "resolution_test": (
+        {"resolution_test": "Verify the deadline."},
+        {"resolution_test": "Obtain controlling authority."},
+    ),
+}
+
+
+def valid_scoped_dispute(kind: str = "rationale", **updates: object) -> dict[str, object]:
+    first, second = SCOPED_DISPUTE_CHOICES[kind]
+    value: dict[str, object] = {
+        "dispute_id": "SD-0001",
+        "canonical_order": 0,
+        "dispute_kind": kind,
+        "subject_identity": "GC-0001",
+        "lane_1_choice": first,
+        "lane_2_choice": second,
+        "evidence_refs": ("SOURCE-000001", "BASELINE-REQ-0001"),
+        "report_passages": ("  Exact lane 1 passage.  \n", "Exact lane 2 passage."),
+        "grade_target_fingerprint": HASH,
+        "baseline_fingerprint": "b" * 64,
+        "report_hash": "c" * 64,
+        "dispute_fingerprint": "d" * 64,
     }
     value.update(updates)
     return value
@@ -649,6 +719,179 @@ def test_safety_evidence_refs_rehydrate_validated_frozen_tuples(
     checked = model.model_validate(first)
 
     assert checked.model_dump(mode="json") == first.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("kind", tuple(SCOPED_DISPUTE_CHOICES))
+def test_safety_dispute_accepts_only_dimension_scoped_choices(kind: str) -> None:
+    checked = SafetyDisputeV1.model_validate(valid_scoped_dispute(kind))
+    first, second = SCOPED_DISPUTE_CHOICES[kind]
+
+    assert checked.lane_1_choice == first
+    assert checked.lane_2_choice == second
+    assert checked.report_passages == (
+        "  Exact lane 1 passage.  \n",
+        "Exact lane 2 passage.",
+    )
+
+
+def test_safety_dispute_schema_structurally_excludes_full_lane_records() -> None:
+    properties = SafetyDisputeV1.model_json_schema()["properties"]
+
+    assert "lane_1_choice" in properties
+    assert "lane_2_choice" in properties
+    assert "lane_1_record" not in properties
+    assert "lane_2_record" not in properties
+
+
+def test_safety_dispute_rejects_full_lane_records() -> None:
+    left = valid_safety_assessment()
+    right = valid_safety_assessment(owner_role="outside_counsel")
+
+    with pytest.raises(ValidationError):
+        SafetyDisputeV1.model_validate(
+            {
+                "dispute_id": "SD-0001",
+                "canonical_order": 0,
+                "dispute_kind": "owner",
+                "lane_1_record": left,
+                "lane_2_record": right,
+                "dispute_fingerprint": HASH,
+            }
+        )
+
+
+def test_safety_dispute_rejects_unbound_controller_id_and_order() -> None:
+    left = valid_safety_assessment()
+    right = valid_safety_assessment(owner_role="outside_counsel")
+
+    with pytest.raises(ValidationError):
+        SafetyDisputeV1.model_validate(
+            {
+                "dispute_id": "SD-0002",
+                "canonical_order": 0,
+                "dispute_kind": "owner",
+                "lane_1_record": left,
+                "lane_2_record": right,
+                "dispute_fingerprint": HASH,
+            }
+        )
+
+
+@pytest.mark.parametrize("kind", tuple(SCOPED_DISPUTE_CHOICES))
+def test_safety_dispute_rejects_identical_or_dimension_incompatible_choices(
+    kind: str,
+) -> None:
+    first, _ = SCOPED_DISPUTE_CHOICES[kind]
+    if kind == "finding_existence":
+        invalid = valid_scoped_dispute(kind, lane_1_choice=first, lane_2_choice=first)
+    else:
+        assert first is not None
+        invalid_choice = dict(first)
+        invalid_choice["unrelated_field"] = "must not be admitted"
+        invalid = valid_scoped_dispute(kind, lane_1_choice=invalid_choice)
+
+    with pytest.raises(ValidationError):
+        SafetyDisputeV1.model_validate(invalid)
+
+
+@pytest.mark.parametrize(
+    ("kind", "choice"),
+    (
+        ("finding_existence", {"present": 1}),
+        ("rationale", {"shortfall_description": "missing the other exact keys"}),
+        ("evidence_binding", {"evidence_refs": ("SOURCE-000001",), "report_passages": []}),
+        ("visibility", {"disclosure_location": 1, "visibility": "hidden"}),
+        ("blocker", {"blocking_code": False}),
+        ("follow_up", {"follow_up_code": "UNKNOWN"}),
+        ("owner", {"owner_role": "administrator"}),
+        ("resolution_test", {"resolution_test": " \n"}),
+    ),
+)
+def test_safety_dispute_rejects_wrong_dimension_choice_types(
+    kind: str,
+    choice: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        SafetyDisputeV1.model_validate(valid_scoped_dispute(kind, lane_1_choice=choice))
+
+
+class DisputeChoiceDictSubclass(dict[str, object]):
+    pass
+
+
+def test_safety_dispute_rejects_choice_subclasses_and_nested_iterators_without_consuming() -> None:
+    with pytest.raises(ValidationError):
+        SafetyDisputeV1.model_validate(
+            valid_scoped_dispute(
+                "owner",
+                lane_1_choice=DisputeChoiceDictSubclass({"owner_role": "reviewing_attorney"}),
+            )
+        )
+
+    iterations: list[str] = []
+    with pytest.raises(ValidationError):
+        SafetyDisputeV1.model_validate(
+            valid_scoped_dispute(
+                "rationale",
+                lane_1_choice={
+                    "shortfall_description": ExplodingPassageIterable(iterations),
+                    "rationale_kind": "REPORT_OMISSION",
+                    "why_unresolved": "Missing.",
+                    "why_it_matters": "Material.",
+                },
+            )
+        )
+    assert iterations == []
+
+
+def test_safety_dispute_rejects_choice_cycles_depth_nodes_and_bytes() -> None:
+    cyclic: dict[str, object] = {}
+    cyclic["shortfall_description"] = cyclic
+    deep: object = "leaf"
+    for _ in range(65):
+        deep = {"nested": deep}
+    attacks = (
+        cyclic,
+        {"shortfall_description": deep},
+        {"shortfall_description": [None] * 100_001},
+        {"shortfall_description": "x" * (16 * 1024 * 1024 + 1)},
+    )
+
+    for choice in attacks:
+        with pytest.raises(ValidationError):
+            SafetyDisputeV1.model_validate(valid_scoped_dispute("rationale", lane_1_choice=choice))
+
+
+def test_safety_dispute_detaches_and_freezes_scoped_choices() -> None:
+    first, second = SCOPED_DISPUTE_CHOICES["evidence_binding"]
+    assert first is not None and second is not None
+    raw_first = dict(first)
+    checked = SafetyDisputeV1.model_validate(
+        valid_scoped_dispute("evidence_binding", lane_1_choice=raw_first)
+    )
+    cast(list[str], raw_first["evidence_refs"]).append("SOURCE-000002")
+
+    assert checked.lane_1_choice["evidence_refs"] == ["SOURCE-000001"]
+    with pytest.raises(TypeError):
+        checked.lane_1_choice["evidence_refs"] = []
+
+
+def test_safety_dispute_rejects_constructed_and_subclass_choice_laundering() -> None:
+    invalid = valid_scoped_dispute(
+        "owner",
+        lane_1_choice=valid_safety_assessment(),
+        evidence_refs=["SOURCE-000001"],
+        report_passages=["Exact lane 1 passage."],
+    )
+    forged = SafetyDisputeV1.model_construct(**invalid)
+
+    class ExternalSafetyDispute(SafetyDisputeV1):
+        pass
+
+    external = ExternalSafetyDispute.model_construct(**invalid)
+    for candidate in (forged, external):
+        with pytest.raises(ValidationError):
+            SafetyDisputeV1.model_validate(candidate)
 
 
 def exact_passage_cases(

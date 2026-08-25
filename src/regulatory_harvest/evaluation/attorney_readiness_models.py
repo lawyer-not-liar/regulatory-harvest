@@ -357,6 +357,8 @@ def _wire_snapshot_inner(
         raise ValueError("readiness model wire snapshot exceeds resource limits")
     if isinstance(value, Mapping) and not isinstance(value, dict):
         raise ValueError("readiness model wire snapshot requires a built-in mapping")
+    if isinstance(value, dict) and type(value) not in {dict, _FrozenDict}:
+        raise ValueError("readiness model wire snapshot requires built-in dictionaries")
     if isinstance(value, tuple) and type(value) not in {tuple, _FrozenWireTuple}:
         raise ValueError("readiness model wire snapshot requires built-in tuples")
     if isinstance(value, list) and type(value) not in {list, _FrozenJsonList}:
@@ -1432,37 +1434,143 @@ class SafetyLaneResponseV1(ReadinessStrictModelV1):
         return self
 
 
-SafetyDisputeRecordV1 = SafetyGapAssessmentV1 | SafetyFindingProposalV1
+_SafetyDisputeKindV1 = Literal[
+    "finding_existence",
+    "rationale",
+    "evidence_binding",
+    "visibility",
+    "blocker",
+    "follow_up",
+    "owner",
+    "resolution_test",
+]
+
+_DISPUTE_CHOICE_KEYS: dict[str, frozenset[str]] = {
+    "finding_existence": frozenset({"present"}),
+    "rationale": frozenset(
+        {"shortfall_description", "rationale_kind", "why_unresolved", "why_it_matters"}
+    ),
+    "evidence_binding": frozenset({"evidence_refs", "report_passages"}),
+    "visibility": frozenset({"disclosure_location", "visibility"}),
+    "blocker": frozenset({"blocking_code"}),
+    "follow_up": frozenset({"follow_up_code"}),
+    "owner": frozenset({"owner_role"}),
+    "resolution_test": frozenset({"resolution_test"}),
+}
+
+
+def _choice_nonblank(value: object) -> bool:
+    return type(value) is str and bool(value.strip())
+
+
+def _validate_dispute_choice(kind: str, choice: dict[str, object]) -> None:
+    if set(choice) != _DISPUTE_CHOICE_KEYS[kind]:
+        raise ValueError("safety dispute choice has fields outside its disputed dimension")
+    if kind == "finding_existence":
+        valid = type(choice["present"]) is bool and choice["present"] is True
+    elif kind == "rationale":
+        valid = (
+            _choice_nonblank(choice["shortfall_description"])
+            and choice["rationale_kind"] in {item.value for item in RationaleKindV1}
+            and _choice_nonblank(choice["why_unresolved"])
+            and _choice_nonblank(choice["why_it_matters"])
+        )
+    elif kind == "evidence_binding":
+        evidence = choice["evidence_refs"]
+        passages = choice["report_passages"]
+        if type(evidence) is _FrozenJsonList:
+            evidence = list(evidence)
+        if type(passages) is _FrozenJsonList:
+            passages = list(passages)
+        _unique_evidence_refs(
+            evidence,
+            location="dispute choice evidence references",
+        )
+        _unique_exact_passages(
+            passages,
+            location="dispute choice report passages",
+        )
+        valid = True
+    elif kind == "visibility":
+        location = choice["disclosure_location"]
+        valid = (location is None or _choice_nonblank(location)) and choice["visibility"] in {
+            item.value for item in GapVisibilityV1
+        }
+    elif kind == "blocker":
+        blocker = choice["blocking_code"]
+        valid = blocker is None or _choice_nonblank(blocker)
+    elif kind == "follow_up":
+        valid = choice["follow_up_code"] in {item.value for item in FollowUpCodeV1}
+    elif kind == "owner":
+        valid = choice["owner_role"] in {item.value for item in OwnerRoleV1}
+    else:
+        valid = _choice_nonblank(choice["resolution_test"])
+    if not valid:
+        raise ValueError("safety dispute choice has an invalid dimension value")
 
 
 class SafetyDisputeV1(ReadinessStrictModelV1):
     dispute_id: SafetyDisputeRef
-    canonical_order: int = Field(ge=0, strict=True)
-    dispute_kind: Literal[
-        "finding_existence",
-        "rationale",
-        "evidence_binding",
-        "visibility",
-        "blocker",
-        "follow_up",
-        "owner",
-        "resolution_test",
-    ]
-    lane_1_record: SafetyDisputeRecordV1 | None = None
-    lane_2_record: SafetyDisputeRecordV1 | None = None
+    canonical_order: int = Field(ge=0, lt=_MAX_FINDINGS, strict=True)
+    dispute_kind: _SafetyDisputeKindV1
+    subject_identity: str = Field(max_length=_MAX_EVIDENCE_REF_LENGTH, strict=True)
+    lane_1_choice: dict[str, object] | None
+    lane_2_choice: dict[str, object] | None
+    evidence_refs: tuple[EvidenceRefV1, ...] = Field(max_length=_MAX_FINDINGS)
+    report_passages: tuple[str, ...] = Field(max_length=_MAX_FINDINGS)
+    grade_target_fingerprint: Hash
+    baseline_fingerprint: Hash
+    report_hash: Hash
     dispute_fingerprint: Hash
+
+    _validate_subject = field_validator("subject_identity")(_nonblank)
+    _validate_evidence = field_validator("evidence_refs", mode="before")(
+        lambda values: _unique_evidence_refs(values, location="dispute evidence references")
+    )
+    _validate_passages = field_validator("report_passages", mode="before")(
+        lambda values: _unique_exact_passages(values, location="dispute report passages")
+    )
+
+    @field_validator("lane_1_choice", "lane_2_choice", mode="before")
+    @classmethod
+    def validate_choice_tree(cls, value: object) -> object:
+        if value is None:
+            return None
+        return _validate_json_tree(value, location="safety dispute choice")
 
     @model_validator(mode="after")
     def validate_dispute(self) -> Self:
-        if self.lane_1_record is None and self.lane_2_record is None:
-            raise ValueError("safety disputes require at least one lane record")
-        if (
-            self.lane_1_record is not None
-            and self.lane_2_record is not None
-            and canonical_json_bytes(self.lane_1_record.model_dump(mode="json"))
-            == canonical_json_bytes(self.lane_2_record.model_dump(mode="json"))
-        ):
-            raise ValueError("byte-identical safety lane records are not a dispute")
+        if int(self.dispute_id.split("-")[1]) != self.canonical_order + 1:
+            raise ValueError("safety dispute ID must bind its canonical order")
+        first = self.lane_1_choice
+        second = self.lane_2_choice
+        if self.dispute_kind == "finding_existence":
+            if (first is None) == (second is None):
+                raise ValueError("finding-existence disputes require exactly one absent choice")
+        elif first is None or second is None:
+            raise ValueError("nonexistence is valid only for finding-existence disputes")
+        for choice in (first, second):
+            if choice is not None:
+                _validate_dispute_choice(self.dispute_kind, choice)
+        if canonical_json_bytes(first) == canonical_json_bytes(second):
+            raise ValueError("safety dispute choices must differ")
+        if self.dispute_kind == "evidence_binding":
+            if first is None or second is None:
+                raise ValueError("evidence-binding disputes require two choices")
+            expected_evidence = tuple(
+                dict.fromkeys(
+                    cast(list[str], first["evidence_refs"])
+                    + cast(list[str], second["evidence_refs"])
+                )
+            )
+            expected_passages = tuple(
+                dict.fromkeys(
+                    cast(list[str], first["report_passages"])
+                    + cast(list[str], second["report_passages"])
+                )
+            )
+            if self.evidence_refs != expected_evidence or self.report_passages != expected_passages:
+                raise ValueError("evidence-binding dispute scope must match its two choices")
         return self
 
 
