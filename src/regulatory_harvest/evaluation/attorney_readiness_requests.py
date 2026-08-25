@@ -809,6 +809,7 @@ def _common_payload(
         "baseline_fingerprint": projection.binding.baseline_fingerprint,
         "report_text": inputs.report_text,
         "report_hash": inputs.report_hash,
+        "generation_validation": inputs.generation_validation.model_dump(mode="json"),
         "report_passage_allowlist": list(allowlist),
         "retained_scoring_contract": json.loads(inputs.strict_equivalent_scoring_contract_bytes),
         "retained_scoring_contract_fingerprint": (
@@ -1821,6 +1822,7 @@ def build_safety_referee_request_v1(
             "grade_target_fingerprint": exact.grade_target_fingerprint,
             "baseline_fingerprint": exact.baseline_fingerprint,
             "report_hash": exact.report_hash,
+            "generation_validation": checked.generation_validation.model_dump(mode="json"),
             "disputed_report_passages": report_passages,
             "evidence_handles": scoped_handles,
         },

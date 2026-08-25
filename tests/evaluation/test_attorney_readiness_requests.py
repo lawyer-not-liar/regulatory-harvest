@@ -44,6 +44,7 @@ from regulatory_harvest.evaluation.attorney_readiness_models import (
     BaselineLockedGraderAggregateV1,
     GenerationValidationBindingV1,
     HistoricalV22CrossCheckV1,
+    ReadinessEvaluatorRequestV1,
     ReadinessInputV1,
     SafetyFindingProposalV1,
     SafetyGapAssessmentV1,
@@ -674,6 +675,57 @@ def _finding(
     )
 
 
+def _requests_by_operation(
+    inputs: VerifiedReadinessInputsV1,
+) -> dict[str, ReadinessEvaluatorRequestV1]:
+    lanes = _grader_lanes(inputs)
+    candidates = build_gap_candidate_inventory_v1(inputs, lanes)
+    assessments = tuple(_assessment(item) for item in candidates)
+    lane_1 = SafetyLaneResponseV1(
+        lane=1,
+        candidate_assessments=assessments,
+        finding_proposals=(_finding(rationale="Lane one validation-bound rationale."),),
+    )
+    lane_2 = SafetyLaneResponseV1(
+        lane=2,
+        candidate_assessments=assessments,
+        finding_proposals=(_finding(rationale="Lane two validation-bound rationale."),),
+    )
+    dispute = build_safety_disputes_v1(inputs, lane_1, lane_2)[0]
+    return {
+        "baseline_locked_grade": build_baseline_locked_grade_request_v1(
+            inputs,
+            build_baseline_locked_grade_batches_v1(inputs.gradeable_baseline, lane=1)[0],
+        ),
+        "baseline_locked_contested_grade": build_baseline_locked_contested_grade_request_v1(
+            inputs,
+            lane=1,
+            contested_requirement_id="CONT-0001",
+        ),
+        "safety_review": build_safety_lane_request_v1(
+            inputs,
+            lanes,
+            candidates,
+            lane=1,
+        ),
+        "safety_referee": build_safety_referee_request_v1(inputs, dispute),
+    }
+
+
+def _with_generation_validation_hash(
+    inputs: VerifiedReadinessInputsV1,
+    field: str,
+    value: str,
+) -> VerifiedReadinessInputsV1:
+    validation = inputs.generation_validation.model_copy(update={field: value})
+    readiness = inputs.readiness_input.model_copy(update={"generation_validation": validation})
+    return replace(
+        inputs,
+        readiness_input=readiness,
+        generation_validation=validation,
+    )
+
+
 def test_contract_fingerprints_bind_public_v22_semantics_without_private_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -855,6 +907,102 @@ def test_compiler_fingerprint_changes_with_referee_instruction_factory(
     assert (
         readiness_compiler_contract_fingerprint_v1() != READINESS_COMPILER_CONTRACT_FINGERPRINT_V1
     )
+
+
+def test_all_operation_payloads_bind_exact_generation_validation_and_omit_history(
+    inputs: VerifiedReadinessInputsV1,
+) -> None:
+    historical = _with_history(inputs)
+    expected = {
+        "receipt_hash": historical.generation_validation.receipt_hash,
+        "report_hash": historical.generation_validation.report_hash,
+        "bundle_hash": historical.generation_validation.bundle_hash,
+        "coverage_review_hash": historical.generation_validation.coverage_review_hash,
+        "status": "completed",
+        "evidence_precision_valid": True,
+        "proposition_coverage_valid": True,
+        "provision_recall_valid": True,
+    }
+    requests = _requests_by_operation(historical)
+    assert set(requests) == {
+        "baseline_locked_grade",
+        "baseline_locked_contested_grade",
+        "safety_review",
+        "safety_referee",
+    }
+    for operation, request in requests.items():
+        payload = cast(dict[str, object], request.payload)
+        assert payload["generation_validation"] == expected, operation
+        observed = cast(dict[str, object], payload["generation_validation"])
+        for field in (
+            "evidence_precision_valid",
+            "proposition_coverage_valid",
+            "provision_recall_valid",
+        ):
+            assert type(observed[field]) is bool, (operation, field)
+        wire = canonical_json_bytes(request).decode("utf-8")
+        for forbidden in (
+            "historical_v22",
+            "historical-result",
+            "CRITICAL_RECALL_BELOW_FLOOR",
+            '"FAIL"',
+        ):
+            assert forbidden not in wire, (operation, forbidden)
+
+
+@pytest.mark.parametrize(
+    ("field", "mutated"),
+    (
+        ("receipt_hash", _digest("mutated-receipt")),
+        ("report_hash", _digest("mutated-report")),
+        ("bundle_hash", _digest("mutated-bundle")),
+        ("coverage_review_hash", _digest("mutated-coverage")),
+        ("status", "not-completed"),
+        ("evidence_precision_valid", False),
+        ("proposition_coverage_valid", False),
+        ("provision_recall_valid", False),
+    ),
+)
+def test_each_generation_validation_field_is_request_fingerprint_bound_for_all_operations(
+    inputs: VerifiedReadinessInputsV1,
+    field: str,
+    mutated: object,
+) -> None:
+    for operation, request in _requests_by_operation(inputs).items():
+        assert request.request_fingerprint == _request_fingerprint(request)
+        raw = request.model_dump(mode="json", exclude={"request_fingerprint"})
+        payload = cast(dict[str, object], raw["payload"])
+        validation = payload.get("generation_validation")
+        assert type(validation) is dict, operation
+        exact = cast(dict[str, object], validation)
+        assert field in exact, (operation, field)
+        exact[field] = mutated
+        assert sha256_digest(canonical_json_bytes(raw)) != request.request_fingerprint, (
+            operation,
+            field,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("receipt_hash", "report_hash", "bundle_hash", "coverage_review_hash"),
+)
+def test_rebuilt_operation_fingerprints_change_with_admitted_validation_hashes(
+    inputs: VerifiedReadinessInputsV1,
+    field: str,
+) -> None:
+    original = _requests_by_operation(inputs)
+    if field == "report_hash":
+        changed_inputs = _with_report(inputs, inputs.report_text + "\nValidation hash mutation.\n")
+    else:
+        changed_inputs = _with_generation_validation_hash(
+            inputs,
+            field,
+            _digest(f"mutated-{field}"),
+        )
+    changed = _requests_by_operation(changed_inputs)
+    for operation in original:
+        assert original[operation].request_fingerprint != changed[operation].request_fingerprint
 
 
 def test_grade_batches_are_exact_five_item_lane_specific_inventories(
