@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -292,6 +293,23 @@ def _run_qualification_surface(
     runner: Path,
     *args: str,
 ) -> subprocess.CompletedProcess[str]:
+    python_args = [sys.executable]
+    if runner == PORTABLE_RUNNER:
+        python_args.extend(("-I", "-S"))
+    return subprocess.run(
+        [*python_args, str(runner), *args],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _run_baseline_surface(
+    runner: Path,
+    *args: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run the full or genuinely no-site portable baseline CLI."""
     python_args = [sys.executable]
     if runner == PORTABLE_RUNNER:
         python_args.extend(("-I", "-S"))
@@ -2298,6 +2316,729 @@ def _baseline_cli_control(tmp_path: Path) -> Path:
         )
     )
     return control
+
+
+def _assert_baseline_surface_parity(
+    full_args: tuple[str, ...],
+    portable_args: tuple[str, ...],
+) -> tuple[subprocess.CompletedProcess[str], subprocess.CompletedProcess[str]]:
+    full = _run_baseline_surface(SKILL_RUNNER, *full_args)
+    portable = _run_baseline_surface(PORTABLE_RUNNER, *portable_args)
+    assert (portable.returncode, portable.stdout, portable.stderr) == (
+        full.returncode,
+        full.stdout,
+        full.stderr,
+    )
+    return full, portable
+
+
+def _complete_baseline_parity_pair(
+    tmp_path: Path, *, suffix: str
+) -> tuple[Path, Path, Path]:
+    """Create one minimal terminal pair for bounded adversarial rows."""
+    control = _baseline_cli_control(tmp_path)
+    full_run = tmp_path / f"baseline-full-{suffix}"
+    portable_run = tmp_path / f"baseline-portable-{suffix}"
+    common = ("--input", str(control), "--nonce-hex", "8" * 64)
+    _assert_baseline_surface_parity(
+        ("eval-baseline-init", *common, "--run", str(full_run)),
+        ("eval-baseline-init", *common, "--run", str(portable_run)),
+    )
+    payloads = (
+        {
+            "proposals": [
+                {
+                    "statement": "A covered operator must file notice.",
+                    "kind": "obligation",
+                    "importance": "critical",
+                    "importance_basis": ["legal_bottom_line"],
+                    "importance_rationale": "Omission could change the legal bottom line.",
+                    "passages": [{"source_id": "source-1", "quote": "presentará aviso"}],
+                    "dependency": None,
+                    "confidence": "clear",
+                    "substantive_rationale": "The fictional rule uses mandatory language.",
+                }
+            ],
+            "review_complete": True,
+        },
+        {
+            "concerns": [],
+            "importance_findings": [
+                {
+                    "proposal_ref": "PR-0001",
+                    "reviewed_importance": "critical",
+                    "reviewed_importance_basis": ["legal_bottom_line"],
+                    "importance_rationale": "Omission could change the legal bottom line.",
+                    "disposition": "agree",
+                }
+            ],
+            "audit_complete": True,
+        },
+    )
+    for ordinal, payload in enumerate(payloads, 1):
+        request, _ = _assert_baseline_surface_parity(
+            ("eval-baseline-next", "--run", str(full_run)),
+            ("eval-baseline-next", "--run", str(portable_run)),
+        )
+        assert json.loads(request.stdout)["operation"] in {
+            "baseline_source_review", "baseline_source_audit"
+        }
+        response = tmp_path / f"baseline-{suffix}-response-{ordinal}.json"
+        response.write_bytes(_canonical_bytes(payload))
+        flags = (
+            "--response", str(response), "--provider-name", "fictional-provider",
+            "--model-name", "fictional-model", "--judge-isolation", "scripted_fixture",
+        )
+        _assert_baseline_surface_parity(
+            ("eval-baseline-submit-safe", "--run", str(full_run), *flags),
+            ("eval-baseline-submit-safe", "--run", str(portable_run), *flags),
+        )
+    assert _run_snapshot(portable_run) == _run_snapshot(full_run)
+    return control, full_run, portable_run
+
+
+def _reseal_baseline_parity_run(run: Path, changes: dict[str, bytes]) -> None:
+    """Rehash changed artifacts and both outer manifest fingerprints only."""
+    manifest_path = run / "baseline-manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    records = {item["artifact_path"]: item for item in manifest["artifacts"]}
+    for path, data in changes.items():
+        target = run / path
+        target.chmod(0o600)
+        target.write_bytes(data)
+        records[path]["artifact_hash"] = hashlib.sha256(data).hexdigest()
+    manifest["artifacts"] = [records[path] for path in sorted(records)]
+    manifest["root_hash"] = "0" * 64
+    manifest["manifest_fingerprint"] = "0" * 64
+    manifest["manifest_fingerprint"] = hashlib.sha256(
+        _canonical_bytes(
+            {
+                key: value
+                for key, value in manifest.items()
+                if key not in {"manifest_fingerprint", "root_hash"}
+            }
+        )
+    ).hexdigest()
+    manifest["root_hash"] = hashlib.sha256(
+        _canonical_bytes({key: value for key, value in manifest.items() if key != "root_hash"})
+    ).hexdigest()
+    manifest_path.chmod(0o600)
+    manifest_path.write_bytes(_canonical_bytes(manifest))
+
+
+def test_baseline_parity_stable_zero_dispute_lifecycle_and_complete_tree(
+    tmp_path: Path,
+) -> None:
+    """Deleting any portable lifecycle branch breaks exact command/tree parity."""
+    control = _baseline_cli_control(tmp_path)
+    full_run = tmp_path / "baseline-full"
+    portable_run = tmp_path / "baseline-portable"
+    common = (
+        "--input",
+        str(control),
+        "--nonce-hex",
+        "2" * 64,
+    )
+    _assert_baseline_surface_parity(
+        ("eval-baseline-init", *common, "--run", str(full_run)),
+        ("eval-baseline-init", *common, "--run", str(portable_run)),
+    )
+    first_full, _ = _assert_baseline_surface_parity(
+        ("eval-baseline-next", "--run", str(full_run)),
+        ("eval-baseline-next", "--run", str(portable_run)),
+    )
+    assert json.loads(first_full.stdout)["operation"] == "baseline_source_review"
+
+    malformed = tmp_path / "baseline-malformed.json"
+    malformed.write_bytes(_canonical_bytes({"private_path": str(tmp_path), "source": "secret"}))
+    before_full = _run_snapshot(full_run)
+    before_portable = _run_snapshot(portable_run)
+    submit_flags = (
+        "--response",
+        str(malformed),
+        "--provider-name",
+        "fictional-provider",
+        "--model-name",
+        "fictional-model",
+        "--judge-isolation",
+        "scripted_fixture",
+    )
+    refused, _ = _assert_baseline_surface_parity(
+        ("eval-baseline-submit-safe", "--run", str(full_run), *submit_flags),
+        ("eval-baseline-submit-safe", "--run", str(portable_run), *submit_flags),
+    )
+    assert refused.returncode == 2
+    assert _run_snapshot(full_run) == before_full
+    assert _run_snapshot(portable_run) == before_portable
+
+    review = tmp_path / "baseline-review.json"
+    review.write_bytes(
+        _canonical_bytes(
+            {
+                "proposals": [
+                    {
+                        "statement": "A covered operator must file notice.",
+                        "kind": "obligation",
+                        "importance": "critical",
+                        "importance_basis": ["legal_bottom_line"],
+                        "importance_rationale": "Omission could change the legal bottom line.",
+                        "passages": [{"source_id": "source-1", "quote": "presentará aviso"}],
+                        "dependency": None,
+                        "confidence": "clear",
+                        "substantive_rationale": "The fictional rule uses mandatory language.",
+                    }
+                ],
+                "review_complete": True,
+            }
+        )
+    )
+    review_flags = (
+        "--response",
+        str(review),
+        "--provider-name",
+        "fictional-provider",
+        "--model-name",
+        "fictional-model",
+        "--judge-isolation",
+        "scripted_fixture",
+    )
+    _assert_baseline_surface_parity(
+        ("eval-baseline-submit-safe", "--run", str(full_run), *review_flags),
+        ("eval-baseline-submit-safe", "--run", str(portable_run), *review_flags),
+    )
+    audit_request, _ = _assert_baseline_surface_parity(
+        ("eval-baseline-next", "--run", str(full_run)),
+        ("eval-baseline-next", "--run", str(portable_run)),
+    )
+    assert json.loads(audit_request.stdout)["operation"] == "baseline_source_audit"
+
+    audit = tmp_path / "baseline-audit.json"
+    audit.write_bytes(
+        _canonical_bytes(
+            {
+                "concerns": [],
+                "importance_findings": [
+                    {
+                        "proposal_ref": "PR-0001",
+                        "reviewed_importance": "critical",
+                        "reviewed_importance_basis": ["legal_bottom_line"],
+                        "importance_rationale": "Omission could change the legal bottom line.",
+                        "disposition": "agree",
+                    }
+                ],
+                "audit_complete": True,
+            }
+        )
+    )
+    audit_flags = (
+        "--response",
+        str(audit),
+        "--provider-name",
+        "fictional-provider",
+        "--model-name",
+        "fictional-model",
+        "--judge-isolation",
+        "scripted_fixture",
+    )
+    _assert_baseline_surface_parity(
+        ("eval-baseline-submit-safe", "--run", str(full_run), *audit_flags),
+        ("eval-baseline-submit-safe", "--run", str(portable_run), *audit_flags),
+    )
+    for command in ("eval-baseline-next", "eval-baseline-status", "eval-baseline-verify"):
+        _assert_baseline_surface_parity(
+            (command, "--run", str(full_run)),
+            (command, "--run", str(portable_run)),
+        )
+
+    assert _run_snapshot(portable_run) == _run_snapshot(full_run)
+
+    from regulatory_harvest.evaluation.attorney_baseline_projection import (
+        project_gradeable_baseline_v1,
+    )
+
+    full_projection = project_gradeable_baseline_v1(
+        load_verified_baseline_run(full_run)
+    )
+    projection_spec = importlib.util.spec_from_file_location(
+        "attorney_eval_portable_baseline_projection_test",
+        ROOT / "scripts" / "attorney_eval_portable.py",
+    )
+    assert projection_spec is not None and projection_spec.loader is not None
+    portable_substrate = importlib.util.module_from_spec(projection_spec)
+    sys.modules[projection_spec.name] = portable_substrate
+    projection_spec.loader.exec_module(portable_substrate)
+    portable_projection = portable_substrate._baseline_gradeable_projection_bytes_for_test(
+        _run_snapshot(portable_run)
+    )
+    assert portable_projection == _canonical_bytes(
+        full_projection.model_dump(mode="json")
+    )
+
+    prior_manifest = json.loads((full_run / "baseline-manifest.json").read_bytes())
+    prior_baseline = json.loads((full_run / "canonical-baseline.json").read_bytes())
+    replacement = dict(prior_baseline["requirements"][0])
+    replacement["statement"] = "The covered operator must file a notice."
+    action = {
+        "action": "replace_requirement",
+        "requirement_id": replacement["requirement_id"],
+        "relationship_id": None,
+        "requirement": replacement,
+        "relationship": None,
+    }
+    correction_payload = {
+        "schema_version": "baseline-correction-v1",
+        "prior_baseline_root": prior_manifest["root_hash"],
+        "prior_baseline_fingerprint": prior_baseline["baseline_fingerprint"],
+        "correction_id": "CORR-0001",
+        "actions": [action],
+        "reason": "The attorney approved a source-bound wording correction.",
+        "attorney_approval": {
+            "approved_by": "Fictional Reviewing Attorney",
+            "approved_at": "2026-08-24T20:00:00-07:00",
+            "approval_statement": "I approve this source-bound baseline correction.",
+        },
+        "correction_fingerprint": "0" * 64,
+    }
+    correction_payload["correction_fingerprint"] = hashlib.sha256(
+        _canonical_bytes(
+            {
+                key: value
+                for key, value in correction_payload.items()
+                if key != "correction_fingerprint"
+            }
+        )
+    ).hexdigest()
+    correction = tmp_path / "baseline-parity-correction.json"
+    correction.write_bytes(_canonical_bytes(correction_payload))
+    full_corrected = tmp_path / "baseline-full-corrected"
+    portable_corrected = tmp_path / "baseline-portable-corrected"
+    correction_common = (
+        "--input", str(control), "--nonce-hex", "4" * 64,
+        "--correction", str(correction),
+    )
+    _assert_baseline_surface_parity(
+        (
+            "eval-baseline-init", *correction_common, "--prior-baseline", str(full_run),
+            "--run", str(full_corrected),
+        ),
+        (
+            "eval-baseline-init", *correction_common, "--prior-baseline", str(portable_run),
+            "--run", str(portable_corrected),
+        ),
+    )
+    for command in ("eval-baseline-next", "eval-baseline-status", "eval-baseline-verify"):
+        _assert_baseline_surface_parity(
+            (command, "--run", str(full_corrected)),
+            (command, "--run", str(portable_corrected)),
+        )
+    assert _run_snapshot(portable_corrected) == _run_snapshot(full_corrected)
+    assert "correction-proof.json" in _run_snapshot(portable_corrected)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "eval-baseline-init",
+        "eval-baseline-next",
+        "eval-baseline-submit-safe",
+        "eval-baseline-status",
+        "eval-baseline-verify",
+    ),
+)
+def test_baseline_parity_isolated_help(command: str) -> None:
+    """Removing a portable command or importing site packages breaks isolated help."""
+    full = _run_baseline_surface(SKILL_RUNNER, command, "--help")
+    portable = _run_baseline_surface(PORTABLE_RUNNER, command, "--help")
+    assert (portable.returncode, portable.stdout, portable.stderr) == (
+        full.returncode,
+        full.stdout,
+        full.stderr,
+    )
+
+
+@pytest.mark.parametrize(
+    ("dispute_kind", "decision"),
+    (
+        ("semantic", "accept_reviewer"),
+        ("importance", "accept_auditor"),
+        ("semantic", "unresolved"),
+    ),
+)
+def test_baseline_parity_disputes_pause_resume_and_complete_tree(
+    tmp_path: Path, dispute_kind: str, decision: str
+) -> None:
+    """Semantic, importance-only, and unresolved referee paths stay byte-identical."""
+    control = _baseline_cli_control(tmp_path)
+    full_run = tmp_path / f"baseline-full-{dispute_kind}-{decision}"
+    portable_run = tmp_path / f"baseline-portable-{dispute_kind}-{decision}"
+    common = ("--input", str(control), "--nonce-hex", "3" * 64)
+    _assert_baseline_surface_parity(
+        ("eval-baseline-init", *common, "--run", str(full_run)),
+        ("eval-baseline-init", *common, "--run", str(portable_run)),
+    )
+    review = tmp_path / f"review-{dispute_kind}-{decision}.json"
+    review.write_bytes(
+        _canonical_bytes(
+            {
+                "proposals": [
+                    {
+                        "statement": "A covered operator must file notice.",
+                        "kind": "obligation",
+                        "importance": "critical",
+                        "importance_basis": ["legal_bottom_line"],
+                        "importance_rationale": "Omission could change the legal bottom line.",
+                        "passages": [{"source_id": "source-1", "quote": "presentará aviso"}],
+                        "dependency": None,
+                        "confidence": "clear",
+                        "substantive_rationale": "The fictional rule uses mandatory language.",
+                    }
+                ],
+                "review_complete": True,
+            }
+        )
+    )
+    common_submit = (
+        "--provider-name", "fictional-provider", "--model-name", "fictional-model",
+        "--judge-isolation", "scripted_fixture",
+    )
+    _assert_baseline_surface_parity(
+        (
+            "eval-baseline-submit-safe", "--run", str(full_run),
+            "--response", str(review), *common_submit,
+        ),
+        (
+            "eval-baseline-submit-safe", "--run", str(portable_run),
+            "--response", str(review), *common_submit,
+        ),
+    )
+    for command in ("eval-baseline-status", "eval-baseline-next"):
+        before_full = _run_snapshot(full_run)
+        before_portable = _run_snapshot(portable_run)
+        _assert_baseline_surface_parity(
+            (command, "--run", str(full_run)),
+            (command, "--run", str(portable_run)),
+        )
+        assert _run_snapshot(full_run) == before_full
+        assert _run_snapshot(portable_run) == before_portable
+
+    audit = tmp_path / f"audit-{dispute_kind}-{decision}.json"
+    importance = "material" if dispute_kind == "importance" else "critical"
+    basis = ["attorney_briefing"] if dispute_kind == "importance" else ["legal_bottom_line"]
+    rationale = (
+        "The notice duty is necessary for a competent attorney briefing."
+        if dispute_kind == "importance"
+        else "Omission could change the legal bottom line."
+    )
+    audit.write_bytes(
+        _canonical_bytes(
+            {
+                "concerns": (
+                    [
+                        {
+                            "target_proposal_ref": "PR-0001",
+                            "concern_type": "ambiguity",
+                            "passages": [
+                                {"source_id": "source-1", "quote": "presentará aviso"}
+                            ],
+                            "explanation": "The retained text could support a narrower duty.",
+                            "correction": None,
+                        }
+                    ]
+                    if dispute_kind == "semantic"
+                    else []
+                ),
+                "importance_findings": [
+                    {
+                        "proposal_ref": "PR-0001",
+                        "reviewed_importance": importance,
+                        "reviewed_importance_basis": basis,
+                        "importance_rationale": rationale,
+                        "disposition": "correct" if dispute_kind == "importance" else "agree",
+                    }
+                ],
+                "audit_complete": True,
+            }
+        )
+    )
+    _assert_baseline_surface_parity(
+        (
+            "eval-baseline-submit-safe", "--run", str(full_run),
+            "--response", str(audit), *common_submit,
+        ),
+        (
+            "eval-baseline-submit-safe", "--run", str(portable_run),
+            "--response", str(audit), *common_submit,
+        ),
+    )
+    referee_full, _ = _assert_baseline_surface_parity(
+        ("eval-baseline-next", "--run", str(full_run)),
+        ("eval-baseline-next", "--run", str(portable_run)),
+    )
+    for command in ("eval-baseline-status", "eval-baseline-next"):
+        before_full = _run_snapshot(full_run)
+        before_portable = _run_snapshot(portable_run)
+        _assert_baseline_surface_parity(
+            (command, "--run", str(full_run)),
+            (command, "--run", str(portable_run)),
+        )
+        assert _run_snapshot(full_run) == before_full
+        assert _run_snapshot(portable_run) == before_portable
+    dispute_id = json.loads(referee_full.stdout)["payload"]["dispute"]["dispute_id"]
+    referee = tmp_path / f"referee-{dispute_kind}-{decision}.json"
+    referee.write_bytes(
+        _canonical_bytes(
+            {
+                "dispute_id": dispute_id,
+                "decision": decision,
+                "passages": [{"source_id": "source-1", "quote": "presentará aviso"}],
+                "importance": importance,
+                "importance_basis": basis,
+                "importance_rationale": rationale,
+                "substantive_rationale": "The source-bound alternatives require this decision.",
+            }
+        )
+    )
+    _assert_baseline_surface_parity(
+        (
+            "eval-baseline-submit-safe", "--run", str(full_run),
+            "--response", str(referee), *common_submit,
+        ),
+        (
+            "eval-baseline-submit-safe", "--run", str(portable_run),
+            "--response", str(referee), *common_submit,
+        ),
+    )
+    _assert_baseline_surface_parity(
+        ("eval-baseline-verify", "--run", str(full_run)),
+        ("eval-baseline-verify", "--run", str(portable_run)),
+    )
+    assert _run_snapshot(portable_run) == _run_snapshot(full_run)
+
+
+@pytest.mark.parametrize(
+    "attack",
+    (
+        "artifact-tamper",
+        "semantic-reseal",
+        "request-response-swap",
+        "source-result-swap",
+        "symlink",
+        "fifo",
+        "hardlink",
+    ),
+)
+def test_baseline_parity_tamper_reseal_swap_and_physical_storage(
+    tmp_path: Path, attack: str
+) -> None:
+    """Tamper and physical-storage attacks return the same bounded verification bytes."""
+    if attack in {"symlink", "fifo", "hardlink"} and os.name != "posix":
+        pytest.skip("POSIX special-file proof")
+    _, full_run, portable_run = _complete_baseline_parity_pair(tmp_path, suffix=attack)
+    for label, run in (("full", full_run), ("portable", portable_run)):
+        if attack == "artifact-tamper":
+            target = run / "canonical-baseline.json"
+            target.chmod(0o600)
+            target.write_bytes(target.read_bytes() + b"\n")
+        elif attack == "semantic-reseal":
+            raw = json.loads((run / "canonical-baseline.json").read_bytes())
+            raw["requirements"][0]["substantive_rationale"] = "A forged rationale."
+            raw["baseline_fingerprint"] = "0" * 64
+            unsigned = dict(raw)
+            unsigned.pop("baseline_fingerprint")
+            raw["baseline_fingerprint"] = hashlib.sha256(
+                _canonical_bytes(unsigned)
+            ).hexdigest()
+            _reseal_baseline_parity_run(
+                run, {"canonical-baseline.json": _canonical_bytes(raw)}
+            )
+        elif attack == "request-response-swap":
+            left = "requests/source-review-0001.json"
+            right = "responses/source-review-0001.json"
+            _reseal_baseline_parity_run(
+                run, {left: (run / right).read_bytes(), right: (run / left).read_bytes()}
+            )
+        elif attack == "source-result-swap":
+            left = "baseline-input.json"
+            right = "canonical-baseline.json"
+            _reseal_baseline_parity_run(
+                run, {left: (run / right).read_bytes(), right: (run / left).read_bytes()}
+            )
+        elif attack == "symlink":
+            target = run / "baseline-input.json"
+            outside = tmp_path / f"outside-{label}.json"
+            outside.write_bytes(target.read_bytes())
+            target.unlink()
+            target.symlink_to(outside)
+        elif attack == "fifo":
+            target = run / "baseline-input.json"
+            target.unlink()
+            os.mkfifo(target)
+        else:
+            os.link(run / "baseline-input.json", tmp_path / f"alias-{label}.json")
+    full = _run_baseline_surface(SKILL_RUNNER, "eval-baseline-verify", "--run", str(full_run))
+    portable = _run_baseline_surface(
+        PORTABLE_RUNNER, "eval-baseline-verify", "--run", str(portable_run)
+    )
+    assert (portable.returncode, portable.stdout, portable.stderr) == (
+        full.returncode, full.stdout, full.stderr
+    )
+    assert full.returncode == 5
+
+
+def test_baseline_parity_concurrent_status_and_verify_are_read_only(tmp_path: Path) -> None:
+    """Concurrent readers observe only one exact immutable terminal root."""
+    _, full_run, portable_run = _complete_baseline_parity_pair(tmp_path, suffix="concurrent")
+    before_full = _run_snapshot(full_run)
+    before_portable = _run_snapshot(portable_run)
+    commands = ("eval-baseline-status", "eval-baseline-verify") * 4
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        full_futures = [
+            executor.submit(_run_baseline_surface, SKILL_RUNNER, command, "--run", str(full_run))
+            for command in commands
+        ]
+        portable_futures = [
+            executor.submit(
+                _run_baseline_surface, PORTABLE_RUNNER, command, "--run", str(portable_run)
+            )
+            for command in commands
+        ]
+    for full_future, portable_future in zip(full_futures, portable_futures, strict=True):
+        full = full_future.result()
+        portable = portable_future.result()
+        assert (portable.returncode, portable.stdout, portable.stderr) == (
+            full.returncode, full.stdout, full.stderr
+        )
+    assert _run_snapshot(full_run) == before_full
+    assert _run_snapshot(portable_run) == before_portable
+
+
+@pytest.mark.parametrize("failure", ("rollback", "root-replacement"))
+def test_baseline_parity_transition_failure_preserves_owned_trees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Injected failures roll back owned bytes and never advance a replacement root."""
+    if failure == "root-replacement" and os.name != "posix":
+        pytest.skip("POSIX root identity proof")
+    control = _baseline_cli_control(tmp_path)
+    full_run = tmp_path / f"full-{failure}"
+    portable_run = tmp_path / f"portable-{failure}"
+    common = ("--input", str(control), "--nonce-hex", "9" * 64)
+    _assert_baseline_surface_parity(
+        ("eval-baseline-init", *common, "--run", str(full_run)),
+        ("eval-baseline-init", *common, "--run", str(portable_run)),
+    )
+    payload = {
+        "proposals": [
+            {
+                "statement": "A covered operator must file notice.",
+                "kind": "obligation",
+                "importance": "critical",
+                "importance_basis": ["legal_bottom_line"],
+                "importance_rationale": "Omission could change the legal bottom line.",
+                "passages": [{"source_id": "source-1", "quote": "presentará aviso"}],
+                "dependency": None,
+                "confidence": "clear",
+                "substantive_rationale": "The fictional rule uses mandatory language.",
+            }
+        ],
+        "review_complete": True,
+    }
+    from regulatory_harvest.evaluation import attorney_artifacts as full_storage
+    from regulatory_harvest.evaluation.attorney_baseline_workflow import (
+        guarded_submit_baseline_response_v1,
+    )
+
+    portable_spec = importlib.util.spec_from_file_location(
+        f"attorney_eval_portable_{failure}", ROOT / "scripts" / "attorney_eval_portable.py"
+    )
+    assert portable_spec is not None and portable_spec.loader is not None
+    portable = importlib.util.module_from_spec(portable_spec)
+    sys.modules[portable_spec.name] = portable
+    portable_spec.loader.exec_module(portable)
+    integrity_errors = (
+        full_storage.EvaluationIntegrityError,
+        portable.EvaluationIntegrityError,
+    )
+
+    def submit_full() -> object:
+        return guarded_submit_baseline_response_v1(
+            full_run, payload, provider_name="fictional-provider",
+            model_name="fictional-model", judge_isolation="scripted_fixture",
+        )
+
+    def submit_portable() -> object:
+        return portable.guarded_submit_baseline_response_v1(
+            portable_run, payload, provider_name="fictional-provider",
+            model_name="fictional-model", judge_isolation="scripted_fixture",
+        )
+
+    if failure == "rollback":
+        for storage_type, run, submit in (
+            (full_storage._PosixRunStorage, full_run, submit_full),
+            (portable._PosixRunStorage, portable_run, submit_portable),
+        ):
+            before = _run_snapshot(run)
+            original = storage_type.atomic_write
+            failed = False
+
+            def fail_after_owned_writes(
+                storage: object, path: str, data: bytes, *, mutable: bool,
+                _original: object = original,
+            ) -> bool:
+                nonlocal failed
+                created = _original(storage, path, data, mutable=mutable)  # type: ignore[operator]
+                if path == "baseline-manifest.json" and mutable and not failed:
+                    failed = True
+                    raise OSError("injected baseline write failure")
+                return created
+
+            monkeypatch.setattr(storage_type, "atomic_write", fail_after_owned_writes)
+            with pytest.raises(integrity_errors):
+                submit()
+            monkeypatch.setattr(storage_type, "atomic_write", original)
+            assert failed
+            assert _run_snapshot(run) == before
+        return
+
+    parked_snapshots: dict[str, dict[str, bytes]] = {}
+    for label, run, submit in (
+        ("full", full_run, submit_full),
+        ("portable", portable_run, submit_portable),
+    ):
+        before = _run_snapshot(run)
+        parked = tmp_path / f"parked-{label}"
+        replacement = tmp_path / f"replacement-{label}"
+        replacement.mkdir()
+        (replacement / "outside.txt").write_bytes(b"outside\n")
+        original_link = os.link
+        swapped = False
+
+        def replace_root(
+            source: object, destination: object, *, src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None, follow_symlinks: bool = True,
+            _run: Path = run, _parked: Path = parked,
+            _replacement: Path = replacement, _original_link: object = original_link,
+        ) -> None:
+            nonlocal swapped
+            if not swapped and destination == "source-audit-0001.json":
+                _run.rename(_parked)
+                _replacement.rename(_run)
+                swapped = True
+            _original_link(
+                source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )  # type: ignore[operator]
+
+        monkeypatch.setattr(os, "link", replace_root)
+        with pytest.raises(integrity_errors):
+            submit()
+        monkeypatch.setattr(os, "link", original_link)
+        assert swapped
+        assert (run / "outside.txt").read_bytes() == b"outside\n"
+        assert _run_snapshot(run) == {"outside.txt": b"outside\n"}
+        parked_snapshots[label] = _run_snapshot(parked)
+        assert set(before).issubset(parked_snapshots[label])
+    assert parked_snapshots["portable"] == parked_snapshots["full"]
 
 
 def test_baseline_full_runner_exposes_exact_commands_safe_status_and_exit_mapping(

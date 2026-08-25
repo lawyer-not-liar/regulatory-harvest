@@ -28,6 +28,10 @@ from regulatory_harvest.evaluation.attorney_admission import (
 )
 from regulatory_harvest.evaluation.attorney_admission import build_admission_packet as packet_core
 from regulatory_harvest.evaluation.attorney_admission import freeze_case as freeze_core
+from regulatory_harvest.evaluation.attorney_baseline_input import (
+    baseline_reuse_decision_v1 as baseline_reuse_decision_core,
+)
+from regulatory_harvest.evaluation.attorney_baseline_models import BaselineInputV1
 from regulatory_harvest.evaluation.attorney_cli import _case_from_fixture
 from regulatory_harvest.evaluation.attorney_contract import (
     PREFLIGHT_ISSUE_MESSAGES,
@@ -192,6 +196,184 @@ def _load_protocol_22_portable() -> ModuleType:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_baseline_parity_policy_asset_is_exact_and_strict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mirror loads the packaged policy and refuses byte or shape drift."""
+    portable = _load_protocol_21_portable()
+    policy_path = ROOT / "assets" / "evaluation-baseline-policy-v1.json"
+    expected = policy_path.read_bytes()
+    policy_bytes, policy, fingerprint = portable._baseline_policy()
+    assert policy_bytes == expected
+    assert fingerprint == hashlib.sha256(expected).hexdigest()
+    assert policy == json.loads(expected)
+
+    for name, mutated in (
+        ("one-byte", expected[:-1] + bytes((expected[-1] ^ 1,))),
+        (
+            "unknown-key",
+            canonical_json_bytes({**json.loads(expected), "unknown_policy_key": True}),
+        ),
+    ):
+        changed = tmp_path / f"policy-{name}.json"
+        changed.write_bytes(mutated)
+        monkeypatch.setattr(portable, "_BASELINE_POLICY_PATH", changed)
+        with pytest.raises(portable.BaselineInputError, match="BASELINE_IMPORTANCE_POLICY_INVALID"):
+            portable._baseline_policy()
+
+
+def test_baseline_parity_projection_adapter_remains_test_only() -> None:
+    """Projection is exposed to differential tests, never as report-grading API."""
+    portable = _load_protocol_21_portable()
+    assert callable(portable._baseline_gradeable_projection_bytes_for_test)
+    assert not hasattr(portable, "project_gradeable_baseline_v1")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("source-bytes", "SOURCE_BYTES_CHANGED"),
+        ("source-id", "SOURCE_ID_CHANGED"),
+        ("question", "QUESTION_CHANGED"),
+        ("jurisdiction", "JURISDICTION_CHANGED"),
+        ("as-of", "AS_OF_CHANGED"),
+        ("authority", "AUTHORITY_SCOPE_CHANGED"),
+        ("client-facts", "CLIENT_FACTS_CHANGED"),
+        ("qualification", "QUALIFICATION_CHANGED"),
+        ("compiler", "COMPILER_CHANGED"),
+        ("rubric", "RUBRIC_CHANGED"),
+        ("policy", "IMPORTANCE_POLICY_CHANGED"),
+        ("fingerprint", "LEGAL_INPUT_FINGERPRINT_CHANGED"),
+    ),
+)
+def test_baseline_parity_reuse_refuses_every_legal_identity_change(
+    mutation: str, reason: str
+) -> None:
+    """Every named Task 2 refusal stays exact in the standard-library mirror."""
+    portable = _load_protocol_21_portable()
+    policy_bytes, policy, policy_fingerprint = portable._baseline_policy()
+    contract = portable._baseline_contract(policy_fingerprint)
+    source_text = "A covered operator must file notice."
+    sealed: dict[str, Any] = {
+        "schema_version": "baseline-input-v1",
+        "sources": [
+            {
+                "source_id": "source-1",
+                "title": "Synthetic Rule",
+                "normalized_text": source_text,
+                "content_hash": hashlib.sha256(source_text.encode()).hexdigest(),
+                "jurisdiction": "Example State",
+                "authority_type": "regulation",
+                "source_role": "official_primary",
+                "source_quality": "primary",
+                "completeness": "complete",
+                "language": "en",
+            }
+        ],
+        "source_record_fingerprint": "a" * 64,
+        "question": "What notice is required?",
+        "jurisdiction": "Example State",
+        "as_of": "2026-08-24",
+        "requested_authorities": [
+            {
+                "authority_id": "rule-1",
+                "title": "Synthetic Rule",
+                "jurisdiction": "Example State",
+                "authority_type": "regulation",
+                "source_ids": ["source-1"],
+            }
+        ],
+        "client_facts": None,
+        "client_facts_binding": "explicit-null",
+        "qualification_root": "b" * 64,
+        "qualification_receipt_fingerprint": "c" * 64,
+        "qualification_readiness": "ADMITTED",
+        "compiler_contract": contract,
+        "compiler_contract_fingerprint": hashlib.sha256(
+            canonical_json_bytes(contract)
+        ).hexdigest(),
+        "evaluation_rubric_version": portable._BASELINE_RUBRIC["version"],
+        "evaluation_rubric_bytes": portable._BASELINE_RUBRIC_BYTES.decode(),
+        "evaluation_rubric_fingerprint": portable._BASELINE_RUBRIC_FINGERPRINT,
+        "importance_policy_version": policy["importance_policy_version"],
+        "importance_policy_bytes": policy_bytes.decode(),
+        "importance_policy_fingerprint": policy_fingerprint,
+        "legal_input_fingerprint": "0" * 64,
+    }
+    sealed["legal_input_fingerprint"] = hashlib.sha256(
+        canonical_json_bytes(portable._baseline_legal_projection(sealed))
+    ).hexdigest()
+    proposed = copy.deepcopy(sealed)
+    if mutation == "source-bytes":
+        proposed["sources"][0]["normalized_text"] += " Changed."
+        proposed["sources"][0]["content_hash"] = hashlib.sha256(
+            proposed["sources"][0]["normalized_text"].encode()
+        ).hexdigest()
+        proposed["source_record_fingerprint"] = "1" * 64
+    elif mutation == "source-id":
+        proposed["sources"][0]["source_id"] = "source-2"
+        proposed["requested_authorities"][0]["source_ids"] = ["source-2"]
+        proposed["source_record_fingerprint"] = "2" * 64
+    elif mutation == "question":
+        proposed["question"] += " Changed?"
+        proposed["source_record_fingerprint"] = "3" * 64
+    elif mutation == "jurisdiction":
+        proposed["jurisdiction"] = "Other State"
+        proposed["source_record_fingerprint"] = "3" * 64
+    elif mutation == "as-of":
+        proposed["as_of"] = "2026-08-25"
+        proposed["source_record_fingerprint"] = "3" * 64
+    elif mutation == "authority":
+        proposed["requested_authorities"][0]["title"] = "Other Rule"
+        proposed["source_record_fingerprint"] = "3" * 64
+    elif mutation == "client-facts":
+        proposed["client_facts"] = "The operator is covered."
+        proposed["client_facts_binding"] = "sha256:" + hashlib.sha256(
+            proposed["client_facts"].encode()
+        ).hexdigest()
+    elif mutation == "qualification":
+        proposed["qualification_root"] = "d" * 64
+    elif mutation == "compiler":
+        proposed["compiler_contract"] = {**contract, "contract_version": "changed"}
+        proposed["compiler_contract_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(proposed["compiler_contract"])
+        ).hexdigest()
+    elif mutation == "rubric":
+        proposed["evaluation_rubric_bytes"] = '{"version":"attorney-eval-v2.2","changed":true}'
+        proposed["evaluation_rubric_fingerprint"] = hashlib.sha256(
+            proposed["evaluation_rubric_bytes"].encode()
+        ).hexdigest()
+    elif mutation == "policy":
+        proposed["importance_policy_bytes"] = (
+            '{"importance_policy_version":"importance-policy-v1","changed":true}'
+        )
+        proposed["importance_policy_fingerprint"] = hashlib.sha256(
+            proposed["importance_policy_bytes"].encode()
+        ).hexdigest()
+    else:
+        proposed["legal_input_fingerprint"] = "f" * 64
+
+    if mutation != "fingerprint":
+        proposed["legal_input_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(portable._baseline_legal_projection(proposed))
+        ).hexdigest()
+
+    portable_decision = portable.baseline_reuse_decision_v1(sealed, proposed)
+
+    def full_input(value: dict[str, Any]) -> BaselineInputV1:
+        payload = copy.deepcopy(value)
+        payload["evaluation_rubric_bytes"] = payload["evaluation_rubric_bytes"].encode()
+        payload["importance_policy_bytes"] = payload["importance_policy_bytes"].encode()
+        return BaselineInputV1.model_validate(payload)
+
+    core = baseline_reuse_decision_core(full_input(sealed), full_input(proposed))
+    assert portable_decision == {
+        "reusable": core.reusable,
+        "reason_codes": list(core.reason_codes),
+    }
+    assert portable_decision == {"reusable": False, "reason_codes": [reason]}
 
 
 def _protocol_21_test_response(request: dict[str, Any]) -> dict[str, Any]:
