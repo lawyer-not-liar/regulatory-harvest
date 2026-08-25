@@ -89,6 +89,9 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
+[tool.ruff.lint.per-file-ignores]
+"assets/evaluation-baseline-policy-v1.json" = ["B018", "E501"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
