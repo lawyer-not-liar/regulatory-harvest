@@ -1164,19 +1164,31 @@ def _qualification_limits_with_text(
     return replace(limits, language_treatments=tuple(treatments))
 
 
+_QUALIFICATION_PUBLIC_TEXT_SURFACES = (
+    "check-rationale",
+    "issue-message",
+    "receipt-rationale",
+    "authority-title",
+    "language-method",
+    "language-rationale",
+    "language-limitations",
+)
+
+
 @pytest.mark.parametrize(
     "surface",
+    _QUALIFICATION_PUBLIC_TEXT_SURFACES,
+)
+@pytest.mark.parametrize(
+    "payload",
     [
-        "check-rationale",
-        "issue-message",
-        "receipt-rationale",
-        "authority-title",
-        "language-method",
-        "language-rationale",
-        "language-limitations",
+        "private-path",
+        "complete-source",
+        "complete-report",
+        "embedded-source",
+        "embedded-report",
     ],
 )
-@pytest.mark.parametrize("payload", ["private-path", "complete-source", "complete-report"])
 def test_qualification_public_text_rejects_private_paths_and_complete_payload_duplicates(
     verified_inputs: VerifiedInputsFixture,
     monkeypatch: pytest.MonkeyPatch,
@@ -1188,8 +1200,13 @@ def test_qualification_public_text_rejects_private_paths_and_complete_payload_du
         value = "Inspect /private/var/folders/secret/client-matter.json for support."
     elif payload == "complete-source":
         value = verified_inputs.baseline_context.baseline_input.sources[0].normalized_text
-    else:
+    elif payload == "complete-report":
         value = verified_inputs.report_text
+    elif payload == "embedded-source":
+        source = verified_inputs.baseline_context.baseline_input.sources[0].normalized_text
+        value = f"Unsafe prefix. {source} Unsafe suffix."
+    else:
+        value = f"Unsafe prefix. {verified_inputs.report_text} Unsafe suffix."
     unsafe = _qualification_limits_with_text(
         admitted.qualification_limits,
         surface=surface,
@@ -1205,26 +1222,55 @@ def test_qualification_public_text_rejects_private_paths_and_complete_payload_du
         build_verified_readiness_input_v1(**verified_inputs.without_history())
 
 
-def test_qualification_public_text_preserves_safe_bytes_without_substring_false_positives(
+@pytest.mark.parametrize("surface", _QUALIFICATION_PUBLIC_TEXT_SURFACES)
+def test_qualification_public_text_preserves_safe_routes_and_partial_payload_bytes(
     verified_inputs: VerifiedInputsFixture,
     monkeypatch: pytest.MonkeyPatch,
+    surface: str,
 ) -> None:
     admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
     source = verified_inputs.baseline_context.baseline_input.sources[0].normalized_text
     safe = (
-        "  Compare https://public.example/source, section 1/2, /single-token, and this "
+        "  Compare https://public.example/source, /regulations/title-12/section-34, "
+        "/api/v1/public/status, section 1/2, /single-token, and this "
         f"non-complete source prefix: {source[:-1]}  "
     )
     limits = _qualification_limits_with_text(
         admitted.qualification_limits,
-        surface="check-rationale",
+        surface=surface,
         value=safe,
     )
     monkeypatch.setattr(inputs_module, "_load_qualification_limits", lambda *_: limits)
 
     rebuilt = build_verified_readiness_input_v1(**verified_inputs.without_history())
 
-    assert rebuilt.qualification_limits.admission_checks[0].rationale == safe
+    assert rebuilt.qualification_limits == limits
+
+
+@pytest.mark.parametrize("surface", _QUALIFICATION_PUBLIC_TEXT_SURFACES)
+@pytest.mark.parametrize(
+    "unsafe_uri",
+    [
+        "file:/Users/private/client-matter.json",
+        "file://private-host/share/client-matter.json",
+    ],
+)
+def test_qualification_public_text_rejects_every_local_file_uri_form(
+    verified_inputs: VerifiedInputsFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    unsafe_uri: str,
+) -> None:
+    admitted = build_verified_readiness_input_v1(**verified_inputs.without_history())
+    limits = _qualification_limits_with_text(
+        admitted.qualification_limits,
+        surface=surface,
+        value=f"Inspect {unsafe_uri} for support.",
+    )
+    monkeypatch.setattr(inputs_module, "_load_qualification_limits", lambda *_: limits)
+
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
 
 
 @pytest.mark.parametrize(

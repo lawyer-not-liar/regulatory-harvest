@@ -6,6 +6,8 @@ import json
 import os
 import re
 import stat
+from array import array
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -80,17 +82,18 @@ _MAX_QUALIFICATION_PUBLIC_ITEMS = 1024
 _MAX_QUALIFICATION_PUBLIC_TEXT_BYTES = 64 * 1024
 _MAX_QUALIFICATION_PUBLIC_TOTAL_BYTES = 4 * 1024 * 1024
 _MAX_QUALIFICATION_PUBLIC_TEXT_FIELDS = 8192
+_MAX_QUALIFICATION_FORBIDDEN_PATTERN_BYTES = 1024 * 1024
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
-_POSIX_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9:/])/(?:[^/\s\x00\"'<>]+/)+[^/\s\x00\"'<>]*")
 _POSIX_PRIVATE_ROOT_RE = re.compile(
-    r"(?<![A-Za-z0-9:/])/(?:Users|home|private|tmp|var|Volumes)(?:/|(?=[\s,.;:!?)]|$))"
+    r"(?<![A-Za-z0-9:/])/(?:Users|home|private|tmp|Volumes)(?:/|(?=[\s,.;:!?)]|$))"
+    r"|(?<![A-Za-z0-9:/])/var/folders(?:/|(?=[\s,.;:!?)]|$))"
 )
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9])[A-Z]:[\\/][^\s\x00\"'<>|?*]+")
 _WINDOWS_UNC_PATH_RE = re.compile(
     r"(?<![\\A-Za-z0-9])\\\\[^\\/\s\x00\"'<>|?*]+[\\/]"
     r"[^\s\x00\"'<>|?*]+"
 )
-_FILE_URI_RE = re.compile(r"(?i)(?<![A-Za-z0-9])file:///[^\s\x00\"'<>]+")
+_FILE_URI_RE = re.compile(r"(?i)(?<![A-Za-z0-9+.-])file:")
 _DOSSIER_NAME = "agent-dossier.json"
 _DOSSIER_FIELDS = {
     "coverage_contract_version",
@@ -403,11 +406,82 @@ class QualificationLimitsV1:
     language_treatments: tuple[QualificationLanguageTreatmentV1, ...]
 
 
+class _BoundedPayloadMatcher:
+    """Compact linear-time matcher for bounded complete byte payloads."""
+
+    def __init__(self, patterns: tuple[bytes, ...]) -> None:
+        self._first_child = array("i", [-1])
+        self._next_sibling = array("i", [-1])
+        self._failure = array("i", [0])
+        self._labels = bytearray(1)
+        self._terminal = bytearray(1)
+        for pattern in patterns:
+            node = 0
+            for label in pattern:
+                child = self._child(node, label)
+                if child == -1:
+                    child = self._append_child(node, label)
+                node = child
+            self._terminal[node] = 1
+        self._build_failures()
+
+    def _child(self, node: int, label: int) -> int:
+        child = self._first_child[node]
+        while child != -1:
+            if self._labels[child] == label:
+                return child
+            child = self._next_sibling[child]
+        return -1
+
+    def _append_child(self, parent: int, label: int) -> int:
+        child = len(self._labels)
+        self._labels.append(label)
+        self._first_child.append(-1)
+        self._next_sibling.append(self._first_child[parent])
+        self._failure.append(0)
+        self._terminal.append(0)
+        self._first_child[parent] = child
+        return child
+
+    def _children(self, node: int) -> Iterator[int]:
+        child = self._first_child[node]
+        while child != -1:
+            yield child
+            child = self._next_sibling[child]
+
+    def _build_failures(self) -> None:
+        pending: deque[int] = deque(self._children(0))
+        while pending:
+            node = pending.popleft()
+            for child in self._children(node):
+                pending.append(child)
+                label = self._labels[child]
+                fallback = self._failure[node]
+                target = self._child(fallback, label)
+                while fallback and target == -1:
+                    fallback = self._failure[fallback]
+                    target = self._child(fallback, label)
+                self._failure[child] = 0 if target == -1 else target
+                if self._terminal[self._failure[child]]:
+                    self._terminal[child] = 1
+
+    def contains_pattern(self, value: bytes) -> bool:
+        node = 0
+        for label in value:
+            child = self._child(node, label)
+            while node and child == -1:
+                node = self._failure[node]
+                child = self._child(node, label)
+            node = 0 if child == -1 else child
+            if self._terminal[node]:
+                return True
+        return False
+
+
 def _contains_private_absolute_path(value: str) -> bool:
     return any(
         pattern.search(value) is not None
         for pattern in (
-            _POSIX_ABSOLUTE_PATH_RE,
             _POSIX_PRIVATE_ROOT_RE,
             _WINDOWS_ABSOLUTE_PATH_RE,
             _WINDOWS_UNC_PATH_RE,
@@ -430,6 +504,18 @@ def _validate_qualification_public_projection(
             type(payload) is not bytes for payload in forbidden_payloads
         ):
             raise TypeError("qualification forbidden payload inventory is invalid")
+        patterns = tuple(
+            sorted(
+                {
+                    payload
+                    for payload in forbidden_payloads
+                    if payload and len(payload) <= _MAX_QUALIFICATION_PUBLIC_TEXT_BYTES
+                }
+            )
+        )
+        if sum(map(len, patterns)) > _MAX_QUALIFICATION_FORBIDDEN_PATTERN_BYTES:
+            raise ValueError("qualification forbidden payload inventory is excessive")
+        payload_matcher = _BoundedPayloadMatcher(patterns)
         if (
             type(limits.case_schema_version) is not str
             or limits.case_schema_version != "1.1"
@@ -474,7 +560,9 @@ def _validate_qualification_public_projection(
 
         def public_text(value: object) -> str:
             checked, encoded = bounded_native_text(value)
-            if encoded in forbidden_payloads or _contains_private_absolute_path(checked):
+            if payload_matcher.contains_pattern(encoded) or _contains_private_absolute_path(
+                checked
+            ):
                 raise ValueError("qualification public text is unsafe")
             return checked
 
