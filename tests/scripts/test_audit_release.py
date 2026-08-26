@@ -71,6 +71,11 @@ def _run_audit(path: Path, *extra: str) -> subprocess.CompletedProcess[str]:
         ("runs/demo/readiness-input.json", "{}\n", "GENERATED_EXPORT"),
         ("runs/demo/requests/safety-lane-1.json", "{}\n", "GENERATED_EXPORT"),
         ("runs/demo/responses/safety-lane-2.json", "{}\n", "GENERATED_EXPORT"),
+        (
+            "runs/demo/requests/safety-referee-SD-0001.json",
+            "{}\n",
+            "GENERATED_EXPORT",
+        ),
         ("runs/demo/requirement-matrix.json", "{}\n", "GENERATED_EXPORT"),
         ("runs/demo/gap-follow-up-matrix.json", "{}\n", "GENERATED_EXPORT"),
         ("runs/demo/delivery-readiness.json", "{}\n", "GENERATED_EXPORT"),
@@ -490,15 +495,24 @@ def test_audit_rejects_archived_readiness_handoff_without_echoing_content(
     assert handoff.strip() not in result.stderr
 
 
-def test_audit_rejects_archived_readiness_handoff_even_when_content_is_binary(
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "regulatory-harvest/archives/demo/attorney-review-handoff.md",
+        "regulatory-harvest/runs/demo/requests/safety-referee-SD-0001.json",
+        "regulatory-harvest/runs/demo/responses/safety-referee-SD-9999.json",
+    ],
+)
+def test_audit_rejects_archived_readiness_artifact_even_when_content_is_binary(
     tmp_path: Path,
+    member_name: str,
 ) -> None:
     """Path inventory must reject work product before text decoding can skip it."""
     _init_repo(tmp_path, {"README.md": "# Clean test repository\n"})
     archive = tmp_path / "candidate.zip"
     with zipfile.ZipFile(archive, "w") as bundle:
         bundle.writestr(
-            "regulatory-harvest/archives/demo/attorney-review-handoff.md",
+            member_name,
             b"\x00synthetic-binary-handoff",
         )
 

@@ -996,6 +996,9 @@ def test_extracted_skill_runs_all_readiness_help_and_public_terminal_journeys(
             assert json.loads(full_submit.stdout)["accepted"] is True
             assert _run_snapshot(full_run) == _run_snapshot(portable_run)
 
+        expected_exit = (
+            4 if journey["expected_delivery_readiness"] == "NOT_DELIVERABLE" else 0
+        )
         for command in ("eval-readiness-status", "eval-readiness-verify"):
             full_terminal = _run_isolated(
                 full_runner,
@@ -1022,6 +1025,17 @@ def test_extracted_skill_runs_all_readiness_help_and_public_terminal_journeys(
                 portable_terminal.stdout,
                 portable_terminal.stderr,
             )
+            assert full_terminal.returncode == expected_exit
+            payload = json.loads(full_terminal.stdout)
+            assert payload["protocol_version"] == "delivery-readiness-v1"
+            assert payload["delivery_readiness"] == journey["expected_delivery_readiness"]
+            if command == "eval-readiness-status":
+                assert payload["engine_paused"] is False
+                assert payload["pending_operation"] is None
+            else:
+                assert payload["ok"] is True
+                assert payload["issue_codes"] == []
+            assert _run_snapshot(full_run) == _run_snapshot(portable_run)
         result = json.loads((full_run / "delivery-readiness.json").read_bytes())
         assert result["delivery_readiness"] == journey["expected_delivery_readiness"]
         handoff = (full_run / "attorney-review-handoff.md").read_text(encoding="utf-8")
@@ -1058,24 +1072,33 @@ def test_readiness_packaging_preserves_retained_protocol_trees_and_transcripts(
 
     def retained_transcripts() -> tuple[tuple[int, str, str], ...]:
         outputs: list[tuple[int, str, str]] = []
-        for runner, isolated in (
-            (full_runner, False),
-            (portable_runner, True),
-        ):
-            for command in ("eval-status", "eval-verify"):
-                result = _run_isolated(
-                    runner,
-                    tmp_path,
-                    command,
-                    "--run",
-                    str(run),
-                    without_site_packages=isolated,
-                )
-                outputs.append((result.returncode, result.stdout, result.stderr))
+        for command in ("eval-status", "eval-verify"):
+            full = _run_isolated(
+                full_runner,
+                tmp_path,
+                command,
+                "--run",
+                str(run),
+                without_site_packages=False,
+            )
+            portable = _run_isolated(
+                portable_runner,
+                tmp_path,
+                command,
+                "--run",
+                str(run),
+                without_site_packages=True,
+            )
+            full_transcript = (full.returncode, full.stdout, full.stderr)
+            portable_transcript = (portable.returncode, portable.stdout, portable.stderr)
+            assert full_transcript == portable_transcript
+            assert full.returncode == 0
+            outputs.append(full_transcript)
         return tuple(outputs)
 
     before = retained_transcripts()
     assert _run_snapshot(run) == frozen_tree
+    frozen_siblings = tuple(sorted(path.name for path in tmp_path.iterdir()))
     for runner, isolated in ((full_runner, False), (portable_runner, True)):
         for command in (
             "eval-readiness-init",
@@ -1092,6 +1115,7 @@ def test_readiness_packaging_preserves_retained_protocol_trees_and_transcripts(
                 without_site_packages=isolated,
             )
             assert help_result.returncode == 0
+            assert tuple(sorted(path.name for path in tmp_path.iterdir())) == frozen_siblings
         refused = _run_isolated(
             runner,
             tmp_path,
@@ -1102,6 +1126,7 @@ def test_readiness_packaging_preserves_retained_protocol_trees_and_transcripts(
         )
         assert refused.returncode != 0
         assert _run_snapshot(run) == frozen_tree
+        assert tuple(sorted(path.name for path in tmp_path.iterdir())) == frozen_siblings
 
     assert retained_transcripts() == before
     assert _run_snapshot(run) == frozen_tree

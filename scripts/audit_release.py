@@ -88,6 +88,9 @@ GENERATED_FILENAMES: Final = frozenset(
         "safety-lane-2.json",
     }
 )
+GENERATED_FILENAME_PATTERNS: Final = (
+    re.compile(r"safety-referee-SD-[0-9]{4}\.json"),
+)
 PRIVATE_EVALUATION_FIELDS: Final = frozenset(
     {
         "harvest_label",
@@ -646,7 +649,10 @@ def _scan_path(
             findings.append(finding)
     if (
         GENERATED_DIRECTORIES.intersection(pure_path.parts[:-1])
-        and pure_path.name in GENERATED_FILENAMES
+        and (
+            pure_path.name in GENERATED_FILENAMES
+            or any(pattern.fullmatch(pure_path.name) for pattern in GENERATED_FILENAME_PATTERNS)
+        )
     ):
         finding = _finding(
             "GENERATED_EXPORT",
