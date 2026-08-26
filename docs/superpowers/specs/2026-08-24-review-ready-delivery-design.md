@@ -614,7 +614,10 @@ Readiness verification returns:
 - exit `3` for a verified substantive readiness inconclusive state that lacks a
   safe tier;
 - exit `5` for integrity or unsupported secure-storage failure; and
-- exit `6` for a verified resumable engine pause.
+- exit `6` for a verified resumable engine pause returned by the live workflow
+  driver. Because the second refusal is write-free, later stateless status and
+  verification commands see the unchanged valid pending run and exit `0`; they
+  do not infer a pause or treat a mutable response-control ledger as authority.
 
 JSON status output includes `baseline_locked_strict_equivalent_disposition` and
 `delivery_readiness`, plus `historical_v22_strict_disposition` and its explicit
