@@ -16595,6 +16595,8 @@ def _baseline_gradeable_projection_bytes_for_test(
 READINESS_PROTOCOL_V1 = "delivery-readiness-v1"
 READINESS_EXTERNAL_RESPONSE_INVALID = "READINESS_EXTERNAL_RESPONSE_INVALID"
 _READINESS_SUBMISSION_LOCKS = tuple(_threading.RLock() for _ in range(64))
+_READINESS_STORAGE_LOCKS_GUARD = _threading.Lock()
+_READINESS_STORAGE_LOCKS: dict[tuple[int, int], Any] = {}
 _READINESS_CANONICAL_RUBRIC_PATH = (
     Path(__file__).resolve().parents[1]
     / "src"
@@ -16603,6 +16605,51 @@ _READINESS_CANONICAL_RUBRIC_PATH = (
     / "readiness-rubric-v1.json"
 )
 _READINESS_RUBRIC_PATH = _READINESS_CANONICAL_RUBRIC_PATH
+
+
+@contextmanager
+def _readiness_locked_storage(
+    run_dir: Path,
+    *,
+    initialize: bool = False,
+    exclusive: bool,
+) -> Iterator[_PosixRunStorage]:
+    """Hold the full runtime's parent-and-run POSIX descriptor lock boundary."""
+    try:
+        parent = Path(os.path.abspath(os.fspath(run_dir))).parent
+        metadata = os.stat(parent, follow_symlinks=False)
+        key = (metadata.st_dev, metadata.st_ino)
+    except (NotImplementedError, OSError, TypeError, ValueError) as error:
+        raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE") from error
+    with _READINESS_STORAGE_LOCKS_GUARD:
+        lock = _READINESS_STORAGE_LOCKS.setdefault(key, _threading.RLock())
+
+    def lock_descriptor(storage: _PosixRunStorage) -> None:
+        descriptor = getattr(storage, "_root_descriptor", None)
+        if os.name != "posix" or type(descriptor) is not int:
+            raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE")
+        try:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        except (ImportError, NotImplementedError, OSError) as error:
+            raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE") from error
+
+    # The parent inode key gives path aliases one process-local lock identity.
+    with lock, _open_run_storage(parent) as parent_storage:
+        lock_descriptor(parent_storage)
+        opened_parent = os.fstat(parent_storage._root_descriptor)
+        if (opened_parent.st_dev, opened_parent.st_ino) != key:
+            raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE")
+        parent_storage.assert_root_identity()
+        with _open_run_storage(run_dir, initialize=initialize) as storage:
+            lock_descriptor(storage)
+            storage.assert_root_identity()
+            yield storage
+            storage.assert_root_identity()
+        parent_storage.assert_root_identity()
+
+
 _READINESS_CLOSED_V1_POLICY_FINGERPRINT = (
     "dfe5247769afcc991dea9ea694dd54f4ccbd1736722490214f2674a9c25f06c6"
 )
@@ -17873,7 +17920,9 @@ def initialize_readiness_v1(
         ),
     )
     manifest = _readiness_manifest(readiness_input, files, request)
-    with _open_run_storage(output_dir, initialize=True) as storage:
+    with _readiness_locked_storage(
+        output_dir, initialize=True, exclusive=True
+    ) as storage:
         _readiness_write_transaction(
             storage,
             files,
@@ -17891,9 +17940,9 @@ def initialize_readiness_v1(
     }
 
 
-def next_readiness_request_v1(run_dir: Path) -> JsonObject | None:
-    manifest, _persisted, files = _readiness_snapshot(run_dir)
-    verification = verify_readiness_run_v1(run_dir)
+def _next_readiness_request_unlocked_v1(run_dir: Path) -> JsonObject | None:
+    manifest, _persisted, files = _readiness_snapshot_unlocked(run_dir)
+    verification = _verify_readiness_run_unlocked_v1(run_dir)
     if verification["valid"] is not True:
         raise EvaluationIntegrityError("READINESS_ARTIFACT_CALL_HISTORY")
     pending = cast(JsonObject | None, manifest.get("pending_call"))
@@ -17903,6 +17952,11 @@ def next_readiness_request_v1(run_dir: Path) -> JsonObject | None:
     return _readiness_checked_request(
         parse_canonical_json_bytes(files[path], location=path)
     )
+
+
+def next_readiness_request_v1(run_dir: Path) -> JsonObject | None:
+    with _readiness_locked_storage(run_dir, exclusive=False):
+        return _next_readiness_request_unlocked_v1(run_dir)
 
 
 def _readiness_checked_request(value: object) -> JsonObject:
@@ -18533,7 +18587,9 @@ def compile_readiness_draft_v1(
     }
 
 
-def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str, bytes]]:
+def _readiness_snapshot_unlocked(
+    run_dir: Path,
+) -> tuple[JsonObject, JsonObject, dict[str, bytes]]:
     with _open_run_storage(run_dir) as storage:
         storage.assert_root_identity()
         initial_inventory = storage.scan_inventory()
@@ -18891,14 +18947,24 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                     invalid_persisted()
                 return [native_text(item, nonblank=True) for item in value]
 
-            def hash_pairs(value: object) -> None:
-                if type(value) is not list:
+            def hash_pairs(value: object) -> list[list[str]]:
+                if type(value) is not list or len(value) > 1_024:
                     invalid_persisted()
+                result: list[list[str]] = []
                 for item in value:
                     if type(item) is not list or len(item) != 2:
                         invalid_persisted()
-                    native_text(item[0], nonblank=True)
-                    native_hash(item[1])
+                    result.append(
+                        [
+                            native_text(item[0], nonblank=True),
+                            cast(str, native_hash(item[1])),
+                        ]
+                    )
+                if result != sorted(result) or len(result) != len(
+                    {item[0] for item in result}
+                ):
+                    invalid_persisted()
+                return result
 
             if readiness_input["protocol_version"] != READINESS_PROTOCOL_V1:
                 invalid_persisted()
@@ -18926,7 +18992,7 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 },
                 location="persisted gradeable baseline",
             )
-            _shape(
+            generation_validation = _shape(
                 readiness_input["generation_validation"],
                 required={
                     "receipt_hash",
@@ -18940,9 +19006,30 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 },
                 location="persisted generation validation",
             )
+            for key in (
+                "receipt_hash",
+                "report_hash",
+                "bundle_hash",
+                "coverage_review_hash",
+            ):
+                native_hash(generation_validation[key])
+            if (
+                generation_validation["status"] != "completed"
+                or any(
+                    generation_validation[key] is not True
+                    for key in (
+                        "evidence_precision_valid",
+                        "proposition_coverage_valid",
+                        "provision_recall_valid",
+                    )
+                )
+                or generation_validation["report_hash"]
+                != readiness_input["report_hash"]
+            ):
+                invalid_persisted()
             historical = readiness_input["historical_v22_cross_check"]
             if historical is not None:
-                _shape(
+                historical = _shape(
                     historical,
                     required={
                         "report_hash",
@@ -18957,6 +19044,29 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                     },
                     location="persisted historical cross-check",
                 )
+                for key in (
+                    "report_hash",
+                    "result_fingerprint",
+                    "manifest_fingerprint",
+                    "baseline_fingerprint",
+                ):
+                    native_hash(historical[key])
+                if (
+                    historical["strict_disposition"]
+                    not in {"PASS", "FAIL", "INCONCLUSIVE"}
+                    or type(historical["baseline_comparable"]) is not bool
+                    or type(historical["report_comparable"]) is not bool
+                ):
+                    invalid_persisted()
+                aggregates = _array(
+                    historical["grader_aggregate_fingerprints"],
+                    location="persisted historical aggregate fingerprints",
+                )
+                for value in aggregates:
+                    native_hash(value)
+                reason_codes = native_texts(historical["reason_codes"])
+                if len(reason_codes) != len(set(reason_codes)):
+                    invalid_persisted()
             baseline_context = _shape(
                 persisted["baseline_context"],
                 required={"manifest", "baseline_input", "baseline", "verification"},
@@ -19153,6 +19263,27 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 "judgment_fingerprint",
             ):
                 native_hash(qualification_limits[key])
+            baseline_sources = {
+                cast(str, source["source_id"]): source
+                for source in cast(list[JsonObject], checked_baseline_input["sources"])
+            }
+            if (
+                qualification_binding["qualification_root"]
+                != checked_baseline_input["qualification_root"]
+                or qualification_binding["qualification_receipt_fingerprint"]
+                != checked_baseline_input["qualification_receipt_fingerprint"]
+                or qualification_limits["qualification_root"]
+                != qualification_binding["qualification_root"]
+                or qualification_limits["qualification_receipt_fingerprint"]
+                != qualification_binding["qualification_receipt_fingerprint"]
+                or qualification_limits["source_record_fingerprint"]
+                != checked_baseline_input["source_record_fingerprint"]
+                or qualification_limits["requested_authorities"]
+                != checked_baseline_input["requested_authorities"]
+                or len(baseline_sources)
+                != len(cast(list[JsonObject], checked_baseline_input["sources"]))
+            ):
+                invalid_persisted()
             for raw in _array(
                 qualification_limits["requested_authorities"],
                 location="persisted qualification authorities",
@@ -19185,7 +19316,13 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                     raise EvaluationIntegrityError("READINESS_INPUT_INVALID")
                 check_codes.append(native_text(check["code"], nonblank=True))
                 native_text(check["rationale"], nonblank=True)
-                native_texts(check["source_ids"])
+                check_source_ids = native_texts(check["source_ids"])
+                if (
+                    len(check_source_ids) != len(set(check_source_ids))
+                    or not set(check_source_ids).issubset(baseline_sources)
+                    or (not check["satisfied"] and not check_source_ids)
+                ):
+                    invalid_persisted()
             if len(check_codes) != 5 or set(check_codes) != {
                 "AUTHORITY_ALIGNMENT",
                 "OPERATIVE_TEXT",
@@ -19209,7 +19346,9 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                     )
                 native_text(issue["code"], nonblank=True)
                 native_text(issue["message"], nonblank=True)
-                native_texts(issue["related_ids"])
+                related_ids = native_texts(issue["related_ids"])
+                if len(related_ids) != len(set(related_ids)):
+                    invalid_persisted()
             receipt_readiness = _shape(
                 qualification_limits["receipt_readiness"],
                 required={"status", "issue_codes", "rationale"},
@@ -19217,8 +19356,11 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
             )
             if receipt_readiness["status"] != "ADMITTED":
                 invalid_persisted()
-            native_texts(receipt_readiness["issue_codes"])
+            issue_codes = native_texts(receipt_readiness["issue_codes"])
+            if len(issue_codes) != len(set(issue_codes)):
+                invalid_persisted()
             native_text(receipt_readiness["rationale"], nonblank=True)
+            treatment_source_ids: list[str] = []
             for raw in _array(
                 qualification_limits["language_treatments"],
                 location="persisted language treatments",
@@ -19247,12 +19389,29 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                     native_text(checked_source["source_id"], nonblank=True)
                     native_hash(checked_source["content_hash"])
                     native_text(checked_source["language"], nonblank=True)
+                    expected_source = baseline_sources.get(
+                        cast(str, checked_source["source_id"])
+                    )
+                    if expected_source is None or (
+                        checked_source["content_hash"],
+                        checked_source["language"],
+                    ) != (
+                        expected_source["content_hash"],
+                        expected_source["language"],
+                    ):
+                        invalid_persisted()
+                    treatment_source_ids.append(cast(str, checked_source["source_id"]))
                 limitation_status = treatment["limitation_status"]
                 limitation_text = treatment["limitation_text"]
                 if limitation_status == "DECLARED":
                     native_text(limitation_text, nonblank=True)
                 elif limitation_status != "NOT_DECLARED" or limitation_text is not None:
                     invalid_persisted()
+            if (
+                len(treatment_source_ids) != len(set(treatment_source_ids))
+                or set(treatment_source_ids) != set(baseline_sources)
+            ):
+                invalid_persisted()
             try:
                 _readiness_validate_qualification_privacy(
                     qualification_limits,
@@ -19291,14 +19450,40 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
             ):
                 native_hash(generation_binding[key])
             native_hash(generation_binding["client_facts_hash"], nullable=True)
-            hash_pairs(generation_binding["source_hashes"])
+            source_hashes = hash_pairs(generation_binding["source_hashes"])
             hash_pairs(generation_binding["generator_artifact_hashes"])
+            expected_source_hashes = sorted(
+                [
+                    [cast(str, source["source_id"]), cast(str, source["content_hash"])]
+                    for source in baseline_sources.values()
+                ]
+            )
+            client_facts = checked_baseline_input["client_facts"]
+            expected_client_facts_hash = (
+                None
+                if client_facts is None
+                else _sha256(cast(str, client_facts).encode("utf-8"))
+            )
+            if (
+                generation_binding["capsule_root"]
+                != readiness_input["generation_capsule_root"]
+                or generation_binding["report_hash"] != readiness_input["report_hash"]
+                or source_hashes != expected_source_hashes
+                or generation_binding["client_facts_hash"]
+                != expected_client_facts_hash
+            ):
+                invalid_persisted()
         except PortableEvaluationInputError as error:
             raise EvaluationIntegrityError("READINESS_ARTIFACT_REPLAY") from error
         if storage.scan_inventory() != initial_inventory:
             raise EvaluationIntegrityError("READINESS_ARTIFACT_INVENTORY_CHANGED")
         storage.assert_root_identity()
     return manifest, persisted, files
+
+
+def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str, bytes]]:
+    with _readiness_locked_storage(run_dir, exclusive=False):
+        return _readiness_snapshot_unlocked(run_dir)
 
 
 def _readiness_pending(request: JsonObject) -> JsonObject:
@@ -21309,7 +21494,7 @@ def _guarded_submit_readiness_response_unlocked_v1(
     run_dir: Path, response_value: object
 ) -> JsonObject:
     """Accept one exact response and append the next immutable transition."""
-    manifest, persisted, files = _readiness_snapshot(run_dir)
+    manifest, persisted, files = _readiness_snapshot_unlocked(run_dir)
     pending = cast(JsonObject | None, manifest.get("pending_call"))
     if pending is None:
         return {"accepted": False, "reason_code": READINESS_EXTERNAL_RESPONSE_INVALID}
@@ -21585,16 +21770,16 @@ def guarded_submit_readiness_response_v1(
     lock = _READINESS_SUBMISSION_LOCKS[
         int.from_bytes(digest[:2], "big") % len(_READINESS_SUBMISSION_LOCKS)
     ]
-    with lock:
+    with lock, _readiness_locked_storage(run_dir, exclusive=True):
         return _guarded_submit_readiness_response_unlocked_v1(run_dir, response_value)
 
 
-def readiness_status_payload_v1(run_dir: Path) -> JsonObject:
-    verification = verify_readiness_run_v1(run_dir)
+def _readiness_status_payload_unlocked_v1(run_dir: Path) -> JsonObject:
+    verification = _verify_readiness_run_unlocked_v1(run_dir)
     if verification["valid"] is not True:
         issues = cast(list[str], verification["issues"])
         raise EvaluationIntegrityError(issues[0])
-    manifest, persisted, files = _readiness_snapshot(run_dir)
+    manifest, persisted, files = _readiness_snapshot_unlocked(run_dir)
     pending = cast(JsonObject | None, manifest.get("pending_call"))
     result: JsonObject | None = None
     if "delivery-readiness.json" in files:
@@ -21646,9 +21831,14 @@ def readiness_status_payload_v1(run_dir: Path) -> JsonObject:
     return payload
 
 
-def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
+def readiness_status_payload_v1(run_dir: Path) -> JsonObject:
+    with _readiness_locked_storage(run_dir, exclusive=False):
+        return _readiness_status_payload_unlocked_v1(run_dir)
+
+
+def _verify_readiness_run_unlocked_v1(run_dir: Path) -> JsonObject:
     try:
-        manifest, persisted, files = _readiness_snapshot(run_dir)
+        manifest, persisted, files = _readiness_snapshot_unlocked(run_dir)
         rubric_bytes, rubric, rubric_fingerprint = _readiness_rubric_v1()
         if (
             files.get("readiness-rubric.json") != rubric_bytes
@@ -22012,9 +22202,17 @@ def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
         }
 
 
-def readiness_verification_payload_v1(
+def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
+    with _readiness_locked_storage(run_dir, exclusive=False):
+        return _verify_readiness_run_unlocked_v1(run_dir)
+
+
+def _readiness_verification_payload_unlocked_v1(
     run_dir: Path, verification: JsonObject
 ) -> JsonObject:
+    current = _verify_readiness_run_unlocked_v1(run_dir)
+    if current != verification:
+        verification = current
     if verification.get("valid") is not True:
         return {
             "baseline_locked_strict_equivalent_disposition": None,
@@ -22027,7 +22225,7 @@ def readiness_verification_payload_v1(
             "root_hash": None,
             "strict_equivalent_scoring_contract_fingerprint": None,
         }
-    manifest, persisted, files = _readiness_snapshot(run_dir)
+    manifest, persisted, files = _readiness_snapshot_unlocked(run_dir)
     result = (
         None
         if "delivery-readiness.json" not in files
@@ -22073,6 +22271,13 @@ def readiness_verification_payload_v1(
             "strict_disposition"
         ]
     return payload
+
+
+def readiness_verification_payload_v1(
+    run_dir: Path, verification: JsonObject
+) -> JsonObject:
+    with _readiness_locked_storage(run_dir, exclusive=False):
+        return _readiness_verification_payload_unlocked_v1(run_dir, verification)
 
 
 # Protocol 2.2 portable mirror

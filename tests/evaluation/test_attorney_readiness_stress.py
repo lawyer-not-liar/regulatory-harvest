@@ -141,6 +141,26 @@ def _vector(seed: int, rubric: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _expected_fresh_strict(vector: dict[str, object]) -> str:
+    mode = cast(str, vector["coverage_mode"])
+    if mode == "all_met":
+        return "PASS"
+    if mode == "uncertain":
+        return "INCONCLUSIVE"
+    return "FAIL"
+
+
+def _expected_history_status(mode: str) -> str:
+    return {
+        "none": "NOT_PROVIDED",
+        "one_report_match": "MATCH",
+        "one_report_not_comparable": "REPORT_NOT_COMPARABLE",
+        "two_ab_label_a": "BASELINE_NOT_COMPARABLE",
+        "two_ba_label_b": "BASELINE_NOT_COMPARABLE",
+        "one_report_inconclusive": "DISPOSITION_DIFFERS",
+    }[mode]
+
+
 def _inputs(
     tmp_path: Path,
     vector: dict[str, object],
@@ -228,6 +248,9 @@ def _inputs(
         assert source.historical_v22 is not None
         assert portable_history == source.historical_v22.model_dump(mode="json")
         assert len(portable_history["grader_aggregate_fingerprints"]) == 2
+        # Retained v2.2 omits the stable-only importance proof, so its actual
+        # authenticated import must remain fail-closed under the Task 2 contract.
+        assert source.historical_v22.baseline_comparable is False
     prerequisite_code = {
         "CURRENTNESS_NOT_ESTABLISHED": "CURRENTNESS_EVIDENCE",
         "LANGUAGE_LIMITATION": "LANGUAGE_RESOLUTION",
@@ -339,12 +362,32 @@ def _inputs(
             "grade_target_fingerprint": projection.binding.grade_target_fingerprint,
         }
     )
+    historical = source.historical_v22
+    if historical is not None and history_mode in {
+        "one_report_match",
+        "one_report_not_comparable",
+        "one_report_inconclusive",
+    }:
+        # These are explicit typed contract fixtures, not inferred crosswalks from
+        # retained prose. Real retained imports above remain noncomparable.
+        proof = historical.model_dump(mode="json", warnings="error")
+        proof["baseline_comparable"] = True
+        proof["report_comparable"] = history_mode != "one_report_not_comparable"
+        if history_mode == "one_report_match":
+            proof["strict_disposition"] = _expected_fresh_strict(vector)
+        elif history_mode == "one_report_inconclusive":
+            proof["strict_disposition"] = "INCONCLUSIVE"
+            assert _expected_fresh_strict(vector) != "INCONCLUSIVE"
+        historical = type(historical).model_validate(proof)
+        readiness_input = readiness_input.model_copy(
+            update={"historical_v22_cross_check": historical}
+        )
     return replace(
         source,
         readiness_input=readiness_input,
         baseline_context=context,
         gradeable_baseline=projection,
-        historical_v22=source.historical_v22,
+        historical_v22=historical,
     )
 
 
@@ -825,6 +868,7 @@ def test_readiness_seeded_scoring_boundary_matrix(
     )
     assert full_status.returncode == expected_exit
     historical = inputs.historical_v22
+    history_mode = cast(str, vector["history_mode"])
     if historical is None:
         assert result["historical_v22_cross_check_status"] == "NOT_PROVIDED"
         assert "historical-v22-cross-check.json" not in tree
@@ -838,6 +882,7 @@ def test_readiness_seeded_scoring_boundary_matrix(
             else "MATCH" if historical.strict_disposition.value == strict["absolute_disposition"]
             else "DISPOSITION_DIFFERS"
         )
+        assert expected == _expected_history_status(history_mode)
         assert result["historical_v22_cross_check_status"] == expected
 
 
@@ -849,6 +894,13 @@ def test_readiness_stress_matrix_covers_every_executed_dimension() -> None:
     assert {item["finding_count"] for item in vectors} == set(FINDING_COUNTS)
     assert {item["coverage_mode"] for item in vectors} == set(COVERAGE_MODES)
     assert {item["history_mode"] for item in vectors} == set(HISTORY_MODES)
+    assert {_expected_history_status(item) for item in HISTORY_MODES} == {
+        "NOT_PROVIDED",
+        "BASELINE_NOT_COMPARABLE",
+        "REPORT_NOT_COMPARABLE",
+        "MATCH",
+        "DISPOSITION_DIFFERS",
+    }
     assert {item["dispute_kind"] for item in vectors if item["lane_dispute"]} == set(DISPUTE_KINDS)
     for key, inventory in (
         ("rationale_kind", rubric["rationale_kinds"]),

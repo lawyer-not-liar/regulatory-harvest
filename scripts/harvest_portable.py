@@ -8313,7 +8313,9 @@ def _readiness_replay_generation_validation_v1(
                 "INVALID_REQUEST", "The validation request is invalid."
             ) from error
         if raw_input["language"] is not None and (
-            not isinstance(raw_input["language"], str) or not raw_input["language"].strip()
+            not isinstance(raw_input["language"], str)
+            or not raw_input["language"].strip()
+            or raw_input["language"] != raw_input["language"].strip()
         ):
             raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
     for raw_gap in raw_gaps:

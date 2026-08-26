@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
@@ -94,6 +95,9 @@ from regulatory_harvest.evaluation.attorney_readiness_drafts import (
     CompiledReadinessDraftV1,
     ReadinessEvaluatorProvenanceV1,
     compile_readiness_draft_v1,
+)
+from regulatory_harvest.evaluation.attorney_readiness_models import (
+    ReadinessEvaluatorRequestV1,
 )
 from regulatory_harvest.evaluation.attorney_readiness_workflow import (
     guarded_submit_readiness_response_v1 as submit_readiness_core,
@@ -651,6 +655,7 @@ def test_readiness_portable_rejects_boolean_validation_receipt_count(
         "validated-at-invalid",
         "generator-mismatch",
         "source-input-title-type",
+        "source-input-language-normalization",
         "multi-running-stages",
         "nonterminal-before-terminal",
     ],
@@ -685,6 +690,10 @@ def test_readiness_portable_rejects_nested_validation_bundle_mutations(
     elif mutation == "source-input-title-type":
         bundle["request"]["source_inputs"][0]["title"] = 7
         dossier["request"]["source_inputs"][0]["title"] = 7
+        dossier_path.write_bytes(canonical_json_bytes(dossier) + b"\n")
+    elif mutation == "source-input-language-normalization":
+        bundle["request"]["source_inputs"][0]["language"] = " en "
+        dossier["request"]["source_inputs"][0]["language"] = " en "
         dossier_path.write_bytes(canonical_json_bytes(dossier) + b"\n")
     elif mutation == "multi-running-stages":
         bundle["manifest"]["stages"][0]["status"] = "running"
@@ -908,6 +917,205 @@ def test_readiness_portable_transition_is_atomic_and_serialized(
         portable.guarded_submit_readiness_response_v1(portable_run, response)
     assert _tree_bytes(portable_run) == before
     assert portable.verify_readiness_run_v1(portable_run)["valid"] is True
+
+
+def test_readiness_portable_isolated_processes_serialize_same_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Descriptor locking gives two isolated submitters one exact winner."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    workflow = __import__("test_attorney_readiness_workflow")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    full_run = tmp_path / "process-lock-full"
+    portable_run = tmp_path / "process-lock-portable"
+    initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(portable_run, **init, generation_substrate=generation)
+    request = next_readiness_core(full_run)
+    portable_request = portable.next_readiness_request_v1(portable_run)
+    assert request is not None and portable_request is not None
+    response = portable.compile_readiness_draft_v1(
+        portable_request,
+        workflow._draft(request, grade_mode="met"),
+        {
+            "provider_name": "portable-parity-provider",
+            "model_name": "portable-parity-model",
+            "judge_isolation": "scripted_fixture",
+        },
+    )
+    response_path = tmp_path / "process-response.json"
+    response_path.write_bytes(canonical_json_bytes(response))
+    barrier = tmp_path / "process-barrier"
+    barrier.mkdir()
+    script = """
+import importlib.util, json, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("portable_process", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+run = Path(sys.argv[2])
+response = json.loads(Path(sys.argv[3]).read_bytes())
+barrier = Path(sys.argv[4])
+identity = sys.argv[5]
+original = module._readiness_snapshot_unlocked
+def synchronized_snapshot(path):
+    result = original(path)
+    (barrier / identity).write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 1.0
+    while len(tuple(barrier.iterdir())) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return result
+module._readiness_snapshot_unlocked = synchronized_snapshot
+print(json.dumps(module.guarded_submit_readiness_response_v1(run, response), sort_keys=True))
+"""
+    processes = [
+        subprocess.Popen(
+            [
+                "python3",
+                "-I",
+                "-S",
+                "-c",
+                script,
+                str(SCRIPT),
+                str(portable_run),
+                str(response_path),
+                str(barrier),
+                str(index),
+            ],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for index in range(2)
+    ]
+    completed = [process.communicate(timeout=20) for process in processes]
+    assert [process.returncode for process in processes] == [0, 0]
+    assert [stderr for _stdout, stderr in completed] == [b"", b""]
+    outcomes = [json.loads(stdout) for stdout, _stderr in completed]
+    assert sorted(outcome["accepted"] for outcome in outcomes) == [False, True]
+    assert portable.verify_readiness_run_v1(portable_run)["valid"] is True
+
+
+@pytest.mark.parametrize("reader", ["status", "verify"])
+def test_readiness_portable_isolated_readers_wait_for_transition(
+    reader: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shared descriptor locks keep readers outside an active transition."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    workflow = __import__("test_attorney_readiness_workflow")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    portable = _load_protocol_22_portable()
+    run = tmp_path / f"process-reader-{reader}"
+    portable.initialize_readiness_v1(
+        run,
+        baseline_run_dir=source.baseline_run_dir,
+        qualification_run_dir=source.qualification_run_dir,
+        generation_run_dir=source.generation_run_dir,
+        validation_receipt_path=source.validation_receipt_path,
+        generation_substrate=generation,
+    )
+    request = portable.next_readiness_request_v1(run)
+    assert request is not None
+    response = portable.compile_readiness_draft_v1(
+        request,
+        workflow._draft(ReadinessEvaluatorRequestV1.model_validate(request), grade_mode="met"),
+        {
+            "provider_name": "portable-parity-provider",
+            "model_name": "portable-parity-model",
+            "judge_isolation": "scripted_fixture",
+        },
+    )
+    response_path = tmp_path / f"reader-{reader}-response.json"
+    response_path.write_bytes(canonical_json_bytes(response))
+    entered = tmp_path / f"reader-{reader}-entered"
+    release = tmp_path / f"reader-{reader}-release"
+    transition_script = """
+import importlib.util, json, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("portable_transition", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+run, response_path, entered, release = map(Path, sys.argv[2:])
+response = json.loads(response_path.read_bytes())
+original = module._readiness_commit
+def paused_commit(*args, **kwargs):
+    entered.write_text("entered", encoding="utf-8")
+    deadline = time.monotonic() + 10.0
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return original(*args, **kwargs)
+module._readiness_commit = paused_commit
+print(json.dumps(module.guarded_submit_readiness_response_v1(run, response), sort_keys=True))
+"""
+    reader_script = """
+import importlib.util, json, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("portable_reader", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+run = Path(sys.argv[2])
+value = (module.readiness_status_payload_v1(run) if sys.argv[3] == "status"
+         else module.verify_readiness_run_v1(run))
+print(json.dumps(value, sort_keys=True))
+"""
+    transition = subprocess.Popen(
+        [
+            "python3",
+            "-I",
+            "-S",
+            "-c",
+            transition_script,
+            str(SCRIPT),
+            str(run),
+            str(response_path),
+            str(entered),
+            str(release),
+        ],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 10.0
+    while not entered.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert entered.exists()
+    reading = subprocess.Popen(
+        ["python3", "-I", "-S", "-c", reader_script, str(SCRIPT), str(run), reader],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    time.sleep(0.2)
+    assert reading.poll() is None
+    release.write_bytes(b"release")
+    transition_stdout, transition_stderr = transition.communicate(timeout=20)
+    reader_stdout, reader_stderr = reading.communicate(timeout=20)
+    assert transition.returncode == reading.returncode == 0
+    assert transition_stderr == reader_stderr == b""
+    assert json.loads(transition_stdout)["accepted"] is True
+    payload = json.loads(reader_stdout)
+    if reader == "verify":
+        assert payload["valid"] is True
+    else:
+        assert payload["protocol_version"] == "delivery-readiness-v1"
+        assert payload["pending_operation"]["operation"] == "baseline_locked_grade"
 
 
 @pytest.mark.parametrize("shape", ["cycle", "deep"])
@@ -1404,6 +1612,9 @@ def test_readiness_portable_rejects_nested_manifest_and_input_model_mutations(
         "baseline-unknown",
         "baseline-verification-unknown",
         "baseline-manifest-root-binding",
+        "qualification-root-binding",
+        "generation-source-hash-binding",
+        "historical-disposition",
     ],
 )
 def test_readiness_portable_rejects_persisted_closed_value_and_type_mutations(
@@ -1455,6 +1666,24 @@ def test_readiness_portable_rejects_persisted_closed_value_and_type_mutations(
             ] = "evil"
         elif mutation == "inner-rubric-fingerprint-binding":
             persisted["readiness_input"]["readiness_rubric_fingerprint"] = "1" * 64
+        elif mutation == "qualification-root-binding":
+            persisted["qualification_binding"]["qualification_root"] = "1" * 64
+            persisted["qualification_limits"]["qualification_root"] = "1" * 64
+        elif mutation == "generation-source-hash-binding":
+            persisted["generation_binding"]["source_hashes"][0][1] = "1" * 64
+        elif mutation == "historical-disposition":
+            baseline = persisted["readiness_input"]
+            baseline["historical_v22_cross_check"] = {
+                "report_hash": baseline["report_hash"],
+                "strict_disposition": "EVIL",
+                "result_fingerprint": "1" * 64,
+                "manifest_fingerprint": "2" * 64,
+                "baseline_fingerprint": "3" * 64,
+                "grader_aggregate_fingerprints": ["4" * 64, "5" * 64],
+                "reason_codes": [],
+                "baseline_comparable": True,
+                "report_comparable": True,
+            }
         elif mutation.startswith("baseline-"):
             context_field = {
                 "baseline-manifest-unknown": "manifest",
