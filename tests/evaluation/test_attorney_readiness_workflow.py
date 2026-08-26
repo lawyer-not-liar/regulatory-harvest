@@ -58,6 +58,7 @@ from regulatory_harvest.evaluation.attorney_readiness_workflow import (
     resume_readiness_v1,
     submit_readiness_response_v1,
 )
+from regulatory_harvest.storage import sha256_digest
 
 
 def test_workflow_api_is_exported_additively() -> None:
@@ -418,6 +419,12 @@ async def test_exact_operation_order_fresh_contexts_and_terminal_replay(
             assert "finding_proposals" not in payload
     assert all(prompt.attempt == 1 for prompt in evaluator.prompts)
     assert len(evaluator.tokens) == len(set(evaluator.tokens)) == len(evaluator.prompts)
+    accepted = load_verified_readiness_context_v1(run_dir).manifest.accepted_calls
+    assert tuple(call.context_token_fingerprint for call in accepted) == tuple(
+        sha256_digest(token.encode("utf-8")) for token in evaluator.tokens
+    )
+    assert all(call.provider_name == "public-test-provider" for call in accepted)
+    assert all(call.model_name == "public-test-model" for call in accepted)
     assert outcome.engine_paused is False
     assert outcome.result is not None
     assert verify_readiness_run_v1(run_dir).valid is True
@@ -500,6 +507,9 @@ async def test_one_mechanical_refusal_gets_one_fresh_repair_and_records_attempt_
     context = load_verified_readiness_context_v1(run_dir)
     assert len(context.manifest.accepted_calls) == 1
     assert context.manifest.accepted_calls[0].attempt == 2
+    assert context.manifest.accepted_calls[0].context_token_fingerprint == sha256_digest(
+        b"context-2"
+    )
 
 
 @pytest.mark.asyncio
@@ -552,11 +562,9 @@ async def test_fresh_context_token_reuse_is_rejected_across_resume(
     persisted = repr(before)
     assert "context-constant" not in persisted
     assert accepted_before[0].model_name == "public-test-model"
-    control_files = tuple(tmp_path.glob(".readiness-context-*.tokens"))
-    assert len(control_files) == 1
-    control_bytes = control_files[0].read_bytes()
-    assert b"context-constant" not in control_bytes
-    assert len(control_bytes.splitlines()) == 1
+    assert accepted_before[0].provider_name == "public-test-provider"
+    assert accepted_before[0].context_token_fingerprint == sha256_digest(b"context-constant")
+    assert tuple(tmp_path.glob(".readiness-context-*.tokens")) == ()
 
     resumed = ScriptedEvaluator(grade_mode="met", fresh=True, reused_token=True)
     outcome = await continue_readiness_v1(run_dir, resumed)
@@ -586,7 +594,9 @@ async def test_fresh_context_preserves_maximum_truthful_model_name(tmp_path: Pat
     assert outcome.engine_paused is True
     accepted = load_verified_readiness_context_v1(run_dir).manifest.accepted_calls
     assert len(accepted) == 1
+    assert accepted[0].provider_name == "public-test-provider"
     assert accepted[0].model_name == "m" * 128
+    assert accepted[0].context_token_fingerprint == sha256_digest(b"context-1")
 
 
 @pytest.mark.asyncio
@@ -607,6 +617,11 @@ async def test_external_fresh_response_remains_resumable_by_internal_driver(
     )
     assert isinstance(compiled, CompiledReadinessDraftV1)
     assert guarded_submit_readiness_response_v1(run_dir, compiled.response).accepted is True
+    external = load_verified_readiness_context_v1(run_dir).manifest.accepted_calls
+    assert len(external) == 1
+    assert external[0].provider_name == "external-provider"
+    assert external[0].model_name == "external-model"
+    assert external[0].context_token_fingerprint is None
 
     outcome = await continue_readiness_v1(run_dir, ScriptedEvaluator(grade_mode="met", fresh=True))
     assert outcome.result is not None
@@ -614,56 +629,32 @@ async def test_external_fresh_response_remains_resumable_by_internal_driver(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("hostile_kind", ["symlink", "hardlink", "fifo"])
-async def test_context_token_control_rejects_unsafe_nodes_without_evaluator_call(
-    tmp_path: Path, hostile_kind: str
-) -> None:
-    from regulatory_harvest.evaluation.attorney_artifacts import EvaluationIntegrityError
-
-    run_dir, _ = _initialize_real(tmp_path, limitations=None)
-    metadata = run_dir.stat()
-    control = tmp_path / (f".readiness-context-{metadata.st_dev:x}-{metadata.st_ino:x}.tokens")
-    victim = tmp_path / "victim"
-    victim.write_bytes(b"owned\n")
-    if hostile_kind == "symlink":
-        control.symlink_to(victim)
-    elif hostile_kind == "hardlink":
-        control.hardlink_to(victim)
-    else:
-        control.unlink(missing_ok=True)
-        control.parent.mkdir(parents=True, exist_ok=True)
-        import os
-
-        os.mkfifo(control)
-    evaluator = ScriptedEvaluator(grade_mode="met", fresh=True)
-    with pytest.raises(EvaluationIntegrityError, match="READINESS_STORAGE_UNSAFE"):
-        await continue_readiness_v1(run_dir, evaluator)
-    assert evaluator.prompts == []
-    assert victim.read_bytes() == b"owned\n"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("tamper", ["delete", "truncate"])
-async def test_context_token_control_rollback_is_detected_before_resume(
+@pytest.mark.parametrize("tamper", ["delete", "truncate", "canonical_reseal"])
+async def test_mutable_context_control_cannot_erase_immutable_token_history(
     tmp_path: Path, tamper: str
 ) -> None:
-    from regulatory_harvest.evaluation.attorney_artifacts import EvaluationIntegrityError
-
     run_dir, _ = _initialize_real(tmp_path, limitations=None)
     first = ScriptedEvaluator(grade_mode="met", fresh=True, reused_token=True, fail_after=1)
     paused = await continue_readiness_v1(run_dir, first)
     assert paused.engine_paused is True
     accepted = load_verified_readiness_context_v1(run_dir).manifest.accepted_calls
     assert len(accepted) == 1
-    (control,) = tuple(tmp_path.glob(".readiness-context-*.tokens"))
+    assert accepted[0].context_token_fingerprint == sha256_digest(b"context-constant")
+    controls = tuple(tmp_path.glob(".readiness-context-*.tokens"))
+    metadata = run_dir.stat()
+    control = tmp_path / f".readiness-context-{metadata.st_dev:x}-{metadata.st_ino:x}.tokens"
     if tamper == "delete":
-        control.unlink()
-    else:
+        for item in controls:
+            item.unlink()
+    elif tamper == "truncate":
         control.write_bytes(b"")
+    else:
+        control.write_bytes(f"I:{accepted[0].request_fingerprint}:{'a' * 64}\n".encode("ascii"))
     before = _tree_bytes(run_dir)
     resumed = ScriptedEvaluator(grade_mode="met", fresh=True, reused_token=True)
-    with pytest.raises(EvaluationIntegrityError, match="READINESS_CONTEXT_CONTROL_INVALID"):
-        await continue_readiness_v1(run_dir, resumed)
+    outcome = await continue_readiness_v1(run_dir, resumed)
+    assert outcome.engine_paused is True
+    assert outcome.pause_reason_codes == (READINESS_CONTEXT_ISOLATION_INVALID,)
     assert resumed.prompts == []
     assert _tree_bytes(run_dir) == before
     assert load_verified_readiness_context_v1(run_dir).manifest.accepted_calls == accepted
@@ -690,6 +681,10 @@ async def test_high_assurance_path_and_exit_code(tmp_path: Path) -> None:
     assert outcome.result.baseline_locked_strict_equivalent_disposition.value == "PASS"
     assert outcome.result.delivery_readiness.value == "HIGH_ASSURANCE"
     assert outcome.exit_code == readiness_exit_code_v1(outcome.result, paused=False) == 0
+    assert all(
+        call.context_token_fingerprint is None
+        for call in load_verified_readiness_context_v1(run_dir).manifest.accepted_calls
+    )
 
 
 @pytest.mark.asyncio

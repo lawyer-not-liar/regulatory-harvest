@@ -93,7 +93,6 @@ READINESS_CONTEXT_ISOLATION_INVALID = "READINESS_CONTEXT_ISOLATION_INVALID"
 READINESS_COMPILER_PREFLIGHT_DISAGREEMENT = "READINESS_COMPILER_PREFLIGHT_DISAGREEMENT"
 
 _SUBMISSION_LOCKS = tuple(threading.RLock() for _ in range(64))
-_CONTEXT_CONTROL_MAX_BYTES = 262_144
 _STALE_TRANSITION_CODES = {
     "READINESS_STALE_TRANSITION",
     "READINESS_ARTIFACT_STALE_TRANSITION",
@@ -409,13 +408,15 @@ def _advance_response_v1(
     response: ReadinessEvaluatorResponseV1,
     *,
     attempt: Literal[1, 2],
+    context_token_fingerprint: str | None = None,
 ) -> ReadinessRunStateV1:
     pending = context.manifest.pending_call
     if pending is None or context.pending_request is None:
         raise ValueError(READINESS_EXTERNAL_RESPONSE_INVALID)
     response_bytes = _response_bytes(response)
-    accepted = pending.model_copy(
-        update={
+    accepted = ReadinessCallRecordV1.model_validate(
+        {
+            **pending.model_dump(mode="python"),
             "state": "accepted",
             "attempt": attempt,
             "response_artifact_path": f"responses/{pending.call_id}.json",
@@ -423,6 +424,7 @@ def _advance_response_v1(
             "provider_name": response.provider_name,
             "model_name": response.model_name,
             "judge_isolation": response.judge_isolation,
+            "context_token_fingerprint": context_token_fingerprint,
         }
     )
     assert accepted.response_artifact_path is not None
@@ -519,11 +521,10 @@ def _guarded_submit(
     response: object,
     *,
     attempt: Literal[1, 2],
-    context_token_reserved: bool = False,
+    context_token_fingerprint: str | None = None,
 ) -> GuardedReadinessSubmissionResultV1:
     with _submission_guard(run_dir):
         context = load_verified_readiness_context_v1(run_dir)
-        _assert_context_control_bindings(run_dir, context)
         preflight = artifact_preflight_readiness_response_v1(run_dir, response)
         if not preflight.valid:
             return GuardedReadinessSubmissionResultV1(False, preflight)
@@ -534,9 +535,13 @@ def _guarded_submit(
                 else response
             )
             checked = validate_readiness_evaluator_response_v1(raw)
-            if checked.judge_isolation == "fresh_context" and not context_token_reserved:
-                _record_external_fresh_response(run_dir, context, checked)
-            state = _advance_response_v1(run_dir, context, checked, attempt=attempt)
+            state = _advance_response_v1(
+                run_dir,
+                context,
+                checked,
+                attempt=attempt,
+                context_token_fingerprint=context_token_fingerprint,
+            )
         except EvaluationIntegrityError as error:
             if str(error) in _STALE_TRANSITION_CODES:
                 return GuardedReadinessSubmissionResultV1(
@@ -623,187 +628,12 @@ def _event(
     )
 
 
-def _write_all(descriptor: int, data: bytes) -> None:
-    offset = 0
-    while offset < len(data):
-        written = os.write(descriptor, data[offset:])
-        if written <= 0:
-            raise OSError("context control write did not progress")
-        offset += written
-
-
-def _context_control_entry(
-    kind: Literal["I", "E"], request_fingerprint: str, binding: str
-) -> bytes:
-    return f"{kind}:{request_fingerprint}:{binding}".encode("ascii")
-
-
-def _update_context_control(
-    run_dir: Path,
-    context: VerifiedReadinessContextV1,
-    *,
-    entry: bytes | None = None,
-    reject_existing: bool = False,
-) -> None:
-    root_identity = _root_identity(run_dir)
-    absolute = Path(os.path.abspath(run_dir))
-    name = f".readiness-context-{root_identity[0]:x}-{root_identity[1]:x}.tokens"
-    parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    control_flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-    expected_requests = {
-        call.request_fingerprint.encode("ascii")
-        for call in context.manifest.accepted_calls
-        if call.judge_isolation == "fresh_context"
-    }
-    try:
-        import fcntl
-
-        parent_descriptor = os.open(absolute.parent, parent_flags)
-        try:
-            parent_metadata = os.fstat(parent_descriptor)
-            visible_parent = os.stat(absolute.parent, follow_symlinks=False)
-            if not stat.S_ISDIR(parent_metadata.st_mode) or (
-                parent_metadata.st_dev,
-                parent_metadata.st_ino,
-            ) != (visible_parent.st_dev, visible_parent.st_ino):
-                raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE")
-            created = False
-            try:
-                descriptor = os.open(name, control_flags, dir_fd=parent_descriptor)
-            except FileNotFoundError:
-                if expected_requests or entry is None:
-                    raise EvaluationIntegrityError("READINESS_CONTEXT_CONTROL_INVALID") from None
-                try:
-                    descriptor = os.open(
-                        name,
-                        control_flags | os.O_CREAT | os.O_EXCL,
-                        0o600,
-                        dir_fd=parent_descriptor,
-                    )
-                    created = True
-                except FileExistsError:
-                    descriptor = os.open(name, control_flags, dir_fd=parent_descriptor)
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
-                metadata = os.fstat(descriptor)
-                visible = os.stat(
-                    name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-                identity = (metadata.st_dev, metadata.st_ino)
-                if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_nlink != 1
-                    or metadata.st_uid != os.geteuid()
-                    or stat.S_IMODE(metadata.st_mode) & 0o077
-                    or identity != (visible.st_dev, visible.st_ino)
-                ):
-                    raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE")
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                chunks: list[bytes] = []
-                total = 0
-                while True:
-                    chunk = os.read(descriptor, min(65_536, _CONTEXT_CONTROL_MAX_BYTES + 1 - total))
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    total += len(chunk)
-                    if total > _CONTEXT_CONTROL_MAX_BYTES:
-                        break
-                data = b"".join(chunks)
-                if len(data) > _CONTEXT_CONTROL_MAX_BYTES or (data and not data.endswith(b"\n")):
-                    raise EvaluationIntegrityError("READINESS_CONTEXT_CONTROL_INVALID")
-                lines = data.splitlines()
-                parsed = tuple(line.split(b":") for line in lines)
-                if len(lines) != len(set(lines)) or any(
-                    len(parts) != 3
-                    or parts[0] not in {b"I", b"E"}
-                    or any(
-                        len(value) != 64
-                        or any(character not in b"0123456789abcdef" for character in value)
-                        for value in parts[1:]
-                    )
-                    for parts in parsed
-                ):
-                    raise EvaluationIntegrityError("READINESS_CONTEXT_CONTROL_INVALID")
-                observed_requests = {parts[1] for parts in parsed}
-                if not expected_requests.issubset(observed_requests):
-                    raise EvaluationIntegrityError("READINESS_CONTEXT_CONTROL_INVALID")
-                if entry is not None:
-                    entry_parts = entry.split(b":")
-                    token_reused = reject_existing and any(
-                        parts[0] == b"I" and parts[2] == entry_parts[2] for parts in parsed
-                    )
-                    if token_reused or (entry in lines and reject_existing):
-                        raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
-                    if entry not in lines:
-                        os.lseek(descriptor, 0, os.SEEK_END)
-                        _write_all(descriptor, entry + b"\n")
-                        os.fsync(descriptor)
-                final = os.stat(
-                    name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-                if identity != (final.st_dev, final.st_ino):
-                    raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE")
-                if created:
-                    os.fsync(parent_descriptor)
-            finally:
-                os.close(descriptor)
-        finally:
-            os.close(parent_descriptor)
-    except EvaluationIntegrityError:
-        raise
-    except ValueError:
-        raise
-    except (ImportError, NotImplementedError, OSError, TypeError) as error:
-        raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE") from error
-    if _root_identity(run_dir) != root_identity:
-        raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE")
-
-
-def _assert_context_control_bindings(run_dir: Path, context: VerifiedReadinessContextV1) -> None:
-    if any(call.judge_isolation == "fresh_context" for call in context.manifest.accepted_calls):
-        _update_context_control(run_dir, context)
-
-
-def _reserve_context_token(
-    run_dir: Path,
-    context: VerifiedReadinessContextV1,
-    request_fingerprint: str,
-    token: str,
-) -> None:
-    digest = sha256_digest(token.encode("utf-8"))
-    entry = _context_control_entry("I", request_fingerprint, digest)
-    _update_context_control(
-        run_dir,
-        context,
-        entry=entry,
-        reject_existing=True,
-    )
-
-
-def _record_external_fresh_response(
-    run_dir: Path,
-    context: VerifiedReadinessContextV1,
-    response: ReadinessEvaluatorResponseV1,
-) -> None:
-    entry = _context_control_entry(
-        "E",
-        response.request_fingerprint,
-        sha256_digest(_response_bytes(response)),
-    )
-    _update_context_control(run_dir, context, entry=entry)
-
-
 def _provenance(
-    run_dir: Path,
     context: VerifiedReadinessContextV1,
     evaluator: ReadinessDraftEvaluatorV1,
     prompt: ReadinessEvaluatorDraftPromptV1,
-) -> ReadinessEvaluatorProvenanceV1:
+    seen_context_tokens: set[str],
+) -> tuple[ReadinessEvaluatorProvenanceV1, str | None]:
     scripted_fixture = getattr(evaluator, "scripted_fixture", False) is True
     factory = getattr(evaluator, "provenance", None)
     supplied = factory(prompt) if callable(factory) else None
@@ -821,7 +651,7 @@ def _provenance(
     if checked.judge_isolation == "scripted_fixture":
         if not scripted_fixture:
             raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
-        return checked
+        return checked, None
     token_factory = getattr(evaluator, "context_token", None)
     if not callable(token_factory):
         raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
@@ -833,8 +663,16 @@ def _provenance(
         or len(token.encode("utf-8")) > 256
     ):
         raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
-    _reserve_context_token(run_dir, context, prompt.request.request_fingerprint, token)
-    return checked
+    token_fingerprint = sha256_digest(token.encode("utf-8"))
+    accepted_token_fingerprints = {
+        call.context_token_fingerprint
+        for call in context.manifest.accepted_calls
+        if call.context_token_fingerprint is not None
+    }
+    if token_fingerprint in seen_context_tokens or token_fingerprint in accepted_token_fingerprints:
+        raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
+    seen_context_tokens.add(token_fingerprint)
+    return checked, token_fingerprint
 
 
 def _pause(
@@ -871,9 +709,9 @@ async def continue_readiness_v1(
     if not isinstance(evaluator, ReadinessDraftEvaluatorV1):
         raise TypeError("evaluator must implement ReadinessDraftEvaluatorV1")
     sink = _NOOP_TELEMETRY if telemetry_sink is None else telemetry_sink
+    seen_context_tokens: set[str] = set()
     while True:
         context = load_verified_readiness_context_v1(run_dir)
-        _assert_context_control_bindings(run_dir, context)
         if context.manifest.terminal_status is not None:
             return _completed(context)
         request = context.pending_request
@@ -887,7 +725,9 @@ async def continue_readiness_v1(
                 clarification_codes=clarification_codes,
             )
             try:
-                provenance = _provenance(run_dir, context, evaluator, prompt)
+                provenance, context_token_fingerprint = _provenance(
+                    context, evaluator, prompt, seen_context_tokens
+                )
             except EvaluationIntegrityError:
                 raise
             except (TypeError, ValueError):
@@ -941,7 +781,7 @@ async def continue_readiness_v1(
                 run_dir,
                 compiled.response,
                 attempt=attempt,
-                context_token_reserved=provenance.judge_isolation == "fresh_context",
+                context_token_fingerprint=context_token_fingerprint,
             )
             if not submitted.accepted or submitted.state is None:
                 current = next_readiness_request_v1(run_dir)
