@@ -18954,9 +18954,20 @@ def _readiness_snapshot_unlocked(
                 for item in value:
                     if type(item) is not list or len(item) != 2:
                         invalid_persisted()
+                    key = native_text(item[0], nonblank=True)
+                    if len(key) > 65_536 or any(
+                        pattern.search(key) is not None
+                        for pattern in (
+                            _READINESS_POSIX_PRIVATE_ROOT_RE,
+                            _READINESS_WINDOWS_ABSOLUTE_PATH_RE,
+                            _READINESS_WINDOWS_UNC_PATH_RE,
+                            _READINESS_FILE_URI_RE,
+                        )
+                    ):
+                        invalid_persisted()
                     result.append(
                         [
-                            native_text(item[0], nonblank=True),
+                            key,
                             cast(str, native_hash(item[1])),
                         ]
                     )

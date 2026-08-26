@@ -1614,6 +1614,8 @@ def test_readiness_portable_rejects_nested_manifest_and_input_model_mutations(
         "baseline-manifest-root-binding",
         "qualification-root-binding",
         "generation-source-hash-binding",
+        "generation-artifact-private-key",
+        "generation-artifact-oversized-key",
         "historical-disposition",
     ],
 )
@@ -1671,6 +1673,14 @@ def test_readiness_portable_rejects_persisted_closed_value_and_type_mutations(
             persisted["qualification_limits"]["qualification_root"] = "1" * 64
         elif mutation == "generation-source-hash-binding":
             persisted["generation_binding"]["source_hashes"][0][1] = "1" * 64
+        elif mutation == "generation-artifact-private-key":
+            persisted["generation_binding"]["generator_artifact_hashes"][0][0] = (
+                "/Users/private/secret.json"
+            )
+        elif mutation == "generation-artifact-oversized-key":
+            persisted["generation_binding"]["generator_artifact_hashes"][0][0] = (
+                "x" * 65_537
+            )
         elif mutation == "historical-disposition":
             baseline = persisted["readiness_input"]
             baseline["historical_v22_cross_check"] = {
