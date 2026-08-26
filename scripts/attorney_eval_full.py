@@ -15,7 +15,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Never
+from typing import Literal, Never, cast
 
 from pydantic import ValidationError
 
@@ -64,6 +64,30 @@ from regulatory_harvest.evaluation.attorney_qualification import (
     next_qualification_request,
     resume_case_qualification,
     verify_case_qualification,
+)
+from regulatory_harvest.evaluation.attorney_readiness_artifacts import (
+    VerifiedReadinessContextV1,
+    load_verified_readiness_context_v1,
+    verify_readiness_run_v1,
+)
+from regulatory_harvest.evaluation.attorney_readiness_drafts import (
+    CompiledReadinessDraftV1,
+    ReadinessEvaluatorProvenanceV1,
+    compile_readiness_draft_v1,
+)
+from regulatory_harvest.evaluation.attorney_readiness_inputs import ReadinessInputError
+from regulatory_harvest.evaluation.attorney_readiness_models import (
+    READINESS_PROTOCOL_V1,
+    DeliveryReadinessResultV1,
+    ReadinessEvaluatorRequestV1,
+)
+from regulatory_harvest.evaluation.attorney_readiness_workflow import (
+    READINESS_EXTERNAL_RESPONSE_INVALID,
+    GuardedReadinessSubmissionResultV1,
+    guarded_submit_readiness_response_v1,
+    initialize_readiness_v1,
+    next_readiness_request_v1,
+    readiness_exit_code_v1,
 )
 from regulatory_harvest.evaluation.attorney_v2_artifacts import (
     V2ResponsePreflight,
@@ -196,6 +220,24 @@ def _parser() -> argparse.ArgumentParser:
     baseline_status_parser.add_argument("--run", required=True)
     baseline_verify_parser = subparsers.add_parser("eval-baseline-verify")
     baseline_verify_parser.add_argument("--run", required=True)
+    readiness_init_parser = subparsers.add_parser("eval-readiness-init")
+    readiness_init_parser.add_argument("--baseline-run", required=True)
+    readiness_init_parser.add_argument("--qualification-run", required=True)
+    readiness_init_parser.add_argument("--generation-run", required=True)
+    readiness_init_parser.add_argument("--validation-receipt", required=True)
+    readiness_init_parser.add_argument("--run", required=True)
+    readiness_init_parser.add_argument("--historical-v22-run")
+    readiness_init_parser.add_argument("--historical-report-label", choices=("A", "B"))
+    readiness_next_parser = subparsers.add_parser("eval-readiness-next")
+    readiness_next_parser.add_argument("--run", required=True)
+    readiness_submit_parser = subparsers.add_parser("eval-readiness-submit-safe")
+    readiness_submit_parser.add_argument("--run", required=True)
+    readiness_submit_parser.add_argument("--response", required=True)
+    _add_payload_response_arguments(readiness_submit_parser)
+    readiness_status_parser = subparsers.add_parser("eval-readiness-status")
+    readiness_status_parser.add_argument("--run", required=True)
+    readiness_verify_parser = subparsers.add_parser("eval-readiness-verify")
+    readiness_verify_parser.add_argument("--run", required=True)
     eval_init_parser = subparsers.add_parser("eval-init")
     eval_init_parser.add_argument("--case", required=True)
     eval_init_parser.add_argument("--run", required=True)
@@ -673,6 +715,226 @@ def _v22_guarded_payload(result: GuardedSubmissionResultV22) -> dict[str, object
     return payload
 
 
+def _readiness_pending_operation(
+    request: ReadinessEvaluatorRequestV1 | None,
+) -> dict[str, object] | None:
+    """Project one pending request without identifiers, text, or paths."""
+    if request is None:
+        return None
+    lane_value = request.payload.get("lane")
+    lane = lane_value if type(lane_value) is int and lane_value in {1, 2} else None
+    fragment_class = {
+        "baseline_locked_grade": "ordinary_batch",
+        "baseline_locked_contested_grade": "contested_requirement",
+        "safety_review": "safety_lane",
+        "safety_referee": "safety_dispute",
+    }[request.operation.value]
+    return {
+        "fragment_class": fragment_class,
+        "lane": lane,
+        "operation": request.operation.value,
+    }
+
+
+def _readiness_historical_fields(
+    context: VerifiedReadinessContextV1,
+) -> dict[str, object]:
+    result = context.result
+    if result is not None and result.historical_v22_strict_disposition is not None:
+        return {
+            "historical_v22_cross_check_status": (
+                result.historical_v22_cross_check_status.value
+            ),
+            "historical_v22_strict_disposition": (
+                result.historical_v22_strict_disposition.value
+            ),
+        }
+    historical = context.inputs.historical_v22
+    if historical is None:
+        return {}
+    if not historical.baseline_comparable:
+        status: str | None = "BASELINE_NOT_COMPARABLE"
+    elif not historical.report_comparable:
+        status = "REPORT_NOT_COMPARABLE"
+    else:
+        status = None
+    return {
+        "historical_v22_cross_check_status": status,
+        "historical_v22_strict_disposition": historical.strict_disposition.value,
+    }
+
+
+def _readiness_status_payload(
+    context: VerifiedReadinessContextV1,
+    *,
+    engine_paused: bool = False,
+) -> dict[str, object]:
+    """Return the allowlisted public readiness status projection."""
+    result = context.result
+    payload: dict[str, object] = {
+        "baseline_locked_strict_equivalent_disposition": (
+            None
+            if result is None
+            else result.baseline_locked_strict_equivalent_disposition.value
+        ),
+        "delivery_readiness": None if result is None else result.delivery_readiness.value,
+        "engine_paused": engine_paused,
+        "manifest_fingerprint": context.manifest.manifest_fingerprint,
+        "pending_operation": _readiness_pending_operation(context.pending_request),
+        "protocol_version": READINESS_PROTOCOL_V1,
+    }
+    payload.update(_readiness_historical_fields(context))
+    return payload
+
+
+def render_readiness_status_human_v1(payload: dict[str, object]) -> str:
+    """Render only the three distinct attorney-facing readiness dispositions."""
+    required = {
+        "baseline_locked_strict_equivalent_disposition",
+        "delivery_readiness",
+        "engine_paused",
+        "manifest_fingerprint",
+        "pending_operation",
+        "protocol_version",
+    }
+    historical = {
+        "historical_v22_cross_check_status",
+        "historical_v22_strict_disposition",
+    }
+    keys = set(payload)
+    if not (keys == required or keys == required | historical):
+        raise ValueError("readiness status has an unexpected shape")
+    fresh = payload["baseline_locked_strict_equivalent_disposition"]
+    delivery = payload["delivery_readiness"]
+    if historical <= keys:
+        historical_disposition = payload["historical_v22_strict_disposition"]
+        cross_check = payload["historical_v22_cross_check_status"]
+        suffix = {
+            None: " (cross-check pending)",
+            "BASELINE_NOT_COMPARABLE": " (baseline not comparable)",
+            "REPORT_NOT_COMPARABLE": " (report not comparable)",
+            "MATCH": " (cross-check matches)",
+            "DISPOSITION_DIFFERS": " (cross-check differs)",
+        }.get(cast(str | None, cross_check))
+        if suffix is None:
+            raise ValueError("readiness status has an invalid historical cross-check")
+        history_line = (
+            "Historical Protocol 2.2 strict disposition: "
+            f"{historical_disposition}{suffix}"
+        )
+    else:
+        history_line = "Historical Protocol 2.2 strict disposition: not supplied"
+    return "\n".join(
+        (
+            f"Baseline-locked strict-equivalent: {fresh if fresh is not None else 'pending'}",
+            history_line,
+            f"Delivery readiness: {delivery if delivery is not None else 'pending'}",
+        )
+    )
+
+
+def _readiness_preflight_payload(result: GuardedReadinessSubmissionResultV1) -> dict[str, object]:
+    diagnostics = (
+        [] if result.accepted else [READINESS_EXTERNAL_RESPONSE_INVALID]
+    )
+    return {"diagnostics": diagnostics, "valid": result.accepted}
+
+
+def _readiness_guarded_payload(
+    result: GuardedReadinessSubmissionResultV1,
+    context: VerifiedReadinessContextV1 | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "accepted": result.accepted,
+        "preflight": _readiness_preflight_payload(result),
+    }
+    if result.accepted:
+        if context is None:
+            raise EvaluationIntegrityError("READINESS_ACCEPTED_STATE_REQUIRED")
+        payload["status"] = _readiness_status_payload(context)
+    return payload
+
+
+def _read_guarded_readiness_response(
+    args: argparse.Namespace,
+    run: Path,
+) -> object:
+    """Read a strict response or compile and bind one role-authored inner payload."""
+    value = _read_guarded_eval_object(Path(args.response))
+    if value is None:
+        return None
+    metadata = (
+        getattr(args, "provider_name", None),
+        getattr(args, "model_name", None),
+        getattr(args, "judge_isolation", None),
+    )
+    if not any(item is not None for item in metadata):
+        return value
+    if any(item is None for item in metadata):
+        return None
+    request = next_readiness_request_v1(run)
+    if request is None:
+        return None
+    provider_name, model_name, judge_isolation = cast(tuple[str, str, str], metadata)
+    try:
+        provenance = ReadinessEvaluatorProvenanceV1(
+            provider_name=provider_name,
+            model_name=model_name,
+            judge_isolation=cast(
+                Literal["fresh_context", "scripted_fixture"], judge_isolation
+            ),
+        )
+    except (TypeError, ValidationError, ValueError):
+        return None
+    compiled = compile_readiness_draft_v1(request, value, provenance)
+    return compiled.response if isinstance(compiled, CompiledReadinessDraftV1) else None
+
+
+def _readiness_context_exit_code(
+    context: VerifiedReadinessContextV1,
+    *,
+    engine_paused: bool = False,
+) -> int:
+    if engine_paused:
+        return EVAL_EXIT_ENGINE_PAUSED
+    if context.manifest.terminal_status is None:
+        return EVAL_EXIT_SUCCESS
+    return readiness_exit_code_v1(context.result, paused=False)
+
+
+def _readiness_verification_payload(
+    context: VerifiedReadinessContextV1 | None,
+    *,
+    valid: bool,
+    issue_codes: tuple[str, ...],
+) -> dict[str, object]:
+    result: DeliveryReadinessResultV1 | None = None if context is None else context.result
+    payload: dict[str, object] = {
+        "baseline_locked_strict_equivalent_disposition": (
+            None
+            if result is None
+            else result.baseline_locked_strict_equivalent_disposition.value
+        ),
+        "delivery_readiness": None if result is None else result.delivery_readiness.value,
+        "issue_codes": list(issue_codes),
+        "manifest_fingerprint": (
+            None if context is None else context.manifest.manifest_fingerprint
+        ),
+        "ok": valid,
+        "protocol_version": READINESS_PROTOCOL_V1,
+        "result_fingerprint": None if result is None else result.result_fingerprint,
+        "root_hash": None if context is None else context.manifest.root_hash,
+        "strict_equivalent_scoring_contract_fingerprint": (
+            None
+            if context is None
+            else context.manifest.strict_equivalent_scoring_contract_fingerprint
+        ),
+    }
+    if context is not None:
+        payload.update(_readiness_historical_fields(context))
+    return payload
+
+
 def _eval_exit_v22(state: EvaluationRunStateV22, run: Path) -> int:
     if state.terminal_status is None:
         return EVAL_EXIT_SUCCESS
@@ -1141,6 +1403,87 @@ def _run_baseline_command(args: argparse.Namespace) -> int:
         ) from error
 
 
+def _run_readiness_command(args: argparse.Namespace) -> int:
+    """Run the opt-in readiness companion without changing retained evaluation commands."""
+    run = _physical_run_path(args.run)
+    try:
+        if args.command == "eval-readiness-init":
+            historical_run_value = getattr(args, "historical_v22_run", None)
+            historical_label = getattr(args, "historical_report_label", None)
+            if (historical_run_value is None) != (historical_label is None):
+                raise EvaluationCliInputError(
+                    "READINESS_INPUT_INVALID",
+                    "Historical Protocol 2.2 options must be supplied together.",
+                )
+            initialize_readiness_v1(
+                run,
+                baseline_run_dir=_physical_run_path(args.baseline_run),
+                qualification_run_dir=_physical_run_path(args.qualification_run),
+                generation_run_dir=_physical_run_path(args.generation_run),
+                validation_receipt_path=_physical_run_path(args.validation_receipt),
+                historical_v22_run_dir=(
+                    None
+                    if historical_run_value is None
+                    else _physical_run_path(historical_run_value)
+                ),
+                historical_anonymous_label=cast(
+                    Literal["A", "B"] | None, historical_label
+                ),
+            )
+            context = load_verified_readiness_context_v1(run)
+            _eval_json(_readiness_status_payload(context))
+            return EVAL_EXIT_SUCCESS
+        if args.command == "eval-readiness-next":
+            request = next_readiness_request_v1(run)
+            _eval_json(None if request is None else request.model_dump(mode="json"))
+            context = load_verified_readiness_context_v1(run)
+            return _readiness_context_exit_code(context)
+        if args.command == "eval-readiness-submit-safe":
+            response = _read_guarded_readiness_response(args, run)
+            guarded = guarded_submit_readiness_response_v1(run, response)
+            submitted_context: VerifiedReadinessContextV1 | None = (
+                load_verified_readiness_context_v1(run) if guarded.accepted else None
+            )
+            _eval_json(_readiness_guarded_payload(guarded, submitted_context))
+            if not guarded.accepted:
+                return EVAL_EXIT_INPUT
+            assert submitted_context is not None
+            return _readiness_context_exit_code(submitted_context)
+        if args.command == "eval-readiness-status":
+            context = load_verified_readiness_context_v1(run)
+            _eval_json(_readiness_status_payload(context))
+            return _readiness_context_exit_code(context)
+        verification = verify_readiness_run_v1(run)
+        if not verification.valid:
+            _eval_json(
+                _readiness_verification_payload(
+                    None,
+                    valid=False,
+                    issue_codes=verification.issues,
+                )
+            )
+            return EVAL_EXIT_INTEGRITY
+        context = load_verified_readiness_context_v1(run)
+        _eval_json(
+            _readiness_verification_payload(
+                context,
+                valid=True,
+                issue_codes=verification.issues,
+            )
+        )
+        return _readiness_context_exit_code(context)
+    except (EvaluationCliInputError, EvaluationIntegrityError):
+        raise
+    except ReadinessInputError as error:
+        raise EvaluationCliInputError(
+            "READINESS_INPUT_INVALID", "The readiness input is invalid."
+        ) from error
+    except (OSError, RecursionError, TypeError, UnicodeError, ValidationError, ValueError) as error:
+        raise EvaluationCliInputError(
+            "READINESS_INPUT_INVALID", "The readiness command input is invalid."
+        ) from error
+
+
 def _generation_json(value: object) -> None:
     print(generation.canonical_json_bytes(value).decode("utf-8"))
 
@@ -1172,6 +1515,8 @@ def main(argv: list[str] | None = None) -> int:
         args = _parser().parse_args(argv)
         if args.command.startswith("eval-baseline-"):
             return _run_baseline_command(args)
+        if args.command.startswith("eval-readiness-"):
+            return _run_readiness_command(args)
         if args.command.startswith("eval-gen-"):
             return _run_generation_command(args)
         if args.command.startswith("eval-qualify-"):

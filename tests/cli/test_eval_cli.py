@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import json
 import shutil
 import subprocess
@@ -58,6 +59,57 @@ ATTORNEY_V22_FIXTURE = Path(__file__).parents[1] / "fixtures" / "attorney-eval-v
 ROOT = Path(__file__).parents[2]
 FULL_PUBLIC_RUNNER = ROOT / "scripts" / "harvest_skill.py"
 PORTABLE_PUBLIC_RUNNER = ROOT / "scripts" / "harvest_portable.py"
+
+_LEGACY_FULL_EVAL_HELP_SHA256 = {
+    "eval-baseline-init": "d1f1641f4dd8d24505c3ea8d955a620c15f0fc3b574aba898d438ff8fc84db75",
+    "eval-baseline-next": "367847de27511bd2a0b54bcd9f81ceb0a913181aaec2e9b04639ccf03406be9c",
+    "eval-baseline-submit-safe": "e82544e520debb391b4c07cf6cf042945c6e7e0bad9cbcdc0775cab74168b3be",
+    "eval-baseline-status": "eaa96286b94ffeb89456c75eb0898fe16f3afb67ec794e146fb528fdeba36ca5",
+    "eval-baseline-verify": "2147611fccb5cda86b572f75fa750cd90d2087011dc566499839890e5fa6f7bf",
+    "eval-init": "dcf6a1a94d1bca15211b05be2c0feafdec23e78f8a15b3ca0eaa462e8068e234",
+    "eval-next": "4a0abbd80ea3b30feef6d87d8d723f8a81585ba0978f25fac8925e6b20755586",
+    "eval-preflight": "5431884971e06354a1d93ef40ddc3079a40017a297f63d3b03cf1fb6843777c8",
+    "eval-submit": "0c682dc1314e51da7f9556a901efa195399863674321a78326a01bc029aab922",
+    "eval-submit-safe": "ff9d52254e10eb411c669f96c746622ed98d28309254d106cd80a7a89d84bb62",
+    "eval-stop-inconclusive": "201dc8b309fb70cfa61f3b77f47d41f1f5b9dacc3debb98e7a10f7efca170d6c",
+    "eval-status": "e1a6a403cc702e4b687f25b4057c5c625329dd9254fadae56a894265aeb85b34",
+    "eval-verify": "8cc2c3bf81680fb9d096b5eed3642f9eb81ede1407f8f6599c28d84a1e85b460",
+    "eval-resume": "6111cdbc830fa23055a6c2e8fee297d876ffe6f28ee7db19e91906ed1a6d9698",
+    "eval-qualify-init": "4dc6742d19259eba2f983f088098f02cf165488e16e3dca7265a252b6d56918a",
+    "eval-qualify-next": "0793fe4de07b18fb1931cfee9947088bc6477b10d591d04ab2929f7df2e773b5",
+    "eval-qualify-submit": "13811d043601e702a4277833300b8bd0619346bb5aace04c6fc2a5a7ee3bdc22",
+    "eval-qualify-status": "291e6aaa94a01fca2520afed918cbe16d088abf2812052115654518e304cb6c6",
+    "eval-qualify-verify": "e0f30e5393c65fa2bf4d74d825714c70650e9bfe0ff9364d76e967e614ba64a7",
+    "eval-gen-init": "b4de50e5aa5ba1290617fc0178a66ad6f0c935d8fc4fb00191a33354afd01707",
+    "eval-gen-next": "eb9a0f04f96251c9d9e4a87e53e1bead3c02e097bb9e8e70e0f936a5239ef88c",
+    "eval-gen-submit": "50ab154bf1f6cb3ed717e181152c3a0e131b72dacfd8488cbe6edd86e649ae93",
+    "eval-gen-status": "76ebdd0b7e6636988323045ec21b60c40250d1e858cbe1f4da64e924ea13abe7",
+    "eval-gen-verify": "e5060d62065fe30150b275ccf488efb89775930bdb85b202c670b6f8449160f0",
+}
+
+
+def test_legacy_full_evaluation_help_and_default_protocol_are_byte_stable() -> None:
+    for command, expected in _LEGACY_FULL_EVAL_HELP_SHA256.items():
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "attorney_eval_full.py"), command, "--help"],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        )
+        assert (result.returncode, result.stderr) == (0, b"")
+        assert hashlib.sha256(result.stdout).hexdigest() == expected
+
+    import importlib.util
+
+    runner_path = ROOT / "scripts" / "attorney_eval_full.py"
+    spec = importlib.util.spec_from_file_location("retained_cli_parser_snapshot", runner_path)
+    assert spec is not None and spec.loader is not None
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    parsed = runner._parser().parse_args(
+        ["eval-init", "--case", "case.json", "--run", "run", "--seed-hex", "0" * 64]
+    )
+    assert parsed.protocol == "2.1"
 
 
 def test_baseline_scripted_fixture_has_bounded_exhaustion_and_malformed_taxonomy() -> None:
