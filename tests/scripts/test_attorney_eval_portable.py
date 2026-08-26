@@ -90,6 +90,20 @@ from regulatory_harvest.evaluation.attorney_qualification import (
 from regulatory_harvest.evaluation.attorney_qualification import (
     verify_case_qualification as verify_qualification_core,
 )
+from regulatory_harvest.evaluation.attorney_readiness_drafts import (
+    CompiledReadinessDraftV1,
+    ReadinessEvaluatorProvenanceV1,
+    compile_readiness_draft_v1,
+)
+from regulatory_harvest.evaluation.attorney_readiness_workflow import (
+    guarded_submit_readiness_response_v1 as submit_readiness_core,
+)
+from regulatory_harvest.evaluation.attorney_readiness_workflow import (
+    initialize_readiness_v1 as initialize_readiness_core,
+)
+from regulatory_harvest.evaluation.attorney_readiness_workflow import (
+    next_readiness_request_v1 as next_readiness_core,
+)
 from regulatory_harvest.evaluation.attorney_scoring import (
     ReportScoreInputs,
 )
@@ -148,6 +162,13 @@ ROOT = Path(__file__).parents[2]
 SCRIPT = ROOT / "scripts" / "attorney_eval_portable.py"
 FIXTURE = ROOT / "tests" / "fixtures" / "attorney-eval"
 V2_FIXTURE = ROOT / "tests" / "fixtures" / "attorney-eval-v2"
+READINESS_RUBRIC = (
+    ROOT
+    / "src"
+    / "regulatory_harvest"
+    / "evaluation"
+    / "readiness-rubric-v1.json"
+)
 GOLDEN_ARTIFACTS = (
     "case-readiness.json",
     "legal-ledger.json",
@@ -196,6 +217,783 @@ def _load_protocol_22_portable() -> ModuleType:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_readiness_portable_rubric_asset_is_shared_exact_and_strict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Portable readiness consumes the one packaged policy asset without redeclaration."""
+    portable = _load_protocol_22_portable()
+    expected = READINESS_RUBRIC.read_bytes()
+    rubric_bytes, rubric, fingerprint = portable._readiness_rubric_v1()
+
+    assert rubric_bytes == expected
+    assert rubric == json.loads(expected)
+    assert fingerprint == hashlib.sha256(expected).hexdigest()
+
+    for name, mutated in (
+        ("duplicate", expected[:-1] + b',"version":"delivery-readiness-v1"}'),
+        (
+            "unknown-key",
+            canonical_json_bytes({**json.loads(expected), "unknown_policy_key": True}),
+        ),
+    ):
+        changed = tmp_path / f"readiness-rubric-{name}.json"
+        changed.write_bytes(mutated)
+        monkeypatch.setattr(portable, "_READINESS_RUBRIC_PATH", changed)
+        with pytest.raises(
+            portable.PortableEvaluationInputError,
+            match="READINESS_RUBRIC_INVALID",
+        ):
+            portable._readiness_rubric_v1()
+
+
+@pytest.mark.parametrize(
+    ("command", "flags"),
+    [
+        (
+            "eval-readiness-init",
+            (
+                "--baseline-run",
+                "--qualification-run",
+                "--generation-run",
+                "--validation-receipt",
+                "--historical-v22-run",
+                "--historical-report-label",
+                "--run",
+            ),
+        ),
+        ("eval-readiness-next", ("--run",)),
+        (
+            "eval-readiness-submit-safe",
+            (
+                "--run",
+                "--response",
+                "--provider-name",
+                "--model-name",
+                "--judge-isolation",
+            ),
+        ),
+        ("eval-readiness-status", ("--run",)),
+        ("eval-readiness-verify", ("--run",)),
+    ],
+)
+def test_readiness_portable_help_isolated(
+    command: str, flags: tuple[str, ...]
+) -> None:
+    completed = subprocess.run(
+        [
+            "python3",
+            "-I",
+            "-S",
+            str(ROOT / "scripts" / "harvest_portable.py"),
+            command,
+            "--help",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert (completed.returncode, completed.stderr) == (0, "")
+    assert f"harvest-skill {command}" in completed.stdout
+    for flag in flags:
+        assert flag in completed.stdout
+
+
+def test_readiness_initial_tree_full_portable_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Admission, projection, first request, manifest, and rubric bytes match exactly."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    full_run = tmp_path / "readiness-full"
+    portable_run = tmp_path / "readiness-portable"
+
+    initialize_readiness_core(
+        full_run,
+        baseline_run_dir=source.baseline_run_dir,
+        qualification_run_dir=source.qualification_run_dir,
+        generation_run_dir=source.generation_run_dir,
+        validation_receipt_path=source.validation_receipt_path,
+    )
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(
+        portable_run,
+        baseline_run_dir=source.baseline_run_dir,
+        qualification_run_dir=source.qualification_run_dir,
+        generation_run_dir=source.generation_run_dir,
+        validation_receipt_path=source.validation_receipt_path,
+        generation_substrate=generation,
+    )
+
+    assert _tree_bytes(portable_run) == _tree_bytes(full_run)
+    assert portable.next_readiness_request_v1(portable_run) == json.loads(
+        (full_run / "requests" / "grade-lane-1-GB-1-0001.json").read_text()
+    )
+
+
+def test_readiness_contested_request_and_compiler_full_portable_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Contested alternatives retain the exact full request and response contract."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    request_tests = __import__("test_attorney_readiness_requests")
+    draft_tests = __import__("test_attorney_readiness_drafts")
+    request_builders = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_requests",
+        fromlist=["*"],
+    )
+    inputs = request_tests.inputs.__wrapped__(tmp_path)
+    full_request = request_builders.build_baseline_locked_contested_grade_request_v1(
+        inputs,
+        lane=1,
+        contested_requirement_id="CONT-0001",
+    )
+    portable = _load_protocol_22_portable()
+    _, rubric, _ = portable._readiness_rubric_v1()
+    readiness_input = inputs.readiness_input.model_dump(mode="json")
+    contest = inputs.gradeable_baseline.contested_requirements[0].model_dump(mode="json")
+    portable_request = portable._readiness_contested_request(
+        readiness_input,
+        rubric,
+        lane=1,
+        contest=contest,
+    )
+    assert portable_request == full_request.model_dump(mode="json")
+
+    draft = draft_tests._contested_draft(full_request)
+    provenance = ReadinessEvaluatorProvenanceV1(
+        provider_name="portable-parity-provider",
+        model_name="portable-parity-model",
+        judge_isolation="scripted_fixture",
+    )
+    full_response = compile_readiness_draft_v1(full_request, draft, provenance)
+    assert isinstance(full_response, CompiledReadinessDraftV1)
+    portable_response = portable.compile_readiness_draft_v1(
+        portable_request,
+        copy.deepcopy(draft),
+        {
+            "provider_name": provenance.provider_name,
+            "model_name": provenance.model_name,
+            "judge_isolation": provenance.judge_isolation,
+        },
+    )
+    assert portable_response == full_response.response.model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+    (
+        "grade_mode",
+        "blocking_safety",
+        "disputes",
+        "referee_disposition",
+        "limitations",
+        "expected_delivery",
+    ),
+    [
+        ("met", False, False, None, None, "HIGH_ASSURANCE"),
+        ("met", True, False, None, None, "NOT_DELIVERABLE"),
+        ("review", False, False, None, None, "NOT_DELIVERABLE"),
+        ("review", False, True, None, None, "NOT_DELIVERABLE"),
+        ("review", False, True, "unresolved", None, "NOT_DELIVERABLE"),
+        ("met", False, False, None, "Machine translated.", "REVIEW_READY_WITH_GAPS"),
+    ],
+)
+def test_readiness_complete_terminal_tree_full_portable_parity(
+    grade_mode: str,
+    blocking_safety: bool,
+    disputes: bool,
+    referee_disposition: str | None,
+    limitations: str | None,
+    expected_delivery: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every accepted transition produces the same high or blocked complete tree."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    workflow = __import__("test_attorney_readiness_workflow")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=limitations)
+    full_run = tmp_path / "readiness-full"
+    portable_run = tmp_path / "readiness-portable"
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(
+        portable_run, **init, generation_substrate=generation
+    )
+    provenance = ReadinessEvaluatorProvenanceV1(
+        provider_name="portable-parity-provider",
+        model_name="portable-parity-model",
+        judge_isolation="scripted_fixture",
+    )
+
+    while True:
+        full_request = next_readiness_core(full_run)
+        portable_request = portable.next_readiness_request_v1(portable_run)
+        assert portable_request == (
+            None if full_request is None else full_request.model_dump(mode="json")
+        )
+        if full_request is None:
+            break
+        draft = workflow._draft(
+            full_request,
+            grade_mode=grade_mode,
+            blocking_safety=blocking_safety,
+            disputes=disputes,
+        )
+        if referee_disposition is not None and full_request.operation.value == "safety_referee":
+            draft["disposition"] = referee_disposition
+        full_compiled = compile_readiness_draft_v1(full_request, draft, provenance)
+        assert isinstance(full_compiled, CompiledReadinessDraftV1)
+        portable_response = portable.compile_readiness_draft_v1(
+            portable_request,
+            copy.deepcopy(draft),
+            {
+                "provider_name": provenance.provider_name,
+                "model_name": provenance.model_name,
+                "judge_isolation": provenance.judge_isolation,
+            },
+        )
+        assert portable_response == full_compiled.response.model_dump(mode="json")
+        full_result = submit_readiness_core(full_run, full_compiled.response)
+        portable_result = portable.guarded_submit_readiness_response_v1(
+            portable_run, portable_response
+        )
+        assert portable_result["accepted"] is full_result.accepted
+        assert _tree_bytes(portable_run) == _tree_bytes(full_run)
+
+    assert "delivery-readiness.json" in _tree_bytes(full_run)
+    assert portable.readiness_status_payload_v1(portable_run) == {
+        "baseline_locked_strict_equivalent_disposition": (
+            "FAIL" if grade_mode == "review" else "PASS"
+        ),
+        "delivery_readiness": expected_delivery,
+        "engine_paused": False,
+        "manifest_fingerprint": json.loads(
+            (full_run / "readiness-manifest.json").read_text()
+        )["manifest_fingerprint"],
+        "pending_operation": None,
+        "protocol_version": "delivery-readiness-v1",
+    }
+    expected_exit = 4 if expected_delivery == "NOT_DELIVERABLE" else 0
+    for command in (
+        "eval-readiness-next",
+        "eval-readiness-status",
+        "eval-readiness-verify",
+    ):
+        full_command = subprocess.run(
+            [
+                str(ROOT / ".venv" / "bin" / "python"),
+                str(ROOT / "scripts" / "attorney_eval_full.py"),
+                command,
+                "--run",
+                str(full_run),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        )
+        portable_command = subprocess.run(
+            [
+                "python3",
+                "-I",
+                "-S",
+                str(ROOT / "scripts" / "harvest_portable.py"),
+                command,
+                "--run",
+                str(portable_run),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        )
+        assert (
+            portable_command.returncode,
+            portable_command.stdout,
+            portable_command.stderr,
+        ) == (
+            full_command.returncode,
+            full_command.stdout,
+            full_command.stderr,
+        ) == (expected_exit, full_command.stdout, b"")
+
+
+def test_readiness_historical_v22_noncomparable_complete_tree_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verified history remains separately labeled and cannot alter the fresh tier."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    workflow = __import__("test_attorney_readiness_workflow")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    portable = _load_protocol_22_portable()
+    history = tmp_path / "historical-v22"
+    portable.initialize_evaluation_v22(_case_payload(), history, seed_hex="5" * 64)
+    for _ in range(32):
+        historical_request = portable.next_evaluator_request_v22(history)
+        if historical_request is None:
+            break
+        portable.submit_evaluator_response_v22(
+            history,
+            _protocol_22_storage_response(
+                portable, historical_request, disputed=False
+            ),
+        )
+    else:
+        pytest.fail("historical Protocol 2.2 run did not terminate")
+
+    source = inputs._make_verified_inputs(tmp_path / "current", limitations=None)
+    full_run = tmp_path / "readiness-history-full"
+    portable_run = tmp_path / "readiness-history-portable"
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+        "historical_v22_run_dir": history,
+        "historical_anonymous_label": "A",
+    }
+    initialize_readiness_core(full_run, **init)
+    portable.initialize_readiness_v1(
+        portable_run, **init, generation_substrate=generation
+    )
+    assert _tree_bytes(portable_run) == _tree_bytes(full_run)
+    provenance = ReadinessEvaluatorProvenanceV1(
+        provider_name="portable-parity-provider",
+        model_name="portable-parity-model",
+        judge_isolation="scripted_fixture",
+    )
+    while (full_request := next_readiness_core(full_run)) is not None:
+        portable_request = portable.next_readiness_request_v1(portable_run)
+        assert portable_request == full_request.model_dump(mode="json")
+        draft = workflow._draft(full_request, grade_mode="met")
+        full_response = compile_readiness_draft_v1(
+            full_request, draft, provenance
+        ).response
+        portable_response = portable.compile_readiness_draft_v1(
+            portable_request,
+            copy.deepcopy(draft),
+            {
+                "provider_name": provenance.provider_name,
+                "model_name": provenance.model_name,
+                "judge_isolation": provenance.judge_isolation,
+            },
+        )
+        assert portable_response == full_response.model_dump(mode="json")
+        assert submit_readiness_core(full_run, full_response).accepted
+        assert portable.guarded_submit_readiness_response_v1(
+            portable_run, portable_response
+        )["accepted"]
+        assert _tree_bytes(portable_run) == _tree_bytes(full_run)
+    result = json.loads((portable_run / "delivery-readiness.json").read_bytes())
+    assert result["delivery_readiness"] == "HIGH_ASSURANCE"
+    assert result["historical_v22_cross_check_status"] == "BASELINE_NOT_COMPARABLE"
+
+
+@pytest.mark.parametrize(
+    ("historical_grade", "expected_status"),
+    [
+        ("met", "BASELINE_NOT_COMPARABLE"),
+        ("not_met", "BASELINE_NOT_COMPARABLE"),
+    ],
+)
+def test_readiness_historical_v22_seed_orientation_tree_parity(
+    historical_grade: str,
+    expected_status: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both historical grade orientations stay noncomparable and tier-neutral."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    workflow = __import__("test_attorney_readiness_workflow")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path / "current", limitations=None)
+    portable = _load_protocol_22_portable()
+    baseline_input = source.baseline_context.baseline_input.model_dump(mode="json")
+    stable = source.baseline_context.baseline.model_dump(mode="json")
+    case = {
+        "schema_version": "1.1",
+        "case_id": "public-synthetic-history",
+        "mode": "closed-universe",
+        "question": baseline_input["question"],
+        "jurisdiction": baseline_input["jurisdiction"],
+        "as_of": baseline_input["as_of"],
+        "requested_authorities": copy.deepcopy(baseline_input["requested_authorities"]),
+        "sources": copy.deepcopy(baseline_input["sources"]),
+        "candidates": [
+            {
+                "candidate_id": "historical-report",
+                "role": "candidate",
+                "report_text": source.report_text,
+                "report_hash": hashlib.sha256(source.report_text.encode()).hexdigest(),
+                "validation_receipt": {"kind": "external"},
+            }
+        ],
+        "client_facts": baseline_input["client_facts"],
+    }
+    history = tmp_path / f"historical-{historical_grade}"
+    portable.initialize_evaluation_v22(case, history, seed_hex="6" * 64)
+    provenance = {
+        "provider_name": "portable-parity-provider",
+        "model_name": "portable-parity-model",
+        "judge_isolation": "scripted_fixture",
+    }
+    for _ in range(32):
+        request = portable.next_evaluator_request_v22(history)
+        if request is None:
+            break
+        payload = request["payload"]
+        if request["operation"] == "source_review_fragment":
+            draft = {
+                "proposals": [
+                    {
+                        "statement": requirement["statement"],
+                        "kind": requirement["kind"],
+                        "importance": requirement["importance"],
+                        "passages": [
+                            {
+                                "source_id": passage["source_id"],
+                                "quote": passage["quote"],
+                            }
+                            for passage in requirement["passages"]
+                        ],
+                        "dependency": requirement["dependency"],
+                        "confidence": requirement["confidence"],
+                        "rationale": requirement["substantive_rationale"],
+                    }
+                    for requirement in stable["requirements"]
+                ],
+                "review_complete": True,
+            }
+        elif request["operation"] == "source_audit_fragment":
+            draft = {"concerns": [], "audit_complete": True}
+        else:
+            assert request["operation"] == "ordinary_grade_fragment"
+            draft = {
+                "requirement_grades": [
+                    {
+                        "requirement_ordinal": ordinal,
+                        "disposition": historical_grade,
+                        "report_passages": [payload["report_text"]]
+                        if historical_grade == "met"
+                        else [],
+                        "rationale": "The historical report was independently graded.",
+                        "omission": None
+                        if historical_grade == "met"
+                        else "The historical report does not state the requirement.",
+                    }
+                    for ordinal, _ in enumerate(payload["requirements"], 1)
+                ],
+                "rationale": "The historical batch is complete.",
+            }
+        response, reasons = portable._v22_compile_draft(request, draft, provenance)
+        assert response is not None, reasons
+        portable.submit_evaluator_response_v22(history, response)
+    else:
+        pytest.fail("comparable historical Protocol 2.2 run did not terminate")
+
+    full_run = tmp_path / f"readiness-{historical_grade}-full"
+    portable_run = tmp_path / f"readiness-{historical_grade}-portable"
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+        "historical_v22_run_dir": history,
+        "historical_anonymous_label": "A",
+    }
+    initialize_readiness_core(full_run, **init)
+    portable.initialize_readiness_v1(
+        portable_run, **init, generation_substrate=generation
+    )
+    while (full_request := next_readiness_core(full_run)) is not None:
+        portable_request = portable.next_readiness_request_v1(portable_run)
+        assert portable_request == full_request.model_dump(mode="json")
+        draft = workflow._draft(full_request, grade_mode="met")
+        full_response = compile_readiness_draft_v1(
+            full_request,
+            draft,
+            ReadinessEvaluatorProvenanceV1(**provenance),
+        ).response
+        portable_response = portable.compile_readiness_draft_v1(
+            portable_request, copy.deepcopy(draft), provenance
+        )
+        assert submit_readiness_core(full_run, full_response).accepted
+        assert portable.guarded_submit_readiness_response_v1(
+            portable_run, portable_response
+        )["accepted"]
+        assert _tree_bytes(portable_run) == _tree_bytes(full_run)
+    result = json.loads((portable_run / "delivery-readiness.json").read_bytes())
+    assert result["delivery_readiness"] == "HIGH_ASSURANCE"
+    assert result["historical_v22_cross_check_status"] == expected_status
+
+
+def test_readiness_multi_batch_request_inventory_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Six-plus requirements preserve exact lane and batch request order."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    workflow = __import__("test_attorney_readiness_workflow")
+    readiness_workflow = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_workflow",
+        fromlist=["*"],
+    )
+    full_run, verified = workflow._initialize_verified_multi(monkeypatch, tmp_path)
+    portable = _load_protocol_22_portable()
+    persisted = json.loads((full_run / "readiness-input.json").read_bytes())
+    rubric = verified.readiness_rubric.model_dump(mode="json")
+    portable_requests = portable._readiness_grade_requests(
+        persisted["readiness_input"], rubric
+    )
+    full_requests = [
+        request.model_dump(mode="json")
+        for request in readiness_workflow._grade_requests(verified)
+    ]
+    assert portable_requests == full_requests
+    assert [request["payload"]["batch_ref"] for request in portable_requests[:2]] == [
+        "GB-1-0001",
+        "GB-1-0002",
+    ]
+
+
+def test_readiness_isolated_cli_init_next_submit_complete_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The isolated command family matches full stdout, stderr, exits, and every byte."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    workflow = __import__("test_attorney_readiness_workflow")
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    full_run = tmp_path / "readiness-full-cli"
+    portable_run = tmp_path / "readiness-portable-cli"
+
+    def command(
+        script: Path, name: str, *arguments: str, isolated: bool = False
+    ) -> subprocess.CompletedProcess[bytes]:
+        prefix = ["python3", "-I", "-S"] if isolated else [
+            str(ROOT / ".venv" / "bin" / "python")
+        ]
+        return subprocess.run(
+            [*prefix, str(script), name, *arguments],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        )
+
+    common = (
+        "--baseline-run",
+        str(source.baseline_run_dir),
+        "--qualification-run",
+        str(source.qualification_run_dir),
+        "--generation-run",
+        str(source.generation_run_dir),
+        "--validation-receipt",
+        str(source.validation_receipt_path),
+    )
+    full_init = command(
+        ROOT / "scripts" / "attorney_eval_full.py",
+        "eval-readiness-init",
+        *common,
+        "--run",
+        str(full_run),
+    )
+    portable_init = command(
+        ROOT / "scripts" / "harvest_portable.py",
+        "eval-readiness-init",
+        *common,
+        "--run",
+        str(portable_run),
+        isolated=True,
+    )
+    assert (
+        portable_init.returncode,
+        portable_init.stdout,
+        portable_init.stderr,
+    ) == (full_init.returncode, full_init.stdout, full_init.stderr) == (
+        0,
+        full_init.stdout,
+        b"",
+    )
+    assert _tree_bytes(portable_run) == _tree_bytes(full_run)
+
+    invalid = tmp_path / "invalid-readiness-draft.json"
+    invalid.write_bytes(b"{}")
+    before_full = _tree_bytes(full_run)
+    before_portable = _tree_bytes(portable_run)
+    invalid_metadata = (
+        "--provider-name",
+        "portable-parity-provider",
+        "--model-name",
+        "portable-parity-model",
+        "--judge-isolation",
+        "scripted_fixture",
+    )
+    full_invalid = command(
+        ROOT / "scripts" / "attorney_eval_full.py",
+        "eval-readiness-submit-safe",
+        "--run",
+        str(full_run),
+        "--response",
+        str(invalid),
+        *invalid_metadata,
+    )
+    portable_invalid = command(
+        ROOT / "scripts" / "harvest_portable.py",
+        "eval-readiness-submit-safe",
+        "--run",
+        str(portable_run),
+        "--response",
+        str(invalid),
+        *invalid_metadata,
+        isolated=True,
+    )
+    assert (
+        portable_invalid.returncode,
+        portable_invalid.stdout,
+        portable_invalid.stderr,
+    ) == (
+        full_invalid.returncode,
+        full_invalid.stdout,
+        full_invalid.stderr,
+    ) == (2, full_invalid.stdout, b"")
+    assert _tree_bytes(full_run) == before_full
+    assert _tree_bytes(portable_run) == before_portable
+    full_second_invalid = command(
+        ROOT / "scripts" / "attorney_eval_full.py",
+        "eval-readiness-submit-safe",
+        "--run",
+        str(full_run),
+        "--response",
+        str(invalid),
+        *invalid_metadata,
+    )
+    portable_second_invalid = command(
+        ROOT / "scripts" / "harvest_portable.py",
+        "eval-readiness-submit-safe",
+        "--run",
+        str(portable_run),
+        "--response",
+        str(invalid),
+        *invalid_metadata,
+        isolated=True,
+    )
+    assert (
+        portable_second_invalid.returncode,
+        portable_second_invalid.stdout,
+        portable_second_invalid.stderr,
+    ) == (
+        full_second_invalid.returncode,
+        full_second_invalid.stdout,
+        full_second_invalid.stderr,
+    ) == (2, full_second_invalid.stdout, b"")
+    for script, current_run, isolated in (
+        (ROOT / "scripts" / "attorney_eval_full.py", full_run, False),
+        (ROOT / "scripts" / "harvest_portable.py", portable_run, True),
+    ):
+        status = command(
+            script,
+            "eval-readiness-status",
+            "--run",
+            str(current_run),
+            isolated=isolated,
+        )
+        assert status.returncode == 0
+        assert json.loads(status.stdout)["engine_paused"] is False
+
+    ordinal = 0
+    while (request := next_readiness_core(full_run)) is not None:
+        ordinal += 1
+        draft = workflow._draft(request, grade_mode="met")
+        full_draft = tmp_path / f"full-draft-{ordinal}.json"
+        portable_draft = tmp_path / f"portable-draft-{ordinal}.json"
+        draft_bytes = canonical_json_bytes(draft)
+        full_draft.write_bytes(draft_bytes)
+        portable_draft.write_bytes(draft_bytes)
+        metadata = (
+            "--provider-name",
+            "portable-parity-provider",
+            "--model-name",
+            "portable-parity-model",
+            "--judge-isolation",
+            "scripted_fixture",
+        )
+        full_submit = command(
+            ROOT / "scripts" / "attorney_eval_full.py",
+            "eval-readiness-submit-safe",
+            "--run",
+            str(full_run),
+            "--response",
+            str(full_draft),
+            *metadata,
+        )
+        portable_submit = command(
+            ROOT / "scripts" / "harvest_portable.py",
+            "eval-readiness-submit-safe",
+            "--run",
+            str(portable_run),
+            "--response",
+            str(portable_draft),
+            *metadata,
+            isolated=True,
+        )
+        assert (
+            portable_submit.returncode,
+            portable_submit.stdout,
+            portable_submit.stderr,
+        ) == (
+            full_submit.returncode,
+            full_submit.stdout,
+            full_submit.stderr,
+        ) == (0, full_submit.stdout, b"")
+        assert _tree_bytes(portable_run) == _tree_bytes(full_run)
+
+    for run in (full_run, portable_run):
+        response_path = run / "responses" / "safety-lane-2.json"
+        response = json.loads(response_path.read_bytes())
+        response["provider_name"] = "tampered-provider"
+        response_path.write_bytes(canonical_json_bytes(response))
+    full_verify = command(
+        ROOT / "scripts" / "attorney_eval_full.py",
+        "eval-readiness-verify",
+        "--run",
+        str(full_run),
+    )
+    portable_verify = command(
+        ROOT / "scripts" / "harvest_portable.py",
+        "eval-readiness-verify",
+        "--run",
+        str(portable_run),
+        isolated=True,
+    )
+    assert (
+        portable_verify.returncode,
+        portable_verify.stdout,
+        portable_verify.stderr,
+    ) == (
+        full_verify.returncode,
+        full_verify.stdout,
+        full_verify.stderr,
+    ) == (5, full_verify.stdout, b"")
 
 
 def test_baseline_parity_policy_asset_is_exact_and_strict(

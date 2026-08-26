@@ -8439,6 +8439,26 @@ def _parser() -> argparse.ArgumentParser:
     baseline_status_parser.add_argument("--run", required=True)
     baseline_verify_parser = subparsers.add_parser("eval-baseline-verify")
     baseline_verify_parser.add_argument("--run", required=True)
+    readiness_init_parser = subparsers.add_parser("eval-readiness-init")
+    readiness_init_parser.add_argument("--baseline-run", required=True)
+    readiness_init_parser.add_argument("--qualification-run", required=True)
+    readiness_init_parser.add_argument("--generation-run", required=True)
+    readiness_init_parser.add_argument("--validation-receipt", required=True)
+    readiness_init_parser.add_argument("--run", required=True)
+    readiness_init_parser.add_argument("--historical-v22-run")
+    readiness_init_parser.add_argument(
+        "--historical-report-label", choices=("A", "B")
+    )
+    readiness_next_parser = subparsers.add_parser("eval-readiness-next")
+    readiness_next_parser.add_argument("--run", required=True)
+    readiness_submit_parser = subparsers.add_parser("eval-readiness-submit-safe")
+    readiness_submit_parser.add_argument("--run", required=True)
+    readiness_submit_parser.add_argument("--response", required=True)
+    _add_payload_response_arguments(readiness_submit_parser)
+    readiness_status_parser = subparsers.add_parser("eval-readiness-status")
+    readiness_status_parser.add_argument("--run", required=True)
+    readiness_verify_parser = subparsers.add_parser("eval-readiness-verify")
+    readiness_verify_parser.add_argument("--run", required=True)
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("--charter", required=True)
     prepare_parser.add_argument("--matter", required=True)
@@ -9857,6 +9877,108 @@ def _run_baseline_command(args: argparse.Namespace) -> int:
         ) from error
 
 
+def _run_readiness_command(args: argparse.Namespace) -> int:
+    """Run the dependency-free delivery-readiness companion."""
+    sub = _evaluation_substrate()
+    run = _physical_eval_run_path(args.run)
+
+    def readiness_exit() -> int:
+        status = sub.readiness_status_payload_v1(run)
+        if status["delivery_readiness"] == "NOT_DELIVERABLE":
+            return EVAL_EXIT_FAIL
+        return EVAL_EXIT_SUCCESS
+
+    try:
+        if args.command == "eval-readiness-init":
+            historical_run = getattr(args, "historical_v22_run", None)
+            historical_label = getattr(args, "historical_report_label", None)
+            if (historical_run is None) != (historical_label is None):
+                raise PortableInputError(
+                    "READINESS_INPUT_INVALID",
+                    "Historical Protocol 2.2 options must be supplied together.",
+                )
+            sub.initialize_readiness_v1(
+                run,
+                baseline_run_dir=_physical_eval_run_path(args.baseline_run),
+                qualification_run_dir=_physical_eval_run_path(args.qualification_run),
+                generation_run_dir=_physical_eval_run_path(args.generation_run),
+                validation_receipt_path=Path(args.validation_receipt),
+                historical_v22_run_dir=(
+                    None
+                    if historical_run is None
+                    else _physical_eval_run_path(historical_run)
+                ),
+                historical_anonymous_label=historical_label,
+                generation_substrate=_generation_substrate(),
+            )
+        elif args.command == "eval-readiness-next":
+            _eval_json(sub, sub.next_readiness_request_v1(run))
+            return readiness_exit()
+        elif args.command == "eval-readiness-submit-safe":
+            value = _portable_guarded_eval_response(sub, Path(args.response))
+            metadata = (
+                getattr(args, "provider_name", None),
+                getattr(args, "model_name", None),
+                getattr(args, "judge_isolation", None),
+            )
+            response: object = value
+            if any(item is not None for item in metadata):
+                if value is None or any(item is None for item in metadata):
+                    response = None
+                else:
+                    request = sub.next_readiness_request_v1(run)
+                    if request is None:
+                        response = None
+                    else:
+                        try:
+                            response = sub.compile_readiness_draft_v1(
+                                request,
+                                value,
+                                {
+                                    "provider_name": metadata[0],
+                                    "model_name": metadata[1],
+                                    "judge_isolation": metadata[2],
+                                },
+                            )
+                        except (sub.PortableEvaluationInputError, TypeError, ValueError):
+                            response = None
+            try:
+                guarded = sub.guarded_submit_readiness_response_v1(run, response)
+            except (sub.PortableEvaluationInputError, TypeError, ValueError):
+                guarded = {"accepted": False}
+            accepted = guarded.get("accepted") is True
+            payload: dict[str, object] = {
+                "accepted": accepted,
+                "preflight": {
+                    "diagnostics": (
+                        [] if accepted else [sub.READINESS_EXTERNAL_RESPONSE_INVALID]
+                    ),
+                    "valid": accepted,
+                },
+            }
+            if accepted:
+                payload["status"] = sub.readiness_status_payload_v1(run)
+            _eval_json(sub, payload)
+            return readiness_exit() if accepted else EVAL_EXIT_INPUT
+        elif args.command == "eval-readiness-status":
+            _eval_json(sub, sub.readiness_status_payload_v1(run))
+            return readiness_exit()
+        else:
+            verification = sub.verify_readiness_run_v1(run)
+            _eval_json(sub, sub.readiness_verification_payload_v1(run, verification))
+            return readiness_exit() if verification["valid"] else EVAL_EXIT_INTEGRITY
+        _eval_json(sub, sub.readiness_status_payload_v1(run))
+        return EVAL_EXIT_SUCCESS
+    except PortableInputError:
+        raise
+    except sub.PortableEvaluationInputError as error:
+        raise PortableInputError(
+            "READINESS_INPUT_INVALID", "The readiness command input is invalid."
+        ) from error
+    except sub.EvaluationIntegrityError as error:
+        raise _EvaluationIntegrityError(str(error)) from error
+
+
 def _run_qualification_command(args: argparse.Namespace) -> int:
     sub = _evaluation_substrate()
     run = _physical_eval_run_path(args.run)
@@ -9952,6 +10074,8 @@ def main(argv: list[str] | None = None) -> int:
         args = _parser().parse_args(argv)
         if args.command.startswith("eval-baseline-"):
             return _run_baseline_command(args)
+        if args.command.startswith("eval-readiness-"):
+            return _run_readiness_command(args)
         if args.command.startswith("eval-gen-"):
             return _run_generation_command(args)
         if args.command.startswith("eval-qualify-"):
