@@ -2172,6 +2172,10 @@ def test_readiness_templates_are_canonical_public_and_validate_exact_outer_contr
     assert readiness_input.report_text == (
         READINESS_FIXTURE / "stable" / "report-high-assurance.md"
     ).read_text(encoding="utf-8")
+    assert readiness_input.generation_capsule_root == "0" * 64
+    assert readiness_input.generation_validation.receipt_hash == "0" * 64
+    assert readiness_input.generation_validation.bundle_hash == "0" * 64
+    assert readiness_input.generation_validation.coverage_review_hash == "0" * 64
 
     response = ReadinessEvaluatorResponseV1.model_validate(
         json.loads(response_path.read_bytes())
@@ -2812,6 +2816,8 @@ def test_readiness_guidance_publishes_the_complete_experimental_contract() -> No
         "historical delta",
         "aggregate baseline-correction rate",
         "tests/fixtures/attorney-readiness-v1/stable",
+        "illustrative, non-verifying integrity hashes",
+        "must not be submitted to `eval-readiness-init`",
     ):
         assert required.casefold() in combined.casefold(), required
 

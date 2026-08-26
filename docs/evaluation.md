@@ -243,12 +243,20 @@ Repeat `next` and `submit-safe` until terminal. Run the same sequence with
 reproducible assertion that their source, report, validation, request, response,
 tree, tier, and handoff bytes match the licensed fixture.
 
-`assets/attorney-delivery-readiness-input.template.json` is the canonical public
-JSON-wire representation of the exact `ReadinessInputV1` contract produced by the
-high-assurance fixture. Strict typed consumers rehydrate the embedded baseline
-`evaluation_rubric_bytes` and `importance_policy_bytes` UTF-8 strings as bytes before
-model validation, exactly as readiness artifact admission does. The response template
-validates directly as `ReadinessEvaluatorResponseV1` and its operation payload.
+`assets/attorney-delivery-readiness-input.template.json` is a canonical,
+schema-valid public JSON-wire example of the exact `ReadinessInputV1` shape. It carries
+the licensed fixture's source, five-requirement projection, and high-assurance report,
+but uses all-zero, illustrative, non-verifying integrity hashes for the generation
+capsule, receipt, bundle, and coverage review. Those values cannot authenticate a
+physical run because receipt and artifact bytes are materialized in the operator's
+access-controlled work directory. The example must not be submitted to `eval-readiness-init`,
+used as verification evidence, or described as fixture output.
+The init command derives authenticated values only from the verified prerequisite
+runs and full validation receipt. For schema inspection, strict typed consumers
+rehydrate the embedded baseline `evaluation_rubric_bytes` and
+`importance_policy_bytes` UTF-8 strings as bytes before model validation, exactly as
+readiness artifact admission does. The response template validates directly as
+`ReadinessEvaluatorResponseV1` and its operation payload.
 
 Repeat `next` and `submit-safe` only for the exact pending request. Every fresh grade,
 safety, referee, and repair role requires a genuinely fresh context. A rejected
