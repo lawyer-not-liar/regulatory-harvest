@@ -237,6 +237,15 @@ def test_readiness_portable_rubric_asset_is_shared_exact_and_strict(
             "unknown-key",
             canonical_json_bytes({**json.loads(expected), "unknown_policy_key": True}),
         ),
+        (
+            "unchanged-version-floor-drift",
+            canonical_json_bytes(
+                {
+                    **json.loads(expected),
+                    "review_ready_weighted_coverage_floor": 0.1,
+                }
+            ),
+        ),
     ):
         changed = tmp_path / f"readiness-rubric-{name}.json"
         changed.write_bytes(mutated)
@@ -336,6 +345,254 @@ def test_readiness_initial_tree_full_portable_parity(
     assert portable.next_readiness_request_v1(portable_run) == json.loads(
         (full_run / "requests" / "grade-lane-1-GB-1-0001.json").read_text()
     )
+
+
+def test_readiness_portable_rejects_nested_output_and_tampered_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Portable admission and next fail closed at the same physical/hash boundaries."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    portable = _load_protocol_22_portable()
+    with pytest.raises(ValueError, match="READINESS_OUTPUT_OVERLAPS_INPUT"):
+        initialize_readiness_core(source.baseline_run_dir / "nested-full", **init)
+    with pytest.raises(
+        portable.PortableEvaluationInputError,
+        match="READINESS_OUTPUT_OVERLAPS_INPUT",
+    ):
+        portable.initialize_readiness_v1(
+            source.baseline_run_dir / "nested-portable",
+            **init,
+            generation_substrate=generation,
+        )
+    assert not (source.baseline_run_dir / "nested-full").exists()
+    assert not (source.baseline_run_dir / "nested-portable").exists()
+
+    full_run = tmp_path / "tampered-next-full"
+    portable_run = tmp_path / "tampered-next-portable"
+    initialize_readiness_core(full_run, **init)
+    portable.initialize_readiness_v1(
+        portable_run, **init, generation_substrate=generation
+    )
+    for run in (full_run, portable_run):
+        manifest = json.loads((run / "readiness-manifest.json").read_bytes())
+        request_path = manifest["pending_call"]["request_artifact_path"]
+        request = json.loads((run / request_path).read_bytes())
+        request["system_instructions"] += " tampered"
+        (run / request_path).write_bytes(canonical_json_bytes(request))
+    with pytest.raises(Exception, match="READINESS_ARTIFACT_ARTIFACT_HASH"):
+        next_readiness_core(full_run)
+    with pytest.raises(
+        portable.EvaluationIntegrityError, match="READINESS_ARTIFACT_HASH"
+    ):
+        portable.next_readiness_request_v1(portable_run)
+
+
+def test_readiness_portable_rejects_private_qualification_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Qualification text containing a private absolute path is never persisted."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(
+        tmp_path,
+        limitations="See /private/client-matter/source.txt before delivery.",
+    )
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    portable = _load_protocol_22_portable()
+    full_run = tmp_path / "private-full"
+    portable_run = tmp_path / "private-portable"
+    with pytest.raises(Exception, match="READINESS_QUALIFICATION_INVALID"):
+        initialize_readiness_core(full_run, **init)
+    with pytest.raises(
+        portable.PortableEvaluationInputError,
+        match="READINESS_QUALIFICATION_INVALID",
+    ):
+        portable.initialize_readiness_v1(
+            portable_run, **init, generation_substrate=generation
+        )
+    assert not full_run.exists()
+    assert not portable_run.exists()
+
+
+def test_readiness_portable_rejects_forged_validation_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A canonical but non-replayable bundle cannot satisfy readiness admission."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    receipt = json.loads(source.validation_receipt_path.read_bytes())
+    Path(receipt["bundle"]).write_bytes(b"{}")
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    full_run = tmp_path / "forged-validation-full"
+    portable_run = tmp_path / "forged-validation-portable"
+    with pytest.raises(Exception, match="READINESS_VALIDATION_RECEIPT_INVALID"):
+        initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    with pytest.raises(
+        portable.PortableEvaluationInputError,
+        match="READINESS_VALIDATION_RECEIPT_INVALID",
+    ):
+        portable.initialize_readiness_v1(
+            portable_run, **init, generation_substrate=generation
+        )
+    assert not full_run.exists()
+    assert not portable_run.exists()
+
+
+def test_readiness_portable_rejects_generic_safety_rationale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Generic safety rationale is refused before either controller can persist it."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    workflow = __import__("test_attorney_readiness_workflow")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations="Machine translated.")
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    full_run = tmp_path / "generic-rationale-full"
+    portable_run = tmp_path / "generic-rationale-portable"
+    initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(
+        portable_run, **init, generation_substrate=generation
+    )
+    provenance = ReadinessEvaluatorProvenanceV1(
+        provider_name="portable-parity-provider",
+        model_name="portable-parity-model",
+        judge_isolation="scripted_fixture",
+    )
+    while True:
+        request = next_readiness_core(full_run)
+        portable_request = portable.next_readiness_request_v1(portable_run)
+        assert request is not None
+        assert portable_request == request.model_dump(mode="json")
+        draft = workflow._draft(request, grade_mode="met")
+        if request.operation.value == "safety_review":
+            break
+        full_response = compile_readiness_draft_v1(
+            request, draft, provenance
+        ).response
+        portable_response = portable.compile_readiness_draft_v1(
+            portable_request,
+            copy.deepcopy(draft),
+            {
+                "provider_name": provenance.provider_name,
+                "model_name": provenance.model_name,
+                "judge_isolation": provenance.judge_isolation,
+            },
+        )
+        assert submit_readiness_core(full_run, full_response).accepted
+        assert portable.guarded_submit_readiness_response_v1(
+            portable_run, portable_response
+        )["accepted"]
+    cast(dict[str, object], cast(list[object], draft["candidate_assessments"])[0])[
+        "why_unresolved"
+    ] = "more research needed"
+    full_outcome = compile_readiness_draft_v1(request, draft, provenance)
+    assert tuple(item.value for item in full_outcome.reason_codes) == (
+        "RATIONALE_GENERIC",
+    )
+    with pytest.raises(
+        portable.PortableEvaluationInputError, match="READINESS_DRAFT_INVALID"
+    ):
+        portable.compile_readiness_draft_v1(
+            portable_request,
+            copy.deepcopy(draft),
+            {
+                "provider_name": provenance.provider_name,
+                "model_name": provenance.model_name,
+                "judge_isolation": provenance.judge_isolation,
+            },
+        )
+    assert _tree_bytes(portable_run) == _tree_bytes(full_run)
+
+
+def test_readiness_portable_rejects_resealed_unknown_manifest_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Canonical resealing cannot smuggle an unknown manifest field past verification."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    artifacts = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_artifacts",
+        fromlist=["*"],
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    full_run = tmp_path / "unknown-manifest-full"
+    portable_run = tmp_path / "unknown-manifest-portable"
+    initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(
+        portable_run, **init, generation_substrate=generation
+    )
+    for run in (full_run, portable_run):
+        path = run / "readiness-manifest.json"
+        manifest = json.loads(path.read_bytes())
+        manifest["unknown"] = True
+        body = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"manifest_fingerprint", "root_hash"}
+        }
+        manifest["manifest_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(body)
+        ).hexdigest()
+        manifest["root_hash"] = hashlib.sha256(
+            canonical_json_bytes(
+                {key: value for key, value in manifest.items() if key != "root_hash"}
+            )
+        ).hexdigest()
+        path.write_bytes(canonical_json_bytes(manifest))
+    full_verification = artifacts.verify_readiness_run_v1(full_run)
+    portable_verification = portable.verify_readiness_run_v1(portable_run)
+    assert full_verification.valid is False
+    assert full_verification.issues == ("READINESS_ARTIFACT_INVALID",)
+    assert portable_verification["valid"] is False
+    assert portable_verification["issues"] == ["READINESS_ARTIFACT_INVALID"]
 
 
 def test_readiness_contested_request_and_compiler_full_portable_parity(

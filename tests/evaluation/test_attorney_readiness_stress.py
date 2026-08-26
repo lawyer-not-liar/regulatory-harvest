@@ -12,6 +12,7 @@ from types import ModuleType
 import pytest
 
 from regulatory_harvest.evaluation.attorney_readiness_drafts import (
+    CompiledReadinessDraftV1,
     ReadinessEvaluatorProvenanceV1,
     compile_readiness_draft_v1,
 )
@@ -57,28 +58,7 @@ def test_readiness_seeded_scoring_boundary_matrix(
         / "evaluation"
         / "readiness-rubric-v1.json"
     ).read_bytes()
-    assert vector["minimum_lane_weighted_coverage"] in {
-        0.69,
-        0.70,
-        0.71,
-        0.89,
-        0.90,
-        0.91,
-    }
-    assert vector["requirement_count"] in {0, 1, 5, 6, 52, 128, 129}
-    assert vector["gap_count"] in {0, 1, 5, 6, 21, 129}
-    assert vector["fresh_disposition"] in {"PASS", "FAIL", "INCONCLUSIVE"}
-    assert vector["historical_disposition"] in {
-        None,
-        "PASS",
-        "FAIL",
-        "INCONCLUSIVE",
-    }
-    assert vector["readiness_tier"] in {
-        "HIGH_ASSURANCE",
-        "REVIEW_READY_WITH_GAPS",
-        "NOT_DELIVERABLE",
-    }
+    assert vector["grade_mode"] in {"met", "review", "inconclusive"}
     assert vector["rationale_kind"] in full_rubric["rationale_kinds"]
     assert vector["follow_up_code"] in full_rubric["follow_up_codes"]
     assert vector["owner_role"] in full_rubric["owner_roles"]
@@ -93,7 +73,7 @@ def test_readiness_seeded_scoring_boundary_matrix(
     source = inputs._make_verified_inputs(
         tmp_path / "inputs",
         limitations=(
-            None if vector["gap_count"] == 0 else f"Synthetic limitation seed {seed}."
+            "Machine translated." if vector["declared_limitation"] else None
         ),
     )
     full_run = tmp_path / "full"
@@ -113,14 +93,9 @@ def test_readiness_seeded_scoring_boundary_matrix(
         model_name="public-stress-model",
         judge_isolation="scripted_fixture",
     )
-    grade_mode = (
-        "met"
-        if vector["minimum_lane_weighted_coverage"]
-        >= full_rubric["high_assurance_weighted_coverage_floor"]
-        else "review"
-    )
-    blocking = seed % 11 == 0
-    disputes = seed % 13 == 0 and grade_mode == "review"
+    grade_mode = vector["grade_mode"]
+    blocking = vector["blocking_safety"]
+    disputes = vector["lane_dispute"]
     transcript: list[tuple[bytes, bytes]] = []
     while (full_request := next_readiness_request_v1(full_run)) is not None:
         portable_request = portable.next_readiness_request_v1(portable_run)
@@ -131,12 +106,79 @@ def test_readiness_seeded_scoring_boundary_matrix(
         ).encode()
         portable_request_bytes = portable.canonical_json_bytes(portable_request)
         assert portable_request_bytes == full_request_bytes
+        if vector["interrupt_resume"]:
+            assert portable.next_readiness_request_v1(portable_run) == portable_request
+            assert portable.readiness_status_payload_v1(portable_run)[
+                "pending_operation"
+            ]["operation"] == full_request.operation.value
         draft = workflow._draft(
             full_request,
             grade_mode=grade_mode,
             blocking_safety=blocking,
             disputes=disputes,
         )
+        if full_request.operation.value == "safety_review":
+            probe = workflow._draft(
+                full_request,
+                grade_mode=grade_mode,
+                blocking_safety=True,
+                disputes=disputes,
+            )
+            target = probe["finding_proposals"][0]
+            target["rationale_kind"] = vector["rationale_kind"]
+            target["follow_up_code"] = vector["follow_up_code"]
+            target["owner_role"] = vector["owner_role"]
+            target["visibility"] = vector["visibility"]
+            target["blocking_code"] = vector["blocking_code"]
+            dispute_field = {
+                "finding_existence": "subject_id",
+                "rationale": "shortfall_description",
+                "evidence_binding": "evidence_refs",
+                "visibility": "visibility",
+                "blocker": "blocking_code",
+                "follow_up": "follow_up_code",
+                "owner": "owner_role",
+                "resolution_test": "resolution_test",
+            }[vector["dispute_kind"]]
+            assert dispute_field in target
+            if vector["normalization"] or vector["one_repair_success"] or vector[
+                "second_refusal_pause"
+            ]:
+                target["why_unresolved"] = "more research is needed"
+            attempts = 2 if vector["second_refusal_pause"] else 1
+            before_probe = {
+                path.relative_to(full_run).as_posix(): path.read_bytes()
+                for path in sorted(full_run.rglob("*"))
+                if path.is_file()
+            }
+            for _ in range(attempts):
+                full_probe = compile_readiness_draft_v1(
+                    full_request, deepcopy(probe), provenance
+                )
+                try:
+                    portable_probe = portable.compile_readiness_draft_v1(
+                        portable_request,
+                        deepcopy(probe),
+                        {
+                            "provider_name": provenance.provider_name,
+                            "model_name": provenance.model_name,
+                            "judge_isolation": provenance.judge_isolation,
+                        },
+                    )
+                except portable.PortableEvaluationInputError:
+                    assert not isinstance(full_probe, CompiledReadinessDraftV1)
+                else:
+                    assert isinstance(full_probe, CompiledReadinessDraftV1)
+                    assert portable_probe == full_probe.response.model_dump(mode="json")
+            assert {
+                path.relative_to(full_run).as_posix(): path.read_bytes()
+                for path in sorted(full_run.rglob("*"))
+                if path.is_file()
+            } == before_probe
+            if vector["second_refusal_pause"]:
+                assert portable.readiness_status_payload_v1(portable_run)[
+                    "engine_paused"
+                ] is False
         full_response = compile_readiness_draft_v1(
             full_request, draft, provenance
         ).response
@@ -186,15 +228,10 @@ def test_readiness_stress_matrix_covers_every_declared_dimension() -> None:
     vectors = [portable._readiness_stress_vector_v1(seed, rubric) for seed in range(96)]
 
     for field, expected in (
-        ("requirement_count", {0, 1, 5, 6, 52, 128, 129}),
-        ("gap_count", {0, 1, 5, 6, 21, 129}),
-        ("minimum_lane_weighted_coverage", {0.69, 0.70, 0.71, 0.89, 0.90, 0.91}),
-        ("fresh_disposition", {"PASS", "FAIL", "INCONCLUSIVE"}),
-        ("historical_disposition", {None, "PASS", "FAIL", "INCONCLUSIVE"}),
-        (
-            "readiness_tier",
-            {"HIGH_ASSURANCE", "REVIEW_READY_WITH_GAPS", "NOT_DELIVERABLE"},
-        ),
+        ("grade_mode", {"met", "review", "inconclusive"}),
+        ("declared_limitation", {False, True}),
+        ("blocking_safety", {False, True}),
+        ("lane_dispute", {False, True}),
         ("rationale_kind", set(rubric["rationale_kinds"])),
         ("follow_up_code", set(rubric["follow_up_codes"])),
         ("owner_role", set(rubric["owner_roles"])),

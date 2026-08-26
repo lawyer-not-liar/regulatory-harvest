@@ -8160,6 +8160,315 @@ def _render_audit(bundle: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _readiness_replay_generation_validation_v1(
+    *,
+    draft: dict[str, Any],
+    dossier: dict[str, Any],
+    bundle: dict[str, Any],
+    coverage: dict[str, Any],
+    draft_bytes: bytes,
+    dossier_bytes: bytes,
+    coverage_bytes: bytes,
+    report_bytes: bytes,
+    receipt: dict[str, Any],
+) -> None:
+    """Replay the portable generation proof consumed by delivery readiness.
+
+    This deliberately shares the retained generation algorithms instead of
+    introducing a second set of coverage or validation thresholds.
+    """
+    if set(dossier) != {
+        "coverage_contract_version",
+        "evidence_inventory",
+        "gaps",
+        "request",
+        "schema_version",
+        "source_mode",
+        "source_unit_inventory",
+        "sources",
+    } or dossier.get("schema_version") != "1.0":
+        raise PortableInputError("INVALID_DOSSIER", "The validation dossier is invalid.")
+    raw_sources = dossier.get("sources")
+    raw_gaps = dossier.get("gaps")
+    request = dossier.get("request")
+    if (
+        not isinstance(raw_sources, list)
+        or not isinstance(raw_gaps, list)
+        or not isinstance(request, dict)
+    ):
+        raise PortableInputError("INVALID_DOSSIER", "The validation dossier is invalid.")
+    if set(request) != {
+        "as_of",
+        "context",
+        "excluded_topics",
+        "jurisdictions",
+        "matter_title",
+        "output_instructions",
+        "question",
+        "request_id",
+        "source_inputs",
+        "source_mode",
+    }:
+        raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
+    for key in ("request_id", "question"):
+        if (
+            not isinstance(request[key], str)
+            or request[key] != request[key].strip()
+            or not request[key]
+        ):
+            raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
+    for key in ("matter_title", "context", "output_instructions"):
+        value = request[key]
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
+    try:
+        if date.fromisoformat(request["as_of"]).isoformat() != request["as_of"]:
+            raise ValueError
+    except (TypeError, ValueError) as error:
+        raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.") from error
+    jurisdictions = request["jurisdictions"]
+    excluded_topics = request["excluded_topics"]
+    source_inputs = request["source_inputs"]
+    if (
+        request["source_mode"] not in {"provided-only", "web"}
+        or not isinstance(jurisdictions, list)
+        or not jurisdictions
+        or any(not isinstance(item, str) or not item.strip() for item in jurisdictions)
+        or len(jurisdictions) != len(set(jurisdictions))
+        or not isinstance(excluded_topics, list)
+        or any(not isinstance(item, str) for item in excluded_topics)
+        or not isinstance(source_inputs, list)
+        or not source_inputs
+    ):
+        raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
+    source_input_fields = {
+        "authority_type",
+        "canonical_url",
+        "citation",
+        "effective_date",
+        "jurisdiction",
+        "language",
+        "license_assertion",
+        "location",
+        "publisher",
+        "source_quality",
+        "source_role",
+        "supersession",
+        "title",
+    }
+    for raw_input in source_inputs:
+        if not isinstance(raw_input, dict) or set(raw_input) != source_input_fields:
+            raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
+        if (
+            not isinstance(raw_input["location"], str)
+            or not raw_input["location"].strip()
+            or raw_input["source_quality"] not in SOURCE_QUALITIES
+            or raw_input["source_role"] not in SOURCE_ROLES | {None}
+            or not isinstance(raw_input["license_assertion"], str)
+        ):
+            raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
+        try:
+            canonical_url = _canonical_public_url(
+                raw_input["canonical_url"], "request canonical URL"
+            )
+            if canonical_url != raw_input["canonical_url"]:
+                raise ValueError
+        except (PortableInputError, ValueError) as error:
+            raise PortableInputError(
+                "INVALID_REQUEST", "The validation request is invalid."
+            ) from error
+        if raw_input["language"] is not None and (
+            not isinstance(raw_input["language"], str) or not raw_input["language"].strip()
+        ):
+            raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
+    for raw_gap in raw_gaps:
+        if not isinstance(raw_gap, dict) or set(raw_gap) != {
+            "category",
+            "code",
+            "gap_id",
+            "jurisdiction",
+            "message",
+            "presentation_role",
+            "source_ids",
+        }:
+            raise PortableInputError("INVALID_DOSSIER", "The validation dossier is invalid.")
+        if (
+            any(
+                not isinstance(raw_gap[key], str) or not raw_gap[key].strip()
+                for key in ("gap_id", "code", "message")
+            )
+            or raw_gap["category"] not in ISSUE_CATEGORIES
+            or raw_gap["presentation_role"] not in PRESENTATION_ROLES | {None}
+            or (
+                raw_gap["jurisdiction"] is not None
+                and not isinstance(raw_gap["jurisdiction"], str)
+            )
+            or not isinstance(raw_gap["source_ids"], list)
+            or any(not isinstance(item, str) for item in raw_gap["source_ids"])
+        ):
+            raise PortableInputError("INVALID_DOSSIER", "The validation dossier is invalid.")
+    sources: list[dict[str, Any]] = []
+    for raw_source in raw_sources:
+        source = _portable_source_record(raw_source)
+        if source is None:
+            raise PortableInputError("INVALID_DOSSIER", "The validation dossier is invalid.")
+        sources.append(source)
+    evidence_inventory = _build_evidence_inventory(sources)
+    source_unit_inventory = _build_source_unit_inventory(sources)
+    contract_version = dossier.get("coverage_contract_version")
+    expected_dossier = {
+        "schema_version": "1.0",
+        "coverage_contract_version": contract_version,
+        "source_mode": request.get("source_mode"),
+        "request": request,
+        "sources": sources,
+        "gaps": raw_gaps,
+        "evidence_inventory": evidence_inventory,
+        "source_unit_inventory": source_unit_inventory,
+    }
+    if (
+        contract_version not in {COVERAGE_CONTRACT_VERSION, ATOMIC_COVERAGE_CONTRACT_VERSION}
+        or dossier.get("source_mode") != request.get("source_mode")
+        or dossier != expected_dossier
+        or dossier_bytes != _canonical_bytes(expected_dossier) + b"\n"
+    ):
+        raise PortableInputError("INVALID_DOSSIER", "The validation dossier is invalid.")
+
+    parsed_draft = _finalization_draft(draft)
+    if parsed_draft != draft or draft_bytes != _canonical_bytes(parsed_draft) + b"\n":
+        raise PortableInputError("INVALID_DRAFT", "The validation draft is invalid.")
+    if contract_version == ATOMIC_COVERAGE_CONTRACT_VERSION:
+        expected_coverage = _evaluate_portable_atomic_coverage(
+            source_unit_inventory,
+            evidence_inventory,
+            parsed_draft,
+            sources,
+        )
+        coverage_issue_count = len(expected_coverage.get("issues", []))
+    else:
+        coverage_draft = parsed_draft
+        if parsed_draft.get("coverage_contract_version") != COVERAGE_CONTRACT_VERSION:
+            coverage_draft = dict(parsed_draft)
+            coverage_draft["coverage_contract_version"] = None
+        expected_coverage = _evaluate_coverage_closure(
+            evidence_inventory,
+            source_unit_inventory,
+            coverage_draft,
+            sources,
+        )
+        coverage_issue_count = len(expected_coverage["lead_recall"]["issues"]) + len(
+            expected_coverage["proposition_coverage"]["issues"]
+        )
+    if (
+        coverage != expected_coverage
+        or coverage_bytes != _canonical_bytes(expected_coverage) + b"\n"
+        or expected_coverage.get("valid") is not True
+        or receipt.get("coverage_review_hash") != expected_coverage.get("coverage_review_hash")
+        or receipt.get("coverage_issue_count") != coverage_issue_count
+    ):
+        raise PortableInputError("INVALID_COVERAGE", "The validation coverage proof is invalid.")
+
+    findings, citations, review_items = _build_analysis(parsed_draft, sources)
+    gaps = [
+        _gap(
+            item["code"],
+            item["message"],
+            item["jurisdiction"],
+            item["source_ids"],
+            category=item["category"],
+            presentation_role=item["presentation_role"],
+        )
+        for item in parsed_draft["gaps"]
+    ]
+    gap_keys = {(gap["code"], gap["jurisdiction"], tuple(gap["source_ids"])) for gap in gaps}
+    for source in sources:
+        key = ("SOURCE_RETRIEVAL_FAILED", source["jurisdiction"], (source["source_id"],))
+        if source["fetch_status"] == "failed" and key not in gap_keys:
+            gaps.append(
+                _gap(
+                    "SOURCE_RETRIEVAL_FAILED",
+                    "A requested source could not be retrieved or normalized.",
+                    source["jurisdiction"],
+                    [source["source_id"]],
+                )
+            )
+            gap_keys.add(key)
+    category_by_issue_id = {
+        issue["issue_id"]: issue["category"] for issue in parsed_draft["issues"]
+    }
+    supported_categories = {
+        category_by_issue_id[finding["issue_id"]]
+        for finding in findings
+        if finding["issue_id"] in category_by_issue_id
+        and any(
+            claim["kind"] == "source_supported" and claim["citation_ids"]
+            for claim in finding["claims"]
+        )
+    }
+    gap_categories = {gap["category"] for gap in gaps}
+    for category in REQUIRED_COVERAGE_CATEGORIES:
+        if category not in supported_categories and category not in gap_categories:
+            gaps.append(
+                _gap(
+                    f"COVERAGE_{category.upper()}_NOT_ESTABLISHED",
+                    _COVERAGE_GAP_MESSAGES[category],
+                    None,
+                    [],
+                    category=category,
+                )
+            )
+    covered = {finding["jurisdiction"].casefold() for finding in findings}
+    covered.update(
+        gap["jurisdiction"].casefold()
+        for gap in gaps
+        if gap["jurisdiction"] is not None
+    )
+    for jurisdiction in request.get("jurisdictions", []):
+        if not isinstance(jurisdiction, str):
+            raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
+        if jurisdiction.casefold() not in covered:
+            gaps.append(
+                _gap(
+                    "JURISDICTION_UNCOVERED",
+                    "No supported finding was produced for this jurisdiction.",
+                    jurisdiction,
+                    [],
+                )
+            )
+    replay_fields = {
+        "request": request,
+        "sources": sources,
+        "issues": parsed_draft["issues"],
+        "findings": findings,
+        "citations": citations,
+        "gaps": gaps,
+        "review_items": review_items,
+        "brief": parsed_draft["brief"],
+    }
+    if any(bundle.get(key) != value for key, value in replay_fields.items()):
+        raise PortableInputError("INVALID_BUNDLE", "The validation bundle cannot be replayed.")
+    validation_base = dict(bundle)
+    validation_base["validation"] = None
+    validation_base["bundle_hash"] = None
+    validation_issues = _validate_bundle(validation_base)
+    validation = bundle.get("validation")
+    blocking_count = sum(
+        item["code"] in BLOCKING_REVIEW_CODES for item in review_items
+    )
+    if (
+        not isinstance(validation, dict)
+        or set(validation) != {"valid", "issues", "validated_at"}
+        or validation.get("valid") is not True
+        or validation.get("issues") != validation_issues
+        or not isinstance(validation.get("validated_at"), str)
+        or any(item.get("level") == "error" for item in validation_issues)
+        or receipt.get("validation_issue_count") != len(validation_issues)
+        or receipt.get("blocking_review_count") != blocking_count
+        or _render_report(bundle).encode("utf-8") != report_bytes
+    ):
+        raise PortableInputError("INVALID_BUNDLE", "The validation bundle proof is invalid.")
+
+
 def finalize(
     matter: Path,
     draft_path: Path,

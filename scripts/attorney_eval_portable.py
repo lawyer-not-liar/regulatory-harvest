@@ -13,6 +13,7 @@ import base64
 import errno
 import hashlib
 import html
+import importlib.util
 import json
 import math
 import os
@@ -16578,13 +16579,14 @@ def _baseline_gradeable_projection_bytes_for_test(
 
 READINESS_PROTOCOL_V1 = "delivery-readiness-v1"
 READINESS_EXTERNAL_RESPONSE_INVALID = "READINESS_EXTERNAL_RESPONSE_INVALID"
-_READINESS_RUBRIC_PATH = (
+_READINESS_CANONICAL_RUBRIC_PATH = (
     Path(__file__).resolve().parents[1]
     / "src"
     / "regulatory_harvest"
     / "evaluation"
     / "readiness-rubric-v1.json"
 )
+_READINESS_RUBRIC_PATH = _READINESS_CANONICAL_RUBRIC_PATH
 _READINESS_RUBRIC_KEYS = {
     "attorney_review_warning",
     "blocking_codes",
@@ -16600,11 +16602,83 @@ _READINESS_RUBRIC_KEYS = {
     "strict_importance_weights",
     "version",
 }
+_READINESS_EVIDENCE_TOKEN_RE = re.compile(
+    r"(?:SOURCE-[0-9]{6}|BASELINE-(?:REQ|CONT)-[0-9]{4}|"
+    r"PREREQUISITE-(?:CURRENTNESS|COMPLETENESS|LANGUAGE)-"
+    r"[A-Za-z0-9][A-Za-z0-9._:-]*|PREREQUISITE-CLIENT-FACTS)"
+)
+_READINESS_CONSEQUENCES = (
+    "legal conclusion",
+    "applicability",
+    "implementation decision",
+    "deadline",
+    "enforcement exposure",
+    "attorney follow up",
+)
+_READINESS_RESOLUTION_OUTCOMES = (
+    "evidence",
+    "fact",
+    "legal judgment",
+    "report correction",
+    "correct the report",
+)
+_READINESS_RESOLUTION_ACTIONS = (
+    "verify",
+    "obtain",
+    "confirm",
+    "correct",
+    "revise",
+    "establish",
+    "resolve",
+    "document",
+)
+_READINESS_SPECIFICITY_TERMS = {
+    "report",
+    "treatment",
+    "evidence",
+    "source",
+    "fact",
+    "conflict",
+    "ambiguity",
+    "ambiguous",
+    "currentness",
+    "language",
+    "missing",
+    "omission",
+    "assertion",
+    "limitation",
+    "interpretation",
+    "authority",
+    "requirement",
+    "gap",
+    "dependency",
+    "support",
+    "establish",
+    "disclose",
+}
+_READINESS_POSIX_PRIVATE_ROOT_RE = re.compile(
+    r"(?<![A-Za-z0-9:/])/(?:Applications|Library|System|Users|Volumes|etc|home|opt|"
+    r"private|root|tmp|usr|var)(?:/|(?=[\s,.;:!?)]|$))"
+)
+_READINESS_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])[A-Z]:[\\/][^\s\x00\"'<>|?*]+"
+)
+_READINESS_WINDOWS_UNC_PATH_RE = re.compile(
+    r"(?<![\\A-Za-z0-9])\\\\[^\\/\s\x00\"'<>|?*]+[\\/]"
+    r"[^\s\x00\"'<>|?*]+"
+)
+_READINESS_FILE_URI_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9+.-])file:/+[^\s/\x00\"'<>][^\s\x00\"'<>]*"
+)
 
 
 def _readiness_rubric_v1() -> tuple[bytes, JsonObject, str]:
     """Load the one canonical readiness policy used by full and portable runtimes."""
     try:
+        if _READINESS_RUBRIC_PATH.resolve(strict=True) != (
+            _READINESS_CANONICAL_RUBRIC_PATH.resolve(strict=True)
+        ):
+            raise PortableEvaluationInputError("readiness rubric path is invalid")
         data = _READINESS_RUBRIC_PATH.read_bytes()
         value = parse_canonical_json_bytes(data, location="readiness rubric")
         rubric = _shape(
@@ -16669,34 +16743,13 @@ def _readiness_rubric_v1() -> tuple[bytes, JsonObject, str]:
 
 
 def _readiness_stress_vector_v1(seed: int, rubric: object) -> JsonObject:
-    """Derive one bounded deterministic scoring vector from the loaded rubric."""
+    """Derive one bounded deterministic lifecycle/probe vector from the loaded rubric."""
     if type(seed) is not int or seed < 0:
         raise PortableEvaluationInputError("readiness stress seed is invalid")
     checked = _shape(
         _copy_json(rubric),
         required=_READINESS_RUBRIC_KEYS,
         location="readiness stress rubric",
-    )
-    review_floor = checked["review_ready_weighted_coverage_floor"]
-    high_floor = checked["high_assurance_weighted_coverage_floor"]
-    if type(review_floor) not in {int, float} or type(high_floor) not in {int, float}:
-        raise PortableEvaluationInputError("readiness stress thresholds are invalid")
-    offsets = (-0.01, 0.0, 0.01)
-    floor = review_floor if seed % 6 < 3 else high_floor
-    coverage = round(float(floor) + offsets[seed % 3], 2)
-    requirement_counts = (0, 1, 5, 6, 52, 128, 129)
-    gap_counts = (0, 1, 5, 6, 21, 129)
-    fresh_dispositions = ("PASS", "FAIL", "INCONCLUSIVE")
-    historical_dispositions: tuple[str | None, ...] = (
-        None,
-        "PASS",
-        "FAIL",
-        "INCONCLUSIVE",
-    )
-    readiness_tiers = (
-        "HIGH_ASSURANCE",
-        "REVIEW_READY_WITH_GAPS",
-        "NOT_DELIVERABLE",
     )
     visibility = ("hidden", "visible", "prominent")
     dispute_kinds = (
@@ -16715,14 +16768,10 @@ def _readiness_stress_vector_v1(seed: int, rubric: object) -> JsonObject:
     blockers = cast(list[str], checked["blocking_codes"])
     return {
         "seed": seed,
-        "minimum_lane_weighted_coverage": coverage,
-        "requirement_count": requirement_counts[seed % len(requirement_counts)],
-        "gap_count": gap_counts[seed % len(gap_counts)],
-        "fresh_disposition": fresh_dispositions[seed % len(fresh_dispositions)],
-        "historical_disposition": historical_dispositions[
-            seed % len(historical_dispositions)
-        ],
-        "readiness_tier": readiness_tiers[seed % len(readiness_tiers)],
+        "grade_mode": ("met", "review", "inconclusive")[seed % 3],
+        "declared_limitation": seed % 2 == 0,
+        "blocking_safety": seed % 5 == 0,
+        "lane_dispute": seed % 7 == 0,
         "rationale_kind": rationale_kinds[seed % len(rationale_kinds)],
         "follow_up_code": follow_up_codes[seed % len(follow_up_codes)],
         "owner_role": owner_roles[seed % len(owner_roles)],
@@ -16893,6 +16942,128 @@ def _readiness_generation_projection(
     return report_text, report_bytes, binding
 
 
+def _readiness_validate_qualification_privacy(
+    limits: JsonObject, *, forbidden_payloads: tuple[bytes, ...]
+) -> None:
+    if len(forbidden_payloads) > 1_025 or any(
+        type(payload) is not bytes for payload in forbidden_payloads
+    ):
+        raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
+    patterns = tuple(
+        sorted(
+            {
+                payload
+                for payload in forbidden_payloads
+                if payload and len(payload) <= 65_536
+            }
+        )
+    )
+    if sum(map(len, patterns)) > 1_048_576:
+        raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
+    text_count = 0
+    total_bytes = 0
+
+    def checked_text(value: object, *, public: bool) -> None:
+        nonlocal text_count, total_bytes
+        if type(value) is not str or not value or value.isspace() or len(value) > 65_536:
+            raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise PortableEvaluationInputError(
+                "READINESS_QUALIFICATION_INVALID"
+            ) from error
+        text_count += 1
+        total_bytes += len(encoded)
+        if (
+            len(encoded) > 65_536
+            or text_count > 8_192
+            or total_bytes > 4_194_304
+            or (
+                public
+                and (
+                    any(pattern in encoded for pattern in patterns)
+                    or any(
+                        regex.search(value) is not None
+                        for regex in (
+                            _READINESS_POSIX_PRIVATE_ROOT_RE,
+                            _READINESS_WINDOWS_ABSOLUTE_PATH_RE,
+                            _READINESS_WINDOWS_UNC_PATH_RE,
+                            _READINESS_FILE_URI_RE,
+                        )
+                    )
+                )
+            )
+        ):
+            raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
+
+    inventories = tuple(
+        cast(list[object], limits[name])
+        for name in (
+            "requested_authorities",
+            "admission_checks",
+            "admission_issues",
+            "language_treatments",
+        )
+    )
+    if any(type(value) is not list or len(value) > 1_024 for value in inventories):
+        raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
+    authorities, checks, issues, treatments = inventories
+    for raw in authorities:
+        authority = _object(raw, location="qualification authority")
+        checked_text(authority["authority_id"], public=False)
+        for key in ("title", "jurisdiction", "authority_type"):
+            checked_text(authority[key], public=True)
+        source_ids = _array(authority["source_ids"], location="qualification source ids")
+        if len(source_ids) > 1_024:
+            raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
+        for value in source_ids:
+            checked_text(value, public=False)
+    for raw in checks:
+        check = _object(raw, location="qualification check")
+        checked_text(check["code"], public=False)
+        checked_text(check["rationale"], public=True)
+        source_ids = _array(check["source_ids"], location="qualification check sources")
+        if len(source_ids) > 1_024:
+            raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
+        for value in source_ids:
+            checked_text(value, public=False)
+    for raw in issues:
+        issue = _object(raw, location="qualification issue")
+        checked_text(issue["code"], public=False)
+        checked_text(issue["message"], public=True)
+        related = _array(issue["related_ids"], location="qualification issue relations")
+        if len(related) > 1_024:
+            raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
+        for value in related:
+            checked_text(value, public=False)
+    readiness = _object(limits["receipt_readiness"], location="qualification readiness")
+    issue_codes = _array(readiness["issue_codes"], location="qualification issue codes")
+    if len(issue_codes) > 1_024:
+        raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
+    for value in issue_codes:
+        checked_text(value, public=False)
+    checked_text(readiness["rationale"], public=True)
+    treatment_source_count = 0
+    for raw in treatments:
+        treatment = _object(raw, location="qualification treatment")
+        sources = _array(treatment["sources"], location="qualification treatment sources")
+        treatment_source_count += len(sources)
+        if len(sources) > 1_024 or treatment_source_count > 1_024:
+            raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
+        for raw_source in sources:
+            source = _object(raw_source, location="qualification language source")
+            checked_text(source["source_id"], public=False)
+            checked_text(source["language"], public=True)
+        checked_text(treatment["method"], public=True)
+        checked_text(treatment["rationale"], public=True)
+        limitation = treatment["limitation_text"]
+        if treatment["limitation_status"] == "DECLARED":
+            checked_text(limitation, public=True)
+        elif treatment["limitation_status"] != "NOT_DECLARED" or limitation is not None:
+            raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
+
+
 def _readiness_validation_projection(
     receipt_path: Path, report_bytes: bytes
 ) -> JsonObject:
@@ -16928,8 +17099,33 @@ def _readiness_validation_projection(
         receipt = file_object(
             receipt_bytes, trailing_newline=True, location=absolute.name
         )
+        expected_receipt_fields = {
+            "analysis_draft",
+            "audit",
+            "blocking_review_count",
+            "bundle",
+            "coverage_issue_count",
+            "coverage_review",
+            "coverage_review_hash",
+            "evidence_precision_valid",
+            "proposition_coverage_valid",
+            "provision_recall_valid",
+            "report",
+            "status",
+            "valid",
+            "validation_issue_count",
+        }
+        if set(receipt) != expected_receipt_fields:
+            raise PortableEvaluationInputError("READINESS_VALIDATION_RECEIPT_INVALID")
         artifacts: dict[str, bytes] = {}
-        for field in ("bundle", "coverage_review", "report"):
+        observed_paths: set[str] = set()
+        for field in (
+            "analysis_draft",
+            "audit",
+            "bundle",
+            "coverage_review",
+            "report",
+        ):
             declared = receipt.get(field)
             if type(declared) is not str:
                 raise PortableEvaluationInputError("READINESS_VALIDATION_RECEIPT_INVALID")
@@ -16940,7 +17136,15 @@ def _readiness_validation_projection(
                 raise PortableEvaluationInputError(
                     "READINESS_VALIDATION_RECEIPT_INVALID"
                 ) from error
+            if relative in observed_paths:
+                raise PortableEvaluationInputError(
+                    "READINESS_VALIDATION_RECEIPT_INVALID"
+                )
+            observed_paths.add(relative)
             artifacts[field] = storage.read_artifact(relative, max_bytes=16 * 1024 * 1024)
+        artifacts["dossier"] = storage.read_artifact(
+            "agent-dossier.json", max_bytes=16 * 1024 * 1024
+        )
         storage.assert_root_identity()
     if (
         receipt.get("status") != "completed"
@@ -16949,15 +17153,94 @@ def _readiness_validation_projection(
         or receipt.get("proposition_coverage_valid") is not True
         or receipt.get("provision_recall_valid") is not True
         or receipt.get("blocking_review_count") != 0
+        or type(receipt.get("coverage_issue_count")) is not int
+        or type(receipt.get("validation_issue_count")) is not int
         or artifacts["report"] != report_bytes
     ):
         raise PortableEvaluationInputError("READINESS_VALIDATION_RECEIPT_INVALID")
-    file_object(
+    bundle = file_object(
         artifacts["bundle"], trailing_newline=False, location="validation bundle"
     )
-    file_object(
+    bundle_keys = {
+        "schema_version",
+        "generator_version",
+        "request",
+        "manifest",
+        "sources",
+        "issues",
+        "findings",
+        "citations",
+        "gaps",
+        "review_items",
+        "brief",
+        "validation",
+        "disclaimer",
+        "requires_attorney_review",
+        "bundle_hash",
+    }
+    if set(bundle) != bundle_keys or type(bundle["bundle_hash"]) is not str:
+        raise PortableEvaluationInputError("READINESS_VALIDATION_RECEIPT_INVALID")
+    unhashed = {key: value for key, value in bundle.items() if key != "bundle_hash"}
+    validation = _object(bundle["validation"], location="bundle validation")
+    if (
+        bundle["bundle_hash"] != _sha256(canonical_json_bytes(unhashed))
+        or validation.get("valid") is not True
+        or type(validation.get("issues")) is not list
+        or len(cast(list[object], validation["issues"]))
+        != receipt["validation_issue_count"]
+    ):
+        raise PortableEvaluationInputError("READINESS_VALIDATION_RECEIPT_INVALID")
+    coverage = file_object(
         artifacts["coverage_review"], trailing_newline=True, location="coverage review"
     )
+    declared_coverage_hash = coverage.get("coverage_review_hash")
+    coverage_body = {
+        key: value for key, value in coverage.items() if key != "coverage_review_hash"
+    }
+    if (
+        type(declared_coverage_hash) is not str
+        or declared_coverage_hash != _sha256(canonical_json_bytes(coverage_body))
+        or declared_coverage_hash != receipt["coverage_review_hash"]
+        or coverage.get("valid") is not True
+    ):
+        raise PortableEvaluationInputError("READINESS_VALIDATION_RECEIPT_INVALID")
+    draft = file_object(
+        artifacts["analysis_draft"],
+        trailing_newline=True,
+        location="analysis draft",
+    )
+    dossier = file_object(
+        artifacts["dossier"], trailing_newline=True, location="agent dossier"
+    )
+    try:
+        path = Path(__file__).with_name("harvest_portable.py")
+        spec = importlib.util.spec_from_file_location(
+            "harvest_readiness_validation_portable", path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError("portable validation substrate unavailable")
+        validation_substrate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validation_substrate)
+        replay = getattr(
+            validation_substrate, "_readiness_replay_generation_validation_v1", None
+        )
+        if not callable(replay):
+            raise ImportError("portable validation replay unavailable")
+        replay(
+            draft=draft,
+            dossier=dossier,
+            bundle=bundle,
+            coverage=coverage,
+            draft_bytes=artifacts["analysis_draft"],
+            dossier_bytes=artifacts["dossier"],
+            coverage_bytes=artifacts["coverage_review"],
+            report_bytes=artifacts["report"],
+            receipt=receipt,
+        )
+    except (ImportError, KeyError, OSError, RecursionError, TypeError, ValueError) as error:
+        raise PortableEvaluationInputError(
+            "READINESS_VALIDATION_RECEIPT_INVALID"
+        ) from error
     return {
         "receipt_hash": _sha256(receipt_bytes),
         "report_hash": _sha256(report_bytes),
@@ -17449,6 +17732,24 @@ def _readiness_historical_v22(
         raise PortableEvaluationInputError("READINESS_HISTORICAL_INVALID") from error
 
 
+def _readiness_validate_output_separation(
+    output_dir: Path, roots: tuple[Path, ...]
+) -> None:
+    absolute = Path(os.path.abspath(output_dir))
+    try:
+        parent = absolute.parent.resolve(strict=True)
+        physical_roots = tuple(
+            Path(os.path.abspath(root)).resolve(strict=True) for root in roots
+        )
+    except (OSError, RuntimeError) as error:
+        raise PortableEvaluationInputError("READINESS_OUTPUT_PATH_INVALID") from error
+    if absolute.parent != parent:
+        raise PortableEvaluationInputError("READINESS_OUTPUT_PATH_INVALID")
+    candidate = parent / absolute.name
+    if any(candidate == root or root in candidate.parents for root in physical_roots):
+        raise PortableEvaluationInputError("READINESS_OUTPUT_OVERLAPS_INPUT")
+
+
 def initialize_readiness_v1(
     output_dir: Path,
     *,
@@ -17471,6 +17772,19 @@ def initialize_readiness_v1(
     )
     report_text, report_bytes, generation_binding = _readiness_generation_projection(
         generation_run_dir, projection, generation_substrate
+    )
+    _readiness_validate_qualification_privacy(
+        qualification_limits,
+        forbidden_payloads=(
+            *(
+                cast(str, source["normalized_text"]).encode("utf-8")
+                for source in cast(
+                    list[JsonObject],
+                    cast(JsonObject, projection["baseline_input"])["sources"],
+                )
+            ),
+            report_bytes,
+        ),
     )
     generation_validation = _readiness_validation_projection(
         validation_receipt_path, report_bytes
@@ -17518,6 +17832,19 @@ def initialize_readiness_v1(
         "readiness-rubric.json": rubric_bytes,
         f"requests/{call_id}.json": canonical_json_bytes(request),
     }
+    _readiness_validate_output_separation(
+        output_dir,
+        tuple(
+            path
+            for path in (
+                baseline_run_dir,
+                qualification_run_dir,
+                generation_run_dir,
+                historical_v22_run_dir,
+            )
+            if path is not None
+        ),
+    )
     manifest = _readiness_manifest(readiness_input, files, request)
     with _open_run_storage(output_dir, initialize=True) as storage:
         for path in sorted(files):
@@ -17538,24 +17865,14 @@ def initialize_readiness_v1(
 
 
 def next_readiness_request_v1(run_dir: Path) -> JsonObject | None:
-    with _open_run_storage(run_dir) as storage:
-        manifest = _object(
-            parse_canonical_json_bytes(
-                storage.read_artifact("readiness-manifest.json"),
-                location="readiness-manifest.json",
-            ),
-            location="readiness-manifest.json",
-        )
-        pending = cast(JsonObject | None, manifest.get("pending_call"))
-        if pending is None:
-            return None
-        path = cast(str, pending["request_artifact_path"])
-        request = _object(
-            parse_canonical_json_bytes(storage.read_artifact(path), location=path),
-            location=path,
-        )
-        storage.assert_root_identity()
-        return request
+    manifest, _persisted, files = _readiness_snapshot(run_dir)
+    pending = cast(JsonObject | None, manifest.get("pending_call"))
+    if pending is None:
+        return None
+    path = cast(str, pending["request_artifact_path"])
+    return _readiness_checked_request(
+        parse_canonical_json_bytes(files[path], location=path)
+    )
 
 
 def _readiness_checked_request(value: object) -> JsonObject:
@@ -17603,11 +17920,172 @@ def _readiness_provenance(value: object) -> JsonObject:
     return provenance
 
 
-def _readiness_exact_text(value: object, *, location: str) -> str:
+def _readiness_generic_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold().replace("_", " ")
+    normalized = "".join(
+        character if character.isalnum() else " " for character in normalized
+    )
+    words = normalized.split()
+    if words == ["more", "research", "is", "needed"]:
+        words.remove("is")
+    return " ".join(words)
+
+
+def _readiness_exact_text(
+    value: object, *, location: str, rationale: bool = False
+) -> str:
     text = _string(value, location=location, nonblank=True)
-    if len(text.encode("utf-8")) > 16_384:
+    if text != text.strip() or len(text.encode("utf-8")) > 16_384:
         raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+    if rationale:
+        _, rubric, _ = _readiness_rubric_v1()
+        generic = {
+            _readiness_generic_key(item)
+            for item in cast(list[str], rubric["generic_rationales"])
+        }
+        generic.update(
+            {
+                "met",
+                "partially met",
+                "not met",
+                "uncertain",
+                "pass",
+                "fail",
+                "inconclusive",
+            }
+        )
+        key = _readiness_generic_key(text)
+        if key in generic or re.fullmatch(r"[0-9]+(?: [0-9]+)?", key):
+            raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
     return text
+
+
+def _readiness_evidence_tokens(value: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    for match in _READINESS_EVIDENCE_TOKEN_RE.finditer(value):
+        before = value[match.start() - 1] if match.start() else ""
+        after = value[match.end()] if match.end() < len(value) else ""
+        if (before and (before in "._:-" or ("A" + before).isidentifier())) or (
+            after and (after in "._:-" or ("A" + after).isidentifier())
+        ):
+            continue
+        tokens.append(match.group(0))
+    return tuple(tokens)
+
+
+def _readiness_validate_safety_semantics(
+    item: JsonObject,
+    *,
+    all_refs: set[str],
+    scoped_refs: set[str] | None,
+    finding: bool,
+    candidate_importance: str | None = None,
+) -> None:
+    shortfall = cast(str, item["shortfall_description"])
+    unresolved = cast(str, item["why_unresolved"])
+    matters = cast(str, item["why_it_matters"])
+    resolution = cast(str, item["resolution_test"])
+    shortfall_words = _readiness_generic_key(shortfall).split()
+    unresolved_words = _readiness_generic_key(unresolved).split()
+    if (
+        len(shortfall_words) < 5
+        or not any(word in _READINESS_SPECIFICITY_TERMS for word in shortfall_words)
+        or len(unresolved_words) < 5
+        or not any(word in _READINESS_SPECIFICITY_TERMS for word in unresolved_words)
+        or _readiness_generic_key(unresolved)
+        in {
+            _readiness_generic_key(shortfall),
+            _readiness_generic_key(cast(str, item["rationale_kind"])),
+        }
+    ):
+        raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+    normalized_matters = _readiness_generic_key(matters)
+    if not any(value in normalized_matters for value in _READINESS_CONSEQUENCES):
+        raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+    mentioned = _readiness_evidence_tokens(matters)
+    remainder = matters
+    for value in mentioned:
+        remainder = remainder.replace(value, " ")
+    for consequence in (
+        "legal_conclusion",
+        "legal conclusion",
+        "applicability",
+        "implementation_decision",
+        "implementation decision",
+        "deadline",
+        "enforcement_exposure",
+        "enforcement exposure",
+        "attorney_follow_up",
+        "attorney follow up",
+    ):
+        remainder = remainder.casefold().replace(consequence, " ")
+    refs = set(cast(list[str], item["evidence_refs"]))
+    if (
+        len(_readiness_generic_key(remainder).split()) < 3
+        or any(value not in all_refs for value in mentioned)
+        or not mentioned
+        or not refs.intersection(mentioned)
+        or (scoped_refs is not None and not refs.intersection(scoped_refs))
+    ):
+        raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+    normalized_resolution = _readiness_generic_key(resolution)
+    if not any(
+        value in normalized_resolution for value in _READINESS_RESOLUTION_OUTCOMES
+    ) or not any(
+        value in normalized_resolution for value in _READINESS_RESOLUTION_ACTIONS
+    ):
+        raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+    rationale_prefixes: tuple[str, ...] | None = {
+        "SOURCE_ABSENT": ("SOURCE-",),
+        "SOURCE_AMBIGUOUS": ("SOURCE-",),
+        "SOURCE_CONFLICT": ("SOURCE-",),
+        "CURRENTNESS_NOT_ESTABLISHED": ("PREREQUISITE-CURRENTNESS-",),
+        "LANGUAGE_LIMITATION": ("PREREQUISITE-LANGUAGE-",),
+        "APPLICABILITY_FACT_MISSING": ("PREREQUISITE-CLIENT-FACTS",),
+    }.get(cast(str, item["rationale_kind"]))
+    rationale_scope = refs if scoped_refs is None else scoped_refs
+    if rationale_prefixes is not None and not any(
+        ref in rationale_scope
+        and ref in mentioned
+        and ref.startswith(rationale_prefixes)
+        for ref in refs
+    ):
+        raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+    if not finding:
+        if candidate_importance == "critical" and (
+            item["visibility"] != "prominent"
+            or item["owner_role"]
+            not in {"reviewing_attorney", "outside_counsel"}
+        ):
+            raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+        return
+    finding_kind = cast(str, item["finding_kind"])
+    required_prefixes = {
+        "MATERIAL_UNSUPPORTED_ASSERTION": ("SOURCE-",),
+        "BASELINE_CONTRADICTION": ("BASELINE-",),
+        "HIDDEN_OR_UNDERSTATED_LIMITATION": ("SOURCE-", "PREREQUISITE-"),
+        "UNDISCLOSED_DISPOSITIVE_CLIENT_FACT": ("PREREQUISITE-CLIENT-FACTS",),
+        "MISLEADING_CURRENTNESS_OR_AUTHORITY": (
+            "SOURCE-",
+            "PREREQUISITE-CURRENTNESS-",
+            "PREREQUISITE-COMPLETENESS-",
+        ),
+        "UNDISCLOSED_GRADER_GAP": ("BASELINE-",),
+    }[finding_kind]
+    if not any(ref in mentioned and ref.startswith(required_prefixes) for ref in refs):
+        raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+    report_content = {
+        "MATERIAL_UNSUPPORTED_ASSERTION",
+        "BASELINE_CONTRADICTION",
+        "MISLEADING_CURRENTNESS_OR_AUTHORITY",
+    }
+    if finding_kind in report_content and not item["report_passages"]:
+        raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+    if (item["blocking_code"] is not None or finding_kind in report_content) and (
+        item["visibility"] != "prominent"
+        or item["owner_role"] not in {"reviewing_attorney", "outside_counsel"}
+    ):
+        raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
 
 
 def compile_readiness_draft_v1(
@@ -17665,7 +18143,9 @@ def compile_readiness_draft_v1(
                     "disposition": grade["disposition"],
                     "report_passages": passages,
                     "rationale": _readiness_exact_text(
-                        grade["rationale"], location="readiness grade rationale"
+                        grade["rationale"],
+                        location="readiness grade rationale",
+                        rationale=True,
                     ),
                     "omission": (
                         None
@@ -17690,7 +18170,9 @@ def compile_readiness_draft_v1(
             ],
             "requirement_grades": grades,
             "rationale": _readiness_exact_text(
-                draft["rationale"], location="readiness batch rationale"
+                draft["rationale"],
+                location="readiness batch rationale",
+                rationale=True,
             ),
         }
         compiled["fragment_fingerprint"] = _sha256(canonical_json_bytes(compiled))
@@ -17756,14 +18238,20 @@ def compile_readiness_draft_v1(
             "reviewer_report_passages": reviewer,
             "auditor_report_passages": auditor,
             "reviewer_rationale": _readiness_exact_text(
-                draft["reviewer_rationale"], location="reviewer rationale"
+                draft["reviewer_rationale"],
+                location="reviewer rationale",
+                rationale=True,
             ),
             "auditor_rationale": _readiness_exact_text(
-                draft["auditor_rationale"], location="auditor rationale"
+                draft["auditor_rationale"],
+                location="auditor rationale",
+                rationale=True,
             ),
             "ambiguity_disposition": draft["ambiguity_disposition"],
             "rationale": _readiness_exact_text(
-                draft["rationale"], location="contested rationale"
+                draft["rationale"],
+                location="contested rationale",
+                rationale=True,
             ),
         }
         compiled["grade_fingerprint"] = _sha256(canonical_json_bytes(compiled))
@@ -17782,6 +18270,12 @@ def compile_readiness_draft_v1(
         candidates = _array(
             payload["gap_candidates"], location="readiness gap candidates"
         )
+        candidate_by_id = {
+            cast(str, cast(JsonObject, candidate)["candidate_id"]): cast(
+                JsonObject, candidate
+            )
+            for candidate in candidates
+        }
         if len(assessments) != len(candidates):
             raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
         allowed_refs = {
@@ -17863,8 +18357,36 @@ def compile_readiness_draft_v1(
                     "resolution_test",
                     *identity,
                 } or (key == "disclosure_location" and value is not None):
-                    value = _readiness_exact_text(value, location=key)
+                    value = _readiness_exact_text(
+                        value,
+                        location=key,
+                        rationale=key
+                        in {
+                            "shortfall_description",
+                            "why_unresolved",
+                            "why_it_matters",
+                            "resolution_test",
+                        },
+                    )
                 result[key] = value
+            candidate = (
+                None
+                if finding
+                else candidate_by_id[cast(str, result["candidate_id"])]
+            )
+            _readiness_validate_safety_semantics(
+                result,
+                all_refs=allowed_refs,
+                scoped_refs=(
+                    None
+                    if candidate is None
+                    else set(cast(list[str], candidate["evidence_refs"]))
+                ),
+                finding=finding,
+                candidate_importance=(
+                    None if candidate is None else cast(str, candidate["importance"])
+                ),
+            )
             return result
 
         compiled_assessments = [
@@ -17912,7 +18434,7 @@ def compile_readiness_draft_v1(
             "dispute_id": payload["dispute_id"],
             "disposition": draft["disposition"],
             "rationale": _readiness_exact_text(
-                draft["rationale"], location="referee rationale"
+                draft["rationale"], location="referee rationale", rationale=True
             ),
             "evidence_refs": refs,
         }
@@ -17932,12 +18454,35 @@ def compile_readiness_draft_v1(
 def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str, bytes]]:
     with _open_run_storage(run_dir) as storage:
         manifest_bytes = storage.read_artifact("readiness-manifest.json")
-        manifest = _object(
-            parse_canonical_json_bytes(
-                manifest_bytes, location="readiness-manifest.json"
-            ),
-            location="readiness-manifest.json",
-        )
+        try:
+            manifest = _shape(
+                parse_canonical_json_bytes(
+                    manifest_bytes, location="readiness-manifest.json"
+                ),
+                required={
+                    "protocol_version",
+                    "grade_target_fingerprint",
+                    "report_hash",
+                    "generation_capsule_root",
+                    "readiness_rubric_fingerprint",
+                    "strict_equivalent_scoring_contract_fingerprint",
+                    "phase",
+                    "terminal_status",
+                    "pending_call",
+                    "accepted_calls",
+                    "baseline_locked_strict_equivalent_fingerprint",
+                    "safety_review_fingerprint",
+                    "requirement_matrix_fingerprint",
+                    "gap_matrix_fingerprint",
+                    "result_fingerprint",
+                    "artifacts",
+                    "root_hash",
+                    "manifest_fingerprint",
+                },
+                location="readiness-manifest.json",
+            )
+        except PortableEvaluationInputError as error:
+            raise EvaluationIntegrityError("READINESS_ARTIFACT_MODEL") from error
         inventory = _array(manifest.get("artifacts"), location="readiness artifacts")
         files: dict[str, bytes] = {}
         for raw in inventory:
@@ -17969,12 +18514,23 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
             )
         ):
             raise EvaluationIntegrityError("READINESS_MANIFEST_INVALID")
-        persisted = _object(
-            parse_canonical_json_bytes(
-                files["readiness-input.json"], location="readiness-input.json"
-            ),
-            location="readiness-input.json",
-        )
+        try:
+            persisted = _shape(
+                parse_canonical_json_bytes(
+                    files["readiness-input.json"], location="readiness-input.json"
+                ),
+                required={
+                    "schema_version",
+                    "readiness_input",
+                    "baseline_context",
+                    "qualification_binding",
+                    "qualification_limits",
+                    "generation_binding",
+                },
+                location="readiness-input.json",
+            )
+        except PortableEvaluationInputError as error:
+            raise EvaluationIntegrityError("READINESS_ARTIFACT_MODEL") from error
         storage.assert_root_identity()
     return manifest, persisted, files
 
