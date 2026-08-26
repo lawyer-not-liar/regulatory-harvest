@@ -521,19 +521,25 @@ def _read_guarded_readiness_object(path: Path) -> dict[str, object] | None:
             parent = root
             for segment in segments[:-1]:
                 child = os.open(segment, directory_flags, dir_fd=parent)
-                opened = os.fstat(child)
-                named = os.stat(segment, dir_fd=parent, follow_symlinks=False)
-                if (
-                    not stat.S_ISDIR(opened.st_mode)
-                    or stat.S_ISLNK(named.st_mode)
-                    or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
-                ):
-                    os.close(child)
-                    return None
-                directories.append(
-                    (parent, segment, child, _readiness_node_identity(opened))
-                )
-                parent = child
+                registered = False
+                try:
+                    opened = os.fstat(child)
+                    named = os.stat(segment, dir_fd=parent, follow_symlinks=False)
+                    if (
+                        not stat.S_ISDIR(opened.st_mode)
+                        or stat.S_ISLNK(named.st_mode)
+                        or (opened.st_dev, opened.st_ino)
+                        != (named.st_dev, named.st_ino)
+                    ):
+                        return None
+                    directories.append(
+                        (parent, segment, child, _readiness_node_identity(opened))
+                    )
+                    registered = True
+                    parent = child
+                finally:
+                    if not registered:
+                        os.close(child)
 
             leaf = os.open(segments[-1], leaf_flags, dir_fd=parent)
             before = os.fstat(leaf)

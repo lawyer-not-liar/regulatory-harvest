@@ -381,6 +381,38 @@ def test_readiness_response_control_rejects_aliases_and_nonregular_files(
         assert _runner()._read_guarded_readiness_object(path) is None
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor controls")
+def test_readiness_response_control_closes_descriptors_on_path_race(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    response = tmp_path / "response.json"
+    response.write_bytes(canonical_json_bytes({}))
+    runner = _runner()
+    real_open = runner.os.open
+    real_stat = runner.os.stat
+    opened: list[int] = []
+
+    def tracked_open(*args: object, **kwargs: object) -> int:
+        descriptor = real_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def raced_stat(*args: object, **kwargs: object) -> os.stat_result:
+        raise OSError("synthetic path replacement")
+
+    monkeypatch.setattr(runner.os, "open", tracked_open)
+    monkeypatch.setattr(runner.os, "stat", raced_stat)
+    assert runner._read_guarded_readiness_object(response) is None
+    monkeypatch.setattr(runner.os, "stat", real_stat)
+    monkeypatch.setattr(runner.os, "open", real_open)
+
+    assert len(opened) >= 2
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 def test_terminal_status_verify_and_human_projection_keep_dispositions_distinct(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
