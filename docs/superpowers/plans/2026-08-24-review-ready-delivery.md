@@ -1250,6 +1250,7 @@ git commit -m "feat: expose readiness companion CLI"
 
 **Files:**
 - Modify: `scripts/attorney_eval_portable.py`
+- Modify: `scripts/harvest_portable.py`
 - Modify: `tests/scripts/test_attorney_eval_portable.py`
 - Create: `tests/evaluation/test_attorney_readiness_stress.py`
 
@@ -1324,7 +1325,7 @@ Expected: all pass; isolated help emits no import error and stress trees are byt
 - [ ] **Step 6: Commit portable parity**
 
 ```bash
-git add scripts/attorney_eval_portable.py tests/scripts/test_attorney_eval_portable.py tests/evaluation/test_attorney_readiness_stress.py
+git add scripts/attorney_eval_portable.py scripts/harvest_portable.py tests/scripts/test_attorney_eval_portable.py tests/evaluation/test_attorney_readiness_stress.py
 git commit -m "feat: mirror readiness in portable runtime"
 ```
 
