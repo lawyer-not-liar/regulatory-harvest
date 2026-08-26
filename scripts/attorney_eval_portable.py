@@ -17074,7 +17074,7 @@ def _readiness_validate_qualification_privacy(
             "language_treatments",
         )
     )
-    if any(type(value) is not list or len(value) > 1_024 for value in inventories):
+    if any(type(value) is not list or len(value) > 640 for value in inventories):
         raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
     authorities, checks, issues, treatments = inventories
     for raw in authorities:
@@ -17083,7 +17083,7 @@ def _readiness_validate_qualification_privacy(
         for key in ("title", "jurisdiction", "authority_type"):
             checked_text(authority[key], public=True)
         source_ids = _array(authority["source_ids"], location="qualification source ids")
-        if len(source_ids) > 1_024:
+        if len(source_ids) > 640:
             raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
         for value in source_ids:
             checked_text(value, public=False)
@@ -17092,7 +17092,7 @@ def _readiness_validate_qualification_privacy(
         checked_text(check["code"], public=False)
         checked_text(check["rationale"], public=True)
         source_ids = _array(check["source_ids"], location="qualification check sources")
-        if len(source_ids) > 1_024:
+        if len(source_ids) > 640:
             raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
         for value in source_ids:
             checked_text(value, public=False)
@@ -17101,13 +17101,13 @@ def _readiness_validate_qualification_privacy(
         checked_text(issue["code"], public=False)
         checked_text(issue["message"], public=True)
         related = _array(issue["related_ids"], location="qualification issue relations")
-        if len(related) > 1_024:
+        if len(related) > 640:
             raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
         for value in related:
             checked_text(value, public=False)
     readiness = _object(limits["receipt_readiness"], location="qualification readiness")
     issue_codes = _array(readiness["issue_codes"], location="qualification issue codes")
-    if len(issue_codes) > 1_024:
+    if len(issue_codes) > 640:
         raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
     for value in issue_codes:
         checked_text(value, public=False)
@@ -17117,7 +17117,7 @@ def _readiness_validate_qualification_privacy(
         treatment = _object(raw, location="qualification treatment")
         sources = _array(treatment["sources"], location="qualification treatment sources")
         treatment_source_count += len(sources)
-        if len(sources) > 1_024 or treatment_source_count > 1_024:
+        if len(sources) > 640 or treatment_source_count > 640:
             raise PortableEvaluationInputError("READINESS_QUALIFICATION_INVALID")
         for raw_source in sources:
             source = _object(raw_source, location="qualification language source")

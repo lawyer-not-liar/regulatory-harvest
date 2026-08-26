@@ -1797,6 +1797,78 @@ def test_readiness_portable_generation_artifact_inventory_limit_parity(
     assert portable_verification["issues"] == list(full_verification.issues)
 
 
+@pytest.mark.parametrize(("count", "expected_valid"), [(640, True), (641, False)])
+def test_readiness_portable_qualification_inventory_limit_parity(
+    count: int,
+    expected_valid: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Qualification inventories retain the same exact 640-item boundary."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    artifacts = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_artifacts",
+        fromlist=["*"],
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    portable = _load_protocol_22_portable()
+    runs = (
+        tmp_path / f"qualification-limit-{count}-full",
+        tmp_path / f"qualification-limit-{count}-portable",
+    )
+    initialize_readiness_core(runs[0], **init)
+    portable.initialize_readiness_v1(runs[1], **init, generation_substrate=generation)
+    issues = [
+        {
+            "code": f"PUBLIC_SYNTHETIC_{index:04d}",
+            "severity": "info",
+            "message": "A public synthetic qualification issue remains recorded.",
+            "related_ids": [],
+        }
+        for index in range(count)
+    ]
+    for run in runs:
+        input_path = run / "readiness-input.json"
+        persisted = json.loads(input_path.read_bytes())
+        persisted["qualification_limits"]["admission_issues"] = issues
+        input_bytes = canonical_json_bytes(persisted)
+        input_path.write_bytes(input_bytes)
+        manifest_path = run / "readiness-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        for record in manifest["artifacts"]:
+            if record["artifact_path"] == "readiness-input.json":
+                record["artifact_hash"] = hashlib.sha256(input_bytes).hexdigest()
+        body = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"manifest_fingerprint", "root_hash"}
+        }
+        manifest["manifest_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(body)
+        ).hexdigest()
+        manifest["root_hash"] = hashlib.sha256(
+            canonical_json_bytes(
+                {key: value for key, value in manifest.items() if key != "root_hash"}
+            )
+        ).hexdigest()
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+    full_verification = artifacts.verify_readiness_run_v1(runs[0])
+    portable_verification = portable.verify_readiness_run_v1(runs[1])
+    assert full_verification.valid is expected_valid
+    assert portable_verification["valid"] is expected_valid
+    assert portable_verification["issues"] == list(full_verification.issues)
+
+
 @pytest.mark.parametrize("mutation", ["reorder", "omit-first", "phase-created"])
 def test_readiness_portable_rejects_authenticated_call_history_mutations(
     mutation: str,
