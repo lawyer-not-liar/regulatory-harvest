@@ -57,6 +57,37 @@ BASELINE_ARCHIVE_REQUIREMENTS = frozenset(
 BASELINE_CANONICAL_JSON_INPUTS = frozenset(
     path for path in BASELINE_ARCHIVE_REQUIREMENTS if path.startswith("assets/")
 )
+READINESS_ARCHIVE_REQUIREMENTS = frozenset(
+    {
+        "README.md",
+        "SKILL.md",
+        "assets/attorney-delivery-readiness-input.template.json",
+        "assets/attorney-delivery-readiness-response.template.json",
+        "docs/evaluation.md",
+        "references/attorney-evaluation.md",
+        "references/security-and-privacy.md",
+        "scripts/attorney_eval_full.py",
+        "scripts/attorney_eval_portable.py",
+        "scripts/harvest_portable.py",
+        "scripts/harvest_skill.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_artifacts.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_compiler.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_drafts.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_handoff.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_inputs.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_models.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_requests.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_workflow.py",
+        "src/regulatory_harvest/evaluation/readiness-rubric-v1.json",
+    }
+)
+READINESS_CANONICAL_JSON_INPUTS = frozenset(
+    {
+        "assets/attorney-delivery-readiness-input.template.json",
+        "assets/attorney-delivery-readiness-response.template.json",
+        "src/regulatory_harvest/evaluation/readiness-rubric-v1.json",
+    }
+)
 
 
 class SkillBuildError(RuntimeError):
@@ -80,9 +111,27 @@ def _assert_baseline_canonical_inputs() -> None:
                 f"evaluation-baseline-v1 input is not canonical JSON: {relative}"
             ) from error
         if data != canonical:
+            raise SkillBuildError(f"evaluation-baseline-v1 input is not canonical JSON: {relative}")
+
+
+def _assert_readiness_canonical_inputs() -> None:
+    for relative in sorted(READINESS_CANONICAL_JSON_INPUTS):
+        data = (ROOT / relative).read_bytes()
+        try:
+            value = json.loads(data)
+            canonical = json.dumps(
+                value,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise SkillBuildError(
-                f"evaluation-baseline-v1 input is not canonical JSON: {relative}"
-            )
+                f"delivery-readiness-v1 input is not canonical JSON: {relative}"
+            ) from error
+        if data != canonical:
+            raise SkillBuildError(f"delivery-readiness-v1 input is not canonical JSON: {relative}")
 
 
 def _runtime_files() -> list[Path]:
@@ -116,8 +165,12 @@ def _runtime_files() -> list[Path]:
     missing_baseline = sorted(BASELINE_ARCHIVE_REQUIREMENTS - expected)
     if missing_baseline:
         raise SkillBuildError(
-            "skill package manifest is missing evaluation-baseline-v1 input: "
-            f"{missing_baseline[0]}"
+            f"skill package manifest is missing evaluation-baseline-v1 input: {missing_baseline[0]}"
+        )
+    missing_readiness = sorted(READINESS_ARCHIVE_REQUIREMENTS - expected)
+    if missing_readiness:
+        raise SkillBuildError(
+            f"skill package manifest is missing delivery-readiness-v1 input: {missing_readiness[0]}"
         )
     discovered: set[str] = set()
     for relative in GUARDED_TREES:
@@ -140,6 +193,7 @@ def _runtime_files() -> list[Path]:
     if any(path.is_symlink() for path in paths):
         raise SkillBuildError("runtime archive inputs must not be symbolic links")
     _assert_baseline_canonical_inputs()
+    _assert_readiness_canonical_inputs()
     return sorted(set(paths), key=lambda path: path.relative_to(ROOT).as_posix())
 
 

@@ -64,17 +64,28 @@ LEGACY_IDENTIFIER_HASHES: Final = frozenset(
     }
 )
 FIXTURE_LICENSE_NAMES: Final = ("FIXTURE_LICENSE.md", "FIXTURE_LICENSES.md")
-GENERATED_DIRECTORIES: Final = frozenset({"run", "runs", "output", "outputs"})
+GENERATED_DIRECTORIES: Final = frozenset(
+    {"archive", "archives", "run", "runs", "output", "outputs"}
+)
 GENERATED_FILENAMES: Final = frozenset(
     {
+        "attorney-review-handoff.md",
         "bundle.json",
         "coverage-review.json",
         "audit.md",
+        "delivery-readiness.json",
         "evaluation.json",
+        "gap-follow-up-matrix.json",
         "manifest.json",
+        "readiness-input.json",
+        "readiness-manifest.json",
+        "readiness-verification.json",
         "receipt.json",
         "report.md",
+        "requirement-matrix.json",
         "result.json",
+        "safety-lane-1.json",
+        "safety-lane-2.json",
     }
 )
 PRIVATE_EVALUATION_FIELDS: Final = frozenset(
@@ -144,6 +155,41 @@ ALLOWLIST: Final = frozenset(
             "tests/analysis/test_report.py",
             "ABSOLUTE_HOME_PATH",
             "C:\\" + "Users\\private\\",
+        ),
+        (
+            "tests/evaluation/test_attorney_readiness_drafts.py",
+            "ABSOLUTE_HOME_PATH",
+            "/" + "Users/private/",
+        ),
+        (
+            "tests/evaluation/test_attorney_readiness_handoff.py",
+            "ABSOLUTE_HOME_PATH",
+            "/" + "Users/private/",
+        ),
+        (
+            "tests/evaluation/test_attorney_readiness_inputs.py",
+            "ABSOLUTE_HOME_PATH",
+            "/" + "Users/private/",
+        ),
+        (
+            "tests/evaluation/test_attorney_readiness_inputs.py",
+            "ABSOLUTE_HOME_PATH",
+            "/" + "home/private/",
+        ),
+        (
+            "tests/evaluation/test_attorney_readiness_models.py",
+            "ABSOLUTE_HOME_PATH",
+            "/" + "Users/client/",
+        ),
+        (
+            "tests/evaluation/test_attorney_readiness_requests.py",
+            "ABSOLUTE_HOME_PATH",
+            "/" + "Users/client/",
+        ),
+        (
+            "tests/scripts/test_attorney_eval_portable.py",
+            "ABSOLUTE_HOME_PATH",
+            "/" + "Users/private/",
         ),
         (
             "tests/cli/test_cite_cli.py",
@@ -424,13 +470,9 @@ def _scan_decoded_json(
             for key, value in current.items():
                 normalized_key = _normalized_json_key(key)
                 if (
-                    (
-                        normalized_key in JSON_CREDENTIAL_FIELDS
-                        or normalized_key.replace("_", "")
-                        in JSON_CREDENTIAL_COMPACT_FIELDS
-                    )
-                    and _json_value_is_present(value)
-                ):
+                    normalized_key in JSON_CREDENTIAL_FIELDS
+                    or normalized_key.replace("_", "") in JSON_CREDENTIAL_COMPACT_FIELDS
+                ) and _json_value_is_present(value):
                     encoded_key = json.dumps(str(key), ensure_ascii=False)
                     offset = text.find(encoded_key)
                     finding = _finding(
@@ -580,8 +622,14 @@ def _fixture_is_licensed(path: PurePosixPath, tracked: set[str]) -> bool:
         directory = directory.parent
 
 
-def _scan_path(path: str, tracked: set[str]) -> list[Finding]:
+def _scan_path(
+    path: str,
+    tracked: set[str],
+    *,
+    display_path: str | None = None,
+) -> list[Finding]:
     pure_path = PurePosixPath(path)
+    reported_path = path if display_path is None else display_path
     findings: list[Finding] = []
     if (
         "fixtures" in pure_path.parts
@@ -590,7 +638,7 @@ def _scan_path(path: str, tracked: set[str]) -> list[Finding]:
     ):
         finding = _finding(
             "UNLICENSED_FIXTURE",
-            path,
+            reported_path,
             1,
             "Release fixture has no license manifest in its fixture tree.",
         )
@@ -602,7 +650,7 @@ def _scan_path(path: str, tracked: set[str]) -> list[Finding]:
     ):
         finding = _finding(
             "GENERATED_EXPORT",
-            path,
+            reported_path,
             1,
             "Release run output appears to be a prohibited generated export.",
         )
@@ -639,6 +687,7 @@ def audit_archive(path: Path, *, markers: tuple[str, ...] = ()) -> list[Finding]
     try:
         with zipfile.ZipFile(resolved) as archive:
             infos = archive.infolist()
+            archive_paths = {info.filename for info in infos}
             names = [info.filename for info in infos]
             if len(names) != len(set(names)):
                 raise AuditError("release archive contains duplicate paths")
@@ -652,14 +701,9 @@ def audit_archive(path: Path, *, markers: tuple[str, ...] = ()) -> list[Finding]
                     not segment
                     or segment in {".", ".."}
                     or segment.endswith((".", " "))
-                    or any(
-                        unicodedata.category(character) in {"Cc", "Cf"}
-                        for character in segment
-                    )
+                    or any(unicodedata.category(character) in {"Cc", "Cf"} for character in segment)
                     or ":" in segment
-                    or segment.split(".", 1)[0]
-                    .translate(str.maketrans("¹²³", "123"))
-                    .casefold()
+                    or segment.split(".", 1)[0].translate(str.maketrans("¹²³", "123")).casefold()
                     in WINDOWS_RESERVED_NAMES
                     for segment in segments
                 )
@@ -685,6 +729,14 @@ def audit_archive(path: Path, *, markers: tuple[str, ...] = ()) -> list[Finding]
                 total_size += info.file_size
                 if total_size > MAX_ARCHIVE_TOTAL_BYTES:
                     raise AuditError("release archive exceeds the expanded-size limit")
+                display_path = f"archive:{resolved.name}!/{info.filename}"
+                findings.extend(
+                    _scan_path(
+                        info.filename,
+                        archive_paths,
+                        display_path=display_path,
+                    )
+                )
                 data = archive.read(info)
                 if b"\0" in data:
                     continue
@@ -692,7 +744,6 @@ def audit_archive(path: Path, *, markers: tuple[str, ...] = ()) -> list[Finding]
                     text = data.decode("utf-8")
                 except UnicodeDecodeError:
                     continue
-                display_path = f"archive:{resolved.name}!/{info.filename}"
                 findings.extend(_scan_text(display_path, text, markers))
     except AuditError:
         raise

@@ -10,6 +10,8 @@ SKILL.md
 THIRD_PARTY_NOTICES.md
 agents/openai.yaml
 assets/analysis-draft.template.json
+assets/attorney-delivery-readiness-input.template.json
+assets/attorney-delivery-readiness-response.template.json
 assets/attorney-evaluation-baseline-correction.template.json
 assets/attorney-evaluation-baseline-input.template.json
 assets/attorney-evaluation-baseline-response.template.json
@@ -81,6 +83,14 @@ src/regulatory_harvest/evaluation/attorney_ledger.py
 src/regulatory_harvest/evaluation/attorney_models.py
 src/regulatory_harvest/evaluation/attorney_protocol.py
 src/regulatory_harvest/evaluation/attorney_qualification.py
+src/regulatory_harvest/evaluation/attorney_readiness_artifacts.py
+src/regulatory_harvest/evaluation/attorney_readiness_compiler.py
+src/regulatory_harvest/evaluation/attorney_readiness_drafts.py
+src/regulatory_harvest/evaluation/attorney_readiness_handoff.py
+src/regulatory_harvest/evaluation/attorney_readiness_inputs.py
+src/regulatory_harvest/evaluation/attorney_readiness_models.py
+src/regulatory_harvest/evaluation/attorney_readiness_requests.py
+src/regulatory_harvest/evaluation/attorney_readiness_workflow.py
 src/regulatory_harvest/evaluation/attorney_scoring.py
 src/regulatory_harvest/evaluation/attorney_v21_artifacts.py
 src/regulatory_harvest/evaluation/attorney_v21_compiler.py
@@ -103,6 +113,7 @@ src/regulatory_harvest/evaluation/attorney_v2_workflow.py
 src/regulatory_harvest/evaluation/attorney_workflow.py
 src/regulatory_harvest/evaluation/cli.py
 src/regulatory_harvest/evaluation/legalbench_rag.py
+src/regulatory_harvest/evaluation/readiness-rubric-v1.json
 src/regulatory_harvest/evaluation/runner.py
 src/regulatory_harvest/models/__init__.py
 src/regulatory_harvest/models/analysis.py

@@ -39,7 +39,7 @@ The scanner has a small path, finding-code, and exact-value allowlist for synthe
 Before declaring the candidate technically verified:
 
 1. Build the universal skill ZIP twice from the same clean committed snapshot and confirm identical file counts, byte lengths, and SHA-256 hashes.
-2. Confirm both archives and both clean extractions have one `regulatory-harvest/` root and contain `SKILL.md`, the runtime engine, runner, assets, references, license, notices, README, and package metadata. In particular, require the qualification module and template plus the full and portable evaluator and skill runners.
+2. Confirm both archives and both clean extractions have one `regulatory-harvest/` root and contain `SKILL.md`, the runtime engine, runner, assets, references, license, notices, README, and package metadata. In particular, require the qualification module and template; both delivery-readiness templates; the canonical readiness rubric; all eight readiness model, input, request, draft, compiler, handoff, artifact, and workflow modules; the readiness documentation and references; and the full and portable evaluator and skill runners.
 3. Confirm the skill name matches the archive root and the description remains at or below Claude Desktop's 200-character limit.
 4. Confirm the archive excludes Git state, worktrees, tests, internal plans, caches, generated matters, prior distributions, and private records.
 5. Extract the ZIP into a clean directory and run `prepare` and `finalize` in both source modes with site packages disabled and package-index access blocked, without importing the development checkout.
@@ -54,7 +54,7 @@ Before declaring the candidate technically verified:
 14. Review `references/security-and-privacy.md`; confirm the evaluation directory is access-controlled, non-public, and non-synced, and that no secrets, environment files, configuration, Git state, or unrelated records were captured.
 15. Upload that exact ZIP to Claude Desktop with code execution enabled and exercise both source modes.
 16. Install the same folder or ZIP in Codex and exercise both source modes.
-17. Install the built wheel in a new environment outside the checkout and run the offline CLI example.
+17. Install the built wheel in a new environment outside the checkout, load `evaluation/readiness-rubric-v1.json` through `importlib.resources`, require its bytes to equal the source policy asset, and run the offline CLI example.
 18. Run the synthetic LegalBench-RAG evaluation.
 19. Keep all private evaluation packets, prior analyses, reviewer responses, comparison results, and the local private-marker file outside the release candidate.
 20. Record commands, versions, results, and artifact hashes under `docs/verification/` without converting unperformed UI checks into claims.
@@ -65,6 +65,8 @@ Before declaring the candidate technically verified:
 25. Confirm two fresh baseline-locked grading lanes and two fresh safety lanes run for every fixture, every safety disagreement receives one fresh dispute-scoped referee, and every repair is isolated. Exit `0` for review-ready must be described as attorney-review delivery, exit `4` as nondelivery, exit `5` as integrity failure, and exit `6` as a live write-free pause.
 26. Treat the `0.70` review-ready floor as provisional. Before changing it, record at least three and preferably five diverse attorney-reviewed calibration cases. For every report revision, require the exact public calibration record plus a linked restricted companion containing both fresh grade-lane matrices and scores, tier and gap-matrix visibility, usefulness, follow-up sufficiency, false nondelivery, unsafe delivery, importance disagreement, baseline correction, and optional historical disposition, historical comparability, and historical delta. Compute the aggregate baseline-correction rate across the calibration set. Keep private cases and linked companion records outside the repository. Any threshold, blocker, or scoring change requires a new rubric version and may not weaken integrity, silently diverge from retained Protocol 2.2 semantics, or rewrite historical results.
 27. Confirm `REVIEW_READY_WITH_GAPS` is not authorization for unreviewed client delivery, `NOT_DELIVERABLE` preserves sealed artifacts while suppressing the report, and publication or a default change still requires a separate owner decision.
+28. Rebuild retained Protocol 1.3, 2.0, 2.1, and 2.2 fixture trees, capture their status and verification transcripts through both full and isolated portable verifiers, run the opt-in readiness commands, and require the trees and transcripts to remain byte-identical. No historical run may acquire an inferred readiness sibling; only explicit readiness initialization may create one.
+29. Require the release audit to reject generated readiness manifests and inputs, safety requests and responses, requirement and gap matrices, delivery results, readiness verification records, and attorney handoffs from candidate source or detached archives. Record only neutral finding codes, paths, line numbers, and counts; never matched private content.
 
 Results are AI Generated and may contain errors. Output must be validated by an attorney before the attorney delivers legal advice.
 
@@ -82,3 +84,9 @@ The audit always reports `MANUAL_CONFIRMATION_REQUIRED`, even when all automated
 Record that decision outside this codebase in an access-controlled location with the approver, date, candidate commit, and publication destinations. Do not encode approval as a file or boolean that an automated check could mistake for authority.
 
 Until that confirmation is complete, a local version may be described as technically verified, but it must not be described as publicly released.
+
+## External privacy-marker and private-readiness gates
+
+The automated repository/archive audit without owner markers is a public technical gate. The external-marker audit is a separate privacy gate: use only an already approved opaque marker-file path in its access-controlled location. Never search for, infer, invent, copy, or commit that path or its contents. If no approved path is explicitly available to the operator, record the external-marker gate as pending; do not weaken the audit or add a content exception to manufacture a pass.
+
+After every public technical and privacy gate passes, a fresh private `delivery-readiness-v1` matter remains a separate, explicitly authorized rollout gate. Keep its sources, reports, requests, responses, matrices, handoffs, identifiers, hashes, and results outside the repository and public logs. Require full/isolated-portable complete-tree parity and qualified-attorney assessment of usefulness and follow-up sufficiency. A private result does not publish a package, change Protocol 2.1 as the default, or authorize a release.

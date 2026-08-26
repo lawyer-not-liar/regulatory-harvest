@@ -67,6 +67,19 @@ def _run_audit(path: Path, *extra: str) -> subprocess.CompletedProcess[str]:
         ("runs/demo/bundle.json", "{}\n", "GENERATED_EXPORT"),
         ("runs/demo/audit.md", "# Generated audit\n", "GENERATED_EXPORT"),
         ("runs/demo/coverage-review.json", "{}\n", "GENERATED_EXPORT"),
+        ("runs/demo/readiness-manifest.json", "{}\n", "GENERATED_EXPORT"),
+        ("runs/demo/readiness-input.json", "{}\n", "GENERATED_EXPORT"),
+        ("runs/demo/requests/safety-lane-1.json", "{}\n", "GENERATED_EXPORT"),
+        ("runs/demo/responses/safety-lane-2.json", "{}\n", "GENERATED_EXPORT"),
+        ("runs/demo/requirement-matrix.json", "{}\n", "GENERATED_EXPORT"),
+        ("runs/demo/gap-follow-up-matrix.json", "{}\n", "GENERATED_EXPORT"),
+        ("runs/demo/delivery-readiness.json", "{}\n", "GENERATED_EXPORT"),
+        ("runs/demo/readiness-verification.json", "{}\n", "GENERATED_EXPORT"),
+        (
+            "archives/demo/attorney-review-handoff.md",
+            "# Synthetic archived handoff\n",
+            "GENERATED_EXPORT",
+        ),
     ],
 )
 def test_audit_reports_stable_codes_without_echoing_sensitive_content(
@@ -133,6 +146,30 @@ def test_audit_exception_allows_only_the_exact_synthetic_sentinel(
     assert [item["code"] for item in payload["automated_findings"]] == ["SECRET_PATTERN"]
 
 
+def test_audit_exception_allows_only_exact_readiness_home_path_probes(
+    tmp_path: Path,
+) -> None:
+    """Synthetic path tests may ship, but a different home identity must still fail."""
+    allowed = "/" + "Users/private/probe.json"
+    unexpected = "/" + "Users/customer/matter.json"
+    _init_repo(
+        tmp_path,
+        {
+            "tests/evaluation/test_attorney_readiness_inputs.py": (
+                f'allowed = "{allowed}"\nunexpected = "{unexpected}"\n'
+            )
+        },
+    )
+
+    result = _run_audit(tmp_path)
+    payload = json.loads(result.stdout)
+
+    assert result.returncode == 1
+    assert [item["code"] for item in payload["automated_findings"]] == ["ABSOLUTE_HOME_PATH"]
+    assert allowed not in result.stdout
+    assert unexpected not in result.stdout
+
+
 def test_audit_scans_untracked_nonignored_candidate_files(tmp_path: Path) -> None:
     """A pre-commit audit must not miss a newly created private file."""
     _init_repo(tmp_path, {"README.md": "# Clean test repository\n"})
@@ -191,9 +228,7 @@ def test_audit_rejects_duplicate_repository_json_keys_without_echo(
     payload = json.loads(result.stdout)
 
     assert result.returncode == 1
-    assert "DUPLICATE_JSON_KEY" in {
-        item["code"] for item in payload["automated_findings"]
-    }
+    assert "DUPLICATE_JSON_KEY" in {item["code"] for item in payload["automated_findings"]}
     assert secret not in result.stdout
     assert secret not in result.stderr
 
@@ -207,9 +242,7 @@ def test_audit_rejects_a_json_escaped_windows_home_path(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
 
     assert result.returncode == 1
-    assert {item["code"] for item in payload["automated_findings"]} == {
-        "ABSOLUTE_HOME_PATH"
-    }
+    assert {item["code"] for item in payload["automated_findings"]} == {"ABSOLUTE_HOME_PATH"}
     assert private_path not in result.stdout
     assert private_path not in result.stderr
 
@@ -266,9 +299,7 @@ def test_audit_rejects_duplicate_json_keys_inside_the_exact_archive_without_echo
     payload = json.loads(result.stdout)
 
     assert result.returncode == 1
-    assert "DUPLICATE_JSON_KEY" in {
-        item["code"] for item in payload["automated_findings"]
-    }
+    assert "DUPLICATE_JSON_KEY" in {item["code"] for item in payload["automated_findings"]}
     assert secret not in result.stdout
     assert secret not in result.stderr
 
@@ -290,9 +321,7 @@ def test_audit_rejects_a_json_escaped_windows_home_path_inside_the_exact_archive
     payload = json.loads(result.stdout)
 
     assert result.returncode == 1
-    assert {item["code"] for item in payload["automated_findings"]} == {
-        "ABSOLUTE_HOME_PATH"
-    }
+    assert {item["code"] for item in payload["automated_findings"]} == {"ABSOLUTE_HOME_PATH"}
     assert private_path not in result.stdout
     assert private_path not in result.stderr
 
@@ -361,9 +390,7 @@ def test_audit_matches_external_private_markers_in_decoded_repository_json(
     payload = json.loads(result.stdout)
 
     assert result.returncode == 1
-    assert {item["code"] for item in payload["automated_findings"]} == {
-        "PRIVATE_EVALUATION_MARKER"
-    }
+    assert {item["code"] for item in payload["automated_findings"]} == {"PRIVATE_EVALUATION_MARKER"}
     assert marker not in result.stdout
     assert marker not in result.stderr
 
@@ -397,9 +424,7 @@ def test_audit_matches_external_private_markers_in_decoded_archive_json(
     payload = json.loads(result.stdout)
 
     assert result.returncode == 1
-    assert {item["code"] for item in payload["automated_findings"]} == {
-        "PRIVATE_EVALUATION_MARKER"
-    }
+    assert {item["code"] for item in payload["automated_findings"]} == {"PRIVATE_EVALUATION_MARKER"}
     assert marker not in result.stdout
     assert marker not in result.stderr
 
@@ -438,6 +463,52 @@ def test_audit_scans_the_exact_built_zip_for_private_markers(tmp_path: Path) -> 
         for item in payload["automated_findings"]
     )
     assert "synthetic-private-value" not in result.stdout
+
+
+def test_audit_rejects_archived_readiness_handoff_without_echoing_content(
+    tmp_path: Path,
+) -> None:
+    """A detached archive must not smuggle generated attorney work product."""
+    _init_repo(tmp_path, {"README.md": "# Clean test repository\n"})
+    handoff = "# Confidential synthetic handoff body that must not be echoed\n"
+    archive = tmp_path / "candidate.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(
+            "regulatory-harvest/archives/demo/attorney-review-handoff.md",
+            handoff,
+        )
+
+    result = _run_audit(tmp_path, "--archive", str(archive))
+    payload = json.loads(result.stdout)
+
+    assert result.returncode == 1
+    assert [item["code"] for item in payload["automated_findings"]] == ["GENERATED_EXPORT"]
+    assert payload["automated_findings"][0]["path"].startswith(
+        "archive:candidate.zip!/"
+    )
+    assert handoff.strip() not in result.stdout
+    assert handoff.strip() not in result.stderr
+
+
+def test_audit_rejects_archived_readiness_handoff_even_when_content_is_binary(
+    tmp_path: Path,
+) -> None:
+    """Path inventory must reject work product before text decoding can skip it."""
+    _init_repo(tmp_path, {"README.md": "# Clean test repository\n"})
+    archive = tmp_path / "candidate.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(
+            "regulatory-harvest/archives/demo/attorney-review-handoff.md",
+            b"\x00synthetic-binary-handoff",
+        )
+
+    result = _run_audit(tmp_path, "--archive", str(archive))
+    payload = json.loads(result.stdout)
+
+    assert result.returncode == 1
+    assert [item["code"] for item in payload["automated_findings"]] == [
+        "GENERATED_EXPORT"
+    ]
 
 
 @pytest.mark.parametrize(

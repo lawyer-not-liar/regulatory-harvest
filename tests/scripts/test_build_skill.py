@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import importlib.util
 import json
@@ -81,6 +82,33 @@ BASELINE_PACKAGE_PATHS = (
     "src/regulatory_harvest/evaluation/attorney_baseline_workflow.py",
 )
 BASELINE_ASSET_PATHS = BASELINE_PACKAGE_PATHS[:4]
+READINESS_PACKAGE_PATHS = (
+    "README.md",
+    "SKILL.md",
+    "assets/attorney-delivery-readiness-input.template.json",
+    "assets/attorney-delivery-readiness-response.template.json",
+    "docs/evaluation.md",
+    "references/attorney-evaluation.md",
+    "references/security-and-privacy.md",
+    "scripts/attorney_eval_full.py",
+    "scripts/attorney_eval_portable.py",
+    "scripts/harvest_portable.py",
+    "scripts/harvest_skill.py",
+    "src/regulatory_harvest/evaluation/attorney_readiness_artifacts.py",
+    "src/regulatory_harvest/evaluation/attorney_readiness_compiler.py",
+    "src/regulatory_harvest/evaluation/attorney_readiness_drafts.py",
+    "src/regulatory_harvest/evaluation/attorney_readiness_handoff.py",
+    "src/regulatory_harvest/evaluation/attorney_readiness_inputs.py",
+    "src/regulatory_harvest/evaluation/attorney_readiness_models.py",
+    "src/regulatory_harvest/evaluation/attorney_readiness_requests.py",
+    "src/regulatory_harvest/evaluation/attorney_readiness_workflow.py",
+    "src/regulatory_harvest/evaluation/readiness-rubric-v1.json",
+)
+READINESS_CANONICAL_JSON_PATHS = (
+    "assets/attorney-delivery-readiness-input.template.json",
+    "assets/attorney-delivery-readiness-response.template.json",
+    "src/regulatory_harvest/evaluation/readiness-rubric-v1.json",
+)
 SPEC = importlib.util.spec_from_file_location("regulatory_harvest_skill_builder", BUILDER)
 assert SPEC is not None and SPEC.loader is not None
 skill_builder = importlib.util.module_from_spec(SPEC)
@@ -112,8 +140,7 @@ def test_ci_public_audit_targets_the_exact_built_archive() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert (
-        "python scripts/audit_release.py "
-        "--archive dist/regulatory-harvest-skill.zip --json"
+        "python scripts/audit_release.py --archive dist/regulatory-harvest-skill.zip --json"
     ) in workflow
     assert "--private-markers" not in workflow
 
@@ -344,13 +371,9 @@ def test_built_skill_preserves_qualification_and_ledger_repair_contract(
     }
     assert response_template["judge_isolation"] == "fresh_context"
     reference = " ".join(
-        (skill / "references" / "attorney-evaluation.md")
-        .read_text(encoding="utf-8")
-        .split()
+        (skill / "references" / "attorney-evaluation.md").read_text(encoding="utf-8").split()
     ).casefold()
-    assert "public `fresh_context` value is illustrative, not an observed default" in (
-        reference
-    )
+    assert "public `fresh_context` value is illustrative, not an observed default" in (reference)
     assert "explicitly replace `judge_isolation`" in reference
     assert "only for an initial role response" in reference
     assert "this fallback never applies to a mechanical repair" in reference
@@ -496,9 +519,7 @@ def _strict_coverage(dossier: dict[str, object]) -> dict[str, object]:
         "coverage_contract_version": "proposition-coverage-v2",
         "lead_reviews": [],
         "proposition_coverage": [],
-        "unit_reviews": [
-            {"unit_id": unit_id, "dimensions": dimensions} for unit_id in unit_ids
-        ],
+        "unit_reviews": [{"unit_id": unit_id, "dimensions": dimensions} for unit_id in unit_ids],
         "lead_dispositions_v2": [
             {
                 "lead_id": lead_id,
@@ -596,9 +617,9 @@ def test_skill_archive_is_one_reproducible_cross_platform_package(tmp_path: Path
 
 def test_protocol_2_runtime_and_template_are_exactly_packaged(tmp_path: Path) -> None:
     """A clean archive must carry each v2 runtime byte once and reproducibly."""
-    manifest_entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    manifest_entries = (
+        (ROOT / "scripts" / "skill-package-files.txt").read_text(encoding="utf-8").splitlines()
+    )
     assert manifest_entries == sorted(set(manifest_entries))
     assert all(manifest_entries.count(path) == 1 for path in EVALUATOR_V2_PACKAGE_PATHS)
 
@@ -613,9 +634,9 @@ def test_protocol_2_runtime_and_template_are_exactly_packaged(tmp_path: Path) ->
 
 def test_protocol_21_runtime_and_template_are_exactly_packaged(tmp_path: Path) -> None:
     """A clean archive must contain every Protocol 2.1 runtime byte exactly once."""
-    manifest_entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    manifest_entries = (
+        (ROOT / "scripts" / "skill-package-files.txt").read_text(encoding="utf-8").splitlines()
+    )
     assert manifest_entries == sorted(set(manifest_entries))
     assert all(manifest_entries.count(path) == 1 for path in EVALUATOR_V21_PACKAGE_PATHS)
 
@@ -628,9 +649,9 @@ def test_protocol_21_runtime_and_template_are_exactly_packaged(tmp_path: Path) -
 
 def test_protocol_22_runtime_and_template_are_exactly_packaged(tmp_path: Path) -> None:
     """A clean archive contains every Protocol 2.2 runtime byte exactly once."""
-    manifest_entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    manifest_entries = (
+        (ROOT / "scripts" / "skill-package-files.txt").read_text(encoding="utf-8").splitlines()
+    )
     assert manifest_entries == sorted(set(manifest_entries))
     assert all(manifest_entries.count(path) == 1 for path in EVALUATOR_V22_PACKAGE_PATHS)
 
@@ -646,9 +667,9 @@ def test_protocol_22_runtime_and_template_are_exactly_packaged(tmp_path: Path) -
 
 def test_baseline_runtime_and_assets_are_exactly_packaged_once(tmp_path: Path) -> None:
     """An installable skill must carry the complete stable-baseline runtime byte-for-byte."""
-    entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    entries = (
+        (ROOT / "scripts" / "skill-package-files.txt").read_text(encoding="utf-8").splitlines()
+    )
     assert entries == sorted(set(entries))
     assert all(entries.count(path) == 1 for path in BASELINE_PACKAGE_PATHS)
 
@@ -665,6 +686,453 @@ def test_baseline_runtime_and_assets_are_exactly_packaged_once(tmp_path: Path) -
         assert not any("attorney-eval-baseline" in name for name in names)
 
 
+def test_readiness_runtime_assets_docs_and_runners_are_exactly_packaged_once(
+    tmp_path: Path,
+) -> None:
+    """Removing any readiness dependency must make the distributable incomplete."""
+    entries = (
+        (ROOT / "scripts" / "skill-package-files.txt").read_text(encoding="utf-8").splitlines()
+    )
+    assert entries == sorted(set(entries))
+    assert all(entries.count(path) == 1 for path in READINESS_PACKAGE_PATHS)
+
+    built = tmp_path / "readiness-skill.zip"
+    result = _build(built)
+    assert result.returncode == 0, result.stderr
+    with zipfile.ZipFile(built) as archive:
+        names = archive.namelist()
+        for path in READINESS_PACKAGE_PATHS:
+            member = f"regulatory-harvest/{path}"
+            assert names.count(member) == 1
+            assert archive.read(member) == (ROOT / path).read_bytes()
+
+
+@pytest.mark.parametrize("required", READINESS_PACKAGE_PATHS)
+def test_skill_build_refuses_each_missing_readiness_runtime_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    required: str,
+) -> None:
+    """The build guard must name every omitted readiness input before writing a ZIP."""
+    entries = (
+        (ROOT / "scripts" / "skill-package-files.txt").read_text(encoding="utf-8").splitlines()
+    )
+    manifest = tmp_path / "skill-package-files.txt"
+    manifest.write_text(
+        "\n".join(entry for entry in entries if entry != required) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(skill_builder, "PACKAGE_MANIFEST", manifest)
+
+    with pytest.raises(
+        skill_builder.SkillBuildError,
+        match="skill package manifest is missing delivery-readiness-v1 input: " + required,
+    ):
+        skill_builder._runtime_files()
+
+
+def test_installed_wheel_exposes_exact_readiness_rubric_resource(tmp_path: Path) -> None:
+    """Dropping package JSON data would make installed readiness policy unavailable."""
+    wheel_dir = tmp_path / "wheel"
+    built = subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(wheel_dir)],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert built.returncode == 0, built.stderr
+    wheel = next(wheel_dir.glob("*.whl"))
+    installed_root = tmp_path / "installed"
+    installed = subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--no-deps",
+            "--target",
+            str(installed_root),
+            str(wheel),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert installed.returncode == 0, installed.stderr
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from importlib.resources import files;"
+                "print((files('regulatory_harvest')/'evaluation'/"
+                "'readiness-rubric-v1.json').read_bytes().hex())"
+            ),
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(installed_root)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert (
+        bytes.fromhex(probe.stdout.strip())
+        == (ROOT / "src/regulatory_harvest/evaluation/readiness-rubric-v1.json").read_bytes()
+    )
+
+
+def test_extracted_skill_runs_all_readiness_help_and_public_terminal_journeys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The built ZIP must execute every public tier without the checkout as runtime."""
+    skill = _build_and_extract(tmp_path)
+    full_runner = skill / "scripts" / "harvest_skill.py"
+    portable_runner = skill / "scripts" / "harvest_portable.py"
+    commands = (
+        "eval-readiness-init",
+        "eval-readiness-next",
+        "eval-readiness-submit-safe",
+        "eval-readiness-status",
+        "eval-readiness-verify",
+    )
+    for command in commands:
+        full_help = _run_isolated(
+            full_runner,
+            tmp_path,
+            command,
+            "--help",
+            without_site_packages=False,
+        )
+        portable_help = _run_isolated(
+            portable_runner,
+            tmp_path,
+            command,
+            "--help",
+            without_site_packages=True,
+        )
+        assert full_help.returncode == portable_help.returncode == 0
+        assert full_help.stderr == portable_help.stderr == ""
+
+    rubric = skill / "src/regulatory_harvest/evaluation/readiness-rubric-v1.json"
+    assert (
+        rubric.read_bytes()
+        == (ROOT / "src/regulatory_harvest/evaluation/readiness-rubric-v1.json").read_bytes()
+    )
+
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "skill"))
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    fixture_support = __import__("test_skill_package")
+    stress = __import__("test_attorney_readiness_stress")
+    baseline_artifacts = __import__("test_attorney_baseline_artifacts")
+    input_helpers = __import__("test_attorney_readiness_inputs")
+    workflow_tests = __import__("test_attorney_readiness_workflow")
+    draft_tests = __import__("test_attorney_readiness_drafts")
+    from regulatory_harvest.evaluation.attorney_readiness_drafts import (
+        ReadinessEvaluatorProvenanceV1,
+        compile_readiness_draft_v1,
+    )
+    from regulatory_harvest.evaluation.attorney_readiness_models import (
+        ReadinessEvaluatorRequestV1,
+        ReadinessOperationV1,
+    )
+
+    _, rubric_policy, _ = stress._portable()._readiness_rubric_v1()
+    script = json.loads(
+        (ROOT / "tests/fixtures/attorney-readiness-v1/stable/scripted-drafts.json").read_bytes()
+    )
+    ordinary_journeys = [
+        journey for journey in script["journeys"] if not journey["historical_fail_cross_check"]
+    ]
+    assert [journey["expected_delivery_readiness"] for journey in ordinary_journeys] == [
+        "HIGH_ASSURANCE",
+        "REVIEW_READY_WITH_GAPS",
+        "NOT_DELIVERABLE",
+    ]
+    provenance = ReadinessEvaluatorProvenanceV1(
+        provider_name="public-package-provider",
+        model_name="public-package-model",
+        judge_isolation="scripted_fixture",
+    )
+
+    for journey in ordinary_journeys:
+        journey_id = str(journey["journey_id"])
+        inputs_root = tmp_path / f"package-inputs-{journey_id}"
+        inputs_root.mkdir()
+        qualification_run, baseline_run, baseline_context = fixture_support._write_fixture_baseline(
+            inputs_root,
+            input_helpers,
+            baseline_artifacts,
+        )
+        generation_run, receipt_path, report_text = (
+            fixture_support._write_fixture_validation_matter(
+                inputs_root,
+                baseline_context,
+                journey,
+                input_helpers,
+            )
+        )
+        full_run = tmp_path / f"package-full-{journey_id}"
+        portable_run = tmp_path / f"package-portable-{journey_id}"
+        common = (
+            "eval-readiness-init",
+            "--baseline-run",
+            str(baseline_run),
+            "--qualification-run",
+            str(qualification_run),
+            "--generation-run",
+            str(generation_run),
+            "--validation-receipt",
+            str(receipt_path),
+        )
+        full_init = _run_isolated(
+            full_runner,
+            tmp_path,
+            *common,
+            "--run",
+            str(full_run),
+            without_site_packages=False,
+        )
+        portable_init = _run_isolated(
+            portable_runner,
+            tmp_path,
+            *common,
+            "--run",
+            str(portable_run),
+            without_site_packages=True,
+        )
+        assert (full_init.returncode, full_init.stdout, full_init.stderr) == (
+            portable_init.returncode,
+            portable_init.stdout,
+            portable_init.stderr,
+        )
+        assert full_init.returncode == 0
+        assert _run_snapshot(full_run) == _run_snapshot(portable_run)
+
+        vector = stress._vector(journey["seed"], rubric_policy)
+        vector.update(journey["vector_overrides"])
+        while True:
+            full_next = _run_isolated(
+                full_runner,
+                tmp_path,
+                "eval-readiness-next",
+                "--run",
+                str(full_run),
+                without_site_packages=False,
+            )
+            portable_next = _run_isolated(
+                portable_runner,
+                tmp_path,
+                "eval-readiness-next",
+                "--run",
+                str(portable_run),
+                without_site_packages=True,
+            )
+            assert (full_next.returncode, full_next.stdout, full_next.stderr) == (
+                portable_next.returncode,
+                portable_next.stdout,
+                portable_next.stderr,
+            )
+            request_wire = json.loads(full_next.stdout)
+            if request_wire is None:
+                break
+            request = ReadinessEvaluatorRequestV1.model_validate(request_wire)
+            if request.operation in {
+                ReadinessOperationV1.BASELINE_LOCKED_GRADE,
+                ReadinessOperationV1.BASELINE_LOCKED_CONTESTED_GRADE,
+            }:
+                draft = stress._grade_draft(
+                    request,
+                    workflow_tests,
+                    vector["coverage_mode"],
+                    vector["requirement_count"],
+                )
+            elif request.operation is ReadinessOperationV1.SAFETY_REVIEW:
+                draft = stress._safety_draft(
+                    request,
+                    workflow_tests,
+                    draft_tests,
+                    vector,
+                )
+            else:
+                draft = workflow_tests._draft(request, grade_mode="met")
+            compiled = compile_readiness_draft_v1(
+                request,
+                copy.deepcopy(draft),
+                provenance,
+            )
+            response_path = tmp_path / f"{journey_id}-response.json"
+            response_path.write_bytes(_canonical_bytes(compiled.response.model_dump(mode="json")))
+            full_submit = _run_isolated(
+                full_runner,
+                tmp_path,
+                "eval-readiness-submit-safe",
+                "--run",
+                str(full_run),
+                "--response",
+                str(response_path),
+                without_site_packages=False,
+            )
+            portable_submit = _run_isolated(
+                portable_runner,
+                tmp_path,
+                "eval-readiness-submit-safe",
+                "--run",
+                str(portable_run),
+                "--response",
+                str(response_path),
+                without_site_packages=True,
+            )
+            assert (
+                full_submit.returncode,
+                full_submit.stdout,
+                full_submit.stderr,
+            ) == (
+                portable_submit.returncode,
+                portable_submit.stdout,
+                portable_submit.stderr,
+            )
+            assert json.loads(full_submit.stdout)["accepted"] is True
+            assert _run_snapshot(full_run) == _run_snapshot(portable_run)
+
+        for command in ("eval-readiness-status", "eval-readiness-verify"):
+            full_terminal = _run_isolated(
+                full_runner,
+                tmp_path,
+                command,
+                "--run",
+                str(full_run),
+                without_site_packages=False,
+            )
+            portable_terminal = _run_isolated(
+                portable_runner,
+                tmp_path,
+                command,
+                "--run",
+                str(portable_run),
+                without_site_packages=True,
+            )
+            assert (
+                full_terminal.returncode,
+                full_terminal.stdout,
+                full_terminal.stderr,
+            ) == (
+                portable_terminal.returncode,
+                portable_terminal.stdout,
+                portable_terminal.stderr,
+            )
+        result = json.loads((full_run / "delivery-readiness.json").read_bytes())
+        assert result["delivery_readiness"] == journey["expected_delivery_readiness"]
+        handoff = (full_run / "attorney-review-handoff.md").read_text(encoding="utf-8")
+        assert (report_text in handoff) is (
+            journey["expected_delivery_readiness"] != "NOT_DELIVERABLE"
+        )
+
+
+@pytest.mark.parametrize("protocol", ["1.3", "2.0", "2.1", "2.2"])
+def test_readiness_packaging_preserves_retained_protocol_trees_and_transcripts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+) -> None:
+    """Opt-in readiness commands must never infer or mutate a retained companion."""
+    skill = _build_and_extract(tmp_path)
+    full_runner = skill / "scripts" / "harvest_skill.py"
+    portable_runner = skill / "scripts" / "harvest_portable.py"
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "scripts"))
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    retained = __import__("test_harvest_skill")
+    v22 = __import__("test_attorney_v22_workflow")
+    run = tmp_path / f"retained-{protocol.replace('.', '')}"
+    if protocol == "1.3":
+        retained._initialize_eval_run(full_runner, run)
+    elif protocol == "2.0":
+        retained._initialize_v2_eval_run(run)
+    elif protocol == "2.1":
+        retained._initialize_v21_eval_run(run)
+    else:
+        v22.initialize_evaluation_v22(v22._case(), run, seed_hex="4" * 64)
+
+    frozen_tree = _run_snapshot(run)
+
+    def retained_transcripts() -> tuple[tuple[int, str, str], ...]:
+        outputs: list[tuple[int, str, str]] = []
+        for runner, isolated in (
+            (full_runner, False),
+            (portable_runner, True),
+        ):
+            for command in ("eval-status", "eval-verify"):
+                result = _run_isolated(
+                    runner,
+                    tmp_path,
+                    command,
+                    "--run",
+                    str(run),
+                    without_site_packages=isolated,
+                )
+                outputs.append((result.returncode, result.stdout, result.stderr))
+        return tuple(outputs)
+
+    before = retained_transcripts()
+    assert _run_snapshot(run) == frozen_tree
+    for runner, isolated in ((full_runner, False), (portable_runner, True)):
+        for command in (
+            "eval-readiness-init",
+            "eval-readiness-next",
+            "eval-readiness-submit-safe",
+            "eval-readiness-status",
+            "eval-readiness-verify",
+        ):
+            help_result = _run_isolated(
+                runner,
+                tmp_path,
+                command,
+                "--help",
+                without_site_packages=isolated,
+            )
+            assert help_result.returncode == 0
+        refused = _run_isolated(
+            runner,
+            tmp_path,
+            "eval-readiness-status",
+            "--run",
+            str(run),
+            without_site_packages=isolated,
+        )
+        assert refused.returncode != 0
+        assert _run_snapshot(run) == frozen_tree
+
+    assert retained_transcripts() == before
+    assert _run_snapshot(run) == frozen_tree
+    assert not any("readiness" in path for path in frozen_tree)
+
+
+@pytest.mark.parametrize("required", READINESS_CANONICAL_JSON_PATHS)
+def test_skill_build_refuses_each_noncanonical_readiness_json_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    required: str,
+) -> None:
+    """Reformatting policy or public wire assets must not alter packaged bytes."""
+    for relative in READINESS_CANONICAL_JSON_PATHS:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, target)
+    target = tmp_path / required
+    target.write_text(
+        json.dumps(json.loads(target.read_bytes()), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(skill_builder, "ROOT", tmp_path)
+
+    with pytest.raises(
+        skill_builder.SkillBuildError,
+        match="delivery-readiness-v1 input is not canonical JSON: " + required,
+    ):
+        skill_builder._assert_readiness_canonical_inputs()
+
+
 def test_atomic_v2_template_and_runtime_dependencies_are_byte_complete_in_archive(
     tmp_path: Path,
 ) -> None:
@@ -677,21 +1145,20 @@ def test_atomic_v2_template_and_runtime_dependencies_are_byte_complete_in_archiv
         "src/regulatory_harvest/analysis/atomic_coverage.py",
         "src/regulatory_harvest/analysis/coverage_common.py",
     )
-    manifest_entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    manifest_entries = (
+        (ROOT / "scripts" / "skill-package-files.txt").read_text(encoding="utf-8").splitlines()
+    )
     assert manifest_entries == sorted(set(manifest_entries))
     assert set(required) <= set(manifest_entries)
 
     with zipfile.ZipFile(built) as archive:
         for relative_path in required:
-            assert archive.read(f"regulatory-harvest/{relative_path}") == (
-                ROOT / relative_path
-            ).read_bytes()
+            assert (
+                archive.read(f"regulatory-harvest/{relative_path}")
+                == (ROOT / relative_path).read_bytes()
+            )
         template = json.loads(
-            archive.read(
-                "regulatory-harvest/assets/analysis-draft.template.json"
-            ).decode("utf-8")
+            archive.read("regulatory-harvest/assets/analysis-draft.template.json").decode("utf-8")
         )
     assert template["coverage_contract_version"] == "proposition-coverage-v2"
     assert template["proposition_coverage"] == []
@@ -876,9 +1343,7 @@ def test_extracted_template_reaches_review_required_when_coverage_is_incomplete(
         ),
         encoding="utf-8",
     )
-    matter = tmp_path / (
-        "matter-portable" if without_site_packages else "matter-full"
-    )
+    matter = tmp_path / ("matter-portable" if without_site_packages else "matter-full")
     runner = skill / "scripts" / "harvest_skill.py"
 
     prepared = _run_isolated(
@@ -1252,9 +1717,9 @@ def test_skill_build_refuses_manifest_missing_protocol_21_runtime(
 ) -> None:
     """The archive guard names a missing 2.1 runtime instead of silently building."""
     required = "src/regulatory_harvest/evaluation/attorney_v21_workflow.py"
-    entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    entries = (
+        (ROOT / "scripts" / "skill-package-files.txt").read_text(encoding="utf-8").splitlines()
+    )
     assert required in entries
     manifest = tmp_path / "skill-package-files.txt"
     manifest.write_text(
@@ -1276,9 +1741,9 @@ def test_skill_build_refuses_manifest_missing_protocol_22_runtime(
 ) -> None:
     """The builder rejects an incomplete Protocol 2.2 runtime as one unit."""
     required = "src/regulatory_harvest/evaluation/attorney_v22_workflow.py"
-    entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    entries = (
+        (ROOT / "scripts" / "skill-package-files.txt").read_text(encoding="utf-8").splitlines()
+    )
     assert required in entries
     manifest = tmp_path / "skill-package-files.txt"
     manifest.write_text(
@@ -1301,9 +1766,9 @@ def test_skill_build_refuses_each_missing_baseline_runtime_input(
     required: str,
 ) -> None:
     """Every stable-baseline runtime or asset omission must name the missing input."""
-    entries = (ROOT / "scripts" / "skill-package-files.txt").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    entries = (
+        (ROOT / "scripts" / "skill-package-files.txt").read_text(encoding="utf-8").splitlines()
+    )
     assert required in entries
     manifest = tmp_path / "skill-package-files.txt"
     manifest.write_text(
@@ -1314,8 +1779,7 @@ def test_skill_build_refuses_each_missing_baseline_runtime_input(
 
     with pytest.raises(
         skill_builder.SkillBuildError,
-        match="skill package manifest is missing evaluation-baseline-v1 input: "
-        + required,
+        match="skill package manifest is missing evaluation-baseline-v1 input: " + required,
     ):
         skill_builder._runtime_files()
 
