@@ -142,6 +142,8 @@ def _draft(
 
 
 class ScriptedEvaluator:
+    scripted_fixture = True
+
     def __init__(
         self,
         *,
@@ -516,6 +518,52 @@ async def test_fresh_context_token_reuse_pauses_without_accepting_second_role(
 
 
 @pytest.mark.asyncio
+async def test_method_only_evaluator_cannot_silently_claim_scripted_fixture(
+    tmp_path: Path,
+) -> None:
+    class MethodOnlyEvaluator:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def evaluate_draft(self, prompt: ReadinessEvaluatorDraftPromptV1) -> object:
+            self.calls += 1
+            return _draft(prompt.request, grade_mode="met")
+
+    run_dir, _ = _initialize_real(tmp_path, limitations=None)
+    evaluator = MethodOnlyEvaluator()
+    outcome = await continue_readiness_v1(run_dir, evaluator)
+    assert outcome.engine_paused is True
+    assert outcome.pause_reason_codes == (READINESS_CONTEXT_ISOLATION_INVALID,)
+    assert evaluator.calls == 0
+    assert load_verified_readiness_context_v1(run_dir).manifest.accepted_calls == ()
+
+
+@pytest.mark.asyncio
+async def test_fresh_context_token_reuse_is_rejected_across_resume(
+    tmp_path: Path,
+) -> None:
+    run_dir, _ = _initialize_real(tmp_path, limitations=None)
+    first = ScriptedEvaluator(grade_mode="met", fresh=True, reused_token=True, fail_after=1)
+    paused = await continue_readiness_v1(run_dir, first)
+    assert paused.engine_paused is True
+    before = _tree_bytes(run_dir)
+    accepted_before = load_verified_readiness_context_v1(run_dir).manifest.accepted_calls
+    assert len(accepted_before) == 1
+    persisted = repr(before)
+    assert "context-constant" not in persisted
+    assert accepted_before[0].model_name is not None
+    assert "#readiness-context-sha256=" in accepted_before[0].model_name
+
+    resumed = ScriptedEvaluator(grade_mode="met", fresh=True, reused_token=True)
+    outcome = await continue_readiness_v1(run_dir, resumed)
+    assert outcome.engine_paused is True
+    assert outcome.pause_reason_codes == (READINESS_CONTEXT_ISOLATION_INVALID,)
+    assert resumed.prompts == []
+    assert _tree_bytes(run_dir) == before
+    assert load_verified_readiness_context_v1(run_dir).manifest.accepted_calls == accepted_before
+
+
+@pytest.mark.asyncio
 async def test_unfavorable_substantive_safety_result_is_accepted_without_retry(
     tmp_path: Path,
 ) -> None:
@@ -632,6 +680,30 @@ def test_guarded_submit_is_total_write_free_and_rejects_wrong_bindings(tmp_path:
         assert _tree_bytes(run_dir) == before
 
 
+def test_guarded_submit_converts_stale_transition_to_write_free_rejection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import regulatory_harvest.evaluation.attorney_readiness_workflow as workflow
+    from regulatory_harvest.evaluation.attorney_artifacts import EvaluationIntegrityError
+
+    run_dir, _ = _initialize_real(tmp_path)
+    request = next_readiness_request_v1(run_dir)
+    assert request is not None
+    compiled = compile_readiness_draft_v1(request, _ordinary_draft(request), _provenance())
+    assert isinstance(compiled, CompiledReadinessDraftV1)
+
+    def stale_commit(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise EvaluationIntegrityError("READINESS_STALE_TRANSITION")
+
+    monkeypatch.setattr(workflow, "commit_readiness_transition_v1", stale_commit)
+    before = _tree_bytes(run_dir)
+    result = guarded_submit_readiness_response_v1(run_dir, compiled.response)
+    assert result.accepted is False
+    assert result.preflight.valid is False
+    assert _tree_bytes(run_dir) == before
+
+
 @pytest.mark.parametrize(
     ("operation", "identity_field", "wrong_identity"),
     [
@@ -720,6 +792,7 @@ async def test_telemetry_contains_only_safe_operational_metadata(tmp_path: Path)
     assert str(tmp_path) not in serialized
     assert "historical_v22" not in serialized.lower()
     assert "anonymous_label" not in serialized.lower()
+    assert "resume_count" not in serialized
 
 
 @pytest.mark.parametrize(

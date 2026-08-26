@@ -93,6 +93,11 @@ READINESS_CONTEXT_ISOLATION_INVALID = "READINESS_CONTEXT_ISOLATION_INVALID"
 READINESS_COMPILER_PREFLIGHT_DISAGREEMENT = "READINESS_COMPILER_PREFLIGHT_DISAGREEMENT"
 
 _SUBMISSION_LOCKS = tuple(threading.RLock() for _ in range(64))
+_CONTEXT_BINDING_MARKER = "#readiness-context-sha256="
+_STALE_TRANSITION_CODES = {
+    "READINESS_STALE_TRANSITION",
+    "READINESS_ARTIFACT_STALE_TRANSITION",
+}
 
 
 @runtime_checkable
@@ -114,7 +119,6 @@ class ReadinessTelemetryEventV1:
     normalization_codes: tuple[str, ...] = ()
     clarification_codes: tuple[str, ...] = ()
     pause_count: int = 0
-    resume_count: int = 0
 
 
 @runtime_checkable
@@ -526,7 +530,15 @@ def _guarded_submit(
             )
             checked = validate_readiness_evaluator_response_v1(raw)
             state = _advance_response_v1(run_dir, context, checked, attempt=attempt)
-        except EvaluationIntegrityError:
+        except EvaluationIntegrityError as error:
+            if str(error) in _STALE_TRANSITION_CODES:
+                return GuardedReadinessSubmissionResultV1(
+                    False,
+                    ReadinessResponsePreflightV1(
+                        valid=False,
+                        diagnostics=(READINESS_EXTERNAL_RESPONSE_INVALID,),
+                    ),
+                )
             raise
         except (RecursionError, TypeError, ValidationError, ValueError):
             return GuardedReadinessSubmissionResultV1(
@@ -601,18 +613,41 @@ def _event(
         normalization_codes=normalization_codes,
         clarification_codes=clarification_codes,
         pause_count=1 if paused else 0,
-        resume_count=1,
     )
+
+
+def _accepted_context_digests(context: VerifiedReadinessContextV1) -> set[str]:
+    result: set[str] = set()
+    for call in context.manifest.accepted_calls:
+        if call.judge_isolation != "fresh_context":
+            continue
+        model_name = call.model_name
+        if model_name is None or _CONTEXT_BINDING_MARKER not in model_name:
+            raise EvaluationIntegrityError("READINESS_CONTEXT_PROVENANCE_INVALID")
+        prefix, digest = model_name.rsplit(_CONTEXT_BINDING_MARKER, 1)
+        if (
+            not prefix
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise EvaluationIntegrityError("READINESS_CONTEXT_PROVENANCE_INVALID")
+        if digest in result:
+            raise EvaluationIntegrityError("READINESS_CONTEXT_PROVENANCE_INVALID")
+        result.add(digest)
+    return result
 
 
 def _provenance(
     evaluator: ReadinessDraftEvaluatorV1,
     prompt: ReadinessEvaluatorDraftPromptV1,
-    seen_tokens: set[str],
+    seen_context_digests: set[str],
 ) -> ReadinessEvaluatorProvenanceV1:
+    scripted_fixture = getattr(evaluator, "scripted_fixture", False) is True
     factory = getattr(evaluator, "provenance", None)
     supplied = factory(prompt) if callable(factory) else None
     if supplied is None:
+        if not scripted_fixture:
+            raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
         supplied = ReadinessEvaluatorProvenanceV1(
             provider_name="internal-evaluator",
             model_name=type(evaluator).__qualname__,
@@ -621,21 +656,30 @@ def _provenance(
     if type(supplied) is not ReadinessEvaluatorProvenanceV1:
         raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
     checked = supplied
-    token_factory = getattr(evaluator, "context_token", None)
-    if checked.judge_isolation == "fresh_context" and not callable(token_factory):
-        raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
-    if callable(token_factory):
-        token = token_factory(prompt)
-        if (
-            type(token) is not str
-            or not token
-            or token != token.strip()
-            or len(token.encode("utf-8")) > 256
-            or token in seen_tokens
-        ):
+    if checked.judge_isolation == "scripted_fixture":
+        if not scripted_fixture:
             raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
-        seen_tokens.add(token)
-    return checked
+        return checked
+    token_factory = getattr(evaluator, "context_token", None)
+    if not callable(token_factory):
+        raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
+    token = token_factory(prompt)
+    if (
+        type(token) is not str
+        or not token
+        or token != token.strip()
+        or len(token.encode("utf-8")) > 256
+    ):
+        raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
+    digest = sha256_digest(token.encode("utf-8"))
+    if digest in seen_context_digests:
+        raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
+    seen_context_digests.add(digest)
+    return ReadinessEvaluatorProvenanceV1(
+        provider_name=checked.provider_name,
+        model_name=f"{checked.model_name}{_CONTEXT_BINDING_MARKER}{digest}",
+        judge_isolation="fresh_context",
+    )
 
 
 def _pause(
@@ -672,9 +716,10 @@ async def continue_readiness_v1(
     if not isinstance(evaluator, ReadinessDraftEvaluatorV1):
         raise TypeError("evaluator must implement ReadinessDraftEvaluatorV1")
     sink = _NOOP_TELEMETRY if telemetry_sink is None else telemetry_sink
-    seen_tokens: set[str] = set()
+    seen_context_digests: set[str] = set()
     while True:
         context = load_verified_readiness_context_v1(run_dir)
+        seen_context_digests.update(_accepted_context_digests(context))
         if context.manifest.terminal_status is not None:
             return _completed(context)
         request = context.pending_request
@@ -688,7 +733,7 @@ async def continue_readiness_v1(
                 clarification_codes=clarification_codes,
             )
             try:
-                provenance = _provenance(evaluator, prompt, seen_tokens)
+                provenance = _provenance(evaluator, prompt, seen_context_digests)
             except (TypeError, ValueError):
                 _emit(
                     sink,
@@ -743,12 +788,7 @@ async def continue_readiness_v1(
                     updated = load_verified_readiness_context_v1(run_dir)
                     if updated.result is not None:
                         return _completed(updated)
-                    return ReadinessDriverOutcomeV1(
-                        state=_state(updated),
-                        result=updated.result,
-                        engine_paused=False,
-                        pending_request=current,
-                    )
+                    break
                 return _pause(run_dir, request, READINESS_COMPILER_PREFLIGHT_DISAGREEMENT)
             _emit(
                 sink,
