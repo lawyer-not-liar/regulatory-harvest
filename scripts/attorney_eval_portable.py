@@ -18948,7 +18948,7 @@ def _readiness_snapshot_unlocked(
                 return [native_text(item, nonblank=True) for item in value]
 
             def hash_pairs(value: object) -> list[list[str]]:
-                if type(value) is not list or len(value) > 1_024:
+                if type(value) is not list or len(value) > 640:
                     invalid_persisted()
                 result: list[list[str]] = []
                 for item in value:
