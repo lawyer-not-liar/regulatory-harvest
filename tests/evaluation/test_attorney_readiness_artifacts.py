@@ -170,7 +170,7 @@ def _second_transition_parts(
     run_dir: Path,
     manifest: ReadinessManifestV1,
     *,
-    context_token_fingerprint: str,
+    context_token_fingerprint: str | None,
 ) -> tuple[dict[str, bytes], ReadinessManifestV1]:
     from regulatory_harvest.storage import canonical_json_bytes, sha256_digest
 
@@ -180,7 +180,9 @@ def _second_transition_parts(
     provenance = ReadinessEvaluatorProvenanceV1(
         provider_name="public-test-provider",
         model_name="public-test-model",
-        judge_isolation="fresh_context",
+        judge_isolation=(
+            "fresh_context" if context_token_fingerprint is not None else "scripted_fixture"
+        ),
     )
     compiled = compile_readiness_draft_v1(request, _ordinary_draft(request), provenance)
     assert isinstance(compiled, CompiledReadinessDraftV1)
@@ -483,6 +485,93 @@ def test_resealed_fresh_context_call_reorder_is_rejected(tmp_path: Path) -> None
 
     assert verification.valid is False
     assert verification.issues == ("READINESS_SEMANTIC_REPLAY_INVALID",)
+
+
+def test_transition_rejects_a_context_token_reused_by_the_just_accepted_call(
+    tmp_path: Path,
+) -> None:
+    run_dir, first = _commit_first_transition(
+        tmp_path,
+        context_token_fingerprint="c" * 64,
+    )
+    files, duplicate_successor = _second_transition_parts(
+        run_dir,
+        first,
+        context_token_fingerprint="c" * 64,
+    )
+    before = _tree_bytes(run_dir)
+
+    with pytest.raises(ValueError, match="readiness manifest is invalid"):
+        commit_readiness_transition_v1(
+            run_dir,
+            expected_manifest_fingerprint=first.manifest_fingerprint,
+            files=files,
+            successor=duplicate_successor,
+        )
+
+    assert _tree_bytes(run_dir) == before
+
+
+def test_canonically_resealed_duplicate_context_tokens_fail_task7_replay(
+    tmp_path: Path,
+) -> None:
+    from regulatory_harvest.storage import canonical_json_bytes, sha256_digest
+
+    run_dir, first = _commit_first_transition(
+        tmp_path,
+        context_token_fingerprint="c" * 64,
+    )
+    files, successor = _second_transition_parts(
+        run_dir,
+        first,
+        context_token_fingerprint="d" * 64,
+    )
+    commit_readiness_transition_v1(
+        run_dir,
+        expected_manifest_fingerprint=first.manifest_fingerprint,
+        files=files,
+        successor=successor,
+    )
+    raw_manifest = json.loads((run_dir / READINESS_MANIFEST_PATH).read_bytes())
+    raw_manifest["accepted_calls"][1]["context_token_fingerprint"] = "c" * 64
+    fingerprint_input = {
+        key: value
+        for key, value in raw_manifest.items()
+        if key not in {"manifest_fingerprint", "root_hash"}
+    }
+    raw_manifest["manifest_fingerprint"] = sha256_digest(canonical_json_bytes(fingerprint_input))
+    root_input = {key: value for key, value in raw_manifest.items() if key != "root_hash"}
+    raw_manifest["root_hash"] = sha256_digest(canonical_json_bytes(root_input))
+    (run_dir / READINESS_MANIFEST_PATH).write_bytes(canonical_json_bytes(raw_manifest))
+
+    verification = verify_readiness_run_v1(run_dir)
+
+    assert verification.valid is False
+    assert verification.issues == ("READINESS_ARTIFACT_INVALID",)
+
+
+def test_repeated_none_context_tokens_remain_replay_compatible(tmp_path: Path) -> None:
+    run_dir, first = _commit_first_transition(tmp_path)
+    files, successor = _second_transition_parts(
+        run_dir,
+        first,
+        context_token_fingerprint=None,
+    )
+
+    second = commit_readiness_transition_v1(
+        run_dir,
+        expected_manifest_fingerprint=first.manifest_fingerprint,
+        files=files,
+        successor=successor,
+    )
+    loaded, result = load_verified_readiness_run_v1(run_dir)
+    raw_manifest = json.loads((run_dir / READINESS_MANIFEST_PATH).read_bytes())
+
+    assert tuple(call.context_token_fingerprint for call in second.accepted_calls) == (None, None)
+    assert tuple(call.context_token_fingerprint for call in loaded.accepted_calls) == (None, None)
+    assert all("context_token_fingerprint" not in call for call in raw_manifest["accepted_calls"])
+    assert result is None
+    assert verify_readiness_run_v1(run_dir).valid is True
 
 
 def test_external_context_control_ledger_is_not_task7_replay_authority(
