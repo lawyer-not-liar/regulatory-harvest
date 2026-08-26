@@ -643,6 +643,33 @@ async def test_context_token_control_rejects_unsafe_nodes_without_evaluator_call
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["delete", "truncate"])
+async def test_context_token_control_rollback_is_detected_before_resume(
+    tmp_path: Path, tamper: str
+) -> None:
+    from regulatory_harvest.evaluation.attorney_artifacts import EvaluationIntegrityError
+
+    run_dir, _ = _initialize_real(tmp_path, limitations=None)
+    first = ScriptedEvaluator(grade_mode="met", fresh=True, reused_token=True, fail_after=1)
+    paused = await continue_readiness_v1(run_dir, first)
+    assert paused.engine_paused is True
+    accepted = load_verified_readiness_context_v1(run_dir).manifest.accepted_calls
+    assert len(accepted) == 1
+    (control,) = tuple(tmp_path.glob(".readiness-context-*.tokens"))
+    if tamper == "delete":
+        control.unlink()
+    else:
+        control.write_bytes(b"")
+    before = _tree_bytes(run_dir)
+    resumed = ScriptedEvaluator(grade_mode="met", fresh=True, reused_token=True)
+    with pytest.raises(EvaluationIntegrityError, match="READINESS_CONTEXT_CONTROL_INVALID"):
+        await continue_readiness_v1(run_dir, resumed)
+    assert resumed.prompts == []
+    assert _tree_bytes(run_dir) == before
+    assert load_verified_readiness_context_v1(run_dir).manifest.accepted_calls == accepted
+
+
+@pytest.mark.asyncio
 async def test_unfavorable_substantive_safety_result_is_accepted_without_retry(
     tmp_path: Path,
 ) -> None:
