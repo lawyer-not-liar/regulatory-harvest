@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from hashlib import sha256
 from pathlib import Path
@@ -1558,6 +1559,120 @@ def test_context_token_fingerprint_changes_manifest_root_input() -> None:
         with_token.model_dump(mode="json", exclude={"root_hash"})
     )
     assert sha256(without_root_input).digest() != sha256(with_root_input).digest()
+
+
+def test_manifest_rejects_one_context_token_reused_by_different_calls() -> None:
+    first = valid_call(state="accepted") | {"context_token_fingerprint": "c" * 64}
+    second = valid_call(state="accepted", call_id="safety-lane-2") | {
+        "lane": 2,
+        "context_token_fingerprint": "c" * 64,
+    }
+    assert first["request_fingerprint"] == second["request_fingerprint"]
+
+    with pytest.raises(ValidationError, match="context token fingerprints must be unique"):
+        ReadinessManifestV1.model_validate(
+            valid_manifest(pending_call=None, accepted_calls=(first, second))
+        )
+
+
+@pytest.mark.parametrize("reverse_calls", [False, True], ids=("controller-order", "swapped"))
+def test_canonically_resealed_manifest_cannot_hide_reused_context_token(
+    reverse_calls: bool,
+) -> None:
+    calls = (
+        valid_call(state="accepted") | {"context_token_fingerprint": "c" * 64},
+        valid_call(state="accepted", call_id="safety-lane-2")
+        | {"lane": 2, "context_token_fingerprint": "c" * 64},
+    )
+    if reverse_calls:
+        calls = tuple(reversed(calls))
+    raw = valid_manifest(pending_call=None, accepted_calls=calls)
+    fingerprint_input = {
+        key: value for key, value in raw.items() if key not in {"manifest_fingerprint", "root_hash"}
+    }
+    raw["manifest_fingerprint"] = sha256(canonical_json_bytes(fingerprint_input)).hexdigest()
+    root_input = {key: value for key, value in raw.items() if key != "root_hash"}
+    raw["root_hash"] = sha256(canonical_json_bytes(root_input)).hexdigest()
+    canonically_resealed = json.loads(canonical_json_bytes(raw))
+
+    with pytest.raises(ValidationError, match="context token fingerprints must be unique"):
+        ReadinessManifestV1.model_validate(canonically_resealed)
+
+
+def test_manifest_accepts_unique_context_tokens() -> None:
+    first = valid_call(state="accepted") | {"context_token_fingerprint": "c" * 64}
+    second = valid_call(state="accepted", call_id="safety-lane-2") | {
+        "lane": 2,
+        "context_token_fingerprint": "d" * 64,
+    }
+
+    checked = ReadinessManifestV1.model_validate(
+        valid_manifest(pending_call=None, accepted_calls=(first, second))
+    )
+
+    assert tuple(call.context_token_fingerprint for call in checked.accepted_calls) == (
+        "c" * 64,
+        "d" * 64,
+    )
+
+
+def test_manifest_allows_repeated_none_tokens_for_external_and_scripted_calls() -> None:
+    external = valid_call(state="accepted")
+    scripted = valid_call(state="accepted", call_id="safety-lane-2") | {
+        "lane": 2,
+        "judge_isolation": "scripted_fixture",
+    }
+
+    checked = ReadinessManifestV1.model_validate(
+        valid_manifest(pending_call=None, accepted_calls=(external, scripted))
+    )
+
+    assert tuple(call.context_token_fingerprint for call in checked.accepted_calls) == (None, None)
+
+
+@pytest.mark.parametrize("external_subclass", [False, True], ids=("exact", "subclass"))
+def test_constructed_manifest_cannot_launder_reused_context_token(
+    external_subclass: bool,
+) -> None:
+    first = valid_call(state="accepted") | {"context_token_fingerprint": "c" * 64}
+    second = valid_call(state="accepted", call_id="safety-lane-2") | {
+        "lane": 2,
+        "context_token_fingerprint": "d" * 64,
+    }
+    seed = ReadinessManifestV1.model_validate(
+        valid_manifest(pending_call=None, accepted_calls=(first, second))
+    )
+    duplicate = seed.accepted_calls[1].model_copy(update={"context_token_fingerprint": "c" * 64})
+
+    class ExternalManifest(ReadinessManifestV1):
+        pass
+
+    manifest_type = ExternalManifest if external_subclass else ReadinessManifestV1
+    forged = manifest_type.model_construct(
+        **(dict(seed.__dict__) | {"accepted_calls": (seed.accepted_calls[0], duplicate)})
+    )
+
+    with pytest.raises(ValidationError, match="context token fingerprints must be unique"):
+        ReadinessManifestV1.model_validate(forged)
+
+
+def test_manifest_detaches_and_freezes_unique_context_token_inventory() -> None:
+    first = ReadinessCallRecordV1.model_validate(
+        valid_call(state="accepted") | {"context_token_fingerprint": "c" * 64}
+    )
+    second = ReadinessCallRecordV1.model_validate(
+        valid_call(state="accepted", call_id="safety-lane-2")
+        | {"lane": 2, "context_token_fingerprint": "d" * 64}
+    )
+    manifest = ReadinessManifestV1.model_validate(
+        valid_manifest(pending_call=None, accepted_calls=(first, second))
+    )
+
+    object.__setattr__(second, "context_token_fingerprint", "c" * 64)
+    assert manifest.accepted_calls[1].context_token_fingerprint == "d" * 64
+    with pytest.raises(ValidationError, match="frozen"):
+        manifest.accepted_calls[1].context_token_fingerprint = "c" * 64
+    ReadinessManifestV1.model_validate(manifest)
 
 
 def test_manifest_requires_unique_controller_call_ids() -> None:

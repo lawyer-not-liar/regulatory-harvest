@@ -1970,6 +1970,13 @@ class ReadinessManifestV1(ReadinessStrictModelV1):
         call_ids = tuple(call.call_id for call in calls)
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("readiness call IDs must be unique")
+        context_token_fingerprints = tuple(
+            call.context_token_fingerprint
+            for call in self.accepted_calls
+            if call.context_token_fingerprint is not None
+        )
+        if len(context_token_fingerprints) != len(set(context_token_fingerprints)):
+            raise ValueError("readiness context token fingerprints must be unique")
         paths = tuple(artifact.artifact_path for artifact in self.artifacts)
         if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
             raise ValueError("readiness artifacts must be uniquely path-sorted")
