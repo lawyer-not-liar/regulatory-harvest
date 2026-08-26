@@ -16587,6 +16587,9 @@ _READINESS_CANONICAL_RUBRIC_PATH = (
     / "readiness-rubric-v1.json"
 )
 _READINESS_RUBRIC_PATH = _READINESS_CANONICAL_RUBRIC_PATH
+_READINESS_CLOSED_V1_POLICY_FINGERPRINT = (
+    "dfe5247769afcc991dea9ea694dd54f4ccbd1736722490214f2674a9c25f06c6"
+)
 _READINESS_RUBRIC_KEYS = {
     "attorney_review_warning",
     "blocking_codes",
@@ -16680,6 +16683,8 @@ def _readiness_rubric_v1() -> tuple[bytes, JsonObject, str]:
         ):
             raise PortableEvaluationInputError("readiness rubric path is invalid")
         data = _READINESS_RUBRIC_PATH.read_bytes()
+        if _sha256(data) != _READINESS_CLOSED_V1_POLICY_FINGERPRINT:
+            raise PortableEvaluationInputError("readiness closed-v1 policy is invalid")
         value = parse_canonical_json_bytes(data, location="readiness rubric")
         rubric = _shape(
             value,
@@ -17866,6 +17871,9 @@ def initialize_readiness_v1(
 
 def next_readiness_request_v1(run_dir: Path) -> JsonObject | None:
     manifest, _persisted, files = _readiness_snapshot(run_dir)
+    verification = verify_readiness_run_v1(run_dir)
+    if verification["valid"] is not True:
+        raise EvaluationIntegrityError("READINESS_ARTIFACT_CALL_HISTORY")
     pending = cast(JsonObject | None, manifest.get("pending_call"))
     if pending is None:
         return None
@@ -18145,7 +18153,6 @@ def compile_readiness_draft_v1(
                     "rationale": _readiness_exact_text(
                         grade["rationale"],
                         location="readiness grade rationale",
-                        rationale=True,
                     ),
                     "omission": (
                         None
@@ -18172,7 +18179,6 @@ def compile_readiness_draft_v1(
             "rationale": _readiness_exact_text(
                 draft["rationale"],
                 location="readiness batch rationale",
-                rationale=True,
             ),
         }
         compiled["fragment_fingerprint"] = _sha256(canonical_json_bytes(compiled))
@@ -18240,18 +18246,15 @@ def compile_readiness_draft_v1(
             "reviewer_rationale": _readiness_exact_text(
                 draft["reviewer_rationale"],
                 location="reviewer rationale",
-                rationale=True,
             ),
             "auditor_rationale": _readiness_exact_text(
                 draft["auditor_rationale"],
                 location="auditor rationale",
-                rationale=True,
             ),
             "ambiguity_disposition": draft["ambiguity_disposition"],
             "rationale": _readiness_exact_text(
                 draft["rationale"],
                 location="contested rationale",
-                rationale=True,
             ),
         }
         compiled["grade_fingerprint"] = _sha256(canonical_json_bytes(compiled))
@@ -18276,8 +18279,6 @@ def compile_readiness_draft_v1(
             )
             for candidate in candidates
         }
-        if len(assessments) != len(candidates):
-            raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
         allowed_refs = {
             cast(str, item["evidence_ref"])
             for item in cast(list[JsonObject], payload["evidence_handles"])
@@ -18310,19 +18311,21 @@ def compile_readiness_draft_v1(
                 },
                 location="readiness safety content",
             )
-            refs = _array(item["evidence_refs"], location="readiness evidence refs")
-            passages = _array(
+            raw_refs = _array(item["evidence_refs"], location="readiness evidence refs")
+            raw_passages = _array(
                 item["report_passages"], location="readiness safety passages"
             )
+            if any(
+                type(ref) is not str or ref not in allowed_refs for ref in raw_refs
+            ) or any(
+                type(passage) is not str or passage not in allowed_passages
+                for passage in raw_passages
+            ):
+                raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+            refs = list(dict.fromkeys(cast(list[str], raw_refs)))
+            passages = list(dict.fromkeys(cast(list[str], raw_passages)))
             if (
-                any(type(ref) is not str or ref not in allowed_refs for ref in refs)
-                or len(refs) != len(set(cast(list[str], refs)))
-                or any(
-                    type(passage) is not str or passage not in allowed_passages
-                    for passage in passages
-                )
-                or len(passages) != len(set(cast(list[str], passages)))
-                or item["rationale_kind"] not in cast(list[str], rubric["rationale_kinds"])
+                item["rationale_kind"] not in cast(list[str], rubric["rationale_kinds"])
                 or item["follow_up_code"] not in cast(list[str], rubric["follow_up_codes"])
                 or item["owner_role"] not in cast(list[str], rubric["owner_roles"])
                 or item["visibility"] not in {"prominent", "visible", "hidden"}
@@ -18349,7 +18352,13 @@ def compile_readiness_draft_v1(
                 "resolution_test",
                 "owner_role",
             ):
-                value = item[key]
+                value = (
+                    refs
+                    if key == "evidence_refs"
+                    else passages
+                    if key == "report_passages"
+                    else item[key]
+                )
                 if key in {
                     "shortfall_description",
                     "why_unresolved",
@@ -18389,14 +18398,43 @@ def compile_readiness_draft_v1(
             )
             return result
 
-        compiled_assessments = [
-            safety_content(raw, finding=False) for raw in assessments
-        ]
-        if [item["candidate_id"] for item in compiled_assessments] != [
+        assessment_by_id: dict[str, JsonObject] = {}
+        assessment_order: list[str] = []
+        for raw in assessments:
+            assessment = safety_content(raw, finding=False)
+            candidate_id = cast(str, assessment["candidate_id"])
+            prior = assessment_by_id.get(candidate_id)
+            if prior is not None:
+                if canonical_json_bytes(prior) != canonical_json_bytes(assessment):
+                    raise PortableEvaluationInputError("READINESS_DRAFT_CONFLICTING_ITEMS")
+                continue
+            assessment_by_id[candidate_id] = assessment
+            assessment_order.append(candidate_id)
+        if assessment_order != [
             cast(JsonObject, item)["candidate_id"] for item in candidates
         ]:
             raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
-        compiled_findings = [safety_content(raw, finding=True) for raw in findings]
+        compiled_assessments = [assessment_by_id[item] for item in assessment_order]
+        finding_by_id: dict[tuple[str, str], JsonObject] = {}
+        finding_order: list[tuple[str, str]] = []
+        for raw in findings:
+            finding_item = safety_content(raw, finding=True)
+            identity = (
+                cast(str, finding_item["finding_kind"]),
+                cast(str, finding_item["subject_id"]),
+            )
+            prior_finding = finding_by_id.get(identity)
+            if prior_finding is not None:
+                if canonical_json_bytes(prior_finding) != canonical_json_bytes(
+                    finding_item
+                ):
+                    raise PortableEvaluationInputError(
+                        "READINESS_DRAFT_CONFLICTING_ITEMS"
+                    )
+                continue
+            finding_by_id[identity] = finding_item
+            finding_order.append(identity)
+        compiled_findings = [finding_by_id[item] for item in finding_order]
         finding_kinds = {
             "MATERIAL_UNSUPPORTED_ASSERTION",
             "BASELINE_CONTRADICTION",
@@ -18419,14 +18457,15 @@ def compile_readiness_draft_v1(
             required={"dispute_id", "disposition", "rationale", "evidence_refs"},
             location="readiness referee draft",
         )
-        refs = _array(draft["evidence_refs"], location="readiness referee evidence")
+        raw_refs = _array(draft["evidence_refs"], location="readiness referee evidence")
         allowed = set(cast(list[str], payload["evidence_refs"]))
+        if any(type(ref) is not str or ref not in allowed for ref in raw_refs):
+            raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+        refs = list(dict.fromkeys(cast(list[str], raw_refs)))
         if (
             draft["dispute_id"] != payload["dispute_id"]
             or draft["disposition"]
             not in {"lane_1", "lane_2", "blocking", "unresolved"}
-            or any(type(ref) is not str or ref not in allowed for ref in refs)
-            or len(refs) != len(set(cast(list[str], refs)))
             or (allowed and not refs)
         ):
             raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
@@ -18481,10 +18520,224 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 },
                 location="readiness-manifest.json",
             )
+            phases = {
+                "created",
+                "baseline_locked_grade",
+                "baseline_locked_strict_equivalent",
+                "safety_review",
+                "safety_referee",
+                "compile",
+                "completed",
+                "inconclusive",
+            }
+            expected_terminal = {
+                "completed": "COMPLETED",
+                "inconclusive": "INCONCLUSIVE",
+            }.get(cast(str, manifest["phase"]))
+            if (
+                manifest["protocol_version"] != READINESS_PROTOCOL_V1
+                or manifest["phase"] not in phases
+                or manifest["terminal_status"] != expected_terminal
+            ):
+                raise PortableEvaluationInputError("readiness manifest values are invalid")
+            for key in (
+                "grade_target_fingerprint",
+                "report_hash",
+                "generation_capsule_root",
+                "readiness_rubric_fingerprint",
+                "strict_equivalent_scoring_contract_fingerprint",
+                "root_hash",
+                "manifest_fingerprint",
+            ):
+                checked_hash_value = _string(
+                    manifest[key], location=f"readiness manifest {key}"
+                )
+                if _HASH_RE.fullmatch(checked_hash_value) is None:
+                    raise PortableEvaluationInputError(
+                        "readiness manifest fingerprint is invalid"
+                    )
+            call_fields = {
+                "call_id",
+                "operation",
+                "state",
+                "attempt",
+                "lane",
+                "request_artifact_path",
+                "request_fingerprint",
+                "response_artifact_path",
+                "response_fingerprint",
+                "provider_name",
+                "model_name",
+                "judge_isolation",
+                "dispute_id",
+            }
+
+            def checked_hash(value: object, *, location: str) -> str:
+                fingerprint = _string(value, location=location)
+                if _HASH_RE.fullmatch(fingerprint) is None:
+                    raise PortableEvaluationInputError(f"{location} is invalid")
+                return fingerprint
+
+            def checked_call(value: object, *, expected_state: str) -> JsonObject:
+                call = _shape(
+                    value,
+                    required=call_fields,
+                    optional={"context_token_fingerprint"},
+                    location="readiness call record",
+                )
+                if (
+                    call["state"] != expected_state
+                    or type(call["attempt"]) is not int
+                    or call["attempt"] not in {1, 2}
+                    or type(call["lane"]) not in {int, type(None)}
+                    or call["lane"] not in {None, 1, 2}
+                    or call["operation"]
+                    not in {
+                        "baseline_locked_grade",
+                        "baseline_locked_contested_grade",
+                        "safety_review",
+                        "safety_referee",
+                    }
+                ):
+                    raise PortableEvaluationInputError("readiness call record is invalid")
+                call_id = _string(
+                    call["call_id"], location="readiness call id", nonblank=True
+                )
+                request_path = _string(
+                    call["request_artifact_path"],
+                    location="readiness request path",
+                    nonblank=True,
+                )
+                checked_hash(
+                    call["request_fingerprint"],
+                    location="readiness request fingerprint",
+                )
+                for key in (
+                    "response_artifact_path",
+                    "provider_name",
+                    "model_name",
+                    "dispute_id",
+                ):
+                    _optional_string(
+                        call[key], location=f"readiness call {key}", nonblank=True
+                    )
+                if call["judge_isolation"] not in {
+                    None,
+                    "fresh_context",
+                    "scripted_fixture",
+                }:
+                    raise PortableEvaluationInputError(
+                        "readiness call isolation is invalid"
+                    )
+                for key in ("response_fingerprint", "context_token_fingerprint"):
+                    if key in call and call[key] is not None:
+                        checked_hash(call[key], location=f"readiness call {key}")
+                provenance = (
+                    call["response_artifact_path"],
+                    call["response_fingerprint"],
+                    call["provider_name"],
+                    call["model_name"],
+                    call["judge_isolation"],
+                )
+                if expected_state == "pending" and (
+                    any(item is not None for item in provenance)
+                    or call.get("context_token_fingerprint") is not None
+                ):
+                    raise PortableEvaluationInputError(
+                        "pending readiness call has response provenance"
+                    )
+                if expected_state == "accepted" and any(
+                    item is None for item in provenance
+                ):
+                    raise PortableEvaluationInputError(
+                        "accepted readiness call lacks response provenance"
+                    )
+                if (
+                    call.get("context_token_fingerprint") is not None
+                    and call["judge_isolation"] != "fresh_context"
+                ):
+                    raise PortableEvaluationInputError(
+                        "readiness context provenance is invalid"
+                    )
+                lane = call["lane"]
+                dispute_id = call["dispute_id"]
+                operation = call["operation"]
+                if operation == "baseline_locked_grade":
+                    valid_id = (
+                        lane in {1, 2}
+                        and dispute_id is None
+                        and re.fullmatch(
+                            rf"grade-lane-{lane}-GB-{lane}-[0-9]{{4}}", call_id
+                        )
+                        is not None
+                    )
+                elif operation == "baseline_locked_contested_grade":
+                    valid_id = (
+                        lane in {1, 2}
+                        and dispute_id is None
+                        and re.fullmatch(
+                            rf"contested-grade-lane-{lane}-CONT-[0-9]{{4}}",
+                            call_id,
+                        )
+                        is not None
+                    )
+                elif operation == "safety_review":
+                    valid_id = (
+                        lane in {1, 2}
+                        and dispute_id is None
+                        and call_id == f"safety-lane-{lane}"
+                    )
+                else:
+                    valid_id = (
+                        lane is None
+                        and type(dispute_id) is str
+                        and call_id == f"safety-referee-{dispute_id}"
+                    )
+                if (
+                    not valid_id
+                    or request_path != f"requests/{call_id}.json"
+                    or (
+                        expected_state == "accepted"
+                        and call["response_artifact_path"]
+                        != f"responses/{call_id}.json"
+                    )
+                ):
+                    raise PortableEvaluationInputError(
+                        "readiness call binding is invalid"
+                    )
+                return call
+
+            pending_value = manifest["pending_call"]
+            checked_calls: list[JsonObject] = []
+            if pending_value is not None:
+                checked_calls.append(
+                    checked_call(pending_value, expected_state="pending")
+                )
+            accepted_values = _array(
+                manifest["accepted_calls"], location="accepted readiness calls"
+            )
+            checked_accepted = [
+                checked_call(accepted_call, expected_state="accepted")
+                for accepted_call in accepted_values
+            ]
+            checked_calls.extend(checked_accepted)
+            call_ids = [cast(str, item["call_id"]) for item in checked_calls]
+            context_tokens = [
+                cast(str, item["context_token_fingerprint"])
+                for item in checked_accepted
+                if item.get("context_token_fingerprint") is not None
+            ]
+            if len(call_ids) != len(set(call_ids)) or len(context_tokens) != len(
+                set(context_tokens)
+            ):
+                raise PortableEvaluationInputError(
+                    "readiness call inventory is duplicated"
+                )
         except PortableEvaluationInputError as error:
             raise EvaluationIntegrityError("READINESS_ARTIFACT_MODEL") from error
         inventory = _array(manifest.get("artifacts"), location="readiness artifacts")
         files: dict[str, bytes] = {}
+        inventory_paths: list[str] = []
         for raw in inventory:
             record = _shape(
                 raw,
@@ -18492,10 +18745,13 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 location="readiness artifact record",
             )
             path = _string(record["artifact_path"], location="readiness artifact path")
+            inventory_paths.append(path)
             data = storage.read_artifact(path, max_bytes=16 * 1024 * 1024)
             if _sha256(data) != record["artifact_hash"] or path in files:
                 raise EvaluationIntegrityError("READINESS_ARTIFACT_HASH")
             files[path] = data
+        if inventory_paths != sorted(inventory_paths):
+            raise EvaluationIntegrityError("READINESS_ARTIFACT_INVENTORY_INVALID")
         observed = {
             path for path in storage.scan_inventory() if not path.endswith("/")
         }
@@ -18531,6 +18787,186 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
             )
         except PortableEvaluationInputError as error:
             raise EvaluationIntegrityError("READINESS_ARTIFACT_MODEL") from error
+        try:
+            readiness_input = _shape(
+                persisted["readiness_input"],
+                required={
+                    "protocol_version",
+                    "gradeable_baseline",
+                    "grade_target_fingerprint",
+                    "report_text",
+                    "report_hash",
+                    "generation_capsule_root",
+                    "generation_validation",
+                    "readiness_rubric_fingerprint",
+                    "strict_equivalent_scoring_contract_fingerprint",
+                    "historical_v22_cross_check",
+                },
+                location="persisted readiness input",
+            )
+            _shape(
+                readiness_input["gradeable_baseline"],
+                required={
+                    "schema_version",
+                    "baseline_protocol_version",
+                    "binding",
+                    "baseline_input",
+                    "requirements",
+                    "relationships",
+                    "contested_requirements",
+                    "baseline_provenance",
+                    "projection_fingerprint",
+                },
+                location="persisted gradeable baseline",
+            )
+            _shape(
+                readiness_input["generation_validation"],
+                required={
+                    "receipt_hash",
+                    "report_hash",
+                    "bundle_hash",
+                    "coverage_review_hash",
+                    "status",
+                    "evidence_precision_valid",
+                    "proposition_coverage_valid",
+                    "provision_recall_valid",
+                },
+                location="persisted generation validation",
+            )
+            historical = readiness_input["historical_v22_cross_check"]
+            if historical is not None:
+                _shape(
+                    historical,
+                    required={
+                        "report_hash",
+                        "strict_disposition",
+                        "result_fingerprint",
+                        "manifest_fingerprint",
+                        "baseline_fingerprint",
+                        "grader_aggregate_fingerprints",
+                        "reason_codes",
+                        "baseline_comparable",
+                        "report_comparable",
+                    },
+                    location="persisted historical cross-check",
+                )
+            _shape(
+                persisted["baseline_context"],
+                required={"manifest", "baseline_input", "baseline", "verification"},
+                location="persisted baseline context",
+            )
+            _shape(
+                persisted["qualification_binding"],
+                required={
+                    "qualification_root",
+                    "qualification_receipt_fingerprint",
+                    "qualification_readiness",
+                },
+                location="persisted qualification binding",
+            )
+            qualification_limits = _shape(
+                persisted["qualification_limits"],
+                required={
+                    "case_schema_version",
+                    "admission_status",
+                    "qualification_readiness",
+                    "qualification_root",
+                    "qualification_receipt_fingerprint",
+                    "case_fingerprint",
+                    "source_record_fingerprint",
+                    "request_fingerprint",
+                    "judgment_fingerprint",
+                    "requested_authorities",
+                    "admission_checks",
+                    "admission_issues",
+                    "receipt_readiness",
+                    "language_treatments",
+                },
+                location="persisted qualification limits",
+            )
+            for raw in _array(
+                qualification_limits["requested_authorities"],
+                location="persisted qualification authorities",
+            ):
+                _shape(
+                    raw,
+                    required={
+                        "authority_id",
+                        "title",
+                        "jurisdiction",
+                        "authority_type",
+                        "source_ids",
+                    },
+                    location="persisted qualification authority",
+                )
+            for raw in _array(
+                qualification_limits["admission_checks"],
+                location="persisted qualification checks",
+            ):
+                check = _shape(
+                    raw,
+                    required={"code", "satisfied", "material", "rationale", "source_ids"},
+                    location="persisted qualification check",
+                )
+                if type(check["satisfied"]) is not bool or type(check["material"]) is not bool:
+                    raise EvaluationIntegrityError("READINESS_INPUT_INVALID")
+            for raw in _array(
+                qualification_limits["admission_issues"],
+                location="persisted qualification issues",
+            ):
+                issue = _shape(
+                    raw,
+                    required={"code", "severity", "message", "related_ids"},
+                    location="persisted qualification issue",
+                )
+                if issue["severity"] not in {"error", "warning", "info"}:
+                    raise PortableEvaluationInputError(
+                        "persisted qualification issue severity is invalid"
+                    )
+            _shape(
+                qualification_limits["receipt_readiness"],
+                required={"status", "issue_codes", "rationale"},
+                location="persisted qualification readiness",
+            )
+            for raw in _array(
+                qualification_limits["language_treatments"],
+                location="persisted language treatments",
+            ):
+                treatment = _shape(
+                    raw,
+                    required={
+                        "sources",
+                        "method",
+                        "rationale",
+                        "limitation_status",
+                        "limitation_text",
+                    },
+                    location="persisted language treatment",
+                )
+                for source in _array(
+                    treatment["sources"], location="persisted language sources"
+                ):
+                    _shape(
+                        source,
+                        required={"source_id", "content_hash", "language"},
+                        location="persisted language source",
+                    )
+            _shape(
+                persisted["generation_binding"],
+                required={
+                    "capsule_root",
+                    "capture_fingerprint",
+                    "request_fingerprint",
+                    "response_fingerprint",
+                    "report_hash",
+                    "source_hashes",
+                    "client_facts_hash",
+                    "generator_artifact_hashes",
+                },
+                location="persisted generation binding",
+            )
+        except PortableEvaluationInputError as error:
+            raise EvaluationIntegrityError("READINESS_ARTIFACT_REPLAY") from error
         storage.assert_root_identity()
     return manifest, persisted, files
 
@@ -19717,6 +20153,27 @@ def _readiness_terminal_products(
                 else "lane_2_choice"
             ]
             record = assessment_map.get(identity) or finding_map.get(identity)
+            if dispute["dispute_kind"] == "finding_existence":
+                if choice is None:
+                    reconciled_findings = [
+                        item
+                        for item in cast(list[JsonObject], reconciled_findings)
+                        if (
+                            f"finding:{item['finding_kind']}:{item['subject_id']}"
+                            != identity
+                        )
+                    ]
+                    finding_map.pop(identity, None)
+                    continue
+                if record is None:
+                    lane_2_record = lane_2_finding_map.get(identity)
+                    if lane_2_record is None:
+                        raise PortableEvaluationInputError(
+                            "READINESS_SAFETY_DISPUTE_INVALID"
+                        )
+                    record = cast(JsonObject, _copy_json(lane_2_record))
+                    reconciled_findings.append(record)
+                    finding_map[identity] = record
             if record is None or type(choice) is not dict:
                 raise PortableEvaluationInputError("READINESS_SAFETY_DISPUTE_INVALID")
             record.update(cast(JsonObject, _copy_json(choice)))
@@ -20008,6 +20465,19 @@ def _readiness_terminal_products(
         }
         row["row_fingerprint"] = _sha256(canonical_json_bytes(row))
         gap_rows.append(row)
+    for row in gap_rows:
+        if (
+            row["visibility"] == "hidden"
+            or row["disclosure_location"] is None
+            or not cast(str, row["disclosure_location"]).strip()
+            or not cast(list[object], row["report_passages"])
+        ):
+            blocker_set.add("HIDDEN_MATERIAL_GAP")
+        if row["importance"] == "critical" and (
+            row["visibility"] != "prominent"
+            or row["owner_role"] not in {"reviewing_attorney", "outside_counsel"}
+        ):
+            blocker_set.add("CRITICAL_DISCLOSURE_INVALID")
     gap_matrix: JsonObject = {
         "protocol_version": READINESS_PROTOCOL_V1,
         "grade_target_fingerprint": readiness_input["grade_target_fingerprint"],
@@ -20015,8 +20485,68 @@ def _readiness_terminal_products(
         "rows": gap_rows,
     }
     gap_matrix["matrix_fingerprint"] = _sha256(canonical_json_bytes(gap_matrix))
-    coverage = cast(list[float], strict_equivalent["lane_weighted_coverage"])
-    critical = cast(list[float], strict_equivalent["lane_critical_recall"])
+    weights = cast(JsonObject, rubric["strict_importance_weights"])
+    credits = cast(JsonObject, rubric["disposition_credit"])
+    coverage: list[float] = []
+    critical: list[float] = []
+    for lane in (lane_1, lane_2):
+        observations = [
+            (
+                cast(str, cast(JsonObject, item["requirement"])["importance"]),
+                cast(str, grade["disposition"]),
+            )
+            for item, grade in zip(
+                cast(list[JsonObject], projection["requirements"]),
+                cast(list[JsonObject], lane["requirement_grades"]),
+                strict=True,
+            )
+        ]
+        for contest_item, grade in zip(
+            cast(list[JsonObject], projection["contested_requirements"]),
+            cast(list[JsonObject], lane["contested_grades"]),
+            strict=True,
+        ):
+            contest = cast(JsonObject, contest_item["contested_requirement"])
+            alternatives = [
+                cast(str, grade[key])
+                for alternative, key in (
+                    (
+                        contest["reviewer_alternative"],
+                        "reviewer_alternative_disposition",
+                    ),
+                    (
+                        contest["auditor_alternative"],
+                        "auditor_alternative_disposition",
+                    ),
+                )
+                if alternative is not None
+            ]
+            if not alternatives:
+                raise PortableEvaluationInputError(
+                    "READINESS_CONTESTED_GRADE_INVALID"
+                )
+            observations.append(
+                (
+                    cast(str, contest["importance"]),
+                    min(alternatives, key=lambda item: float(credits[item])),
+                )
+            )
+        denominator = sum(cast(int, weights[item[0]]) for item in observations)
+        numerator = sum(
+            cast(int, weights[importance]) * float(credits[disposition])
+            for importance, disposition in observations
+        )
+        critical_values = [
+            float(credits[disposition])
+            for importance, disposition in observations
+            if importance == "critical"
+        ]
+        coverage.append(1.0 if not denominator else numerator / denominator)
+        critical.append(
+            1.0
+            if not critical_values
+            else sum(critical_values) / len(critical_values)
+        )
     if any(
         value < float(rubric["review_ready_weighted_coverage_floor"])
         for value in coverage
@@ -20683,10 +21213,10 @@ def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
         ):
             raise EvaluationIntegrityError("READINESS_RUBRIC_INVALID")
         readiness_input = cast(JsonObject, persisted["readiness_input"])
-        expected_first = _readiness_ordinary_request(
-            readiness_input, rubric, lane=1, offset=0
-        )
         grade_requests = _readiness_grade_requests(readiness_input, rubric)
+        if not grade_requests:
+            raise EvaluationIntegrityError("READINESS_EMPTY_GRADE_INVENTORY")
+        expected_first = grade_requests[0]
         first_path = cast(
             str, _readiness_pending(expected_first)["request_artifact_path"]
         )

@@ -8447,6 +8447,81 @@ def _readiness_replay_generation_validation_v1(
     }
     if any(bundle.get(key) != value for key, value in replay_fields.items()):
         raise PortableInputError("INVALID_BUNDLE", "The validation bundle cannot be replayed.")
+    manifest = bundle.get("manifest")
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "run_id",
+        "generator_version",
+        "created_at",
+        "updated_at",
+        "stages",
+        "provider_metadata",
+        "configuration_fingerprint",
+    }:
+        raise PortableInputError("INVALID_BUNDLE", "The validation manifest is invalid.")
+    if (
+        bundle.get("schema_version") != "1.1"
+        or bundle.get("generator_version") != manifest.get("generator_version")
+        or bundle.get("disclaimer") != DISCLAIMER
+        or bundle.get("requires_attorney_review") is not True
+        or not isinstance(manifest.get("run_id"), str)
+        or not manifest["run_id"].strip()
+        or not isinstance(manifest.get("generator_version"), str)
+        or not manifest["generator_version"].strip()
+    ):
+        raise PortableInputError("INVALID_BUNDLE", "The validation manifest is invalid.")
+    for key in ("created_at", "updated_at"):
+        value = manifest[key]
+        try:
+            if not isinstance(value, str) or datetime.fromisoformat(value) is None:
+                raise ValueError
+        except ValueError as error:
+            raise PortableInputError(
+                "INVALID_BUNDLE", "The validation manifest is invalid."
+            ) from error
+    provider_metadata = manifest["provider_metadata"]
+    if (
+        not isinstance(provider_metadata, dict)
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in provider_metadata.items()
+        )
+    ):
+        raise PortableInputError("INVALID_BUNDLE", "The validation manifest is invalid.")
+    stages = manifest["stages"]
+    if not isinstance(stages, list) or len(stages) != len(STAGES):
+        raise PortableInputError("INVALID_BUNDLE", "The validation stages are invalid.")
+    for name, stage in zip(STAGES, stages, strict=True):
+        if not isinstance(stage, dict) or set(stage) != {
+            "name",
+            "status",
+            "input_fingerprint",
+            "started_at",
+            "completed_at",
+            "error",
+        }:
+            raise PortableInputError("INVALID_BUNDLE", "The validation stages are invalid.")
+        if (
+            stage["name"] != name
+            or stage["status"] not in {"pending", "running", "completed", "failed", "skipped"}
+            or stage["error"] is not None
+        ):
+            raise PortableInputError("INVALID_BUNDLE", "The validation stages are invalid.")
+        fingerprint = stage["input_fingerprint"]
+        if fingerprint is not None and (
+            not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+        ):
+            raise PortableInputError("INVALID_BUNDLE", "The validation stages are invalid.")
+        for key in ("started_at", "completed_at"):
+            value = stage[key]
+            try:
+                if value is not None and (
+                    not isinstance(value, str) or datetime.fromisoformat(value) is None
+                ):
+                    raise ValueError
+            except ValueError as error:
+                raise PortableInputError(
+                    "INVALID_BUNDLE", "The validation stages are invalid."
+                ) from error
     validation_base = dict(bundle)
     validation_base["validation"] = None
     validation_base["bundle_hash"] = None

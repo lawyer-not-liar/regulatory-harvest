@@ -256,6 +256,23 @@ def test_readiness_portable_rubric_asset_is_shared_exact_and_strict(
         ):
             portable._readiness_rubric_v1()
 
+    in_place = tmp_path / "readiness-rubric-in-place-drift.json"
+    in_place.write_bytes(
+        canonical_json_bytes(
+            {
+                **json.loads(expected),
+                "review_ready_weighted_coverage_floor": 0.1,
+            }
+        )
+    )
+    monkeypatch.setattr(portable, "_READINESS_CANONICAL_RUBRIC_PATH", in_place)
+    monkeypatch.setattr(portable, "_READINESS_RUBRIC_PATH", in_place)
+    with pytest.raises(
+        portable.PortableEvaluationInputError,
+        match="READINESS_RUBRIC_INVALID",
+    ):
+        portable._readiness_rubric_v1()
+
 
 @pytest.mark.parametrize(
     ("command", "flags"),
@@ -397,6 +414,58 @@ def test_readiness_portable_rejects_nested_output_and_tampered_next(
     ):
         portable.next_readiness_request_v1(portable_run)
 
+    full_run = tmp_path / "resealed-next-full"
+    portable_run = tmp_path / "resealed-next-portable"
+    initialize_readiness_core(full_run, **init)
+    portable.initialize_readiness_v1(
+        portable_run, **init, generation_substrate=generation
+    )
+    for run in (full_run, portable_run):
+        manifest_path = run / "readiness-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        request_path = manifest["pending_call"]["request_artifact_path"]
+        request_artifact = run / request_path
+        request = json.loads(request_artifact.read_bytes())
+        request["system_instructions"] += " TAMPERED"
+        request["request_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    key: value
+                    for key, value in request.items()
+                    if key != "request_fingerprint"
+                }
+            )
+        ).hexdigest()
+        request_bytes = canonical_json_bytes(request)
+        request_artifact.write_bytes(request_bytes)
+        manifest["pending_call"]["request_fingerprint"] = request[
+            "request_fingerprint"
+        ]
+        for record in manifest["artifacts"]:
+            if record["artifact_path"] == request_path:
+                record["artifact_hash"] = hashlib.sha256(request_bytes).hexdigest()
+        body = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"manifest_fingerprint", "root_hash"}
+        }
+        manifest["manifest_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(body)
+        ).hexdigest()
+        manifest["root_hash"] = hashlib.sha256(
+            canonical_json_bytes(
+                {key: value for key, value in manifest.items() if key != "root_hash"}
+            )
+        ).hexdigest()
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+    with pytest.raises(Exception, match="READINESS_ARTIFACT_CALL_HISTORY"):
+        next_readiness_core(full_run)
+    with pytest.raises(
+        portable.EvaluationIntegrityError,
+        match="READINESS_ARTIFACT_CALL_HISTORY",
+    ):
+        portable.next_readiness_request_v1(portable_run)
+
 
 def test_readiness_portable_rejects_private_qualification_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -467,6 +536,61 @@ def test_readiness_portable_rejects_forged_validation_bundle(
     assert not portable_run.exists()
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "manifest-unknown",
+        "updated-at-type",
+        "generator-mismatch",
+    ],
+)
+def test_readiness_portable_rejects_nested_validation_bundle_mutations(
+    mutation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Strict generation bundle metadata cannot be canonically resealed around replay."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    receipt = json.loads(source.validation_receipt_path.read_bytes())
+    bundle_path = Path(receipt["bundle"])
+    bundle = json.loads(bundle_path.read_bytes())
+    if mutation == "manifest-unknown":
+        bundle["manifest"]["unknown"] = True
+    elif mutation == "updated-at-type":
+        bundle["manifest"]["updated_at"] = 7
+    else:
+        bundle["generator_version"] = "regulatory-harvest/999"
+    bundle["bundle_hash"] = hashlib.sha256(
+        canonical_json_bytes(
+            {key: value for key, value in bundle.items() if key != "bundle_hash"}
+        )
+    ).hexdigest()
+    bundle_path.write_bytes(canonical_json_bytes(bundle))
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    full_run = tmp_path / f"{mutation}-full"
+    portable_run = tmp_path / f"{mutation}-portable"
+    with pytest.raises(Exception, match="READINESS_VALIDATION_RECEIPT_INVALID"):
+        initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    with pytest.raises(
+        portable.PortableEvaluationInputError,
+        match="READINESS_VALIDATION_RECEIPT_INVALID",
+    ):
+        portable.initialize_readiness_v1(
+            portable_run, **init, generation_substrate=generation
+        )
+    assert not full_run.exists()
+    assert not portable_run.exists()
+
+
 def test_readiness_portable_rejects_generic_safety_rationale(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -504,6 +628,23 @@ def test_readiness_portable_rejects_generic_safety_rationale(
         draft = workflow._draft(request, grade_mode="met")
         if request.operation.value == "safety_review":
             break
+        if request.operation.value == "baseline_locked_grade":
+            ordinary_generic = copy.deepcopy(draft)
+            ordinary_generic["requirement_grades"][0]["rationale"] = "met"
+            ordinary_generic["rationale"] = "met"
+            full_generic = compile_readiness_draft_v1(
+                request, ordinary_generic, provenance
+            )
+            assert isinstance(full_generic, CompiledReadinessDraftV1)
+            assert portable.compile_readiness_draft_v1(
+                portable_request,
+                copy.deepcopy(ordinary_generic),
+                {
+                    "provider_name": provenance.provider_name,
+                    "model_name": provenance.model_name,
+                    "judge_isolation": provenance.judge_isolation,
+                },
+            ) == full_generic.response.model_dump(mode="json")
         full_response = compile_readiness_draft_v1(
             request, draft, provenance
         ).response
@@ -520,6 +661,62 @@ def test_readiness_portable_rejects_generic_safety_rationale(
         assert portable.guarded_submit_readiness_response_v1(
             portable_run, portable_response
         )["accepted"]
+    normalized_drafts: list[dict[str, object]] = []
+    duplicate_ref = copy.deepcopy(draft)
+    duplicate_ref["candidate_assessments"][0]["evidence_refs"].append(
+        duplicate_ref["candidate_assessments"][0]["evidence_refs"][0]
+    )
+    normalized_drafts.append(duplicate_ref)
+    duplicate_assessment = copy.deepcopy(draft)
+    duplicate_assessment["candidate_assessments"].append(
+        copy.deepcopy(duplicate_assessment["candidate_assessments"][0])
+    )
+    normalized_drafts.append(duplicate_assessment)
+    duplicate_finding = workflow._draft(
+        request, grade_mode="met", blocking_safety=True
+    )
+    duplicate_finding["finding_proposals"].append(
+        copy.deepcopy(duplicate_finding["finding_proposals"][0])
+    )
+    normalized_drafts.append(duplicate_finding)
+    for normalized in normalized_drafts:
+        full_normalized = compile_readiness_draft_v1(
+            request, normalized, provenance
+        )
+        assert isinstance(full_normalized, CompiledReadinessDraftV1)
+        assert full_normalized.normalization_codes == (
+            "DRAFT_NORMALIZED_DUPLICATES",
+        )
+        assert portable.compile_readiness_draft_v1(
+            portable_request,
+            copy.deepcopy(normalized),
+            {
+                "provider_name": provenance.provider_name,
+                "model_name": provenance.model_name,
+                "judge_isolation": provenance.judge_isolation,
+            },
+        ) == full_normalized.response.model_dump(mode="json")
+    conflicting = copy.deepcopy(duplicate_finding)
+    conflicting["finding_proposals"][1]["why_unresolved"] = (
+        "The cited source still lacks exact support for this report assertion."
+    )
+    full_conflict = compile_readiness_draft_v1(request, conflicting, provenance)
+    assert tuple(item.value for item in full_conflict.reason_codes) == (
+        "CONFLICTING_ITEMS",
+    )
+    with pytest.raises(
+        portable.PortableEvaluationInputError,
+        match="READINESS_DRAFT_CONFLICTING_ITEMS",
+    ):
+        portable.compile_readiness_draft_v1(
+            portable_request,
+            conflicting,
+            {
+                "provider_name": provenance.provider_name,
+                "model_name": provenance.model_name,
+                "judge_isolation": provenance.judge_isolation,
+            },
+        )
     cast(dict[str, object], cast(list[object], draft["candidate_assessments"])[0])[
         "why_unresolved"
     ] = "more research needed"
@@ -593,6 +790,147 @@ def test_readiness_portable_rejects_resealed_unknown_manifest_field(
     assert full_verification.issues == ("READINESS_ARTIFACT_INVALID",)
     assert portable_verification["valid"] is False
     assert portable_verification["issues"] == ["READINESS_ARTIFACT_INVALID"]
+
+
+def test_readiness_portable_rejects_resealed_unknown_persisted_input_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Semantic replay rejects unknown fields inside the persisted readiness model."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    artifacts = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_artifacts",
+        fromlist=["*"],
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    full_run = tmp_path / "unknown-input-full"
+    portable_run = tmp_path / "unknown-input-portable"
+    initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(
+        portable_run, **init, generation_substrate=generation
+    )
+    for run in (full_run, portable_run):
+        input_path = run / "readiness-input.json"
+        persisted = json.loads(input_path.read_bytes())
+        persisted["readiness_input"]["unknown"] = True
+        input_bytes = canonical_json_bytes(persisted)
+        input_path.write_bytes(input_bytes)
+        manifest_path = run / "readiness-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        for record in manifest["artifacts"]:
+            if record["artifact_path"] == "readiness-input.json":
+                record["artifact_hash"] = hashlib.sha256(input_bytes).hexdigest()
+        body = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"manifest_fingerprint", "root_hash"}
+        }
+        manifest["manifest_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(body)
+        ).hexdigest()
+        manifest["root_hash"] = hashlib.sha256(
+            canonical_json_bytes(
+                {key: value for key, value in manifest.items() if key != "root_hash"}
+            )
+        ).hexdigest()
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+    full_verification = artifacts.verify_readiness_run_v1(full_run)
+    portable_verification = portable.verify_readiness_run_v1(portable_run)
+    assert full_verification.valid is False
+    assert full_verification.issues == ("READINESS_SEMANTIC_REPLAY_INVALID",)
+    assert portable_verification["valid"] is False
+    assert portable_verification["issues"] == ["READINESS_SEMANTIC_REPLAY_INVALID"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_issue"),
+    [
+        ("pending-call-unknown", "READINESS_ARTIFACT_INVALID"),
+        ("protocol-version", "READINESS_ARTIFACT_INVALID"),
+        ("phase", "READINESS_ARTIFACT_INVALID"),
+        ("pending-state", "READINESS_ARTIFACT_INVALID"),
+        ("qualification-check-bool", "READINESS_STORAGE_UNSAFE"),
+    ],
+)
+def test_readiness_portable_rejects_nested_manifest_and_input_model_mutations(
+    mutation: str,
+    expected_issue: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nested call and qualification models remain exact under canonical resealing."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    artifacts = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_artifacts",
+        fromlist=["*"],
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    portable = _load_protocol_22_portable()
+    runs = (tmp_path / f"{mutation}-full", tmp_path / f"{mutation}-portable")
+    initialize_readiness_core(runs[0], **init)
+    portable.initialize_readiness_v1(runs[1], **init, generation_substrate=generation)
+    for run in runs:
+        manifest_path = run / "readiness-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        if mutation == "pending-call-unknown":
+            manifest["pending_call"]["unknown"] = True
+        elif mutation == "protocol-version":
+            manifest["protocol_version"] = "evil"
+        elif mutation == "phase":
+            manifest["phase"] = "evil"
+        elif mutation == "pending-state":
+            manifest["pending_call"]["state"] = "accepted"
+        else:
+            input_path = run / "readiness-input.json"
+            persisted = json.loads(input_path.read_bytes())
+            persisted["qualification_limits"]["admission_checks"][0]["satisfied"] = (
+                "yes"
+            )
+            input_bytes = canonical_json_bytes(persisted)
+            input_path.write_bytes(input_bytes)
+            for record in manifest["artifacts"]:
+                if record["artifact_path"] == "readiness-input.json":
+                    record["artifact_hash"] = hashlib.sha256(input_bytes).hexdigest()
+        body = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"manifest_fingerprint", "root_hash"}
+        }
+        manifest["manifest_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(body)
+        ).hexdigest()
+        manifest["root_hash"] = hashlib.sha256(
+            canonical_json_bytes(
+                {key: value for key, value in manifest.items() if key != "root_hash"}
+            )
+        ).hexdigest()
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+    full_verification = artifacts.verify_readiness_run_v1(runs[0])
+    portable_verification = portable.verify_readiness_run_v1(runs[1])
+    assert full_verification.valid is False
+    assert full_verification.issues == (expected_issue,)
+    assert portable_verification["valid"] is False
+    assert portable_verification["issues"] == [expected_issue]
 
 
 def test_readiness_contested_request_and_compiler_full_portable_parity(
