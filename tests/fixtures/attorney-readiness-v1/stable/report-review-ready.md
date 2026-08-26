@@ -1,25 +1,51 @@
-# Public-Synthetic Notice Rule — Review-Ready Starting Point
+# Synthetic Regulation
+
+**Jurisdiction:** Example
+
+**As of:** 2026-08-24
+
+**Research scope:** Closed universe of supplied materials
+
+**Principal authority:** Rule 1
+
+**Currentness:** Not independently verified through 2026-08-24; retained cited primary authority: Rule 1; attorney verification required
 
 ## Executive Summary
 
-The fictional rule requires a covered operator to file a notice before a filing and identify the operator and filing date. This report is a starting point for qualified-attorney review, not a complete statement of the fictional rule.
+Section 1. A covered operator must file a notice. [S1]
 
 ## Key Requirements
 
-- File the notice before the public-synthetic filing.
-- Identify the operator and filing date.
-- The registry-identification detail is only partially addressed.
+- Section 1. A covered operator must file a notice. [S1]
 
 ## Penalties and Enforcement
 
-Not established: the source does not state a penalty, enforcement route, or immunity.
+Not established: no penalties are retained.
 
 ## Implementation Workplan
 
-Confirm the registry-identification detail and determine whether the one-year retention and registrar-correction provisions change the implementation plan.
+Assign ownership for the notice duty. [S1]
+
+## Review-Ready Follow-up
+
+What is missing: complete treatment of the operator-identification duty. Why it matters: the omitted duty affects filing completeness. How to resolve it: compare the final report against Section 2 and add the omitted treatment. Owner: reviewing attorney.
+
+## Attorney Validation Warning
+
+Results are AI Generated and may contain errors. Output must be validated by an attorney before the attorney delivers legal advice.
 
 ## Limitations and Open Questions
 
-What is missing: complete treatment of registry identification, retention, and correction. Why it matters: those details affect the implementation decision and attorney follow-up. How to resolve it: compare the final report against the exact rule text and add the omitted treatment. Owner: reviewing attorney.
+- The retained source set did not establish legal status.
+- The retained source set did not establish scope and applicability.
+- The retained source set did not establish enforcement or remedies.
+- The retained source set did not establish deadlines or transition timing.
+- The retained source set did not establish implementation implications or the client facts needed to apply them.
 
-Results are AI Generated and may contain errors. Output must be validated by an attorney before the attorney delivers legal advice.
+## Sources Consulted
+
+### Official and Primary Sources
+
+- **S1. Rule 1**. Source: rule-1.txt.
+
+*AI-assisted research work product. A qualified attorney must verify the sources, analysis, currentness, and applicability before relying on it or delivering legal advice.*

@@ -208,23 +208,47 @@ disclosure and reviewing-attorney or outside-counsel ownership. `NOT_DELIVERABLE
 suppresses the report from the ordinary handoff but preserves sealed artifacts and
 operator-safe remediation codes.
 
-An exact fixture lifecycle is:
+The licensed fixture root is
+`tests/fixtures/attorney-readiness-v1/stable`. Its `source.txt`, selected
+`report-*.md`, and relative `validation-receipt.json` seed an access-controlled
+fixture work directory. The package test materializes and verifies the exact
+qualification, five-requirement baseline, generation, validation, and readiness
+graphs from those bytes before driving every accepted transition through the full
+and isolated portable surfaces. For the `high-assurance` fixture journey, the exact
+operator lifecycle after that prerequisite materialization is:
 
 ```bash
+fixture_workdir=fixture-workdir/high-assurance
 python3 scripts/harvest_skill.py eval-readiness-init \
-  --baseline-run baseline-run \
-  --qualification-run qualification-run \
-  --generation-run generation-run \
-  --validation-receipt validation-receipt.json \
-  --run readiness-run
-python3 scripts/harvest_skill.py eval-readiness-next --run readiness-run
+  --baseline-run "$fixture_workdir/baseline-run" \
+  --qualification-run "$fixture_workdir/qualification-run" \
+  --generation-run "$fixture_workdir/generation-capsule" \
+  --validation-receipt "$fixture_workdir/matter/validation-receipt.json" \
+  --run "$fixture_workdir/readiness-run"
+python3 scripts/harvest_skill.py eval-readiness-next \
+  --run "$fixture_workdir/readiness-run"
 python3 scripts/harvest_skill.py eval-readiness-submit-safe \
-  --run readiness-run --response response.json \
+  --run "$fixture_workdir/readiness-run" \
+  --response "$fixture_workdir/response.json" \
   --provider-name actual-provider --model-name actual-model \
   --judge-isolation fresh_context
-python3 scripts/harvest_skill.py eval-readiness-status --run readiness-run
-python3 scripts/harvest_skill.py eval-readiness-verify --run readiness-run
+python3 scripts/harvest_skill.py eval-readiness-status \
+  --run "$fixture_workdir/readiness-run"
+python3 scripts/harvest_skill.py eval-readiness-verify \
+  --run "$fixture_workdir/readiness-run"
 ```
+
+Repeat `next` and `submit-safe` until terminal. Run the same sequence with
+`report-review-ready.md` and `report-not-deliverable.md`; the package test is the
+reproducible assertion that their source, report, validation, request, response,
+tree, tier, and handoff bytes match the licensed fixture.
+
+`assets/attorney-delivery-readiness-input.template.json` is the canonical public
+JSON-wire representation of the exact `ReadinessInputV1` contract produced by the
+high-assurance fixture. Strict typed consumers rehydrate the embedded baseline
+`evaluation_rubric_bytes` and `importance_policy_bytes` UTF-8 strings as bytes before
+model validation, exactly as readiness artifact admission does. The response template
+validates directly as `ReadinessEvaluatorResponseV1` and its operation payload.
 
 Repeat `next` and `submit-safe` only for the exact pending request. Every fresh grade,
 safety, referee, and repair role requires a genuinely fresh context. A rejected
@@ -236,9 +260,16 @@ Later stateless status and verification see the unchanged pending run and exit `
 A report revision reuses the same baseline only when `legal_input_fingerprint` is
 identical. Legal-input changes require a new baseline. Before changing the `0.70`
 floor, record at least three and preferably five diverse attorney-reviewed cases in
-the nonprivate calibration schema; keep restricted calibration records outside the
-public repository. Any threshold, blocker, or scoring-contract change requires a new
-rubric version and never rewrites historical results.
+the exact nonprivate calibration schema. For every report revision, link a restricted
+companion record containing both fresh grade-lane matrices and scores, the tier and
+gap-matrix visibility, attorney usefulness, follow-up sufficiency, false nondelivery,
+unsafe delivery, importance disagreement, baseline correction, and any optional
+historical Protocol 2.2 disposition, historical comparability, and historical delta.
+Across the calibration set, compute the aggregate baseline-correction rate. The exact
+public JSON template remains unchanged; linked private companion records stay outside
+the public repository. Any threshold, blocker, or scoring-contract change requires a
+new rubric version, may not weaken integrity or silently diverge from retained
+Protocol 2.2 semantics, and never rewrites historical results.
 
 Results are AI Generated and may contain errors. Output must be validated by an attorney before the attorney delivers legal advice.
 

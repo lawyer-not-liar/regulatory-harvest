@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import sys
 from dataclasses import asdict, replace
-from hashlib import sha256
 from pathlib import Path
 
 from regulatory_harvest.analysis import AnalysisDraft
@@ -16,6 +15,10 @@ from regulatory_harvest.evaluation.attorney_baseline_artifacts import (
 )
 from regulatory_harvest.evaluation.attorney_baseline_input import (
     baseline_reuse_decision_v1,
+)
+from regulatory_harvest.evaluation.attorney_baseline_models import (
+    BaselineInputV1,
+    GradeableBaselineProjectionV1,
 )
 from regulatory_harvest.evaluation.attorney_baseline_projection import (
     project_gradeable_baseline_v1,
@@ -38,9 +41,9 @@ from regulatory_harvest.evaluation.attorney_readiness_drafts import (
     compile_readiness_draft_v1,
 )
 from regulatory_harvest.evaluation.attorney_readiness_models import (
-    GenerationValidationBindingV1,
     HistoricalV22CrossCheckV1,
     ReadinessEvaluatorResponseV1,
+    ReadinessInputV1,
     ReadinessOperationV1,
     SafetyRefereeDecisionV1,
 )
@@ -2146,16 +2149,29 @@ def test_readiness_templates_are_canonical_public_and_validate_exact_outer_contr
         assert not data.endswith(b"\n"), path
         assert b"/Users/" not in data and b"/home/" not in data
 
-    readiness_input = json.loads(input_path.read_bytes())
-    assert readiness_input == {
-        "baseline_run": "baseline-run",
-        "generation_run": "generation-run",
-        "historical_report_label": None,
-        "historical_v22_run": None,
-        "qualification_run": "qualification-run",
-        "run": "readiness-run",
-        "validation_receipt": "validation-receipt.json",
-    }
+    input_wire = json.loads(input_path.read_bytes())
+    projection_wire = dict(input_wire["gradeable_baseline"])
+    baseline_wire = dict(projection_wire["baseline_input"])
+    for field in ("evaluation_rubric_bytes", "importance_policy_bytes"):
+        baseline_wire[field] = baseline_wire[field].encode("utf-8")
+    projection_wire["baseline_input"] = BaselineInputV1.model_validate(baseline_wire)
+    input_wire["gradeable_baseline"] = GradeableBaselineProjectionV1.model_validate(
+        projection_wire
+    )
+    readiness_input = ReadinessInputV1.model_validate(input_wire)
+    assert readiness_input.protocol_version == "delivery-readiness-v1"
+    assert readiness_input.model_dump(mode="json", warnings="error") == json.loads(
+        input_path.read_bytes()
+    )
+    assert len(readiness_input.gradeable_baseline.requirements) == 5
+    assert readiness_input.gradeable_baseline.baseline_input.sources[
+        0
+    ].normalized_text == (READINESS_FIXTURE / "stable" / "source.txt").read_text(
+        encoding="utf-8"
+    )
+    assert readiness_input.report_text == (
+        READINESS_FIXTURE / "stable" / "report-high-assurance.md"
+    ).read_text(encoding="utf-8")
 
     response = ReadinessEvaluatorResponseV1.model_validate(
         json.loads(response_path.read_bytes())
@@ -2228,46 +2244,325 @@ def test_readiness_calibration_template_has_the_exact_nonprivate_contract() -> N
     }
 
 
-def _readiness_fixture_inputs(source: object, report_text: str, *, historical_fail: bool) -> object:
-    report_hash = sha256_digest(report_text.encode("utf-8"))
-    validation = source.generation_validation.model_copy(  # type: ignore[attr-defined]
-        update={"report_hash": report_hash}
-    )
-    readiness_input = source.readiness_input.model_copy(  # type: ignore[attr-defined]
+_READINESS_WARNING = (
+    "Results are AI Generated and may contain errors. Output must be validated by an "
+    "attorney before the attorney delivers legal advice."
+)
+
+
+def _write_fixture_baseline(
+    root: Path,
+    input_helpers: object,
+    baseline_artifacts: object,
+) -> tuple[Path, Path, object]:
+    """Build an authentic five-requirement baseline from the fixture source bytes."""
+    source_text = (READINESS_FIXTURE / "stable" / "source.txt").read_text(encoding="utf-8")
+    seed = input_helpers._baseline_input()  # type: ignore[attr-defined]
+    source = seed.sources[0].model_copy(  # type: ignore[union-attr]
         update={
-            "report_text": report_text,
-            "report_hash": report_hash,
-            "generation_validation": validation,
+            "normalized_text": source_text,
+            "content_hash": sha256_digest(source_text.encode("utf-8")),
         }
     )
-    historical = None
-    if historical_fail:
-        historical = HistoricalV22CrossCheckV1(
-            report_hash=report_hash,
-            strict_disposition="FAIL",
-            result_fingerprint=sha256_digest(b"public-synthetic-history-result"),
-            manifest_fingerprint=sha256_digest(b"public-synthetic-history-manifest"),
-            baseline_fingerprint=sha256_digest(b"public-synthetic-history-baseline"),
-            grader_aggregate_fingerprints=(
-                sha256_digest(b"public-synthetic-history-lane-1"),
-                sha256_digest(b"public-synthetic-history-lane-2"),
+    baseline_seed = seed.model_copy(update={"sources": (source,)})
+    original = input_helpers._baseline_input  # type: ignore[attr-defined]
+    input_helpers._baseline_input = lambda: baseline_seed  # type: ignore[attr-defined]
+    try:
+        qualification_run = root / "qualification-run"
+        baseline_input = input_helpers._write_qualification(  # type: ignore[attr-defined]
+            qualification_run,
+            limitations=None,
+        )
+    finally:
+        input_helpers._baseline_input = original  # type: ignore[attr-defined]
+
+    review_request = baseline_artifacts.build_baseline_source_review_request_v1(  # type: ignore[attr-defined]
+        baseline_input, (), fragment_ordinal=1
+    )
+    proposals = tuple(
+        {
+            "statement": f"Fictional requirement {index} must be addressed.",
+            "kind": "obligation",
+            "importance": "material",
+            "importance_basis": ("attorney_briefing",),
+            "importance_rationale": (
+                "The point is necessary for a competent attorney briefing."
             ),
-            reason_codes=("PUBLIC_SYNTHETIC_HISTORICAL_FAIL",),
-            baseline_comparable=True,
-            report_comparable=True,
+            "passages": (
+                {
+                    "source_id": "rule-1",
+                    "quote": (
+                        "must file a notice"
+                        if index % 2
+                        else "must identify the operator"
+                    ),
+                },
+            ),
+            "dependency": None,
+            "confidence": "clear",
+            "substantive_rationale": (
+                "The exact public-synthetic source passage supplies the requirement."
+            ),
+        }
+        for index in range(1, 6)
+    )
+    review_payload = baseline_artifacts.BaselineReviewFragmentV1(  # type: ignore[attr-defined]
+        proposals=proposals,
+        review_complete=True,
+    )
+    review_response = baseline_artifacts._response_bytes(  # type: ignore[attr-defined]
+        review_request, review_payload
+    )
+    review_fragment = baseline_artifacts.AcceptedBaselineReviewFragmentV1(  # type: ignore[attr-defined]
+        fragment_ordinal=1,
+        request_fingerprint=review_request.request_fingerprint,
+        response_fingerprint=sha256_digest(review_response),
+        payload=review_payload,
+    )
+    review = baseline_artifacts.aggregate_baseline_review_v1(  # type: ignore[attr-defined]
+        baseline_input, (review_fragment,)
+    )
+    audit_request = baseline_artifacts.build_baseline_source_audit_request_v1(  # type: ignore[attr-defined]
+        baseline_input, review, (), fragment_ordinal=1
+    )
+    audit_payload = baseline_artifacts.BaselineAuditFragmentV1(  # type: ignore[attr-defined]
+        concerns=(),
+        importance_findings=tuple(
+            {
+                "proposal_ref": f"PR-{index:04d}",
+                "reviewed_importance": "material",
+                "reviewed_importance_basis": ("attorney_briefing",),
+                "importance_rationale": (
+                    "The point is necessary for a competent attorney briefing."
+                ),
+                "disposition": "agree",
+            }
+            for index in range(1, 6)
+        ),
+        audit_complete=True,
+    )
+    audit_response = baseline_artifacts._response_bytes(  # type: ignore[attr-defined]
+        audit_request, audit_payload
+    )
+    audit_fragment = baseline_artifacts.AcceptedBaselineAuditFragmentV1(  # type: ignore[attr-defined]
+        fragment_ordinal=1,
+        request_fingerprint=audit_request.request_fingerprint,
+        response_fingerprint=sha256_digest(audit_response),
+        payload=audit_payload,
+    )
+    audit = baseline_artifacts.aggregate_baseline_audit_v1(  # type: ignore[attr-defined]
+        baseline_input, review, (audit_fragment,)
+    )
+    referees = baseline_artifacts.aggregate_baseline_referees_v1(  # type: ignore[attr-defined]
+        baseline_input, (), ()
+    )
+    baseline = baseline_artifacts.compile_canonical_baseline_v1(  # type: ignore[attr-defined]
+        baseline_input, review, audit, referees
+    )
+    verification = baseline_artifacts.BaselineVerificationV1(valid=True)  # type: ignore[attr-defined]
+    files = {
+        baseline_artifacts.BASELINE_INPUT_PATH: baseline_artifacts._canonical(  # type: ignore[attr-defined]
+            baseline_input
+        ),
+        baseline_artifacts._REVIEW_REQUEST: baseline_artifacts._canonical(  # type: ignore[attr-defined]
+            review_request
+        ),
+        baseline_artifacts._REVIEW_RESPONSE: review_response,  # type: ignore[attr-defined]
+        baseline_artifacts.BASELINE_REVIEW_PATH: baseline_artifacts._canonical(  # type: ignore[attr-defined]
+            review
+        ),
+        baseline_artifacts._AUDIT_REQUEST: baseline_artifacts._canonical(  # type: ignore[attr-defined]
+            audit_request
+        ),
+        baseline_artifacts._AUDIT_RESPONSE: audit_response,  # type: ignore[attr-defined]
+        baseline_artifacts.BASELINE_AUDIT_PATH: baseline_artifacts._canonical(  # type: ignore[attr-defined]
+            audit
+        ),
+        baseline_artifacts.BASELINE_REFEREES_PATH: baseline_artifacts._canonical(  # type: ignore[attr-defined]
+            referees
+        ),
+        baseline_artifacts.CANONICAL_BASELINE_PATH: baseline_artifacts._canonical(  # type: ignore[attr-defined]
+            baseline
+        ),
+        baseline_artifacts.BASELINE_VERIFICATION_PATH: baseline_artifacts._canonical(  # type: ignore[attr-defined]
+            verification
+        ),
+    }
+    manifest = baseline_artifacts._manifest(  # type: ignore[attr-defined]
+        baseline_input,
+        baseline_artifacts.BaselinePhaseV1.COMPLETED,  # type: ignore[attr-defined]
+        baseline_fingerprint=baseline.baseline_fingerprint,
+        terminal_status="COMPLETED",
+    )
+    baseline_run = root / "baseline-run"
+    baseline_artifacts.initialize_baseline_storage_v1(  # type: ignore[attr-defined]
+        baseline_run, manifest, files
+    )
+    context = baseline_artifacts.load_verified_baseline_run(baseline_run)  # type: ignore[attr-defined]
+    assert len(context.baseline.requirements) == 5
+    assert context.baseline_input.sources[0].normalized_text == source_text
+    return qualification_run, baseline_run, context
+
+
+def _fixture_analysis_draft(
+    input_helpers: object,
+    context: object,
+    journey_id: str,
+) -> tuple[object, object, dict[str, object], dict[str, object], str]:
+    bundle = input_helpers._validation_bundle(context)  # type: ignore[attr-defined]
+    draft, dossier, _ = input_helpers._coverage_artifacts(bundle)  # type: ignore[attr-defined]
+    raw = draft.model_dump(mode="json")
+    sections = raw["brief"]["sections"]
+    if journey_id == "review-ready":
+        raw["brief"]["executive_summary"][0]["text"] = (
+            "Section 1. A covered operator must file a notice."
         )
-        readiness_input = readiness_input.model_copy(
-            update={"historical_v22_cross_check": historical}
+        sections[0]["blocks"][0]["items"][0]["text"] = (
+            "Section 1. A covered operator must file a notice."
         )
+        sections.append(
+            {
+                "section_id": "review-ready-follow-up",
+                "title": "Review-Ready Follow-up",
+                "role": "other",
+                "blocks": [
+                    {
+                        "kind": "paragraph",
+                        "purpose": "limitation",
+                        "text": (
+                            "What is missing: complete treatment of the operator-identification "
+                            "duty. Why it matters: the omitted duty affects filing completeness. "
+                            "How to resolve it: compare the final report against Section 2 and add "
+                            "the omitted treatment. Owner: reviewing attorney."
+                        ),
+                    }
+                ],
+            }
+        )
+    if journey_id == "not-deliverable":
+        sections.append(
+            {
+                "section_id": "unsafe-assertion",
+                "title": "Unsafe Assertion",
+                "role": "other",
+                "blocks": [
+                    {
+                        "kind": "paragraph",
+                        "purpose": "application",
+                        "text": "The operator is immune from every penalty once it files.",
+                    }
+                ],
+            }
+        )
+    sections.append(
+        {
+            "section_id": "attorney-validation-warning",
+            "title": "Attorney Validation Warning",
+            "role": "other",
+            "blocks": [
+                {"kind": "paragraph", "purpose": "limitation", "text": _READINESS_WARNING}
+            ],
+        }
+    )
+    rebuilt = AnalysisDraft.model_validate(raw)
+    coverage = input_helpers.evaluate_atomic_coverage(  # type: ignore[attr-defined]
+        dossier["source_unit_inventory"],
+        dossier["evidence_inventory"],
+        rebuilt,
+        bundle.sources,
+    )
+    assert coverage["valid"] is True
+    bound = input_helpers._bind_bundle_to_draft(bundle, rebuilt)  # type: ignore[attr-defined]
+    report_text = input_helpers.render_markdown(bound)  # type: ignore[attr-defined]
+    return bound, rebuilt, dossier, coverage, report_text
+
+
+def _write_fixture_validation_matter(
+    root: Path,
+    context: object,
+    journey: dict[str, object],
+    input_helpers: object,
+) -> tuple[Path, Path, str]:
+    journey_id = str(journey["journey_id"])
+    variant = "high-assurance" if journey_id == "fresh-pass-historical-fail" else journey_id
+    bundle, draft, dossier, coverage, report_text = _fixture_analysis_draft(
+        input_helpers, context, variant
+    )
+    expected_report = (
+        READINESS_FIXTURE / "stable" / str(journey["report_file"])
+    ).read_text(encoding="utf-8")
+    assert report_text == expected_report
+    assert sha256_digest(report_text.encode("utf-8")) == journey["report_sha256"]
+
+    matter = root / "matter"
+    run = matter / "runs" / "synthetic-run"
+    run.mkdir(parents=True)
+    (run / "report.md").write_bytes(report_text.encode("utf-8"))
+    (run / "bundle.json").write_bytes(
+        input_helpers.canonical_json_bytes(  # type: ignore[attr-defined]
+            bundle.model_dump(mode="json")
+        )
+    )
+    (matter / "agent-dossier.json").write_bytes(
+        input_helpers._canonical_file(dossier)  # type: ignore[attr-defined]
+    )
+    (matter / "coverage-review.json").write_bytes(
+        input_helpers._canonical_file(coverage)  # type: ignore[attr-defined]
+    )
+    (matter / "analysis-draft.json").write_bytes(
+        input_helpers._canonical_file(  # type: ignore[attr-defined]
+            draft.model_dump(mode="json")
+        )
+    )
+    (run / "audit.md").write_text("# Public-synthetic audit\n", encoding="utf-8")
+
+    receipt_template = json.loads(
+        (READINESS_FIXTURE / "stable" / "validation-receipt.json").read_bytes()
+    )
+    receipt_template["coverage_review_hash"] = coverage["coverage_review_hash"]
+    receipt_template["validation_issue_count"] = len(
+        input_helpers.validate_bundle(  # type: ignore[attr-defined]
+            bundle, require_bundle_hash=True
+        ).issues
+    )
+    receipt = dict(receipt_template)
+    for field in ("analysis_draft", "audit", "bundle", "coverage_review", "report"):
+        receipt[field] = str(matter / str(receipt[field]))
+    receipt_path = matter / "validation-receipt.json"
+    receipt_path.write_bytes(input_helpers._canonical_file(receipt))  # type: ignore[attr-defined]
+    if journey_id == "high-assurance":
+        normalized = dict(receipt)
+        for field in ("analysis_draft", "audit", "bundle", "coverage_review", "report"):
+            normalized[field] = Path(str(receipt[field])).relative_to(matter).as_posix()
+        assert normalized == receipt_template
+
+    generation_run = input_helpers._write_generation_capsule(  # type: ignore[attr-defined]
+        root, context, report_text
+    )
+    return generation_run, receipt_path, report_text
+
+
+def _with_synthetic_fixture_history(source: object) -> object:
+    historical = HistoricalV22CrossCheckV1(
+        report_hash=source.report_hash,  # type: ignore[attr-defined]
+        strict_disposition="FAIL",
+        result_fingerprint=sha256_digest(b"public-synthetic-history-result"),
+        manifest_fingerprint=sha256_digest(b"public-synthetic-history-manifest"),
+        baseline_fingerprint=sha256_digest(b"public-synthetic-history-baseline"),
+        grader_aggregate_fingerprints=(
+            sha256_digest(b"public-synthetic-history-lane-1"),
+            sha256_digest(b"public-synthetic-history-lane-2"),
+        ),
+        reason_codes=("PUBLIC_SYNTHETIC_HISTORICAL_FAIL",),
+        baseline_comparable=True,
+        report_comparable=True,
+    )
+    readiness_input = source.readiness_input.model_copy(  # type: ignore[attr-defined]
+        update={"historical_v22_cross_check": historical}
+    )
     return replace(
         source,
         readiness_input=readiness_input,
-        report_text=report_text,
-        report_hash=report_hash,
-        generation_binding=replace(  # type: ignore[attr-defined]
-            source.generation_binding, report_hash=report_hash  # type: ignore[attr-defined]
-        ),
-        generation_validation=validation,
         historical_v22=historical,
     )
 
@@ -2279,8 +2574,7 @@ def test_readiness_public_fixture_drives_all_tiers_with_full_isolated_portable_p
     """Actual fixture report bytes must survive every full/portable transition."""
     monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))  # type: ignore[attr-defined]
     stress = __import__("test_attorney_readiness_stress")
-    requests = __import__("test_attorney_readiness_requests")
-    projections = __import__("test_attorney_baseline_projection")
+    baseline_artifacts = __import__("test_attorney_baseline_artifacts")
     input_helpers = __import__("test_attorney_readiness_inputs")
     workflow_tests = __import__("test_attorney_readiness_workflow")
     draft_tests = __import__("test_attorney_readiness_drafts")
@@ -2292,41 +2586,85 @@ def test_readiness_public_fixture_drives_all_tiers_with_full_isolated_portable_p
     script = json.loads(
         (READINESS_FIXTURE / "stable" / "scripted-drafts.json").read_bytes()
     )
-    receipt = GenerationValidationBindingV1.model_validate(
-        json.loads(
-            (READINESS_FIXTURE / "stable" / "validation-receipt.json").read_bytes()
-        )
-    )
-    assert receipt.status == "completed"
-
     for journey in script["journeys"]:
         vector = stress._vector(journey["seed"], rubric)
         vector.update(journey["vector_overrides"])
-        inputs = stress._inputs(
-            tmp_path / f"inputs-{journey['journey_id']}",
-            vector,
-            requests,
-            projections,
+        fixture_root = tmp_path / f"inputs-{journey['journey_id']}"
+        fixture_root.mkdir()
+        qualification_run, baseline_run, baseline_context = _write_fixture_baseline(
+            fixture_root,
             input_helpers,
-            full_workflow,
-            portable,
-            monkeypatch,
+            baseline_artifacts,
         )
-        report_text = (
-            READINESS_FIXTURE / "stable" / journey["report_file"]
+        generation_run, receipt_path, report_text = _write_fixture_validation_matter(
+            fixture_root,
+            baseline_context,
+            journey,
+            input_helpers,
+        )
+        inputs = full_workflow.build_verified_readiness_input_v1(
+            baseline_run_dir=baseline_run,
+            qualification_run_dir=qualification_run,
+            generation_run_dir=generation_run,
+            validation_receipt_path=receipt_path,
+        )
+        assert inputs.source_record[0].normalized_text == (
+            READINESS_FIXTURE / "stable" / "source.txt"
         ).read_text(encoding="utf-8")
-        assert sha256(report_text.encode("utf-8")).hexdigest() == journey["report_sha256"]
-        inputs = _readiness_fixture_inputs(
-            inputs,
-            report_text,
-            historical_fail=journey["historical_fail_cross_check"],
-        )
+        assert inputs.report_text == report_text
+        assert inputs.generation_validation.report_hash == journey["report_sha256"]
+        if journey["historical_fail_cross_check"]:
+            inputs = _with_synthetic_fixture_history(inputs)
 
         full_run = tmp_path / f"full-{journey['journey_id']}"
         portable_run = tmp_path / f"portable-{journey['journey_id']}"
-        grade_requests = _grade_requests(inputs)
-        initialize_readiness_run_storage_v1(full_run, inputs, grade_requests[0])
-        stress._portable_initialize(portable, inputs, portable_run)
+        if journey["historical_fail_cross_check"]:
+            grade_requests = _grade_requests(inputs)
+            initialize_readiness_run_storage_v1(full_run, inputs, grade_requests[0])
+            stress._portable_initialize(portable, inputs, portable_run)
+        else:
+            common = [
+                "eval-readiness-init",
+                "--baseline-run",
+                str(baseline_run),
+                "--qualification-run",
+                str(qualification_run),
+                "--generation-run",
+                str(generation_run),
+                "--validation-receipt",
+                str(receipt_path),
+            ]
+            full_init = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "attorney_eval_full.py"),
+                    *common,
+                    "--run",
+                    str(full_run),
+                ],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+            )
+            portable_init = subprocess.run(
+                [
+                    "python3",
+                    "-I",
+                    "-S",
+                    str(ROOT / "scripts" / "harvest_portable.py"),
+                    *common,
+                    "--run",
+                    str(portable_run),
+                ],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+            )
+            assert full_init.returncode == 0, (full_init.stdout, full_init.stderr)
+            assert portable_init.returncode == 0, (
+                portable_init.stdout,
+                portable_init.stderr,
+            )
         assert stress._tree(full_run) == stress._tree(portable_run)
 
         provenance = ReadinessEvaluatorProvenanceV1(
@@ -2468,6 +2806,12 @@ def test_readiness_guidance_publishes_the_complete_experimental_contract() -> No
         "exit `6`",
         "at least three and preferably five",
         "legal_input_fingerprint",
+        "both fresh grade-lane matrices",
+        "false nondelivery",
+        "historical comparability",
+        "historical delta",
+        "aggregate baseline-correction rate",
+        "tests/fixtures/attorney-readiness-v1/stable",
     ):
         assert required.casefold() in combined.casefold(), required
 
