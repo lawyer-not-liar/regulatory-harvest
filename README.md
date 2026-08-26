@@ -1,21 +1,22 @@
 # Regulatory Harvest
 
-> **Experimental beta (`v0.1.0-beta.8`).** Beta.8 gives every Protocol 2.2
-> ordinary and contested grader a controller-issued report-passage allowlist.
-> Each allowed value is an exact unique substring of the supplied report, with a
-> whole-report fallback when no narrower allowed passage suffices; strict grade
-> validation remains unchanged. The beta.7 private evaluation accepted all
-> source-stage calls before pausing at a hidden report-passage interface defect.
-> Beta.8 addresses that interface defect, but beta.8 has not yet earned a private
-> `PASS`.
-> No performance, benchmark, or report-quality claim is made.
+> **Experimental beta (`v0.1.0-beta.9`).** Beta.9 adds an opt-in stable
+> evaluation baseline and delivery-readiness companion. It grades each exact
+> report revision against one report-blind, source-derived baseline, then compiles
+> two independent grading and safety lanes plus referee decisions into
+> `HIGH_ASSURANCE`, `REVIEW_READY_WITH_GAPS`, or `NOT_DELIVERABLE`. Public
+> synthetic validation covered the full and portable runtimes and deterministic
+> release artifacts; no private matter rollout validation was performed.
+> Protocol 2.2 remains opt-in and experimental, and Protocol 2.1 remains the
+> new-run default. No performance, benchmark, legal-correctness, or report-quality
+> claim is made.
 > Results are AI Generated and may contain
 > errors. Output must be validated by an attorney before the attorney delivers
 > legal advice.
 
-The GitHub prerelease label `v0.1.0-beta.8` packages project version `0.1.0`.
+The GitHub prerelease label `v0.1.0-beta.9` packages project version `0.1.0`.
 The beta suffix describes the release channel. This release builds on exact
-merge commit `bc7714f8b4b613aa0e4556e374f66508278091a9`. Protocol 2.2 remains
+merge commit `ad157f677ee220dca5a064783c1cc40f9d13c47d`. Protocol 2.2 remains
 opt-in and experimental; Protocol 2.1 remains the new-run default. No PyPI
 distribution is published.
 

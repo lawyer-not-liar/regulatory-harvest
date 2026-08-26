@@ -39,42 +39,40 @@ def test_public_package_metadata_supports_declared_install_surfaces() -> None:
 
 
 def test_experimental_beta_release_surfaces_are_coherent() -> None:
-    """The prerelease surfaces must describe Protocol 2.2's bounded evidence."""
+    """The prerelease surfaces must describe the bounded readiness companion."""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs" / "roadmap.md").read_text(encoding="utf-8")
+    beta9_heading = "## [0.1.0-beta.9] - 2026-08-26"
     beta8_heading = "## [0.1.0-beta.8] - 2026-08-24"
-    beta7_heading = "## [0.1.0-beta.7] - 2026-08-24"
-    _, found_beta8_heading, beta8_and_history = changelog.partition(beta8_heading)
-    beta8_section, found_beta7_heading, _ = beta8_and_history.partition(beta7_heading)
+    _, found_beta9_heading, beta9_and_history = changelog.partition(beta9_heading)
+    beta9_section, found_beta8_heading, _ = beta9_and_history.partition(beta8_heading)
     readme_words = " ".join(readme.split())
-    beta8_changelog_words = " ".join(beta8_section.split())
+    beta9_changelog_words = " ".join(beta9_section.split())
     roadmap_words = " ".join(roadmap.split())
     release_surfaces = (
         readme_words.replace("> ", "").casefold(),
-        beta8_changelog_words.casefold(),
+        beta9_changelog_words.casefold(),
     )
 
-    assert "v0.1.0-beta.8" in readme
+    assert "v0.1.0-beta.9" in readme
     assert "TO_BE_BOUND" not in readme
     assert "packages project version `0.1.0`" in readme_words
     assert "Protocol 2.1 remains the new-run default" in readme_words
+    assert found_beta9_heading == beta9_heading
     assert found_beta8_heading == beta8_heading
-    assert found_beta7_heading == beta7_heading
     for release_surface in release_surfaces:
         assert "protocol 2.2 remains opt-in and experimental" in release_surface
-        assert "controller-issued report-passage allowlist" in release_surface
-        assert "exact unique substring" in release_surface
-        assert "whole-report fallback" in release_surface
-        assert "strict grade validation remains unchanged" in release_surface
+        assert "stable evaluation baseline" in release_surface
+        assert "delivery-readiness companion" in release_surface
+        assert "report-blind" in release_surface
+        assert "high_assurance" in release_surface
+        assert "review_ready_with_gaps" in release_surface
+        assert "not_deliverable" in release_surface
+        assert "public synthetic validation" in release_surface
+        assert "no private matter rollout validation was performed" in release_surface
         assert (
-            "beta.7 private evaluation accepted all source-stage calls"
-            in release_surface
-        )
-        assert "report-passage interface defect" in release_surface
-        assert "beta.8 has not yet earned a private `pass`" in release_surface
-        assert (
-            "no performance, benchmark, or report-quality claim is made"
+            "no performance, benchmark, legal-correctness, or report-quality claim is made"
             in release_surface
         )
         assert "no pypi distribution is published" in release_surface
