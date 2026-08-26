@@ -502,6 +502,76 @@ def test_readiness_portable_rejects_private_qualification_projection(
     assert not portable_run.exists()
 
 
+def test_readiness_portable_rejects_resealed_private_persisted_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Authenticated replay cannot turn a private qualification path into a prompt."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    artifacts = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_artifacts",
+        fromlist=["*"],
+    )
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    runs = (tmp_path / "persisted-private-full", tmp_path / "persisted-private-portable")
+    initialize_readiness_core(runs[0], **init)
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(runs[1], **init, generation_substrate=generation)
+    private_text = "See /private/client-secret.txt before delivery."
+    for run in runs:
+        input_path = run / "readiness-input.json"
+        persisted = json.loads(input_path.read_bytes())
+        persisted["qualification_limits"]["receipt_readiness"]["rationale"] = (
+            private_text
+        )
+        input_bytes = canonical_json_bytes(persisted)
+        input_path.write_bytes(input_bytes)
+        manifest_path = run / "readiness-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        next(
+            row
+            for row in manifest["artifacts"]
+            if row["artifact_path"] == "readiness-input.json"
+        )["artifact_hash"] = hashlib.sha256(input_bytes).hexdigest()
+        body = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"manifest_fingerprint", "root_hash"}
+        }
+        manifest["manifest_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(body)
+        ).hexdigest()
+        manifest["root_hash"] = hashlib.sha256(
+            canonical_json_bytes(
+                {key: value for key, value in manifest.items() if key != "root_hash"}
+            )
+        ).hexdigest()
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+    full_verification = artifacts.verify_readiness_run_v1(runs[0]).model_dump(
+        mode="json"
+    )
+    portable_verification = portable.verify_readiness_run_v1(runs[1])
+    assert portable_verification == full_verification
+    assert portable_verification["valid"] is False
+    assert portable_verification["issues"] == ["READINESS_STORAGE_UNSAFE"]
+    before = _tree_bytes(runs[1])
+    with pytest.raises(portable.EvaluationIntegrityError):
+        portable.next_readiness_request_v1(runs[1])
+    assert _tree_bytes(runs[1]) == before
+    assert private_text.encode() not in b"".join(
+        data for path, data in before.items() if path.startswith("requests/")
+    )
+
+
 def test_readiness_portable_rejects_forged_validation_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -536,12 +606,53 @@ def test_readiness_portable_rejects_forged_validation_bundle(
     assert not portable_run.exists()
 
 
+def test_readiness_portable_rejects_boolean_validation_receipt_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boolean values cannot impersonate native integer validation counts."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    receipt = json.loads(source.validation_receipt_path.read_bytes())
+    receipt["blocking_review_count"] = False
+    source.validation_receipt_path.write_bytes(canonical_json_bytes(receipt) + b"\n")
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    full_run = tmp_path / "boolean-count-full"
+    portable_run = tmp_path / "boolean-count-portable"
+    with pytest.raises(Exception, match="READINESS_VALIDATION_RECEIPT_INVALID"):
+        initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    with pytest.raises(
+        portable.PortableEvaluationInputError,
+        match="READINESS_VALIDATION_RECEIPT_INVALID",
+    ):
+        portable.initialize_readiness_v1(
+            portable_run, **init, generation_substrate=generation
+        )
+    assert not full_run.exists()
+    assert not portable_run.exists()
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
         "manifest-unknown",
         "updated-at-type",
+        "configuration-fingerprint-type",
+        "created-at-date-only",
+        "validated-at-invalid",
         "generator-mismatch",
+        "source-input-title-type",
+        "multi-running-stages",
+        "nonterminal-before-terminal",
     ],
 )
 def test_readiness_portable_rejects_nested_validation_bundle_mutations(
@@ -557,12 +668,29 @@ def test_readiness_portable_rejects_nested_validation_bundle_mutations(
     receipt = json.loads(source.validation_receipt_path.read_bytes())
     bundle_path = Path(receipt["bundle"])
     bundle = json.loads(bundle_path.read_bytes())
+    dossier_path = source.validation_receipt_path.parent / "agent-dossier.json"
+    dossier = json.loads(dossier_path.read_bytes())
     if mutation == "manifest-unknown":
         bundle["manifest"]["unknown"] = True
     elif mutation == "updated-at-type":
         bundle["manifest"]["updated_at"] = 7
-    else:
+    elif mutation == "configuration-fingerprint-type":
+        bundle["manifest"]["configuration_fingerprint"] = 7
+    elif mutation == "created-at-date-only":
+        bundle["manifest"]["created_at"] = "2026-08-25"
+    elif mutation == "validated-at-invalid":
+        bundle["validation"]["validated_at"] = "banana"
+    elif mutation == "generator-mismatch":
         bundle["generator_version"] = "regulatory-harvest/999"
+    elif mutation == "source-input-title-type":
+        bundle["request"]["source_inputs"][0]["title"] = 7
+        dossier["request"]["source_inputs"][0]["title"] = 7
+        dossier_path.write_bytes(canonical_json_bytes(dossier) + b"\n")
+    elif mutation == "multi-running-stages":
+        bundle["manifest"]["stages"][0]["status"] = "running"
+        bundle["manifest"]["stages"][1]["status"] = "running"
+    else:
+        bundle["manifest"]["stages"][1]["status"] = "completed"
     bundle["bundle_hash"] = hashlib.sha256(
         canonical_json_bytes(
             {key: value for key, value in bundle.items() if key != "bundle_hash"}
@@ -589,6 +717,268 @@ def test_readiness_portable_rejects_nested_validation_bundle_mutations(
         )
     assert not full_run.exists()
     assert not portable_run.exists()
+
+
+@pytest.mark.parametrize("field", ["context", "output_instructions"])
+def test_readiness_portable_accepts_empty_optional_generation_request_text(
+    field: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Strict optional request strings retain the full model's empty-string semantics."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    receipt = json.loads(source.validation_receipt_path.read_bytes())
+    bundle_path = Path(receipt["bundle"])
+    dossier_path = source.validation_receipt_path.parent / "agent-dossier.json"
+    bundle = json.loads(bundle_path.read_bytes())
+    dossier = json.loads(dossier_path.read_bytes())
+    bundle["request"][field] = ""
+    dossier["request"][field] = ""
+    dossier_path.write_bytes(canonical_json_bytes(dossier) + b"\n")
+    bundle["bundle_hash"] = hashlib.sha256(
+        canonical_json_bytes(
+            {key: value for key, value in bundle.items() if key != "bundle_hash"}
+        )
+    ).hexdigest()
+    bundle_path.write_bytes(canonical_json_bytes(bundle))
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    full_run = tmp_path / f"empty-{field}-full"
+    portable_run = tmp_path / f"empty-{field}-portable"
+    initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(
+        portable_run, **init, generation_substrate=generation
+    )
+    assert _tree_bytes(portable_run) == _tree_bytes(full_run)
+
+
+def test_readiness_portable_accepts_full_valid_failed_generation_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A strict failed final generation stage retains full readiness admission parity."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    receipt = json.loads(source.validation_receipt_path.read_bytes())
+    bundle_path = Path(receipt["bundle"])
+    bundle = json.loads(bundle_path.read_bytes())
+    final_stage = bundle["manifest"]["stages"][-1]
+    final_stage["status"] = "failed"
+    final_stage["completed_at"] = None
+    final_stage["error"] = {
+        "stage": final_stage["name"],
+        "category": "public-fixture",
+        "retryable": False,
+        "message": "The public synthetic stage failed.",
+        "provider_status_code": None,
+    }
+    bundle["bundle_hash"] = hashlib.sha256(
+        canonical_json_bytes(
+            {key: value for key, value in bundle.items() if key != "bundle_hash"}
+        )
+    ).hexdigest()
+    bundle_path.write_bytes(canonical_json_bytes(bundle))
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    full_run = tmp_path / "failed-stage-full"
+    portable_run = tmp_path / "failed-stage-portable"
+    initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(
+        portable_run, **init, generation_substrate=generation
+    )
+    assert _tree_bytes(portable_run) == _tree_bytes(full_run)
+
+
+def test_readiness_portable_initialization_rolls_back_manifest_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed initial manifest write leaves no partially authenticated graph."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    portable = _load_protocol_22_portable()
+    original = portable._PosixRunStorage.atomic_write
+
+    def fail_manifest(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> object:
+        if path == "readiness-manifest.json":
+            raise OSError("injected readiness manifest failure")
+        return original(storage, path, data, mutable=mutable)
+
+    monkeypatch.setattr(portable._PosixRunStorage, "atomic_write", fail_manifest)
+    output = tmp_path / "portable-init-rollback"
+    with pytest.raises(portable.EvaluationIntegrityError):
+        portable.initialize_readiness_v1(
+            output,
+            baseline_run_dir=source.baseline_run_dir,
+            qualification_run_dir=source.qualification_run_dir,
+            generation_run_dir=source.generation_run_dir,
+            validation_receipt_path=source.validation_receipt_path,
+            generation_substrate=generation,
+        )
+    assert _tree_bytes(output) == {}
+
+
+@pytest.mark.parametrize("concurrent_callers", [False, True])
+def test_readiness_portable_transition_is_atomic_and_serialized(
+    concurrent_callers: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transition rolls back on failure and admits one cooperating caller only."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    workflow = __import__("test_attorney_readiness_workflow")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    full_run = tmp_path / "transaction-full"
+    portable_run = tmp_path / "transaction-portable"
+    initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(
+        portable_run, **init, generation_substrate=generation
+    )
+    request = next_readiness_core(full_run)
+    portable_request = portable.next_readiness_request_v1(portable_run)
+    assert request is not None and portable_request is not None
+    response = portable.compile_readiness_draft_v1(
+        portable_request,
+        workflow._draft(request, grade_mode="met"),
+        {
+            "provider_name": "portable-parity-provider",
+            "model_name": "portable-parity-model",
+            "judge_isolation": "scripted_fixture",
+        },
+    )
+    if concurrent_callers:
+        barrier = __import__("threading").Barrier(2)
+
+        def submit(_: int) -> dict[str, object]:
+            barrier.wait()
+            return portable.guarded_submit_readiness_response_v1(
+                portable_run, response
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(submit, range(2)))
+        assert sorted(outcome["accepted"] for outcome in outcomes) == [False, True]
+        loser = next(outcome for outcome in outcomes if not outcome["accepted"])
+        assert loser["reason_code"] == "READINESS_EXTERNAL_RESPONSE_INVALID"
+        assert portable.verify_readiness_run_v1(portable_run)["valid"] is True
+        return
+
+    before = _tree_bytes(portable_run)
+    original = portable._PosixRunStorage.atomic_write
+
+    def fail_manifest(
+        storage: object, path: str, data: bytes, *, mutable: bool
+    ) -> object:
+        if path == "readiness-manifest.json" and mutable:
+            raise OSError("injected readiness transition failure")
+        return original(storage, path, data, mutable=mutable)
+
+    monkeypatch.setattr(portable._PosixRunStorage, "atomic_write", fail_manifest)
+    with pytest.raises(portable.EvaluationIntegrityError):
+        portable.guarded_submit_readiness_response_v1(portable_run, response)
+    assert _tree_bytes(portable_run) == before
+    assert portable.verify_readiness_run_v1(portable_run)["valid"] is True
+
+
+@pytest.mark.parametrize("shape", ["cycle", "deep"])
+def test_readiness_portable_bounds_native_response_and_draft_graphs(
+    shape: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cyclic and over-depth native objects are refused without recursion or writes."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    full_run = tmp_path / f"native-{shape}-full"
+    portable_run = tmp_path / f"native-{shape}-portable"
+    initialize_readiness_core(full_run, **init)
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(portable_run, **init, generation_substrate=generation)
+    full_request = next_readiness_core(full_run)
+    portable_request = portable.next_readiness_request_v1(portable_run)
+    assert full_request is not None and portable_request is not None
+    if shape == "cycle":
+        hostile: dict[str, object] = {}
+        hostile["x"] = hostile
+    else:
+        hostile = {}
+        cursor = hostile
+        for _ in range(70):
+            child: dict[str, object] = {}
+            cursor["x"] = child
+            cursor = child
+    provenance = ReadinessEvaluatorProvenanceV1(
+        provider_name="portable-parity-provider",
+        model_name="portable-parity-model",
+        judge_isolation="scripted_fixture",
+    )
+    full_compile = compile_readiness_draft_v1(full_request, hostile, provenance)
+    expected_reason = "DRAFT_INVALID" if shape == "cycle" else "DRAFT_DEPTH_EXCEEDED"
+    assert tuple(code.value for code in full_compile.reason_codes) == (expected_reason,)
+    with pytest.raises(
+        portable.PortableEvaluationInputError, match="READINESS_DRAFT_INVALID"
+    ):
+        portable.compile_readiness_draft_v1(
+            portable_request,
+            hostile,
+            {
+                "provider_name": provenance.provider_name,
+                "model_name": provenance.model_name,
+                "judge_isolation": provenance.judge_isolation,
+            },
+        )
+    before_full, before_portable = _tree_bytes(full_run), _tree_bytes(portable_run)
+    full_submit = submit_readiness_core(full_run, hostile)
+    portable_submit = portable.guarded_submit_readiness_response_v1(
+        portable_run, hostile
+    )
+    assert full_submit.accepted is False
+    assert portable_submit == {
+        "accepted": False,
+        "reason_code": "READINESS_EXTERNAL_RESPONSE_INVALID",
+    }
+    assert (_tree_bytes(full_run), _tree_bytes(portable_run)) == (
+        before_full,
+        before_portable,
+    )
 
 
 def test_readiness_portable_rejects_generic_safety_rationale(
@@ -717,6 +1107,28 @@ def test_readiness_portable_rejects_generic_safety_rationale(
                 "judge_isolation": provenance.judge_isolation,
             },
         )
+    oversized = copy.deepcopy(draft)
+    evidence_refs = oversized["candidate_assessments"][0]["evidence_refs"]
+    assert evidence_refs
+    oversized["candidate_assessments"][0]["evidence_refs"] = [
+        evidence_refs[0]
+    ] * 641
+    full_oversized = compile_readiness_draft_v1(request, oversized, provenance)
+    assert tuple(item.value for item in full_oversized.reason_codes) == (
+        "ITEM_LIMIT_EXCEEDED",
+    )
+    with pytest.raises(
+        portable.PortableEvaluationInputError, match="READINESS_DRAFT_INVALID"
+    ):
+        portable.compile_readiness_draft_v1(
+            portable_request,
+            oversized,
+            {
+                "provider_name": provenance.provider_name,
+                "model_name": provenance.model_name,
+                "judge_isolation": provenance.judge_isolation,
+            },
+        )
     cast(dict[str, object], cast(list[object], draft["candidate_assessments"])[0])[
         "why_unresolved"
     ] = "more research needed"
@@ -788,7 +1200,7 @@ def test_readiness_portable_rejects_resealed_unknown_manifest_field(
     portable_verification = portable.verify_readiness_run_v1(portable_run)
     assert full_verification.valid is False
     assert full_verification.issues == ("READINESS_ARTIFACT_INVALID",)
-    assert portable_verification["valid"] is False
+    assert portable_verification["valid"] is False, full_verification.issues
     assert portable_verification["issues"] == ["READINESS_ARTIFACT_INVALID"]
 
 
@@ -858,7 +1270,19 @@ def test_readiness_portable_rejects_resealed_unknown_persisted_input_field(
         ("pending-call-unknown", "READINESS_ARTIFACT_INVALID"),
         ("protocol-version", "READINESS_ARTIFACT_INVALID"),
         ("phase", "READINESS_ARTIFACT_INVALID"),
+        ("terminal-completed-with-pending", "READINESS_ARTIFACT_INVALID"),
+        ("terminal-inconclusive-with-pending", "READINESS_ARTIFACT_INVALID"),
         ("pending-state", "READINESS_ARTIFACT_INVALID"),
+        ("pending-request-fingerprint-binding", "READINESS_SEMANTIC_REPLAY_INVALID"),
+        ("baseline-derived-fingerprint", "READINESS_ARTIFACT_INVALID"),
+        ("safety-derived-fingerprint", "READINESS_ARTIFACT_INVALID"),
+        ("requirement-derived-fingerprint", "READINESS_ARTIFACT_INVALID"),
+        ("gap-derived-fingerprint", "READINESS_ARTIFACT_INVALID"),
+        ("result-derived-fingerprint", "READINESS_ARTIFACT_INVALID"),
+        ("grade-target-binding", "READINESS_SEMANTIC_REPLAY_INVALID"),
+        ("report-hash-binding", "READINESS_SEMANTIC_REPLAY_INVALID"),
+        ("generation-root-binding", "READINESS_SEMANTIC_REPLAY_INVALID"),
+        ("scoring-contract-binding", "READINESS_SEMANTIC_REPLAY_INVALID"),
         ("qualification-check-bool", "READINESS_STORAGE_UNSAFE"),
     ],
 )
@@ -898,8 +1322,37 @@ def test_readiness_portable_rejects_nested_manifest_and_input_model_mutations(
             manifest["protocol_version"] = "evil"
         elif mutation == "phase":
             manifest["phase"] = "evil"
+        elif mutation == "terminal-completed-with-pending":
+            manifest["phase"] = "completed"
+            manifest["terminal_status"] = "COMPLETED"
+        elif mutation == "terminal-inconclusive-with-pending":
+            manifest["phase"] = "inconclusive"
+            manifest["terminal_status"] = "INCONCLUSIVE"
         elif mutation == "pending-state":
             manifest["pending_call"]["state"] = "accepted"
+        elif mutation == "pending-request-fingerprint-binding":
+            manifest["pending_call"]["request_fingerprint"] = "1" * 64
+        elif mutation.endswith("-derived-fingerprint"):
+            derived_field = {
+                "baseline-derived-fingerprint": (
+                    "baseline_locked_strict_equivalent_fingerprint"
+                ),
+                "safety-derived-fingerprint": "safety_review_fingerprint",
+                "requirement-derived-fingerprint": "requirement_matrix_fingerprint",
+                "gap-derived-fingerprint": "gap_matrix_fingerprint",
+                "result-derived-fingerprint": "result_fingerprint",
+            }[mutation]
+            manifest[derived_field] = 7
+        elif mutation.endswith("-binding"):
+            binding_field = {
+                "grade-target-binding": "grade_target_fingerprint",
+                "report-hash-binding": "report_hash",
+                "generation-root-binding": "generation_capsule_root",
+                "scoring-contract-binding": (
+                    "strict_equivalent_scoring_contract_fingerprint"
+                ),
+            }[mutation]
+            manifest[binding_field] = "1" * 64
         else:
             input_path = run / "readiness-input.json"
             persisted = json.loads(input_path.read_bytes())
@@ -929,8 +1382,493 @@ def test_readiness_portable_rejects_nested_manifest_and_input_model_mutations(
     portable_verification = portable.verify_readiness_run_v1(runs[1])
     assert full_verification.valid is False
     assert full_verification.issues == (expected_issue,)
-    assert portable_verification["valid"] is False
+    assert portable_verification["valid"] is False, full_verification.issues
     assert portable_verification["issues"] == [expected_issue]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "schema-version",
+        "readiness-protocol-version",
+        "binding-readiness",
+        "limits-schema-version",
+        "limits-admission-status",
+        "limits-readiness",
+        "receipt-readiness-status",
+        "language-limitation-status",
+        "client-facts-hash-type",
+        "inner-rubric-fingerprint-binding",
+        "baseline-manifest-unknown",
+        "baseline-input-unknown",
+        "baseline-unknown",
+        "baseline-verification-unknown",
+        "baseline-manifest-root-binding",
+    ],
+)
+def test_readiness_portable_rejects_persisted_closed_value_and_type_mutations(
+    mutation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persisted closed-v1 values and nullable hashes retain full verification parity."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    artifacts = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_artifacts",
+        fromlist=["*"],
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    portable = _load_protocol_22_portable()
+    runs = (tmp_path / f"{mutation}-full", tmp_path / f"{mutation}-portable")
+    initialize_readiness_core(runs[0], **init)
+    portable.initialize_readiness_v1(runs[1], **init, generation_substrate=generation)
+    for run in runs:
+        input_path = run / "readiness-input.json"
+        persisted = json.loads(input_path.read_bytes())
+        if mutation == "schema-version":
+            persisted["schema_version"] = "evil"
+        elif mutation == "readiness-protocol-version":
+            persisted["readiness_input"]["protocol_version"] = "evil"
+        elif mutation == "binding-readiness":
+            persisted["qualification_binding"]["qualification_readiness"] = "evil"
+        elif mutation == "limits-schema-version":
+            persisted["qualification_limits"]["case_schema_version"] = "evil"
+        elif mutation == "limits-admission-status":
+            persisted["qualification_limits"]["admission_status"] = "evil"
+        elif mutation == "limits-readiness":
+            persisted["qualification_limits"]["qualification_readiness"] = "evil"
+        elif mutation == "receipt-readiness-status":
+            persisted["qualification_limits"]["receipt_readiness"]["status"] = "evil"
+        elif mutation == "language-limitation-status":
+            persisted["qualification_limits"]["language_treatments"][0][
+                "limitation_status"
+            ] = "evil"
+        elif mutation == "inner-rubric-fingerprint-binding":
+            persisted["readiness_input"]["readiness_rubric_fingerprint"] = "1" * 64
+        elif mutation.startswith("baseline-"):
+            context_field = {
+                "baseline-manifest-unknown": "manifest",
+                "baseline-input-unknown": "baseline_input",
+                "baseline-unknown": "baseline",
+                "baseline-verification-unknown": "verification",
+                "baseline-manifest-root-binding": "manifest",
+            }[mutation]
+            if mutation == "baseline-manifest-root-binding":
+                persisted["baseline_context"][context_field]["root_hash"] = "1" * 64
+            else:
+                persisted["baseline_context"][context_field]["unknown_nested"] = True
+        else:
+            persisted["generation_binding"]["client_facts_hash"] = 7
+        input_bytes = canonical_json_bytes(persisted)
+        input_path.write_bytes(input_bytes)
+        manifest_path = run / "readiness-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        for record in manifest["artifacts"]:
+            if record["artifact_path"] == "readiness-input.json":
+                record["artifact_hash"] = hashlib.sha256(input_bytes).hexdigest()
+        body = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"manifest_fingerprint", "root_hash"}
+        }
+        manifest["manifest_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(body)
+        ).hexdigest()
+        manifest["root_hash"] = hashlib.sha256(
+            canonical_json_bytes(
+                {key: value for key, value in manifest.items() if key != "root_hash"}
+            )
+        ).hexdigest()
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+    full_verification = artifacts.verify_readiness_run_v1(runs[0])
+    portable_verification = portable.verify_readiness_run_v1(runs[1])
+    assert full_verification.valid is False
+    assert portable_verification["valid"] is False, full_verification.issues
+    assert portable_verification["issues"] == list(full_verification.issues)
+@pytest.mark.parametrize("mutation", ["reorder", "omit-first", "phase-created"])
+def test_readiness_portable_rejects_authenticated_call_history_mutations(
+    mutation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted call order, completeness, and phase remain semantically authenticated."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    workflow = __import__("test_attorney_readiness_workflow")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    artifacts = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_artifacts",
+        fromlist=["*"],
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    portable = _load_protocol_22_portable()
+    runs = (tmp_path / f"{mutation}-full", tmp_path / f"{mutation}-portable")
+    initialize_readiness_core(runs[0], **init)
+    portable.initialize_readiness_v1(runs[1], **init, generation_substrate=generation)
+    provenance = ReadinessEvaluatorProvenanceV1(
+        provider_name="portable-parity-provider",
+        model_name="portable-parity-model",
+        judge_isolation="scripted_fixture",
+    )
+    portable_provenance = {
+        "provider_name": provenance.provider_name,
+        "model_name": provenance.model_name,
+        "judge_isolation": provenance.judge_isolation,
+    }
+    for _ in range(2):
+        full_request = next_readiness_core(runs[0])
+        portable_request = portable.next_readiness_request_v1(runs[1])
+        assert full_request is not None
+        assert portable_request == full_request.model_dump(mode="json")
+        draft = workflow._draft(full_request, grade_mode="met")
+        full_compiled = compile_readiness_draft_v1(full_request, draft, provenance)
+        assert isinstance(full_compiled, CompiledReadinessDraftV1)
+        portable_response = portable.compile_readiness_draft_v1(
+            portable_request, copy.deepcopy(draft), portable_provenance
+        )
+        assert submit_readiness_core(runs[0], full_compiled.response).accepted
+        assert portable.guarded_submit_readiness_response_v1(
+            runs[1], portable_response
+        )["accepted"]
+    for run in runs:
+        manifest_path = run / "readiness-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        if mutation == "reorder":
+            manifest["accepted_calls"][:2] = reversed(manifest["accepted_calls"][:2])
+        elif mutation == "omit-first":
+            del manifest["accepted_calls"][0]
+        else:
+            manifest["phase"] = "created"
+        body = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"manifest_fingerprint", "root_hash"}
+        }
+        manifest["manifest_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(body)
+        ).hexdigest()
+        manifest["root_hash"] = hashlib.sha256(
+            canonical_json_bytes(
+                {key: value for key, value in manifest.items() if key != "root_hash"}
+            )
+        ).hexdigest()
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+    full_verification = artifacts.verify_readiness_run_v1(runs[0])
+    portable_verification = portable.verify_readiness_run_v1(runs[1])
+    assert full_verification.valid is False
+    assert portable_verification["valid"] is False, full_verification.issues
+    assert portable_verification["issues"] == list(full_verification.issues)
+    for command in ("eval-readiness-next", "eval-readiness-status"):
+        full_command = subprocess.run(
+            [
+                str(ROOT / ".venv" / "bin" / "python"),
+                str(ROOT / "scripts" / "attorney_eval_full.py"),
+                command,
+                "--run",
+                str(runs[0]),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        )
+        portable_command = subprocess.run(
+            [
+                "python3",
+                "-I",
+                "-S",
+                str(ROOT / "scripts" / "harvest_portable.py"),
+                command,
+                "--run",
+                str(runs[1]),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        )
+        assert (
+            portable_command.returncode,
+            portable_command.stdout,
+            portable_command.stderr,
+        ) == (
+            full_command.returncode,
+            full_command.stdout,
+            full_command.stderr,
+        )
+        assert full_command.returncode == 5
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ["readiness-verification.json", "unexpected.json", "unexpected-directory/"],
+)
+def test_readiness_portable_rejects_declared_unbound_artifacts(
+    artifact_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nonterminal run cannot inject a self-declared valid verification artifact."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    artifacts = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_artifacts",
+        fromlist=["*"],
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    portable = _load_protocol_22_portable()
+    runs = (tmp_path / "forged-full", tmp_path / "forged-portable")
+    initialize_readiness_core(runs[0], **init)
+    portable.initialize_readiness_v1(runs[1], **init, generation_substrate=generation)
+    forged_bytes = (
+        canonical_json_bytes(
+            {
+                "protocol_version": "delivery-readiness-v1",
+                "valid": True,
+                "checks": {},
+                "issues": [],
+                "graph_fingerprint": "0" * 64,
+                "verification_fingerprint": "0" * 64,
+            }
+        )
+        if artifact_name == "readiness-verification.json"
+        else canonical_json_bytes({"unexpected": True})
+    )
+    for run in runs:
+        if artifact_name.endswith("/"):
+            (run / artifact_name).mkdir()
+            continue
+        (run / artifact_name).write_bytes(forged_bytes)
+        manifest_path = run / "readiness-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["artifacts"].append(
+            {
+                "artifact_path": artifact_name,
+                "artifact_hash": hashlib.sha256(forged_bytes).hexdigest(),
+            }
+        )
+        manifest["artifacts"].sort(key=lambda item: item["artifact_path"])
+        body = {
+            key: value
+            for key, value in manifest.items()
+            if key not in {"manifest_fingerprint", "root_hash"}
+        }
+        manifest["manifest_fingerprint"] = hashlib.sha256(
+            canonical_json_bytes(body)
+        ).hexdigest()
+        manifest["root_hash"] = hashlib.sha256(
+            canonical_json_bytes(
+                {key: value for key, value in manifest.items() if key != "root_hash"}
+            )
+        ).hexdigest()
+        manifest_path.write_bytes(canonical_json_bytes(manifest))
+    full_verification = artifacts.verify_readiness_run_v1(runs[0])
+    portable_verification = portable.verify_readiness_run_v1(runs[1])
+    assert full_verification.valid is False
+    assert full_verification.issues == ("READINESS_INVENTORY_INVALID",)
+    assert portable_verification["valid"] is False
+    assert portable_verification["issues"] == list(full_verification.issues)
+    for command in ("eval-readiness-next", "eval-readiness-status"):
+        full_command = subprocess.run(
+            [
+                str(ROOT / ".venv" / "bin" / "python"),
+                str(ROOT / "scripts" / "attorney_eval_full.py"),
+                command,
+                "--run",
+                str(runs[0]),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        )
+        portable_command = subprocess.run(
+            [
+                "python3",
+                "-I",
+                "-S",
+                str(ROOT / "scripts" / "harvest_portable.py"),
+                command,
+                "--run",
+                str(runs[1]),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        )
+        assert (
+            portable_command.returncode,
+            portable_command.stdout,
+            portable_command.stderr,
+        ) == (
+            full_command.returncode,
+            full_command.stdout,
+            full_command.stderr,
+        )
+        assert full_command.returncode == 5
+
+
+def test_readiness_portable_bounds_oversized_manifest_without_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both verifiers reject an oversized manifest before parsing or rewriting it."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    artifacts = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_artifacts",
+        fromlist=["*"],
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    init = {
+        "baseline_run_dir": source.baseline_run_dir,
+        "qualification_run_dir": source.qualification_run_dir,
+        "generation_run_dir": source.generation_run_dir,
+        "validation_receipt_path": source.validation_receipt_path,
+    }
+    portable = _load_protocol_22_portable()
+    runs = (tmp_path / "oversized-full", tmp_path / "oversized-portable")
+    initialize_readiness_core(runs[0], **init)
+    portable.initialize_readiness_v1(runs[1], **init, generation_substrate=generation)
+    oversized = b" " * (16 * 1024 * 1024 + 1)
+    for run in runs:
+        (run / "readiness-manifest.json").write_bytes(oversized)
+    full_verification = artifacts.verify_readiness_run_v1(runs[0])
+    portable_verification = portable.verify_readiness_run_v1(runs[1])
+    assert full_verification.valid is False
+    assert portable_verification["valid"] is False
+    assert portable_verification["issues"] == list(full_verification.issues)
+    assert (runs[0] / "readiness-manifest.json").read_bytes() == oversized
+    assert (runs[1] / "readiness-manifest.json").read_bytes() == oversized
+
+
+def test_readiness_portable_bounds_deep_manifest_with_cli_parity(
+    tmp_path: Path,
+) -> None:
+    """Deep attacker JSON returns one bounded verification result and CLI error."""
+    artifacts = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_artifacts",
+        fromlist=["*"],
+    )
+    portable = _load_protocol_22_portable()
+    runs = (tmp_path / "deep-full", tmp_path / "deep-portable")
+    deep = b"[" * 1100 + b"0" + b"]" * 1100
+    for run in runs:
+        run.mkdir()
+        (run / "readiness-manifest.json").write_bytes(deep)
+    full_verification = artifacts.verify_readiness_run_v1(runs[0])
+    portable_verification = portable.verify_readiness_run_v1(runs[1])
+    assert full_verification.valid is False
+    assert full_verification.issues == ("READINESS_ARTIFACT_INVALID",)
+    assert portable_verification["valid"] is False
+    assert portable_verification["issues"] == list(full_verification.issues)
+    full_command = subprocess.run(
+        [
+            str(ROOT / ".venv" / "bin" / "python"),
+            str(ROOT / "scripts" / "attorney_eval_full.py"),
+            "eval-readiness-verify",
+            "--run",
+            str(runs[0]),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+    )
+    portable_command = subprocess.run(
+        [
+            "python3",
+            "-I",
+            "-S",
+            str(ROOT / "scripts" / "harvest_portable.py"),
+            "eval-readiness-verify",
+            "--run",
+            str(runs[1]),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+    )
+    assert (
+        portable_command.returncode,
+        portable_command.stdout,
+        portable_command.stderr,
+    ) == (
+        full_command.returncode,
+        full_command.stdout,
+        full_command.stderr,
+    )
+    assert full_command.returncode == 5
+
+
+@pytest.mark.parametrize(
+    "target", ["readiness-manifest.json", "readiness-input.json"]
+)
+def test_readiness_portable_rejects_snapshot_replacement_race(
+    target: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A leaf replaced after the initial identity scan cannot verify from stale bytes."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))
+    inputs = __import__("test_attorney_readiness_inputs")
+    generation = __import__(
+        "regulatory_harvest.evaluation.attorney_generation", fromlist=["*"]
+    )
+    source = inputs._make_verified_inputs(tmp_path, limitations=None)
+    run = tmp_path / f"snapshot-race-{Path(target).stem}"
+    portable = _load_protocol_22_portable()
+    portable.initialize_readiness_v1(
+        run,
+        baseline_run_dir=source.baseline_run_dir,
+        qualification_run_dir=source.qualification_run_dir,
+        generation_run_dir=source.generation_run_dir,
+        validation_receipt_path=source.validation_receipt_path,
+        generation_substrate=generation,
+    )
+    original_scan = portable._PosixRunStorage.scan_inventory
+    replaced = False
+
+    def replace_after_scan(storage: object) -> object:
+        nonlocal replaced
+        inventory = original_scan(storage)
+        if not replaced:
+            (run / target).write_bytes(b"{}")
+            replaced = True
+        return inventory
+
+    monkeypatch.setattr(
+        portable._PosixRunStorage, "scan_inventory", replace_after_scan
+    )
+    verification = portable.verify_readiness_run_v1(run)
+    assert replaced
+    assert verification["valid"] is False
+    assert verification["graph_fingerprint"] is None
+    assert verification["verification_fingerprint"] is None
 
 
 def test_readiness_contested_request_and_compiler_full_portable_parity(

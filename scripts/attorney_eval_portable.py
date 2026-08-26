@@ -29,10 +29,11 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 JsonObject = dict[str, object]
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+_MAX_JSON_DEPTH = 64
 
 EVALUATION_ARTIFACT_SCHEMA_VERSION = "1.3"
 SCORE_INPUT_SCHEMA_VERSION = "1.4"
@@ -433,23 +434,29 @@ def _sha256(data: bytes) -> str:
 
 
 def _ordinary(value: object, *, location: str = "value") -> None:
-    if value is None or type(value) in {str, bool, int}:
-        return
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise EvaluationIntegrityError(f"{location} contains a non-finite number")
-        return
-    if type(value) is list:
-        for index, item in enumerate(cast(list[object], value)):
-            _ordinary(item, location=f"{location}[{index}]")
-        return
-    if type(value) is dict:
-        for key, item in cast(dict[object, object], value).items():
-            if type(key) is not str:
+    pending: list[tuple[object, int]] = [(value, 1)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > _MAX_JSON_DEPTH:
+            raise EvaluationIntegrityError(f"{location} exceeds the JSON depth limit")
+        if current is None or type(current) in {str, bool, int}:
+            continue
+        if type(current) is float:
+            if not math.isfinite(current):
+                raise EvaluationIntegrityError(f"{location} contains a non-finite number")
+            continue
+        if type(current) is list:
+            pending.extend((item, depth + 1) for item in cast(list[object], current))
+            continue
+        if type(current) is dict:
+            mapping = cast(dict[object, object], current)
+            if any(type(key) is not str for key in mapping):
                 raise EvaluationIntegrityError(f"{location} has a non-string key")
-            _ordinary(item, location=f"{location}.{key}")
-        return
-    raise EvaluationIntegrityError(f"{location} is not ordinary JSON: {type(value).__name__}")
+            pending.extend((item, depth + 1) for item in mapping.values())
+            continue
+        raise EvaluationIntegrityError(
+            f"{location} is not ordinary JSON: {type(current).__name__}"
+        )
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -465,9 +472,17 @@ def canonical_json_bytes(value: object) -> bytes:
 
 
 def parse_canonical_json_bytes(data: bytes, *, location: str) -> object:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key in {location}")
+            result[key] = value
+        return result
+
     try:
-        value = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as error:
         raise EvaluationIntegrityError(f"{location} is malformed JSON") from error
     _ordinary(value, location=location)
     if canonical_json_bytes(value) != data:
@@ -16579,6 +16594,7 @@ def _baseline_gradeable_projection_bytes_for_test(
 
 READINESS_PROTOCOL_V1 = "delivery-readiness-v1"
 READINESS_EXTERNAL_RESPONSE_INVALID = "READINESS_EXTERNAL_RESPONSE_INVALID"
+_READINESS_SUBMISSION_LOCKS = tuple(_threading.RLock() for _ in range(64))
 _READINESS_CANONICAL_RUBRIC_PATH = (
     Path(__file__).resolve().parents[1]
     / "src"
@@ -17157,9 +17173,15 @@ def _readiness_validation_projection(
         or receipt.get("evidence_precision_valid") is not True
         or receipt.get("proposition_coverage_valid") is not True
         or receipt.get("provision_recall_valid") is not True
+        or any(
+            type(receipt.get(field)) is not int or receipt[field] < 0
+            for field in (
+                "blocking_review_count",
+                "coverage_issue_count",
+                "validation_issue_count",
+            )
+        )
         or receipt.get("blocking_review_count") != 0
-        or type(receipt.get("coverage_issue_count")) is not int
-        or type(receipt.get("validation_issue_count")) is not int
         or artifacts["report"] != report_bytes
     ):
         raise PortableEvaluationInputError("READINESS_VALIDATION_RECEIPT_INVALID")
@@ -17852,12 +17874,12 @@ def initialize_readiness_v1(
     )
     manifest = _readiness_manifest(readiness_input, files, request)
     with _open_run_storage(output_dir, initialize=True) as storage:
-        for path in sorted(files):
-            storage.atomic_write(path, files[path], mutable=False)
-        storage.atomic_write(
-            "readiness-manifest.json", canonical_json_bytes(manifest), mutable=False
+        _readiness_write_transaction(
+            storage,
+            files,
+            canonical_json_bytes(manifest),
+            previous_manifest_data=None,
         )
-        storage.assert_root_identity()
     return {
         "protocol_version": READINESS_PROTOCOL_V1,
         "phase": manifest["phase"],
@@ -18104,11 +18126,32 @@ def compile_readiness_draft_v1(
     provenance = _readiness_provenance(provenance_value)
     payload = cast(JsonObject, request["payload"])
     operation = _string(request["operation"], location="readiness operation")
-    if len(canonical_json_bytes(draft_value)) > 262_144:
+    try:
+        draft_bytes = canonical_json_bytes(draft_value)
+        draft_copy = _copy_json(draft_value)
+    except (
+        EvaluationIntegrityError,
+        RecursionError,
+        TypeError,
+        ValueError,
+        UnicodeError,
+    ) as error:
+        raise PortableEvaluationInputError("READINESS_DRAFT_INVALID") from error
+    if len(draft_bytes) > 262_144:
         raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+    pending_items = [draft_copy]
+    while pending_items:
+        current = pending_items.pop()
+        if type(current) is list:
+            values = cast(list[object], current)
+            if len(values) > 640:
+                raise PortableEvaluationInputError("READINESS_DRAFT_INVALID")
+            pending_items.extend(values)
+        elif type(current) is dict:
+            pending_items.extend(cast(JsonObject, current).values())
     if operation == "baseline_locked_grade":
         draft = _shape(
-            _copy_json(draft_value),
+            draft_copy,
             required={"requirement_grades", "rationale"},
             location="readiness ordinary draft",
         )
@@ -18184,7 +18227,7 @@ def compile_readiness_draft_v1(
         compiled["fragment_fingerprint"] = _sha256(canonical_json_bytes(compiled))
     elif operation == "baseline_locked_contested_grade":
         draft = _shape(
-            _copy_json(draft_value),
+            draft_copy,
             required={
                 "contested_requirement_id",
                 "reviewer_alternative_disposition",
@@ -18260,7 +18303,7 @@ def compile_readiness_draft_v1(
         compiled["grade_fingerprint"] = _sha256(canonical_json_bytes(compiled))
     elif operation == "safety_review":
         draft = _shape(
-            _copy_json(draft_value),
+            draft_copy,
             required={"candidate_assessments", "finding_proposals"},
             location="readiness safety draft",
         )
@@ -18453,7 +18496,7 @@ def compile_readiness_draft_v1(
         }
     elif operation == "safety_referee":
         draft = _shape(
-            _copy_json(draft_value),
+            draft_copy,
             required={"dispute_id", "disposition", "rationale", "evidence_refs"},
             location="readiness referee draft",
         )
@@ -18492,7 +18535,13 @@ def compile_readiness_draft_v1(
 
 def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str, bytes]]:
     with _open_run_storage(run_dir) as storage:
-        manifest_bytes = storage.read_artifact("readiness-manifest.json")
+        storage.assert_root_identity()
+        initial_inventory = storage.scan_inventory()
+        if "readiness-manifest.json" not in initial_inventory:
+            raise EvaluationIntegrityError("READINESS_ARTIFACT_MANIFEST_MISSING")
+        manifest_bytes = storage.read_artifact(
+            "readiness-manifest.json", max_bytes=16 * 1024 * 1024
+        )
         try:
             manifest = _shape(
                 parse_canonical_json_bytes(
@@ -18538,8 +18587,16 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 manifest["protocol_version"] != READINESS_PROTOCOL_V1
                 or manifest["phase"] not in phases
                 or manifest["terminal_status"] != expected_terminal
+                or (expected_terminal is not None and manifest["pending_call"] is not None)
             ):
                 raise PortableEvaluationInputError("readiness manifest values are invalid")
+
+            def checked_hash(value: object, *, location: str) -> str:
+                fingerprint = _string(value, location=location)
+                if _HASH_RE.fullmatch(fingerprint) is None:
+                    raise PortableEvaluationInputError(f"{location} is invalid")
+                return fingerprint
+
             for key in (
                 "grade_target_fingerprint",
                 "report_hash",
@@ -18556,6 +18613,15 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                     raise PortableEvaluationInputError(
                         "readiness manifest fingerprint is invalid"
                     )
+            for key in (
+                "baseline_locked_strict_equivalent_fingerprint",
+                "safety_review_fingerprint",
+                "requirement_matrix_fingerprint",
+                "gap_matrix_fingerprint",
+                "result_fingerprint",
+            ):
+                if manifest[key] is not None:
+                    checked_hash(manifest[key], location=f"readiness manifest {key}")
             call_fields = {
                 "call_id",
                 "operation",
@@ -18571,12 +18637,6 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 "judge_isolation",
                 "dispute_id",
             }
-
-            def checked_hash(value: object, *, location: str) -> str:
-                fingerprint = _string(value, location=location)
-                if _HASH_RE.fullmatch(fingerprint) is None:
-                    raise PortableEvaluationInputError(f"{location} is invalid")
-                return fingerprint
 
             def checked_call(value: object, *, expected_state: str) -> JsonObject:
                 call = _shape(
@@ -18752,10 +18812,14 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
             files[path] = data
         if inventory_paths != sorted(inventory_paths):
             raise EvaluationIntegrityError("READINESS_ARTIFACT_INVENTORY_INVALID")
-        observed = {
-            path for path in storage.scan_inventory() if not path.endswith("/")
-        }
-        if observed != {*files, "readiness-manifest.json"}:
+        expected_files = {*files, "readiness-manifest.json"}
+        expected_directories: set[str] = set()
+        for path in expected_files:
+            parent = PurePosixPath(path).parent
+            while parent != PurePosixPath("."):
+                expected_directories.add(f"{parent.as_posix()}/")
+                parent = parent.parent
+        if set(initial_inventory) != expected_files | expected_directories:
             raise EvaluationIntegrityError("READINESS_ARTIFACT_INVENTORY_INVALID")
         fingerprint_value = {
             key: value
@@ -18804,6 +18868,49 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 },
                 location="persisted readiness input",
             )
+            if persisted["schema_version"] != "delivery-readiness-input-v1":
+                raise EvaluationIntegrityError("READINESS_ARTIFACT_REPLAY")
+
+            def invalid_persisted() -> NoReturn:
+                raise EvaluationIntegrityError("readiness persisted input is invalid")
+
+            def native_text(value: object, *, nonblank: bool = False) -> str:
+                if type(value) is not str or (nonblank and (not value or value.isspace())):
+                    invalid_persisted()
+                return value
+
+            def native_hash(value: object, *, nullable: bool = False) -> str | None:
+                if nullable and value is None:
+                    return None
+                if type(value) is not str or _HASH_RE.fullmatch(value) is None:
+                    invalid_persisted()
+                return value
+
+            def native_texts(value: object) -> list[str]:
+                if type(value) is not list:
+                    invalid_persisted()
+                return [native_text(item, nonblank=True) for item in value]
+
+            def hash_pairs(value: object) -> None:
+                if type(value) is not list:
+                    invalid_persisted()
+                for item in value:
+                    if type(item) is not list or len(item) != 2:
+                        invalid_persisted()
+                    native_text(item[0], nonblank=True)
+                    native_hash(item[1])
+
+            if readiness_input["protocol_version"] != READINESS_PROTOCOL_V1:
+                invalid_persisted()
+            for key in (
+                "grade_target_fingerprint",
+                "report_hash",
+                "generation_capsule_root",
+                "readiness_rubric_fingerprint",
+                "strict_equivalent_scoring_contract_fingerprint",
+            ):
+                native_hash(readiness_input[key])
+            native_text(readiness_input["report_text"])
             _shape(
                 readiness_input["gradeable_baseline"],
                 required={
@@ -18850,12 +18957,155 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                     },
                     location="persisted historical cross-check",
                 )
-            _shape(
+            baseline_context = _shape(
                 persisted["baseline_context"],
                 required={"manifest", "baseline_input", "baseline", "verification"},
                 location="persisted baseline context",
             )
-            _shape(
+            baseline_manifest = _shape(
+                baseline_context["manifest"],
+                required={
+                    "protocol_version",
+                    "legal_input_fingerprint",
+                    "baseline_fingerprint",
+                    "phase",
+                    "terminal_status",
+                    "pending_call",
+                    "accepted_calls",
+                    "source_review_aggregate_fingerprint",
+                    "source_audit_aggregate_fingerprint",
+                    "source_referee_aggregate_fingerprint",
+                    "prior_baseline_root",
+                    "prior_baseline_fingerprint",
+                    "correction_record_fingerprint",
+                    "artifacts",
+                    "root_hash",
+                    "manifest_fingerprint",
+                },
+                optional={"correction_proof_fingerprint"},
+                location="persisted baseline manifest",
+            )
+            checked_baseline_input = _baseline_validate_input(
+                baseline_context["baseline_input"]
+            )
+            checked_baseline = _baseline_checked_canonical_baseline(
+                baseline_context["baseline"]
+            )
+            baseline_verification = _shape(
+                baseline_context["verification"],
+                required={"valid", "issues"},
+                location="persisted baseline verification",
+            )
+            if (
+                baseline_manifest["protocol_version"] != BASELINE_PROTOCOL_V1
+                or baseline_manifest["phase"] not in {"completed", "inconclusive"}
+                or baseline_manifest["legal_input_fingerprint"]
+                != checked_baseline_input["legal_input_fingerprint"]
+                or baseline_manifest["baseline_fingerprint"]
+                != checked_baseline["baseline_fingerprint"]
+                or baseline_verification != {"valid": True, "issues": []}
+            ):
+                raise PortableEvaluationInputError(
+                    "persisted baseline context is invalid"
+                )
+            baseline_manifest_body = {
+                key: value
+                for key, value in baseline_manifest.items()
+                if key not in {"manifest_fingerprint", "root_hash"}
+            }
+            if baseline_manifest["manifest_fingerprint"] != _sha256(
+                canonical_json_bytes(baseline_manifest_body)
+            ) or baseline_manifest["root_hash"] != _sha256(
+                canonical_json_bytes(
+                    {
+                        key: value
+                        for key, value in baseline_manifest.items()
+                        if key != "root_hash"
+                    }
+                )
+            ):
+                raise EvaluationIntegrityError(
+                    "persisted baseline manifest binding is invalid"
+                )
+            gradeable_requirements = [
+                {
+                    "requirement": _copy_json(requirement),
+                    "semantic_identity_fingerprint": _sha256(
+                        canonical_json_bytes(requirement)
+                    ),
+                }
+                for requirement in cast(list[JsonObject], checked_baseline["requirements"])
+            ]
+            gradeable_contests: list[JsonObject] = []
+            for contest in cast(
+                list[JsonObject], checked_baseline["contested_requirements"]
+            ):
+                reviewer = cast(JsonObject | None, contest["reviewer_alternative"])
+                auditor = cast(JsonObject | None, contest["auditor_alternative"])
+                gradeable_contests.append(
+                    {
+                        "contested_requirement": _copy_json(contest),
+                        "reviewer_identity_fingerprint": (
+                            None
+                            if reviewer is None
+                            else _sha256(canonical_json_bytes(reviewer))
+                        ),
+                        "auditor_identity_fingerprint": (
+                            None
+                            if auditor is None
+                            else _sha256(canonical_json_bytes(auditor))
+                        ),
+                        "semantic_identity_fingerprint": _sha256(
+                            canonical_json_bytes(contest)
+                        ),
+                    }
+                )
+            semantic_inventory: JsonObject = {
+                "requirements": gradeable_requirements,
+                "relationships": _copy_json(checked_baseline["relationships"]),
+                "contested_requirements": gradeable_contests,
+            }
+            projection_binding: JsonObject = {
+                "schema_version": "baseline-grade-target-v1",
+                "legal_input_fingerprint": checked_baseline_input[
+                    "legal_input_fingerprint"
+                ],
+                "baseline_fingerprint": checked_baseline["baseline_fingerprint"],
+                "source_record_fingerprint": checked_baseline_input[
+                    "source_record_fingerprint"
+                ],
+                "semantic_inventory_fingerprint": _sha256(
+                    canonical_json_bytes(semantic_inventory)
+                ),
+                "evaluation_rubric_fingerprint": checked_baseline_input[
+                    "evaluation_rubric_fingerprint"
+                ],
+                "importance_policy_fingerprint": checked_baseline_input[
+                    "importance_policy_fingerprint"
+                ],
+                "compiler_contract_fingerprint": checked_baseline_input[
+                    "compiler_contract_fingerprint"
+                ],
+            }
+            projection_binding["grade_target_fingerprint"] = _sha256(
+                canonical_json_bytes(projection_binding)
+            )
+            expected_projection: JsonObject = {
+                "schema_version": "baseline-gradeable-projection-v1",
+                "baseline_protocol_version": BASELINE_PROTOCOL_V1,
+                "binding": projection_binding,
+                "baseline_input": _copy_json(checked_baseline_input),
+                "requirements": gradeable_requirements,
+                "relationships": _copy_json(checked_baseline["relationships"]),
+                "contested_requirements": gradeable_contests,
+                "baseline_provenance": _copy_json(checked_baseline["provenance"]),
+            }
+            expected_projection["projection_fingerprint"] = _sha256(
+                canonical_json_bytes(expected_projection)
+            )
+            if readiness_input["gradeable_baseline"] != expected_projection:
+                raise EvaluationIntegrityError("readiness persisted binding is invalid")
+            qualification_binding = _shape(
                 persisted["qualification_binding"],
                 required={
                     "qualification_root",
@@ -18864,6 +19114,10 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 },
                 location="persisted qualification binding",
             )
+            if qualification_binding["qualification_readiness"] != "ADMITTED":
+                invalid_persisted()
+            native_hash(qualification_binding["qualification_root"])
+            native_hash(qualification_binding["qualification_receipt_fingerprint"])
             qualification_limits = _shape(
                 persisted["qualification_limits"],
                 required={
@@ -18884,11 +19138,26 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 },
                 location="persisted qualification limits",
             )
+            if (
+                qualification_limits["case_schema_version"] != "1.1"
+                or qualification_limits["admission_status"] != "qualified"
+                or qualification_limits["qualification_readiness"] != "ADMITTED"
+            ):
+                invalid_persisted()
+            for key in (
+                "qualification_root",
+                "qualification_receipt_fingerprint",
+                "case_fingerprint",
+                "source_record_fingerprint",
+                "request_fingerprint",
+                "judgment_fingerprint",
+            ):
+                native_hash(qualification_limits[key])
             for raw in _array(
                 qualification_limits["requested_authorities"],
                 location="persisted qualification authorities",
             ):
-                _shape(
+                authority = _shape(
                     raw,
                     required={
                         "authority_id",
@@ -18899,6 +19168,10 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                     },
                     location="persisted qualification authority",
                 )
+                for key in ("authority_id", "title", "jurisdiction", "authority_type"):
+                    native_text(authority[key], nonblank=True)
+                native_texts(authority["source_ids"])
+            check_codes: list[str] = []
             for raw in _array(
                 qualification_limits["admission_checks"],
                 location="persisted qualification checks",
@@ -18910,6 +19183,17 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 )
                 if type(check["satisfied"]) is not bool or type(check["material"]) is not bool:
                     raise EvaluationIntegrityError("READINESS_INPUT_INVALID")
+                check_codes.append(native_text(check["code"], nonblank=True))
+                native_text(check["rationale"], nonblank=True)
+                native_texts(check["source_ids"])
+            if len(check_codes) != 5 or set(check_codes) != {
+                "AUTHORITY_ALIGNMENT",
+                "OPERATIVE_TEXT",
+                "CURRENTNESS_EVIDENCE",
+                "LANGUAGE_RESOLUTION",
+                "SOURCE_PARITY",
+            }:
+                invalid_persisted()
             for raw in _array(
                 qualification_limits["admission_issues"],
                 location="persisted qualification issues",
@@ -18923,11 +19207,18 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                     raise PortableEvaluationInputError(
                         "persisted qualification issue severity is invalid"
                     )
-            _shape(
+                native_text(issue["code"], nonblank=True)
+                native_text(issue["message"], nonblank=True)
+                native_texts(issue["related_ids"])
+            receipt_readiness = _shape(
                 qualification_limits["receipt_readiness"],
                 required={"status", "issue_codes", "rationale"},
                 location="persisted qualification readiness",
             )
+            if receipt_readiness["status"] != "ADMITTED":
+                invalid_persisted()
+            native_texts(receipt_readiness["issue_codes"])
+            native_text(receipt_readiness["rationale"], nonblank=True)
             for raw in _array(
                 qualification_limits["language_treatments"],
                 location="persisted language treatments",
@@ -18943,15 +19234,41 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                     },
                     location="persisted language treatment",
                 )
+                native_text(treatment["method"], nonblank=True)
+                native_text(treatment["rationale"], nonblank=True)
                 for source in _array(
                     treatment["sources"], location="persisted language sources"
                 ):
-                    _shape(
+                    checked_source = _shape(
                         source,
                         required={"source_id", "content_hash", "language"},
                         location="persisted language source",
                     )
-            _shape(
+                    native_text(checked_source["source_id"], nonblank=True)
+                    native_hash(checked_source["content_hash"])
+                    native_text(checked_source["language"], nonblank=True)
+                limitation_status = treatment["limitation_status"]
+                limitation_text = treatment["limitation_text"]
+                if limitation_status == "DECLARED":
+                    native_text(limitation_text, nonblank=True)
+                elif limitation_status != "NOT_DECLARED" or limitation_text is not None:
+                    invalid_persisted()
+            try:
+                _readiness_validate_qualification_privacy(
+                    qualification_limits,
+                    forbidden_payloads=(
+                        *(
+                            cast(str, source["normalized_text"]).encode("utf-8")
+                            for source in cast(
+                                list[JsonObject], checked_baseline_input["sources"]
+                            )
+                        ),
+                        cast(str, readiness_input["report_text"]).encode("utf-8"),
+                    ),
+                )
+            except PortableEvaluationInputError as error:
+                raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE") from error
+            generation_binding = _shape(
                 persisted["generation_binding"],
                 required={
                     "capsule_root",
@@ -18965,8 +19282,21 @@ def _readiness_snapshot(run_dir: Path) -> tuple[JsonObject, JsonObject, dict[str
                 },
                 location="persisted generation binding",
             )
+            for key in (
+                "capsule_root",
+                "capture_fingerprint",
+                "request_fingerprint",
+                "response_fingerprint",
+                "report_hash",
+            ):
+                native_hash(generation_binding[key])
+            native_hash(generation_binding["client_facts_hash"], nullable=True)
+            hash_pairs(generation_binding["source_hashes"])
+            hash_pairs(generation_binding["generator_artifact_hashes"])
         except PortableEvaluationInputError as error:
             raise EvaluationIntegrityError("READINESS_ARTIFACT_REPLAY") from error
+        if storage.scan_inventory() != initial_inventory:
+            raise EvaluationIntegrityError("READINESS_ARTIFACT_INVENTORY_CHANGED")
         storage.assert_root_identity()
     return manifest, persisted, files
 
@@ -19028,6 +19358,89 @@ def _readiness_seal_manifest(
     return result
 
 
+def _readiness_write_transaction(
+    storage: _PosixRunStorage,
+    files: Mapping[str, bytes],
+    manifest_data: bytes,
+    *,
+    previous_manifest_data: bytes | None,
+) -> None:
+    created: list[tuple[str, bytes, _NodeIdentity]] = []
+    manifest_identity: _NodeIdentity | None = None
+    manifest_changed = False
+    try:
+        for path in sorted(files):
+            made = storage.atomic_write(path, files[path], mutable=False)
+            if made:
+                receipt = storage.atomic_write_receipt(path)
+                if receipt is None or receipt.identity is None:
+                    raise EvaluationIntegrityError("READINESS_ROLLBACK_FAILED")
+                created.append((path, files[path], receipt.identity))
+        try:
+            manifest_changed = storage.atomic_write(
+                "readiness-manifest.json",
+                manifest_data,
+                mutable=previous_manifest_data is not None,
+            )
+        except BaseException as write_error:
+            receipt = storage.atomic_write_receipt("readiness-manifest.json")
+            manifest_identity = (
+                write_error.identity
+                if isinstance(write_error, _AtomicWriteOwnershipError)
+                else None if receipt is None else receipt.identity
+            )
+            manifest_changed = (
+                write_error.created or write_error.replaced
+                if isinstance(write_error, _AtomicWriteOwnershipError)
+                else receipt is not None
+            )
+            raise
+        receipt = storage.atomic_write_receipt("readiness-manifest.json")
+        if manifest_changed:
+            manifest_identity = None if receipt is None else receipt.identity
+            if manifest_identity is None:
+                raise EvaluationIntegrityError("READINESS_ROLLBACK_FAILED")
+        storage.assert_root_identity()
+    except BaseException as error:
+        failure_stage = storage.failure_stage
+        cleanup: BaseException | None = None
+        try:
+            observed = storage.read_optional_artifact_with_identity(
+                "readiness-manifest.json", max_bytes=16 * 1024 * 1024
+            )
+            if manifest_changed and manifest_identity is not None and observed is not None:
+                if observed[0] != manifest_data or not _same_filesystem_object(
+                    observed[1], manifest_identity
+                ):
+                    raise EvaluationIntegrityError("READINESS_ROLLBACK_FAILED")
+                if previous_manifest_data is None:
+                    storage.remove_artifact(
+                        "readiness-manifest.json",
+                        expected_identity=manifest_identity,
+                        expected_data=manifest_data,
+                    )
+                else:
+                    storage.replace_artifact_if_owned(
+                        "readiness-manifest.json",
+                        previous_manifest_data,
+                        owned_identity=manifest_identity,
+                        owned_data=manifest_data,
+                    )
+        except BaseException as rollback:
+            cleanup = rollback
+        for path, data, identity in reversed(created):
+            try:
+                storage.remove_artifact(
+                    path, expected_identity=identity, expected_data=data
+                )
+            except BaseException as rollback:
+                cleanup = rollback
+        if cleanup is not None:
+            raise EvaluationIntegrityError("READINESS_ROLLBACK_FAILED") from cleanup
+        storage.failure_stage = failure_stage
+        raise error
+
+
 def _readiness_commit(
     run_dir: Path,
     previous: JsonObject,
@@ -19038,17 +19451,17 @@ def _readiness_commit(
     all_files = {**previous_files, **new_files}
     committed = _readiness_seal_manifest(successor, all_files)
     with _open_run_storage(run_dir) as storage:
-        current = storage.read_artifact("readiness-manifest.json")
+        current = storage.read_artifact(
+            "readiness-manifest.json", max_bytes=16 * 1024 * 1024
+        )
         if _sha256(current) != _sha256(canonical_json_bytes(previous)):
             raise EvaluationIntegrityError("READINESS_STALE_TRANSITION")
-        for path in sorted(new_files):
-            storage.atomic_write(path, new_files[path], mutable=False)
-        storage.atomic_write(
-            "readiness-manifest.json",
+        _readiness_write_transaction(
+            storage,
+            new_files,
             canonical_json_bytes(committed),
-            mutable=True,
+            previous_manifest_data=current,
         )
-        storage.assert_root_identity()
     return committed
 
 
@@ -20892,7 +21305,7 @@ def _readiness_terminal_products(
     return new_files, updates
 
 
-def guarded_submit_readiness_response_v1(
+def _guarded_submit_readiness_response_unlocked_v1(
     run_dir: Path, response_value: object
 ) -> JsonObject:
     """Accept one exact response and append the next immutable transition."""
@@ -20904,33 +21317,46 @@ def guarded_submit_readiness_response_v1(
     request = _readiness_checked_request(
         parse_canonical_json_bytes(files[request_path], location=request_path)
     )
-    response = _shape(
-        _copy_json(response_value),
-        required={
-            "protocol_version",
-            "operation",
-            "request_fingerprint",
-            "provider_name",
-            "model_name",
-            "judge_isolation",
-            "payload",
-        },
-        location="readiness response",
-    )
-    provenance = {
-        "provider_name": response["provider_name"],
-        "model_name": response["model_name"],
-        "judge_isolation": response["judge_isolation"],
-    }
-    if (
-        response["protocol_version"] != READINESS_PROTOCOL_V1
-        or response["operation"] != request["operation"]
-        or response["request_fingerprint"] != request["request_fingerprint"]
-        or compile_readiness_draft_v1(
-            request, _readiness_response_draft(response), provenance
+    try:
+        response = _shape(
+            _copy_json(response_value),
+            required={
+                "protocol_version",
+                "operation",
+                "request_fingerprint",
+                "provider_name",
+                "model_name",
+                "judge_isolation",
+                "payload",
+            },
+            location="readiness response",
         )
-        != response
+        provenance = {
+            "provider_name": response["provider_name"],
+            "model_name": response["model_name"],
+            "judge_isolation": response["judge_isolation"],
+        }
+        matches = (
+            response["protocol_version"] == READINESS_PROTOCOL_V1
+            and response["operation"] == request["operation"]
+            and response["request_fingerprint"] == request["request_fingerprint"]
+            and compile_readiness_draft_v1(
+                request, _readiness_response_draft(response), provenance
+            )
+            == response
+        )
+    except (
+        AttributeError,
+        EvaluationIntegrityError,
+        KeyError,
+        PortableEvaluationInputError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
     ):
+        matches = False
+    if not matches:
         return {"accepted": False, "reason_code": READINESS_EXTERNAL_RESPONSE_INVALID}
     response_bytes = canonical_json_bytes(response)
     accepted = {
@@ -21150,7 +21576,24 @@ def guarded_submit_readiness_response_v1(
     }
 
 
+def guarded_submit_readiness_response_v1(
+    run_dir: Path, response_value: object
+) -> JsonObject:
+    """Serialize one exact response transition within the portable process."""
+    run_key = os.path.abspath(os.fspath(run_dir))
+    digest = hashlib.sha256(os.fsencode(run_key)).digest()
+    lock = _READINESS_SUBMISSION_LOCKS[
+        int.from_bytes(digest[:2], "big") % len(_READINESS_SUBMISSION_LOCKS)
+    ]
+    with lock:
+        return _guarded_submit_readiness_response_unlocked_v1(run_dir, response_value)
+
+
 def readiness_status_payload_v1(run_dir: Path) -> JsonObject:
+    verification = verify_readiness_run_v1(run_dir)
+    if verification["valid"] is not True:
+        issues = cast(list[str], verification["issues"])
+        raise EvaluationIntegrityError(issues[0])
     manifest, persisted, files = _readiness_snapshot(run_dir)
     pending = cast(JsonObject | None, manifest.get("pending_call"))
     result: JsonObject | None = None
@@ -21213,6 +21656,37 @@ def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
         ):
             raise EvaluationIntegrityError("READINESS_RUBRIC_INVALID")
         readiness_input = cast(JsonObject, persisted["readiness_input"])
+        manifest_bindings = {
+            "grade_target_fingerprint": "grade_target_fingerprint",
+            "report_hash": "report_hash",
+            "generation_capsule_root": "generation_capsule_root",
+            "strict_equivalent_scoring_contract_fingerprint": (
+                "strict_equivalent_scoring_contract_fingerprint"
+            ),
+        }
+        if any(
+            manifest[manifest_key] != readiness_input[input_key]
+            for manifest_key, input_key in manifest_bindings.items()
+        ):
+            raise EvaluationIntegrityError("READINESS_ARTIFACT_DERIVED_BINDING")
+        projection = cast(JsonObject, readiness_input["gradeable_baseline"])
+        projection_binding = cast(JsonObject, projection["binding"])
+        baseline_input = cast(JsonObject, projection["baseline_input"])
+        generation_binding = cast(JsonObject, persisted["generation_binding"])
+        report_text = cast(str, readiness_input["report_text"])
+        scoring_contract = cast(str, baseline_input["evaluation_rubric_bytes"])
+        if (
+            readiness_input["readiness_rubric_fingerprint"]
+            != manifest["readiness_rubric_fingerprint"]
+            or readiness_input["grade_target_fingerprint"]
+            != projection_binding["grade_target_fingerprint"]
+            or readiness_input["report_hash"] != _sha256(report_text.encode("utf-8"))
+            or readiness_input["generation_capsule_root"]
+            != generation_binding["capsule_root"]
+            or readiness_input["strict_equivalent_scoring_contract_fingerprint"]
+            != _sha256(scoring_contract.encode("utf-8"))
+        ):
+            raise EvaluationIntegrityError("readiness persisted binding is invalid")
         grade_requests = _readiness_grade_requests(readiness_input, rubric)
         if not grade_requests:
             raise EvaluationIntegrityError("READINESS_EMPTY_GRADE_INVENTORY")
@@ -21223,6 +21697,29 @@ def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
         if files.get(first_path) != canonical_json_bytes(expected_first):
             raise EvaluationIntegrityError("READINESS_REPLAY_INVALID")
         accepted = cast(list[JsonObject], manifest["accepted_calls"])
+
+        def require_call_binding(call: JsonObject, request: JsonObject) -> None:
+            expected_call = _readiness_pending(request)
+            if any(
+                call[key] != expected_call[key]
+                for key in (
+                    "call_id",
+                    "operation",
+                    "lane",
+                    "request_artifact_path",
+                    "request_fingerprint",
+                    "dispute_id",
+                )
+            ):
+                raise EvaluationIntegrityError("READINESS_ARTIFACT_CALL_HISTORY")
+
+        for index, call in enumerate(accepted[: len(grade_requests)]):
+            require_call_binding(call, grade_requests[index])
+        if len(accepted) < len(grade_requests):
+            pending_call = cast(JsonObject | None, manifest["pending_call"])
+            if pending_call is None:
+                raise EvaluationIntegrityError("READINESS_ARTIFACT_CALL_HISTORY")
+            require_call_binding(pending_call, grade_requests[len(accepted)])
         for expected in grade_requests[: min(len(accepted) + 1, len(grade_requests))]:
             expected_path = cast(
                 str, _readiness_pending(expected)["request_artifact_path"]
@@ -21245,9 +21742,16 @@ def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
                 "model_name": response["model_name"],
                 "judge_isolation": response["judge_isolation"],
             }
-            if compile_readiness_draft_v1(
-                request, _readiness_response_draft(response), provenance
-            ) != response:
+            if (
+                call["response_fingerprint"] != _sha256(files[response_path])
+                or call["provider_name"] != response["provider_name"]
+                or call["model_name"] != response["model_name"]
+                or call["judge_isolation"] != response["judge_isolation"]
+                or compile_readiness_draft_v1(
+                    request, _readiness_response_draft(response), provenance
+                )
+                != response
+            ):
                 raise EvaluationIntegrityError("READINESS_REPLAY_INVALID")
         grade_count = len(grade_requests)
         if len(accepted) >= grade_count:
@@ -21280,6 +21784,16 @@ def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
                 )
             if any(files.get(path) != data for path, data in expected_derived.items()):
                 raise EvaluationIntegrityError("READINESS_REPLAY_INVALID")
+            safety_request_1 = _readiness_safety_request(
+                persisted, rubric, (lane_1, lane_2), candidates, lane=1
+            )
+            if len(accepted) == grade_count:
+                pending_call = cast(JsonObject | None, manifest["pending_call"])
+                if pending_call is None:
+                    raise EvaluationIntegrityError("READINESS_ARTIFACT_CALL_HISTORY")
+                require_call_binding(pending_call, safety_request_1)
+            else:
+                require_call_binding(accepted[grade_count], safety_request_1)
         if len(accepted) >= grade_count + 1:
             expected_safety_2 = _readiness_safety_request(
                 persisted, rubric, (lane_1, lane_2), candidates, lane=2
@@ -21288,6 +21802,13 @@ def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
                 expected_safety_2
             ):
                 raise EvaluationIntegrityError("READINESS_REPLAY_INVALID")
+            if len(accepted) == grade_count + 1:
+                pending_call = cast(JsonObject | None, manifest["pending_call"])
+                if pending_call is None:
+                    raise EvaluationIntegrityError("READINESS_ARTIFACT_CALL_HISTORY")
+                require_call_binding(pending_call, expected_safety_2)
+            else:
+                require_call_binding(accepted[grade_count + 1], expected_safety_2)
         if len(accepted) >= grade_count + 2:
             safety_1_response = cast(
                 JsonObject,
@@ -21329,6 +21850,39 @@ def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
                 )
                 if files.get(expected_path) != canonical_json_bytes(expected_referee):
                     raise EvaluationIntegrityError("READINESS_REPLAY_INVALID")
+            referee_calls = accepted[grade_count + 2 :]
+            for index, call in enumerate(referee_calls):
+                if index >= len(disputes):
+                    raise EvaluationIntegrityError("READINESS_ARTIFACT_CALL_HISTORY")
+                require_call_binding(
+                    call,
+                    _readiness_referee_request(
+                        persisted, safety_request, disputes[index]
+                    ),
+                )
+            pending_call = cast(JsonObject | None, manifest["pending_call"])
+            if pending_call is not None:
+                next_dispute_index = len(referee_calls)
+                if next_dispute_index >= len(disputes):
+                    raise EvaluationIntegrityError("READINESS_ARTIFACT_CALL_HISTORY")
+                require_call_binding(
+                    pending_call,
+                    _readiness_referee_request(
+                        persisted, safety_request, disputes[next_dispute_index]
+                    ),
+                )
+        if "delivery-readiness.json" not in files:
+            pending_call = cast(JsonObject | None, manifest["pending_call"])
+            if pending_call is None:
+                raise EvaluationIntegrityError("READINESS_PHASE_INVENTORY")
+            expected_phase = {
+                "baseline_locked_grade": "baseline_locked_grade",
+                "baseline_locked_contested_grade": "baseline_locked_grade",
+                "safety_review": "safety_review",
+                "safety_referee": "safety_referee",
+            }[cast(str, pending_call["operation"])]
+            if manifest["phase"] != expected_phase:
+                raise EvaluationIntegrityError("READINESS_PHASE_INVENTORY")
         if "delivery-readiness.json" in files:
             response_path = cast(
                 str, cast(JsonObject, accepted[-1])["response_artifact_path"]
@@ -21354,6 +21908,37 @@ def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
             )
             if any(files.get(path) != data for path, data in expected_terminal.items()):
                 raise EvaluationIntegrityError("READINESS_REPLAY_INVALID")
+        bound = {"readiness-input.json", "readiness-rubric.json"}
+        pending_call = cast(JsonObject | None, manifest["pending_call"])
+        calls = [*accepted, *((pending_call,) if pending_call is not None else ())]
+        for call in calls:
+            bound.add(cast(str, call["request_artifact_path"]))
+            response_path = call["response_artifact_path"]
+            if response_path is not None:
+                bound.add(cast(str, response_path))
+        if len(accepted) >= grade_count:
+            bound.update(
+                {
+                    "aggregates/grader-lane-1.json",
+                    "aggregates/grader-lane-2.json",
+                    "baseline-locked-strict-equivalent.json",
+                }
+            )
+            if readiness_input["historical_v22_cross_check"] is not None:
+                bound.add("historical-v22-cross-check.json")
+        if "delivery-readiness.json" in files:
+            bound.update(
+                {
+                    "aggregates/safety-review.json",
+                    "requirement-matrix.json",
+                    "gap-follow-up-matrix.json",
+                    "delivery-readiness.json",
+                    "attorney-review-handoff.md",
+                    "readiness-verification.json",
+                }
+            )
+        if set(files) != bound:
+            raise EvaluationIntegrityError("READINESS_UNBOUND_ARTIFACT")
         if "readiness-verification.json" in files:
             return _object(
                 parse_canonical_json_bytes(
@@ -21422,6 +22007,8 @@ def verify_readiness_run_v1(run_dir: Path) -> JsonObject:
                 )
             },
             "issues": [issue],
+            "graph_fingerprint": None,
+            "verification_fingerprint": None,
         }
 
 

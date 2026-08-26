@@ -8177,6 +8177,17 @@ def _readiness_replay_generation_validation_v1(
     This deliberately shares the retained generation algorithms instead of
     introducing a second set of coverage or validation thresholds.
     """
+    if any(
+        type(receipt.get(field)) is not int or receipt[field] < 0
+        for field in (
+            "blocking_review_count",
+            "coverage_issue_count",
+            "validation_issue_count",
+        )
+    ):
+        raise PortableInputError(
+            "INVALID_BUNDLE", "The validation receipt counts are invalid."
+        )
     if set(dossier) != {
         "coverage_contract_version",
         "evidence_inventory",
@@ -8217,9 +8228,16 @@ def _readiness_replay_generation_validation_v1(
             or not request[key]
         ):
             raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
-    for key in ("matter_title", "context", "output_instructions"):
+    matter_title = request["matter_title"]
+    if matter_title is not None and (
+        not isinstance(matter_title, str)
+        or not matter_title.strip()
+        or matter_title != matter_title.strip()
+    ):
+        raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
+    for key in ("context", "output_instructions"):
         value = request[key]
-        if value is not None and (not isinstance(value, str) or not value.strip()):
+        if value is not None and not isinstance(value, str):
             raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
     try:
         if date.fromisoformat(request["as_of"]).isoformat() != request["as_of"]:
@@ -8233,7 +8251,10 @@ def _readiness_replay_generation_validation_v1(
         request["source_mode"] not in {"provided-only", "web"}
         or not isinstance(jurisdictions, list)
         or not jurisdictions
-        or any(not isinstance(item, str) or not item.strip() for item in jurisdictions)
+        or any(
+            not isinstance(item, str) or not item.strip() or item != item.strip()
+            for item in jurisdictions
+        )
         or len(jurisdictions) != len(set(jurisdictions))
         or not isinstance(excluded_topics, list)
         or any(not isinstance(item, str) for item in excluded_topics)
@@ -8262,11 +8283,25 @@ def _readiness_replay_generation_validation_v1(
         if (
             not isinstance(raw_input["location"], str)
             or not raw_input["location"].strip()
+            or raw_input["location"] != raw_input["location"].strip()
             or raw_input["source_quality"] not in SOURCE_QUALITIES
             or raw_input["source_role"] not in SOURCE_ROLES | {None}
             or not isinstance(raw_input["license_assertion"], str)
         ):
             raise PortableInputError("INVALID_REQUEST", "The validation request is invalid.")
+        for key in (
+            "authority_type",
+            "citation",
+            "effective_date",
+            "jurisdiction",
+            "publisher",
+            "supersession",
+            "title",
+        ):
+            if raw_input[key] is not None and not isinstance(raw_input[key], str):
+                raise PortableInputError(
+                    "INVALID_REQUEST", "The validation request is invalid."
+                )
         try:
             canonical_url = _canonical_public_url(
                 raw_input["canonical_url"], "request canonical URL"
@@ -8469,15 +8504,33 @@ def _readiness_replay_generation_validation_v1(
         or not manifest["generator_version"].strip()
     ):
         raise PortableInputError("INVALID_BUNDLE", "The validation manifest is invalid.")
+
+    def strict_datetime(value: object) -> None:
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+                r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})?",
+                value,
+            )
+            is None
+        ):
+            raise ValueError
+        datetime.fromisoformat(value)
+
     for key in ("created_at", "updated_at"):
         value = manifest[key]
         try:
-            if not isinstance(value, str) or datetime.fromisoformat(value) is None:
-                raise ValueError
-        except ValueError as error:
+            strict_datetime(value)
+        except (TypeError, ValueError) as error:
             raise PortableInputError(
                 "INVALID_BUNDLE", "The validation manifest is invalid."
             ) from error
+    configuration_fingerprint = manifest["configuration_fingerprint"]
+    if configuration_fingerprint is not None and not isinstance(
+        configuration_fingerprint, str
+    ):
+        raise PortableInputError("INVALID_BUNDLE", "The validation manifest is invalid.")
     provider_metadata = manifest["provider_metadata"]
     if (
         not isinstance(provider_metadata, dict)
@@ -8490,6 +8543,8 @@ def _readiness_replay_generation_validation_v1(
     stages = manifest["stages"]
     if not isinstance(stages, list) or len(stages) != len(STAGES):
         raise PortableInputError("INVALID_BUNDLE", "The validation stages are invalid.")
+    running_count = 0
+    unfinished_seen = False
     for name, stage in zip(STAGES, stages, strict=True):
         if not isinstance(stage, dict) or set(stage) != {
             "name",
@@ -8503,25 +8558,52 @@ def _readiness_replay_generation_validation_v1(
         if (
             stage["name"] != name
             or stage["status"] not in {"pending", "running", "completed", "failed", "skipped"}
-            or stage["error"] is not None
         ):
+            raise PortableInputError("INVALID_BUNDLE", "The validation stages are invalid.")
+        status = stage["status"]
+        running_count += int(status == "running")
+        if status not in {"completed", "skipped"}:
+            unfinished_seen = True
+        elif unfinished_seen:
             raise PortableInputError("INVALID_BUNDLE", "The validation stages are invalid.")
         fingerprint = stage["input_fingerprint"]
-        if fingerprint is not None and (
-            not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
-        ):
+        if fingerprint is not None and not isinstance(fingerprint, str):
             raise PortableInputError("INVALID_BUNDLE", "The validation stages are invalid.")
+        stage_error = stage["error"]
+        if stage_error is not None:
+            if not isinstance(stage_error, dict) or set(stage_error) != {
+                "stage",
+                "category",
+                "retryable",
+                "message",
+                "provider_status_code",
+            }:
+                raise PortableInputError("INVALID_BUNDLE", "The validation stages are invalid.")
+            provider_status_code = stage_error["provider_status_code"]
+            if (
+                stage_error["stage"] not in STAGES
+                or not isinstance(stage_error["category"], str)
+                or not stage_error["category"].strip()
+                or type(stage_error["retryable"]) is not bool
+                or not isinstance(stage_error["message"], str)
+                or not stage_error["message"].strip()
+                or (
+                    provider_status_code is not None
+                    and type(provider_status_code) is not int
+                )
+            ):
+                raise PortableInputError("INVALID_BUNDLE", "The validation stages are invalid.")
         for key in ("started_at", "completed_at"):
             value = stage[key]
             try:
-                if value is not None and (
-                    not isinstance(value, str) or datetime.fromisoformat(value) is None
-                ):
-                    raise ValueError
-            except ValueError as error:
+                if value is not None:
+                    strict_datetime(value)
+            except (TypeError, ValueError) as error:
                 raise PortableInputError(
                     "INVALID_BUNDLE", "The validation stages are invalid."
                 ) from error
+    if running_count > 1:
+        raise PortableInputError("INVALID_BUNDLE", "The validation stages are invalid.")
     validation_base = dict(bundle)
     validation_base["validation"] = None
     validation_base["bundle_hash"] = None
@@ -8542,6 +8624,12 @@ def _readiness_replay_generation_validation_v1(
         or _render_report(bundle).encode("utf-8") != report_bytes
     ):
         raise PortableInputError("INVALID_BUNDLE", "The validation bundle proof is invalid.")
+    try:
+        strict_datetime(validation["validated_at"])
+    except (TypeError, ValueError) as error:
+        raise PortableInputError(
+            "INVALID_BUNDLE", "The validation bundle proof is invalid."
+        ) from error
 
 
 def finalize(

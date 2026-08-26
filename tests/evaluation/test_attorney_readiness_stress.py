@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
+import subprocess
 import sys
 from copy import deepcopy
 from dataclasses import asdict, replace
@@ -33,12 +35,10 @@ from regulatory_harvest.evaluation.attorney_readiness_drafts import (
     ReadinessEvaluatorProvenanceV1,
     compile_readiness_draft_v1,
 )
-from regulatory_harvest.evaluation.attorney_readiness_models import (
-    HistoricalV22CrossCheckV1,
-    ReadinessOperationV1,
-)
+from regulatory_harvest.evaluation.attorney_readiness_models import ReadinessOperationV1
 from regulatory_harvest.evaluation.attorney_readiness_workflow import (
     _grade_requests,
+    continue_readiness_v1,
     guarded_submit_readiness_response_v1,
     next_readiness_request_v1,
     readiness_exit_code_v1,
@@ -55,8 +55,8 @@ COVERAGE_MODES = (
     "at_090", "above_090", "all_not_met", "uncertain",
 )
 HISTORY_MODES = (
-    "none", "one_a_baseline_not_comparable", "one_b_report_not_comparable",
-    "two_ab_match", "two_ba_differs", "one_a_inconclusive",
+    "none", "one_report_match", "one_report_not_comparable",
+    "two_ab_label_a", "two_ba_label_b", "one_report_inconclusive",
 )
 DISPUTE_KINDS = (
     "finding_existence", "rationale", "evidence_binding", "visibility",
@@ -82,10 +82,6 @@ def _tree(root: Path) -> dict[str, bytes]:
     }
 
 
-def _digest(label: str) -> str:
-    return sha256(label.encode()).hexdigest()
-
-
 def _vector(seed: int, rubric: dict[str, object]) -> dict[str, object]:
     requirement_count = REQUIREMENT_COUNTS[seed] if seed < 7 else 5
     finding_count = FINDING_COUNTS[seed] if seed < 5 else 1
@@ -109,9 +105,9 @@ def _vector(seed: int, rubric: dict[str, object]) -> dict[str, object]:
         requirement_count, finding_count, coverage_mode = 5, 0, "all_met"
     history_mode = HISTORY_MODES[seed % len(HISTORY_MODES)]
     if seed == 17:
-        history_mode = "two_ab_match"
+        history_mode = "two_ab_label_a"
     if seed == 19:
-        history_mode = "two_ba_differs"
+        history_mode = "two_ba_label_b"
     if seed in {20, 21, 22, 23}:
         finding_count = max(1, finding_count)
     rationale = cast(list[str], rubric["rationale_kinds"])
@@ -145,33 +141,6 @@ def _vector(seed: int, rubric: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _history(mode: str, report_hash: str) -> HistoricalV22CrossCheckV1 | None:
-    if mode == "none":
-        return None
-    count = 2 if mode.startswith("two_") else 1
-    orientation = "ba" if "ba_" in mode else "ab"
-    labels = [f"history-{orientation}-{index}" for index in range(count * 2)]
-    if orientation == "ba":
-        labels.reverse()
-    return HistoricalV22CrossCheckV1(
-        report_hash=report_hash if "report_not_comparable" not in mode else _digest(mode),
-        strict_disposition=(
-            "INCONCLUSIVE"
-            if mode.endswith("inconclusive")
-            else "FAIL"
-            if mode.endswith("differs")
-            else "PASS"
-        ),
-        result_fingerprint=_digest(f"{mode}-result"),
-        manifest_fingerprint=_digest(f"{mode}-manifest"),
-        baseline_fingerprint=_digest(f"{mode}-baseline"),
-        grader_aggregate_fingerprints=tuple(_digest(label) for label in labels),
-        reason_codes=(f"SYNTHETIC_{count}_REPORT_{orientation.upper()}",),
-        baseline_comparable="baseline_not_comparable" not in mode,
-        report_comparable="report_not_comparable" not in mode,
-    )
-
-
 def _inputs(
     tmp_path: Path,
     vector: dict[str, object],
@@ -179,6 +148,8 @@ def _inputs(
     projections: ModuleType,
     input_helpers: ModuleType,
     full_workflow: ModuleType,
+    portable: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     tmp_path.mkdir()
     limitations = (
@@ -195,6 +166,68 @@ def _inputs(
         generation_run_dir=source_artifacts.generation_run_dir,
         validation_receipt_path=source_artifacts.validation_receipt_path,
     )
+    history_mode = cast(str, vector["history_mode"])
+    if history_mode != "none":
+        v22 = __import__("test_attorney_v22_workflow")
+        monkeypatch.setattr(
+            v22.workflow,
+            "_verify_generation_capsules_for_initialization",
+            lambda case, paths: None,
+        )
+        two_reports = history_mode.startswith("two_")
+        historical_report = (
+            "A distinct public synthetic historical report."
+            if history_mode == "one_report_not_comparable"
+            else source.report_text
+        )
+        evaluator = v22._ScriptedEvaluator(
+            referee_decision="unresolved",
+            unresolved_grade=history_mode == "one_report_inconclusive",
+            label_dispositions=(
+                {"A": "met", "B": "not_met"}
+                if two_reports
+                else None
+            ),
+        )
+        history_run = tmp_path / "historical-v22"
+        outcome = asyncio.run(
+            v22.run_evaluation_v22(
+                v22._case(comparator=two_reports, report_text=historical_report),
+                evaluator,
+                history_run,
+                seed_hex=("3" if history_mode == "two_ba_label_b" else "0") * 64,
+            )
+        )
+        assert outcome.result is not None
+        assert len(outcome.result.reports) == (2 if two_reports else 1)
+        history_label = "B" if history_mode == "two_ba_label_b" else "A"
+        source = full_workflow.build_verified_readiness_input_v1(
+            baseline_run_dir=source_artifacts.baseline_run_dir,
+            qualification_run_dir=source_artifacts.qualification_run_dir,
+            generation_run_dir=source_artifacts.generation_run_dir,
+            validation_receipt_path=source_artifacts.validation_receipt_path,
+            historical_v22_run_dir=history_run,
+            historical_anonymous_label=history_label,
+        )
+        context = source.baseline_context
+        portable_history = portable._readiness_historical_v22(
+            history_run,
+            history_label,
+            baseline_context={
+                "manifest": context.manifest.model_dump(mode="json", warnings="error"),
+                "baseline_input": context.baseline_input.model_dump(
+                    mode="json", warnings="error"
+                ),
+                "baseline": context.baseline.model_dump(mode="json", warnings="error"),
+                "verification": context.verification.model_dump(
+                    mode="json", warnings="error"
+                ),
+            },
+            report_hash=source.report_hash,
+        )
+        assert source.historical_v22 is not None
+        assert portable_history == source.historical_v22.model_dump(mode="json")
+        assert len(portable_history["grader_aggregate_fingerprints"]) == 2
     prerequisite_code = {
         "CURRENTNESS_NOT_ESTABLISHED": "CURRENTNESS_EVIDENCE",
         "LANGUAGE_LIMITATION": "LANGUAGE_RESOLUTION",
@@ -300,12 +333,10 @@ def _inputs(
     projection = verify_gradeable_baseline_projection_v1(
         context, project_gradeable_baseline_v1(context)
     )
-    historical = _history(cast(str, vector["history_mode"]), source.report_hash)
     readiness_input = source.readiness_input.model_copy(
         update={
             "gradeable_baseline": projection,
             "grade_target_fingerprint": projection.binding.grade_target_fingerprint,
-            "historical_v22_cross_check": historical,
         }
     )
     return replace(
@@ -313,14 +344,29 @@ def _inputs(
         readiness_input=readiness_input,
         baseline_context=context,
         gradeable_baseline=projection,
-        historical_v22=historical,
+        historical_v22=source.historical_v22,
     )
 
 
-def _portable_initialize(portable: ModuleType, full: Path, output: Path) -> None:
-    persisted_bytes = (full / "readiness-input.json").read_bytes()
-    rubric_bytes = (full / "readiness-rubric.json").read_bytes()
-    persisted, rubric = json.loads(persisted_bytes), json.loads(rubric_bytes)
+def _portable_initialize(portable: ModuleType, inputs: object, output: Path) -> None:
+    context = inputs.baseline_context
+    persisted = {
+        "schema_version": "delivery-readiness-input-v1",
+        "readiness_input": inputs.readiness_input.model_dump(mode="json", warnings="error"),
+        "baseline_context": {
+            "manifest": context.manifest.model_dump(mode="json", warnings="error"),
+            "baseline_input": context.baseline_input.model_dump(mode="json", warnings="error"),
+            "baseline": context.baseline.model_dump(mode="json", warnings="error"),
+            "verification": context.verification.model_dump(mode="json", warnings="error"),
+        },
+        "qualification_binding": asdict(inputs.qualification_binding),
+        "qualification_limits": asdict(inputs.qualification_limits),
+        "generation_binding": asdict(inputs.generation_binding),
+    }
+    persisted = json.loads(canonical_json_bytes(persisted))
+    persisted_bytes = portable.canonical_json_bytes(persisted)
+    rubric = inputs.readiness_rubric.model_dump(mode="json", warnings="error")
+    rubric_bytes = portable.canonical_json_bytes(rubric)
     readiness_input = persisted["readiness_input"]
     request = portable._readiness_grade_requests(readiness_input, rubric)[0]
     call_id = request["payload"]["controller_lane_id"]
@@ -524,11 +570,13 @@ def test_readiness_seeded_scoring_boundary_matrix(
         projections,
         input_helpers,
         full_workflow,
+        portable,
+        monkeypatch,
     )
     full_run, portable_run = tmp_path / "full", tmp_path / "portable"
     grade_requests = _grade_requests(inputs)
     initialize_readiness_run_storage_v1(full_run, inputs, grade_requests[0])
-    _portable_initialize(portable, full_run, portable_run)
+    _portable_initialize(portable, inputs, portable_run)
     assert rubric_bytes == (full_run / "readiness-rubric.json").read_bytes()
     assert _tree(full_run) == _tree(portable_run)
     provenance = ReadinessEvaluatorProvenanceV1(
@@ -540,6 +588,80 @@ def test_readiness_seeded_scoring_boundary_matrix(
         "model_name": provenance.model_name,
         "judge_isolation": provenance.judge_isolation,
     }
+    repair_probe_result: dict[str, object] | None = None
+    if cast(bool, vector["one_repair_success"]) or cast(
+        bool, vector["second_refusal_pause"]
+    ):
+        probe_full = tmp_path / "driver-probe-full"
+        probe_portable = tmp_path / "driver-probe-portable"
+        initialize_readiness_run_storage_v1(probe_full, inputs, grade_requests[0])
+        _portable_initialize(portable, inputs, probe_portable)
+        first_request = next_readiness_request_v1(probe_full)
+        first_portable_request = portable.next_readiness_request_v1(probe_portable)
+        assert first_request is not None
+        assert first_portable_request == first_request.model_dump(mode="json")
+        refusal_count = 2 if cast(bool, vector["second_refusal_pause"]) else 1
+
+        class DriverProbe:
+            scripted_fixture = True
+
+            def __init__(self) -> None:
+                self.refusals = refusal_count
+                self.prompts: list[object] = []
+
+            def provenance(self, prompt: object) -> ReadinessEvaluatorProvenanceV1:
+                return provenance
+
+            async def evaluate_draft(self, prompt: object) -> object:
+                self.prompts.append(prompt)
+                if self.refusals:
+                    self.refusals -= 1
+                    return {}
+                request = prompt.request
+                if request.operation in {
+                    ReadinessOperationV1.BASELINE_LOCKED_GRADE,
+                    ReadinessOperationV1.BASELINE_LOCKED_CONTESTED_GRADE,
+                }:
+                    return _grade_draft(
+                        request,
+                        workflow,
+                        cast(str, vector["coverage_mode"]),
+                        cast(int, vector["requirement_count"]),
+                    )
+                if request.operation is ReadinessOperationV1.SAFETY_REVIEW:
+                    return _safety_draft(request, workflow, drafts, vector)
+                return workflow._draft(request, grade_mode="met")
+
+        driver = DriverProbe()
+        before_full_probe = _tree(probe_full)
+        outcome = asyncio.run(continue_readiness_v1(probe_full, driver))
+        first_prompts = [
+            prompt
+            for prompt in driver.prompts
+            if prompt.request.request_fingerprint == first_request.request_fingerprint
+        ]
+        assert [prompt.attempt for prompt in first_prompts] == [1, 2]
+        assert tuple(item.value for item in first_prompts[1].clarification_codes) == (
+            "DRAFT_INVALID",
+        )
+        before_portable_probe = _tree(probe_portable)
+        for _ in range(refusal_count):
+            with pytest.raises(portable.PortableEvaluationInputError):
+                portable.compile_readiness_draft_v1(
+                    first_portable_request, {}, portable_provenance
+                )
+        assert _tree(probe_portable) == before_portable_probe
+        assert portable.readiness_status_payload_v1(probe_portable)["engine_paused"] is False
+        if cast(bool, vector["second_refusal_pause"]):
+            assert outcome.engine_paused is True
+            assert outcome.exit_code == 6
+            assert outcome.pause_reason_codes == ("DRAFT_INVALID",)
+            assert outcome.pending_request == first_request
+            assert _tree(probe_full) == before_full_probe
+        else:
+            assert outcome.engine_paused is False
+            assert outcome.result is not None
+            repair_probe_result = outcome.result.model_dump(mode="json")
     transcript: list[tuple[bytes, bytes]] = []
     finding_counts: list[int] = []
     disputes: list[str] = []
@@ -553,21 +675,6 @@ def test_readiness_seeded_scoring_boundary_matrix(
             assert next_readiness_request_v1(full_run) == request
             assert portable.next_readiness_request_v1(portable_run) == portable_request
             assert (_tree(full_run), _tree(portable_run)) == before
-            probe_done = True
-        repair = cast(bool, vector["one_repair_success"])
-        refusal = cast(bool, vector["second_refusal_pause"])
-        if (repair or refusal) and not probe_done:
-            for _ in range(2 if refusal else 1):
-                clarification = compile_readiness_draft_v1(request, {}, provenance)
-                assert tuple(item.value for item in clarification.reason_codes) == (
-                    "DRAFT_INVALID",
-                )
-                with pytest.raises(portable.PortableEvaluationInputError):
-                    portable.compile_readiness_draft_v1(portable_request, {}, portable_provenance)
-                assert (_tree(full_run), _tree(portable_run)) == before
-            if refusal:
-                # Pause belongs to the live host; isolated status remains write-free.
-                assert portable.readiness_status_payload_v1(portable_run)["engine_paused"] is False
             probe_done = True
         if request.operation in {
             ReadinessOperationV1.BASELINE_LOCKED_GRADE,
@@ -629,6 +736,8 @@ def test_readiness_seeded_scoring_boundary_matrix(
         assert material["owner_role"] == vector["owner_role"]
         assert material["blocking_code"] == vector["blocking_code"]
     result = json.loads(tree["delivery-readiness.json"])
+    if repair_probe_result is not None:
+        assert repair_probe_result == result
     strict = json.loads(tree["baseline-locked-strict-equivalent.json"])
     requirements = json.loads(tree["requirement-matrix.json"])
     gaps = json.loads(tree["gap-follow-up-matrix.json"])
@@ -672,12 +781,49 @@ def test_readiness_seeded_scoring_boundary_matrix(
     assert status["baseline_locked_strict_equivalent_disposition"] == result[
         "baseline_locked_strict_equivalent_disposition"
     ]
-    assert (4 if result["delivery_readiness"] == "NOT_DELIVERABLE" else 0) == (
+    expected_exit = 4 if result["delivery_readiness"] == "NOT_DELIVERABLE" else 0
+    assert expected_exit == (
         readiness_exit_code_v1(
             load_verified_readiness_context_v1(full_run).result,
             paused=False,
         )
     )
+    full_status = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "attorney_eval_full.py"),
+            "eval-readiness-status",
+            "--run",
+            str(full_run),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+    )
+    portable_status = subprocess.run(
+        [
+            "python3",
+            "-I",
+            "-S",
+            str(ROOT / "scripts" / "harvest_portable.py"),
+            "eval-readiness-status",
+            "--run",
+            str(portable_run),
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+    )
+    assert (
+        portable_status.returncode,
+        portable_status.stdout,
+        portable_status.stderr,
+    ) == (
+        full_status.returncode,
+        full_status.stdout,
+        full_status.stderr,
+    )
+    assert full_status.returncode == expected_exit
     historical = inputs.historical_v22
     if historical is None:
         assert result["historical_v22_cross_check_status"] == "NOT_PROVIDED"
