@@ -551,8 +551,12 @@ async def test_fresh_context_token_reuse_is_rejected_across_resume(
     assert len(accepted_before) == 1
     persisted = repr(before)
     assert "context-constant" not in persisted
-    assert accepted_before[0].model_name is not None
-    assert "#readiness-context-sha256=" in accepted_before[0].model_name
+    assert accepted_before[0].model_name == "public-test-model"
+    control_files = tuple(tmp_path.glob(".readiness-context-*.tokens"))
+    assert len(control_files) == 1
+    control_bytes = control_files[0].read_bytes()
+    assert b"context-constant" not in control_bytes
+    assert len(control_bytes.splitlines()) == 1
 
     resumed = ScriptedEvaluator(grade_mode="met", fresh=True, reused_token=True)
     outcome = await continue_readiness_v1(run_dir, resumed)
@@ -561,6 +565,81 @@ async def test_fresh_context_token_reuse_is_rejected_across_resume(
     assert resumed.prompts == []
     assert _tree_bytes(run_dir) == before
     assert load_verified_readiness_context_v1(run_dir).manifest.accepted_calls == accepted_before
+
+
+@pytest.mark.asyncio
+async def test_fresh_context_preserves_maximum_truthful_model_name(tmp_path: Path) -> None:
+    class MaximumModelEvaluator(ScriptedEvaluator):
+        def provenance(
+            self, prompt: ReadinessEvaluatorDraftPromptV1
+        ) -> ReadinessEvaluatorProvenanceV1:
+            del prompt
+            return ReadinessEvaluatorProvenanceV1(
+                provider_name="public-test-provider",
+                model_name="m" * 128,
+                judge_isolation="fresh_context",
+            )
+
+    run_dir, _ = _initialize_real(tmp_path, limitations=None)
+    evaluator = MaximumModelEvaluator(grade_mode="met", fresh=True, fail_after=1)
+    outcome = await continue_readiness_v1(run_dir, evaluator)
+    assert outcome.engine_paused is True
+    accepted = load_verified_readiness_context_v1(run_dir).manifest.accepted_calls
+    assert len(accepted) == 1
+    assert accepted[0].model_name == "m" * 128
+
+
+@pytest.mark.asyncio
+async def test_external_fresh_response_remains_resumable_by_internal_driver(
+    tmp_path: Path,
+) -> None:
+    run_dir, _ = _initialize_real(tmp_path, limitations=None)
+    request = next_readiness_request_v1(run_dir)
+    assert request is not None
+    compiled = compile_readiness_draft_v1(
+        request,
+        _ordinary_draft(request),
+        ReadinessEvaluatorProvenanceV1(
+            provider_name="external-provider",
+            model_name="external-model",
+            judge_isolation="fresh_context",
+        ),
+    )
+    assert isinstance(compiled, CompiledReadinessDraftV1)
+    assert guarded_submit_readiness_response_v1(run_dir, compiled.response).accepted is True
+
+    outcome = await continue_readiness_v1(run_dir, ScriptedEvaluator(grade_mode="met", fresh=True))
+    assert outcome.result is not None
+    assert outcome.engine_paused is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hostile_kind", ["symlink", "hardlink", "fifo"])
+async def test_context_token_control_rejects_unsafe_nodes_without_evaluator_call(
+    tmp_path: Path, hostile_kind: str
+) -> None:
+    from regulatory_harvest.evaluation.attorney_artifacts import EvaluationIntegrityError
+
+    run_dir, _ = _initialize_real(tmp_path, limitations=None)
+    metadata = run_dir.stat()
+    control = tmp_path / (f".readiness-context-{metadata.st_dev:x}-{metadata.st_ino:x}.tokens")
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"owned\n")
+    if hostile_kind == "symlink":
+        control.symlink_to(victim)
+    elif hostile_kind == "hardlink":
+        control.hardlink_to(victim)
+    else:
+        control.unlink(missing_ok=True)
+        control.parent.mkdir(parents=True, exist_ok=True)
+        import os
+
+        os.mkfifo(control)
+    evaluator = ScriptedEvaluator(grade_mode="met", fresh=True)
+    with pytest.raises(EvaluationIntegrityError, match="READINESS_STORAGE_UNSAFE"):
+        await continue_readiness_v1(run_dir, evaluator)
+    assert evaluator.prompts == []
+    assert victim.read_bytes() == b"owned\n"
 
 
 @pytest.mark.asyncio

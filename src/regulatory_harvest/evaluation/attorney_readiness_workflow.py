@@ -93,7 +93,7 @@ READINESS_CONTEXT_ISOLATION_INVALID = "READINESS_CONTEXT_ISOLATION_INVALID"
 READINESS_COMPILER_PREFLIGHT_DISAGREEMENT = "READINESS_COMPILER_PREFLIGHT_DISAGREEMENT"
 
 _SUBMISSION_LOCKS = tuple(threading.RLock() for _ in range(64))
-_CONTEXT_BINDING_MARKER = "#readiness-context-sha256="
+_CONTEXT_CONTROL_MAX_BYTES = 65_536
 _STALE_TRANSITION_CODES = {
     "READINESS_STALE_TRANSITION",
     "READINESS_ARTIFACT_STALE_TRANSITION",
@@ -616,31 +616,98 @@ def _event(
     )
 
 
-def _accepted_context_digests(context: VerifiedReadinessContextV1) -> set[str]:
-    result: set[str] = set()
-    for call in context.manifest.accepted_calls:
-        if call.judge_isolation != "fresh_context":
-            continue
-        model_name = call.model_name
-        if model_name is None or _CONTEXT_BINDING_MARKER not in model_name:
-            raise EvaluationIntegrityError("READINESS_CONTEXT_PROVENANCE_INVALID")
-        prefix, digest = model_name.rsplit(_CONTEXT_BINDING_MARKER, 1)
-        if (
-            not prefix
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-        ):
-            raise EvaluationIntegrityError("READINESS_CONTEXT_PROVENANCE_INVALID")
-        if digest in result:
-            raise EvaluationIntegrityError("READINESS_CONTEXT_PROVENANCE_INVALID")
-        result.add(digest)
-    return result
+def _write_all(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            raise OSError("context control write did not progress")
+        offset += written
+
+
+def _reserve_context_token(run_dir: Path, token: str) -> None:
+    digest = sha256_digest(token.encode("utf-8")).encode("ascii")
+    root_identity = _root_identity(run_dir)
+    absolute = Path(os.path.abspath(run_dir))
+    name = f".readiness-context-{root_identity[0]:x}-{root_identity[1]:x}.tokens"
+    parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    control_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        import fcntl
+
+        parent_descriptor = os.open(absolute.parent, parent_flags)
+        try:
+            parent_metadata = os.fstat(parent_descriptor)
+            visible_parent = os.stat(absolute.parent, follow_symlinks=False)
+            if not stat.S_ISDIR(parent_metadata.st_mode) or (
+                parent_metadata.st_dev,
+                parent_metadata.st_ino,
+            ) != (visible_parent.st_dev, visible_parent.st_ino):
+                raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE")
+            descriptor = os.open(
+                name,
+                control_flags,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                metadata = os.fstat(descriptor)
+                visible = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                identity = (metadata.st_dev, metadata.st_ino)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                    or identity != (visible.st_dev, visible.st_ino)
+                ):
+                    raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                data = os.read(descriptor, _CONTEXT_CONTROL_MAX_BYTES + 1)
+                if len(data) > _CONTEXT_CONTROL_MAX_BYTES or (data and not data.endswith(b"\n")):
+                    raise EvaluationIntegrityError("READINESS_CONTEXT_CONTROL_INVALID")
+                lines = data.splitlines()
+                if len(lines) != len(set(lines)) or any(
+                    len(line) != 64
+                    or any(character not in b"0123456789abcdef" for character in line)
+                    for line in lines
+                ):
+                    raise EvaluationIntegrityError("READINESS_CONTEXT_CONTROL_INVALID")
+                if digest in lines:
+                    raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
+                os.lseek(descriptor, 0, os.SEEK_END)
+                _write_all(descriptor, digest + b"\n")
+                os.fsync(descriptor)
+                final = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if identity != (final.st_dev, final.st_ino):
+                    raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE")
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(parent_descriptor)
+    except EvaluationIntegrityError:
+        raise
+    except ValueError:
+        raise
+    except (ImportError, NotImplementedError, OSError, TypeError) as error:
+        raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE") from error
+    if _root_identity(run_dir) != root_identity:
+        raise EvaluationIntegrityError("READINESS_STORAGE_UNSAFE")
 
 
 def _provenance(
+    run_dir: Path,
     evaluator: ReadinessDraftEvaluatorV1,
     prompt: ReadinessEvaluatorDraftPromptV1,
-    seen_context_digests: set[str],
 ) -> ReadinessEvaluatorProvenanceV1:
     scripted_fixture = getattr(evaluator, "scripted_fixture", False) is True
     factory = getattr(evaluator, "provenance", None)
@@ -671,15 +738,8 @@ def _provenance(
         or len(token.encode("utf-8")) > 256
     ):
         raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
-    digest = sha256_digest(token.encode("utf-8"))
-    if digest in seen_context_digests:
-        raise ValueError(READINESS_CONTEXT_ISOLATION_INVALID)
-    seen_context_digests.add(digest)
-    return ReadinessEvaluatorProvenanceV1(
-        provider_name=checked.provider_name,
-        model_name=f"{checked.model_name}{_CONTEXT_BINDING_MARKER}{digest}",
-        judge_isolation="fresh_context",
-    )
+    _reserve_context_token(run_dir, token)
+    return checked
 
 
 def _pause(
@@ -716,10 +776,8 @@ async def continue_readiness_v1(
     if not isinstance(evaluator, ReadinessDraftEvaluatorV1):
         raise TypeError("evaluator must implement ReadinessDraftEvaluatorV1")
     sink = _NOOP_TELEMETRY if telemetry_sink is None else telemetry_sink
-    seen_context_digests: set[str] = set()
     while True:
         context = load_verified_readiness_context_v1(run_dir)
-        seen_context_digests.update(_accepted_context_digests(context))
         if context.manifest.terminal_status is not None:
             return _completed(context)
         request = context.pending_request
@@ -733,7 +791,9 @@ async def continue_readiness_v1(
                 clarification_codes=clarification_codes,
             )
             try:
-                provenance = _provenance(evaluator, prompt, seen_context_digests)
+                provenance = _provenance(run_dir, evaluator, prompt)
+            except EvaluationIntegrityError:
+                raise
             except (TypeError, ValueError):
                 _emit(
                     sink,
