@@ -112,6 +112,134 @@ def test_legacy_full_evaluation_help_and_default_protocol_are_byte_stable() -> N
     assert parsed.protocol == "2.1"
 
 
+def test_every_legacy_full_evaluation_command_keeps_json_and_exit_snapshot(
+    tmp_path: Path,
+) -> None:
+    missing = str(tmp_path / "missing")
+    run = str(tmp_path / "missing-run")
+    response = str(tmp_path / "missing-response.json")
+    seed = "0" * 64
+    input_two = (
+        2,
+        b"",
+        b'{"code": "EVALUATION_PROTOCOL_UNSUPPORTED", '
+        b'"message": "The evaluation run protocol is unsupported."}\n',
+    )
+    integrity_five = (
+        5,
+        b"",
+        b'{"code": "EVALUATION_INTEGRITY_INVALID", '
+        b'"message": "The evaluation run failed integrity checks."}\n',
+    )
+    generation_five = (
+        5,
+        b"",
+        b'{"code": "GENERATION_INTEGRITY_INVALID", '
+        b'"message": "The generation capsule failed integrity checks."}\n',
+    )
+    vectors: dict[str, tuple[list[str], tuple[int, bytes, bytes]]] = {
+        "eval-baseline-init": (
+            ["--input", missing, "--run", run, "--nonce-hex", seed],
+            (
+                2,
+                b"",
+                b'{"code": "BASELINE_INPUT_INVALID", '
+                b'"message": "The baseline input is invalid."}\n',
+            ),
+        ),
+        "eval-baseline-next": (["--run", run], integrity_five),
+        "eval-baseline-submit-safe": (
+            [
+                "--run",
+                run,
+                "--response",
+                response,
+                "--provider-name",
+                "provider",
+                "--model-name",
+                "model",
+                "--judge-isolation",
+                "fresh_context",
+            ],
+            integrity_five,
+        ),
+        "eval-baseline-status": (["--run", run], integrity_five),
+        "eval-baseline-verify": (
+            ["--run", run],
+            (
+                5,
+                b'{"issues":["BASELINE_STORAGE_UNSAFE"],"ok":false,'
+                b'"protocol_version":"evaluation-baseline-v1"}\n',
+                b"",
+            ),
+        ),
+        "eval-init": (
+            ["--case", missing, "--run", run, "--seed-hex", seed],
+            (
+                2,
+                b"",
+                b'{"code": "EVALUATION_INPUT_INVALID", '
+                b'"message": "case fixture is unavailable"}\n',
+            ),
+        ),
+        "eval-next": (["--run", run], input_two),
+        "eval-preflight": (["--run", run, "--response", response], input_two),
+        "eval-submit": (["--run", run, "--response", response], input_two),
+        "eval-submit-safe": (["--run", run, "--response", response], input_two),
+        "eval-stop-inconclusive": (
+            ["--run", run, "--reason", "MECHANICAL_RESPONSE_INVALID"],
+            input_two,
+        ),
+        "eval-status": (["--run", run], input_two),
+        "eval-verify": (["--run", run], input_two),
+        "eval-resume": (["--run", run, "--scripted-responses", response], input_two),
+        "eval-qualify-init": (
+            ["--case", missing, "--run", run, "--nonce-hex", seed],
+            (
+                2,
+                b"",
+                b'{"code": "EVALUATION_INPUT_INVALID", '
+                b'"message": "The qualification case fixture is invalid."}\n',
+            ),
+        ),
+        "eval-qualify-next": (["--run", run], integrity_five),
+        "eval-qualify-submit": (["--run", run, "--response", response], integrity_five),
+        "eval-qualify-status": (["--run", run], integrity_five),
+        "eval-qualify-verify": (
+            ["--run", run],
+            (
+                5,
+                b'{"issues":["QUALIFICATION_INTEGRITY_INVALID"],'
+                b'"root_hash":null,"valid":false}\n',
+                b"",
+            ),
+        ),
+        "eval-gen-init": (
+            ["--input", missing, "--run", run, "--nonce-hex", seed],
+            (
+                2,
+                b"",
+                b'{"code": "GENERATION_INPUT_INVALID", '
+                b'"message": "generation capsule must be outside the input root"}\n',
+            ),
+        ),
+        "eval-gen-next": (["--run", run], generation_five),
+        "eval-gen-submit": (["--run", run, "--response", response], generation_five),
+        "eval-gen-status": (["--run", run], generation_five),
+        "eval-gen-verify": (["--run", run], generation_five),
+    }
+
+    assert set(vectors) == set(_LEGACY_FULL_EVAL_HELP_SHA256)
+    for command, (arguments, expected) in vectors.items():
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "attorney_eval_full.py"), command, *arguments],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        )
+        assert (result.returncode, result.stdout, result.stderr) == expected
+
+
 def test_baseline_scripted_fixture_has_bounded_exhaustion_and_malformed_taxonomy() -> None:
     """Fixture defects stay input defects and never become provider/runtime failures."""
     from regulatory_harvest.evaluation.attorney_baseline_models import (

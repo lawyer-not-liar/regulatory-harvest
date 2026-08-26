@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
+import io
 import json
+import os
 import sys
 from dataclasses import replace
 from functools import lru_cache
@@ -22,6 +24,7 @@ from regulatory_harvest.evaluation.attorney_readiness_models import (
     AbsoluteDispositionV2,
     DeliveryReadinessTierV1,
     HistoricalV22CrossCheckStatusV1,
+    HistoricalV22CrossCheckV1,
     ReadinessEvaluatorRequestV1,
     ReadinessPhaseV1,
 )
@@ -332,27 +335,50 @@ def test_submit_safe_compiles_inner_payload_and_rejects_mechanical_invalidity_wr
     assert accepted["status"]["pending_operation"] is not None
 
     before = _tree_bytes(run)
-    response_path.write_bytes(canonical_json_bytes({}))
-    refused_status = _runner().main(
-        [
-            "eval-readiness-submit-safe",
-            "--run",
-            str(run),
-            "--response",
-            str(response_path),
-            *flags,
-        ]
+    invalid_bytes = (
+        canonical_json_bytes({}),
+        b'{ "noncanonical": true }',
+        b"x" * (1024 * 1024 + 1),
     )
-    refused = json.loads(capsys.readouterr().out)
-    assert refused_status == 2
-    assert refused == {
-        "accepted": False,
-        "preflight": {
-            "diagnostics": ["READINESS_EXTERNAL_RESPONSE_INVALID"],
-            "valid": False,
-        },
-    }
-    assert _tree_bytes(run) == before
+    for response_bytes in invalid_bytes:
+        response_path.write_bytes(response_bytes)
+        refused_status = _runner().main(
+            [
+                "eval-readiness-submit-safe",
+                "--run",
+                str(run),
+                "--response",
+                str(response_path),
+                *flags,
+            ]
+        )
+        refused = json.loads(capsys.readouterr().out)
+        assert refused_status == 2
+        assert refused == {
+            "accepted": False,
+            "preflight": {
+                "diagnostics": ["READINESS_EXTERNAL_RESPONSE_INVALID"],
+                "valid": False,
+            },
+        }
+        assert _tree_bytes(run) == before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file-kind controls")
+def test_readiness_response_control_rejects_aliases_and_nonregular_files(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.json"
+    target.write_bytes(canonical_json_bytes({}))
+    symlink = tmp_path / "symlink.json"
+    symlink.symlink_to(target)
+    hardlink = tmp_path / "hardlink.json"
+    os.link(target, hardlink)
+    fifo = tmp_path / "response.fifo"
+    os.mkfifo(fifo)
+
+    for path in (symlink, hardlink, fifo):
+        assert _runner()._read_guarded_readiness_object(path) is None
 
 
 def test_terminal_status_verify_and_human_projection_keep_dispositions_distinct(
@@ -432,6 +458,53 @@ def test_terminal_status_verify_and_human_projection_keep_dispositions_distinct(
     ]
     assert _runner()._readiness_context_exit_code(historical_context) == 0
 
+    matching_result = historical_result.model_copy(
+        update={
+            "historical_v22_strict_disposition": AbsoluteDispositionV2.PASS,
+            "historical_v22_cross_check_status": HistoricalV22CrossCheckStatusV1.MATCH,
+        }
+    )
+    matching_status = _runner()._readiness_status_payload(
+        replace(context, result=matching_result)
+    )
+    assert matching_status["historical_v22_cross_check_status"] == "MATCH"
+    assert "(cross-check matches)" in _runner().render_readiness_status_human_v1(
+        matching_status
+    )
+
+    pending_history = HistoricalV22CrossCheckV1(
+        report_hash=context.manifest.report_hash,
+        strict_disposition="FAIL",
+        result_fingerprint="1" * 64,
+        manifest_fingerprint="2" * 64,
+        baseline_fingerprint="3" * 64,
+        grader_aggregate_fingerprints=("4" * 64, "5" * 64),
+        reason_codes=("SYNTHETIC",),
+        baseline_comparable=True,
+        report_comparable=True,
+    )
+    pending_inputs = replace(context.inputs, historical_v22=pending_history)
+    pending_history_status = _runner()._readiness_status_payload(
+        replace(context, inputs=pending_inputs, result=None)
+    )
+    assert pending_history_status["historical_v22_cross_check_status"] is None
+    assert "(cross-check pending)" in _runner().render_readiness_status_human_v1(
+        pending_history_status
+    )
+    for mutation, expected in (
+        ({"baseline_comparable": False}, "BASELINE_NOT_COMPARABLE"),
+        ({"report_comparable": False}, "REPORT_NOT_COMPARABLE"),
+    ):
+        mutated_history = pending_history.model_copy(update=mutation)
+        mutated_status = _runner()._readiness_status_payload(
+            replace(
+                context,
+                inputs=replace(context.inputs, historical_v22=mutated_history),
+                result=None,
+            )
+        )
+        assert mutated_status["historical_v22_cross_check_status"] == expected
+
     nondeliverable = historical_result.model_copy(
         update={"delivery_readiness": DeliveryReadinessTierV1.NOT_DELIVERABLE}
     )
@@ -448,6 +521,19 @@ def test_terminal_status_verify_and_human_projection_keep_dispositions_distinct(
     assert _runner()._readiness_context_exit_code(
         replace(context, manifest=inconclusive_manifest, result=None)
     ) == 3
+
+    class _TTY(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    terminal = _TTY()
+    monkeypatch.setattr(_runner().sys, "stdout", terminal)
+    assert _runner().main(["eval-readiness-status", "--run", str(run)]) == 0
+    assert terminal.getvalue().splitlines() == [
+        "Baseline-locked strict-equivalent: PASS",
+        "Historical Protocol 2.2 strict disposition: not supplied",
+        "Delivery readiness: HIGH_ASSURANCE",
+    ]
 
 
 def test_readiness_verify_integrity_failure_is_safe_and_exit_five(

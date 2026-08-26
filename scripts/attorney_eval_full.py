@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 from typing import Literal, Never, cast
@@ -477,6 +478,124 @@ def _read_guarded_eval_object(path: Path) -> dict[str, object] | None:
         return None
 
 
+def _readiness_node_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_guarded_readiness_object(path: Path) -> dict[str, object] | None:
+    """Read one canonical readiness object through a stable POSIX descriptor chain."""
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+    if os.name != "posix" or any(not hasattr(os, name) for name in required_flags):
+        return None
+    try:
+        absolute = Path(os.path.abspath(path))
+        segments = absolute.parts[1:]
+        if not segments:
+            return None
+        directory_flags = (
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        )
+        leaf_flags = (
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        )
+        root = os.open(os.sep, directory_flags)
+        directories: list[
+            tuple[int | None, str | None, int, tuple[int, int, int, int, int, int, int]]
+        ] = []
+        leaf: int | None = None
+        try:
+            root_metadata = os.fstat(root)
+            if not stat.S_ISDIR(root_metadata.st_mode):
+                return None
+            directories.append((None, None, root, _readiness_node_identity(root_metadata)))
+            parent = root
+            for segment in segments[:-1]:
+                child = os.open(segment, directory_flags, dir_fd=parent)
+                opened = os.fstat(child)
+                named = os.stat(segment, dir_fd=parent, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or stat.S_ISLNK(named.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+                ):
+                    os.close(child)
+                    return None
+                directories.append(
+                    (parent, segment, child, _readiness_node_identity(opened))
+                )
+                parent = child
+
+            leaf = os.open(segments[-1], leaf_flags, dir_fd=parent)
+            before = os.fstat(leaf)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.getuid()
+                or before.st_size > _EVAL_RESPONSE_MAX_BYTES
+            ):
+                return None
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(
+                    leaf,
+                    min(1024 * 1024, _EVAL_RESPONSE_MAX_BYTES + 1 - total),
+                )
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _EVAL_RESPONSE_MAX_BYTES:
+                    return None
+                chunks.append(chunk)
+            after = os.fstat(leaf)
+            named_leaf = os.stat(segments[-1], dir_fd=parent, follow_symlinks=False)
+            if (
+                _readiness_node_identity(before) != _readiness_node_identity(after)
+                or stat.S_ISLNK(named_leaf.st_mode)
+                or (after.st_dev, after.st_ino)
+                != (named_leaf.st_dev, named_leaf.st_ino)
+            ):
+                return None
+            for directory_parent, name, descriptor, expected in directories:
+                opened = os.fstat(descriptor)
+                if _readiness_node_identity(opened) != expected:
+                    return None
+                if directory_parent is None or name is None:
+                    continue
+                rebound = os.stat(name, dir_fd=directory_parent, follow_symlinks=False)
+                if stat.S_ISLNK(rebound.st_mode) or (opened.st_dev, opened.st_ino) != (
+                    rebound.st_dev,
+                    rebound.st_ino,
+                ):
+                    return None
+            data = b"".join(chunks)
+        finally:
+            if leaf is not None:
+                os.close(leaf)
+            for _, _, descriptor, _ in reversed(directories):
+                os.close(descriptor)
+            if not directories:
+                os.close(root)
+
+        value = json.loads(data.decode("utf-8"))
+        _assert_eval_json_depth(value)
+        if data != canonical_json_bytes(value) or type(value) is not dict:
+            return None
+        return value
+    except (OSError, RecursionError, UnicodeError, TypeError, ValueError):
+        return None
+
+
 def _read_guarded_v2_response(
     args: argparse.Namespace, run: Path
 ) -> dict[str, object] | None:
@@ -833,6 +952,13 @@ def render_readiness_status_human_v1(payload: dict[str, object]) -> str:
     )
 
 
+def _write_readiness_status(payload: dict[str, object]) -> None:
+    if sys.stdout.isatty():
+        print(render_readiness_status_human_v1(payload))
+    else:
+        _eval_json(payload)
+
+
 def _readiness_preflight_payload(result: GuardedReadinessSubmissionResultV1) -> dict[str, object]:
     diagnostics = (
         [] if result.accepted else [READINESS_EXTERNAL_RESPONSE_INVALID]
@@ -860,7 +986,7 @@ def _read_guarded_readiness_response(
     run: Path,
 ) -> object:
     """Read a strict response or compile and bind one role-authored inner payload."""
-    value = _read_guarded_eval_object(Path(args.response))
+    value = _read_guarded_readiness_object(Path(args.response))
     if value is None:
         return None
     metadata = (
@@ -1451,7 +1577,7 @@ def _run_readiness_command(args: argparse.Namespace) -> int:
             return _readiness_context_exit_code(submitted_context)
         if args.command == "eval-readiness-status":
             context = load_verified_readiness_context_v1(run)
-            _eval_json(_readiness_status_payload(context))
+            _write_readiness_status(_readiness_status_payload(context))
             return _readiness_context_exit_code(context)
         verification = verify_readiness_run_v1(run)
         if not verification.valid:
