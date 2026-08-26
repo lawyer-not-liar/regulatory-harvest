@@ -182,6 +182,66 @@ establishes local integrity and replay, not legal correctness, completeness,
 currentness, isolation truth, attorney approval authenticity, or report quality.
 This protocol is experimental and always requires qualified-attorney review.
 
+## Experimental delivery-readiness companion
+
+`delivery-readiness-v1` is a separate sibling graph. Protocol 2.1 remains the
+default. The companion consumes a verified stable baseline; it never rebuilds that
+baseline, writes into a retained run, changes a historical disposition, or authorizes
+unreviewed client delivery.
+
+The controller runs two fresh baseline-locked grading lanes, derives a
+baseline-locked strict-equivalent disposition under the retained Protocol 2.2 scoring
+semantics, then runs two fresh safety lanes. Any safety disagreement receives one
+fresh dispute-scoped referee. A Protocol 2.2 result is optional historical cross-check
+evidence only; it never supplies the fresh grades or changes the delivery tier.
+
+The three tiers are `HIGH_ASSURANCE`, `REVIEW_READY_WITH_GAPS`, and
+`NOT_DELIVERABLE`. The review-ready floor is the exact, versioned, provisional `0.70`
+minimum weighted coverage across the two fresh grading lanes. A strict-equivalent
+`FAIL` remains `FAIL` even when the work is review-ready. Review-ready means a
+qualified attorney may use the report as a starting point; it is not authorization for
+unreviewed client delivery and is not a legal-correctness finding.
+
+Every gap row preserves the exact evidence and renders `What is missing`, `Why it
+matters`, `How to resolve it`, and `Owner`. Critical shortfalls require prominent
+disclosure and reviewing-attorney or outside-counsel ownership. `NOT_DELIVERABLE`
+suppresses the report from the ordinary handoff but preserves sealed artifacts and
+operator-safe remediation codes.
+
+An exact fixture lifecycle is:
+
+```bash
+python3 scripts/harvest_skill.py eval-readiness-init \
+  --baseline-run baseline-run \
+  --qualification-run qualification-run \
+  --generation-run generation-run \
+  --validation-receipt validation-receipt.json \
+  --run readiness-run
+python3 scripts/harvest_skill.py eval-readiness-next --run readiness-run
+python3 scripts/harvest_skill.py eval-readiness-submit-safe \
+  --run readiness-run --response response.json \
+  --provider-name actual-provider --model-name actual-model \
+  --judge-isolation fresh_context
+python3 scripts/harvest_skill.py eval-readiness-status --run readiness-run
+python3 scripts/harvest_skill.py eval-readiness-verify --run readiness-run
+```
+
+Repeat `next` and `submit-safe` only for the exact pending request. Every fresh grade,
+safety, referee, and repair role requires a genuinely fresh context. A rejected
+response is write-free. Exit `0` covers verified `HIGH_ASSURANCE` and
+`REVIEW_READY_WITH_GAPS`; exit `4` covers verified `NOT_DELIVERABLE`; exit `5` covers
+integrity failure; and the live workflow driver uses exit `6` for a write-free pause.
+Later stateless status and verification see the unchanged pending run and exit `0`.
+
+A report revision reuses the same baseline only when `legal_input_fingerprint` is
+identical. Legal-input changes require a new baseline. Before changing the `0.70`
+floor, record at least three and preferably five diverse attorney-reviewed cases in
+the nonprivate calibration schema; keep restricted calibration records outside the
+public repository. Any threshold, blocker, or scoring-contract change requires a new
+rubric version and never rewrites historical results.
+
+Results are AI Generated and may contain errors. Output must be validated by an attorney before the attorney delivers legal advice.
+
 ## Retained Protocol 2.1 reference
 
 ## Protocol 2.1 current evaluator contract

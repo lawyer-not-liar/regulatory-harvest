@@ -24,6 +24,20 @@ not web-search their private names, facts, quotations, bytes, or strategy, witho
 explicit authorization. A report-blind baseline does not make its underlying source
 record public or safe to disclose.
 
+## Protect delivery-readiness work product
+
+Readiness inputs, grade and safety packets, exact report passages, requirement and
+gap matrices, referee decisions, and attorney handoffs are private work product unless
+the owner explicitly authorizes sharing. Keep response controls outside immutable
+readiness roots. Never upload or web-search their private facts, quotations, hashes,
+rationales, or follow-up strategy without explicit authorization.
+
+`REVIEW_READY_WITH_GAPS` authorizes only a qualified-attorney starting-point handoff;
+it is not authorization for unreviewed client delivery. `NOT_DELIVERABLE` suppresses
+the report body from the ordinary handoff but does not erase the sealed graph. Treat
+the preserved graph as sensitive even when public status output contains only codes,
+counts, versions, and hashes.
+
 ## Source retrieval boundary
 
 The deterministic collector accepts local files and public HTTP(S) URLs. It rejects private, loopback, link-local, multicast, credential-bearing, and unsupported URLs. Redirects are revalidated. These controls reduce server-side request-forgery risk but do not make arbitrary files or websites trustworthy.
@@ -46,3 +60,5 @@ The installed-skill runner does not install packages, create a virtual environme
 ## Legal-use boundary
 
 Regulatory Harvest assists research. It does not provide legal advice or replace source review, citation checking, currentness analysis, applicability analysis, professional judgment, or qualified-attorney approval. Preserve the required disclaimer in every delivered report and bundle.
+
+Results are AI Generated and may contain errors. Output must be validated by an attorney before the attorney delivers legal advice.

@@ -10,3 +10,8 @@ and scripted judgments are dedicated to the public domain under CC0 1.0.
 created for Regulatory Harvest's experimental stable-baseline tests. Its qualification
 record, client facts, scripted judgments, pause/resume drafts, and correction are
 dedicated to the public domain under CC0 1.0. It is fictional and is not legal authority.
+
+`attorney-readiness-v1/` is an original, identity-free public-synthetic lifecycle
+fixture created for the experimental delivery-readiness companion. Its fictional
+source, reports, scripted draft recipes, validation binding, and calibration template
+are dedicated to the public domain under CC0 1.0. They are not legal authority.

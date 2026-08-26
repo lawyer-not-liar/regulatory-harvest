@@ -60,6 +60,13 @@ Before declaring the candidate technically verified:
 20. Record commands, versions, results, and artifact hashes under `docs/verification/` without converting unperformed UI checks into claims.
 21. Adversarially confirm that diagnostics cannot echo exception or source text; qualification cannot admit missing currentness evidence; failed guarded submission cannot write any byte; repair instructions cannot permit a fourth attempt; qualification replay rejects changed artifacts; and the archive contains no private marker or identifying absolute path.
 22. Treat qualification `ADMITTED` only as source-record readiness. It is not a report `PASS`, and neither automated result authorizes publication or delivery of legal advice.
+23. Run all three licensed public-synthetic `delivery-readiness-v1` journeys through the full and isolated portable runtimes. Compare every request, accepted response, matrix, result, handoff, verification record, manifest, status payload, exit code, and complete tree. Require `HIGH_ASSURANCE`, exact-floor `REVIEW_READY_WITH_GAPS`, and report-suppressing `NOT_DELIVERABLE`.
+24. Confirm Protocol 2.1 remains the default; a report-only revision reuses the baseline only when `legal_input_fingerprint` is identical; legal-input changes create a new baseline; and optional historical Protocol 2.2 evidence never supplies fresh grades or changes the tier.
+25. Confirm two fresh baseline-locked grading lanes and two fresh safety lanes run for every fixture, every safety disagreement receives one fresh dispute-scoped referee, and every repair is isolated. Exit `0` for review-ready must be described as attorney-review delivery, exit `4` as nondelivery, exit `5` as integrity failure, and exit `6` as a live write-free pause.
+26. Treat the `0.70` review-ready floor as provisional. Before changing it, record at least three and preferably five diverse attorney-reviewed calibration cases, including usefulness, follow-up sufficiency, unsafe delivery, false nondelivery, importance disagreement, and baseline correction. Any threshold, blocker, or scoring change requires a new rubric version.
+27. Confirm `REVIEW_READY_WITH_GAPS` is not authorization for unreviewed client delivery, `NOT_DELIVERABLE` preserves sealed artifacts while suppressing the report, and publication or a default change still requires a separate owner decision.
+
+Results are AI Generated and may contain errors. Output must be validated by an attorney before the attorney delivers legal advice.
 
 ## Manual ownership and publication gate
 

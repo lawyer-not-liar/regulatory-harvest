@@ -94,6 +94,42 @@ establishes local integrity and replay, not legal correctness, completeness,
 currentness, isolation truth, attorney approval authenticity, or report quality.
 This protocol is experimental and always requires qualified-attorney review.
 
+## Experimental delivery-readiness controller
+
+When explicitly requested, initialize `delivery-readiness-v1` as a separate sibling
+graph from a verified baseline, qualification capsule, generation capsule, and
+completed deterministic validation receipt. Protocol 2.1 remains the default. Do not
+infer a readiness companion for a retained run, change a default, or treat the result
+as authorization for unreviewed client delivery.
+
+Run two fresh baseline-locked grading lanes against the exact verified projection,
+then two fresh safety lanes. Start one fresh dispute-scoped referee for each safety
+disagreement. Each role and mechanical repair uses a genuinely fresh context. A
+second mechanical refusal is write-free, leaves the exact request pending, and causes
+the live driver to return exit `6`; it is not a substantive nondelivery result.
+
+Keep the baseline-locked strict-equivalent disposition separate from both the optional
+historical Protocol 2.2 cross-check and delivery readiness. A fresh `FAIL` remains
+`FAIL`; it can coexist with `REVIEW_READY_WITH_GAPS` when the exact provisional `0.70`
+minimum-lane floor and all candor, evidence, visibility, ownership, replay, and safety
+gates pass. Exit `0` then means ready for qualified-attorney review, not legal
+correctness. Verified `NOT_DELIVERABLE` returns exit `4` and suppresses the report as
+attorney work product; integrity failure returns exit `5`.
+
+Render every row under `What is missing`, `Why it matters`, `How to resolve it`, and
+`Owner`. Never invent rationale from a score or code. A visible actionable gap is not
+itself a blocker. Hidden material limitations, unsupported assertions, misleading
+contradictions, unbound dispositive facts, or generic and evidence-unbound rationales
+remain blocking.
+
+Reuse the same stable baseline for a report-only revision only when
+`legal_input_fingerprint` is identical. Any legal-input change requires a new
+baseline. Threshold calibration requires at least three and preferably five diverse
+attorney-reviewed cases and a new rubric version; keep restricted calibration results
+outside the repository.
+
+Results are AI Generated and may contain errors. Output must be validated by an attorney before the attorney delivers legal advice.
+
 ## Protocol 2.2 new-run contract
 
 Protocol 2.2 is explicit experimental behavior; Protocol 2.1 remains the new-run

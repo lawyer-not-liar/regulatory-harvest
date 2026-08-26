@@ -102,6 +102,40 @@ establishes local integrity and replay, not legal correctness, completeness,
 currentness, isolation truth, attorney approval authenticity, or report quality.
 This protocol is experimental and always requires qualified-attorney review.
 
+### Experimental delivery readiness
+
+Use `delivery-readiness-v1` only as the opt-in companion to a verified stable
+baseline, qualification capsule, generation capsule, and completed deterministic
+validation receipt. Protocol 2.1 remains the default. This companion is not
+authorization for unreviewed client delivery, publication, a default change, or a
+claim of legal correctness.
+
+For every report revision, run two fresh baseline-locked grading lanes and then two
+fresh safety lanes. Use one fresh dispute-scoped referee for each safety disagreement.
+Never regenerate the report-blind baseline for a report-only change, and reuse it only
+when `legal_input_fingerprint` is identical. Treat any legal-input change as a new
+baseline case.
+
+Keep these results separate:
+
+- `baseline-locked strict-equivalent`: the fresh `PASS`, `FAIL`, or `INCONCLUSIVE`;
+- optional historical Protocol 2.2 disposition and comparability status; and
+- delivery readiness: `HIGH_ASSURANCE`, `REVIEW_READY_WITH_GAPS`, or
+  `NOT_DELIVERABLE`.
+
+The provisional middle-tier minimum is exact `0.70` in the worse fresh grading lane.
+Do not relabel its strict `FAIL` as `PASS`. Every open row must identify `What is
+missing`, `Why it matters`, `How to resolve it`, and `Owner`. A visible actionable
+gap is not automatically blocking; a hidden gap, unsupported assertion, misleading
+contradiction, invalid rationale, or unbound dispositive fact is blocking.
+
+Exit `0` includes verified review-ready attorney-review delivery, exit `4` is verified
+`NOT_DELIVERABLE`, exit `5` is integrity failure, and exit `6` is the live driver's
+write-free pause after a second mechanical refusal. Run each evaluator role and repair
+in a genuinely fresh context and resume only the exact pending request.
+
+Results are AI Generated and may contain errors. Output must be validated by an attorney before the attorney delivers legal advice.
+
 ### Retained Protocol 2.1 operator reference
 
 - Qualify every locked case before generating a candidate.

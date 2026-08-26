@@ -1,9 +1,12 @@
 import asyncio
+import copy
 import json
 import re
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict, replace
+from hashlib import sha256
 from pathlib import Path
 
 from regulatory_harvest.analysis import AnalysisDraft
@@ -25,8 +28,30 @@ from regulatory_harvest.evaluation.attorney_baseline_workflow import (
     initialize_baseline_v1,
     next_baseline_request_v1,
 )
+from regulatory_harvest.evaluation.attorney_readiness_artifacts import (
+    initialize_readiness_run_storage_v1,
+    verify_readiness_run_v1,
+)
+from regulatory_harvest.evaluation.attorney_readiness_drafts import (
+    CompiledReadinessDraftV1,
+    ReadinessEvaluatorProvenanceV1,
+    compile_readiness_draft_v1,
+)
+from regulatory_harvest.evaluation.attorney_readiness_models import (
+    GenerationValidationBindingV1,
+    HistoricalV22CrossCheckV1,
+    ReadinessEvaluatorResponseV1,
+    ReadinessOperationV1,
+    SafetyRefereeDecisionV1,
+)
+from regulatory_harvest.evaluation.attorney_readiness_workflow import (
+    _grade_requests,
+    guarded_submit_readiness_response_v1,
+    next_readiness_request_v1,
+)
 from regulatory_harvest.evaluation.attorney_v21_models import EvaluatorResponseV21
 from regulatory_harvest.evaluation.attorney_v22_models import EvaluatorResponseV22
+from regulatory_harvest.storage import sha256_digest
 
 ROOT = Path(__file__).parents[2]
 RUNNERS = (
@@ -164,6 +189,18 @@ BASELINE_FIXTURE_FILES = {
     "stable/responses/scripted-responses.json",
 }
 
+READINESS_FIXTURE = ROOT / "tests" / "fixtures" / "attorney-readiness-v1"
+READINESS_FIXTURE_FILES = {
+    "FIXTURE_LICENSE.md",
+    "calibration-record.template.json",
+    "stable/report-high-assurance.md",
+    "stable/report-not-deliverable.md",
+    "stable/report-review-ready.md",
+    "stable/scripted-drafts.json",
+    "stable/source.txt",
+    "stable/validation-receipt.json",
+}
+
 
 def _materialize_baseline_fixture(tmp_path: Path) -> Path:
     target = tmp_path / "attorney-eval-baseline"
@@ -238,11 +275,22 @@ def test_skill_runtime_resources_are_complete_and_templates_are_valid_json() -> 
         "assets/attorney-generation-response.template.json",
         "assets/attorney-evaluation-case.template.json",
         "assets/attorney-evaluation-response.template.json",
+        "assets/attorney-delivery-readiness-input.template.json",
+        "assets/attorney-delivery-readiness-response.template.json",
         "references/attorney-evaluation.md",
         "references/research-protocol.md",
         "references/authority-and-currentness.md",
         "references/draft-schema.md",
         "references/security-and-privacy.md",
+        "src/regulatory_harvest/evaluation/attorney_readiness_artifacts.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_compiler.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_drafts.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_handoff.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_inputs.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_models.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_requests.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_workflow.py",
+        "src/regulatory_harvest/evaluation/readiness-rubric-v1.json",
     }
 
     assert {path for path in required if not (ROOT / path).is_file()} == set()
@@ -2086,6 +2134,342 @@ def test_baseline_correction_fixture_creates_verified_sibling_without_prior_writ
     assert corrected_context.baseline.baseline_fingerprint != (
         prior_context.baseline.baseline_fingerprint
     )
+
+
+def test_readiness_templates_are_canonical_public_and_validate_exact_outer_contracts() -> None:
+    """A copied public template must not require shape repair before bounded use."""
+    input_path = ROOT / "assets" / "attorney-delivery-readiness-input.template.json"
+    response_path = ROOT / "assets" / "attorney-delivery-readiness-response.template.json"
+    for path in (input_path, response_path):
+        data = path.read_bytes()
+        assert data == _canonical_bytes(json.loads(data)), path
+        assert not data.endswith(b"\n"), path
+        assert b"/Users/" not in data and b"/home/" not in data
+
+    readiness_input = json.loads(input_path.read_bytes())
+    assert readiness_input == {
+        "baseline_run": "baseline-run",
+        "generation_run": "generation-run",
+        "historical_report_label": None,
+        "historical_v22_run": None,
+        "qualification_run": "qualification-run",
+        "run": "readiness-run",
+        "validation_receipt": "validation-receipt.json",
+    }
+
+    response = ReadinessEvaluatorResponseV1.model_validate(
+        json.loads(response_path.read_bytes())
+    )
+    assert response.operation is ReadinessOperationV1.SAFETY_REFEREE
+    decision = SafetyRefereeDecisionV1.model_validate(response.payload)
+    assert decision.dispute_id == "SD-0001"
+    assert decision.disposition == "lane_1"
+    assert decision.evidence_refs == ("SOURCE-000001",)
+
+
+def test_readiness_fixture_is_complete_canonical_licensed_and_identity_free() -> None:
+    """The public fixture must be reproducible without private matter bytes."""
+    actual = {
+        path.relative_to(READINESS_FIXTURE).as_posix()
+        for path in READINESS_FIXTURE.rglob("*")
+        if path.is_file()
+    }
+    assert actual == READINESS_FIXTURE_FILES
+    for relative in (
+        "calibration-record.template.json",
+        "stable/scripted-drafts.json",
+        "stable/validation-receipt.json",
+    ):
+        data = (READINESS_FIXTURE / relative).read_bytes()
+        assert data == _canonical_bytes(json.loads(data)), relative
+        assert not data.endswith(b"\n"), relative
+
+    combined = b"\n".join(
+        (READINESS_FIXTURE / relative).read_bytes() for relative in sorted(actual)
+    ).lower()
+    for forbidden in (
+        b"/users/",
+        b"/home/",
+        b"earl mah",
+        b"client matter",
+        b"private evaluation",
+    ):
+        assert forbidden not in combined
+    assert b"public-synthetic" in combined
+    assert b"not legal authority" in combined
+    assert b"cc0 1.0" in (READINESS_FIXTURE / "FIXTURE_LICENSE.md").read_bytes().lower()
+
+    licenses = (ROOT / "tests" / "fixtures" / "FIXTURE_LICENSES.md").read_text(
+        encoding="utf-8"
+    ).casefold()
+    assert "`attorney-readiness-v1/`" in licenses
+    assert "cc0 1.0" in licenses
+
+
+def test_readiness_calibration_template_has_the_exact_nonprivate_contract() -> None:
+    calibration = json.loads(
+        (READINESS_FIXTURE / "calibration-record.template.json").read_bytes()
+    )
+    assert calibration == {
+        "attorney_usefulness": "useful|useful_with_changes|not_useful",
+        "baseline_correction_required": False,
+        "baseline_locked_strict_equivalent_disposition": "FAIL",
+        "case_id": "public-synthetic-case-id",
+        "delivery_readiness": "REVIEW_READY_WITH_GAPS",
+        "fresh_grade_lane_weighted_coverage": [0.7, 0.8],
+        "follow_up_sufficient": True,
+        "gap_visibility_adequate": True,
+        "historical_v22_cross_check_status": "NOT_PROVIDED",
+        "historical_v22_strict_disposition": None,
+        "importance_disagreement_count": 0,
+        "readiness_rubric_version": "delivery-readiness-v1",
+        "strict_equivalent_scoring_semantics": "attorney-eval-v2.2",
+        "unsafe_delivery_observed": False,
+    }
+
+
+def _readiness_fixture_inputs(source: object, report_text: str, *, historical_fail: bool) -> object:
+    report_hash = sha256_digest(report_text.encode("utf-8"))
+    validation = source.generation_validation.model_copy(  # type: ignore[attr-defined]
+        update={"report_hash": report_hash}
+    )
+    readiness_input = source.readiness_input.model_copy(  # type: ignore[attr-defined]
+        update={
+            "report_text": report_text,
+            "report_hash": report_hash,
+            "generation_validation": validation,
+        }
+    )
+    historical = None
+    if historical_fail:
+        historical = HistoricalV22CrossCheckV1(
+            report_hash=report_hash,
+            strict_disposition="FAIL",
+            result_fingerprint=sha256_digest(b"public-synthetic-history-result"),
+            manifest_fingerprint=sha256_digest(b"public-synthetic-history-manifest"),
+            baseline_fingerprint=sha256_digest(b"public-synthetic-history-baseline"),
+            grader_aggregate_fingerprints=(
+                sha256_digest(b"public-synthetic-history-lane-1"),
+                sha256_digest(b"public-synthetic-history-lane-2"),
+            ),
+            reason_codes=("PUBLIC_SYNTHETIC_HISTORICAL_FAIL",),
+            baseline_comparable=True,
+            report_comparable=True,
+        )
+        readiness_input = readiness_input.model_copy(
+            update={"historical_v22_cross_check": historical}
+        )
+    return replace(
+        source,
+        readiness_input=readiness_input,
+        report_text=report_text,
+        report_hash=report_hash,
+        generation_binding=replace(  # type: ignore[attr-defined]
+            source.generation_binding, report_hash=report_hash  # type: ignore[attr-defined]
+        ),
+        generation_validation=validation,
+        historical_v22=historical,
+    )
+
+
+def test_readiness_public_fixture_drives_all_tiers_with_full_isolated_portable_parity(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    """Actual fixture report bytes must survive every full/portable transition."""
+    monkeypatch.syspath_prepend(str(ROOT / "tests" / "evaluation"))  # type: ignore[attr-defined]
+    stress = __import__("test_attorney_readiness_stress")
+    requests = __import__("test_attorney_readiness_requests")
+    projections = __import__("test_attorney_baseline_projection")
+    input_helpers = __import__("test_attorney_readiness_inputs")
+    workflow_tests = __import__("test_attorney_readiness_workflow")
+    draft_tests = __import__("test_attorney_readiness_drafts")
+    full_workflow = __import__(
+        "regulatory_harvest.evaluation.attorney_readiness_workflow", fromlist=["*"]
+    )
+    portable = stress._portable()
+    _, rubric, _ = portable._readiness_rubric_v1()
+    script = json.loads(
+        (READINESS_FIXTURE / "stable" / "scripted-drafts.json").read_bytes()
+    )
+    receipt = GenerationValidationBindingV1.model_validate(
+        json.loads(
+            (READINESS_FIXTURE / "stable" / "validation-receipt.json").read_bytes()
+        )
+    )
+    assert receipt.status == "completed"
+
+    for journey in script["journeys"]:
+        vector = stress._vector(journey["seed"], rubric)
+        vector.update(journey["vector_overrides"])
+        inputs = stress._inputs(
+            tmp_path / f"inputs-{journey['journey_id']}",
+            vector,
+            requests,
+            projections,
+            input_helpers,
+            full_workflow,
+            portable,
+            monkeypatch,
+        )
+        report_text = (
+            READINESS_FIXTURE / "stable" / journey["report_file"]
+        ).read_text(encoding="utf-8")
+        assert sha256(report_text.encode("utf-8")).hexdigest() == journey["report_sha256"]
+        inputs = _readiness_fixture_inputs(
+            inputs,
+            report_text,
+            historical_fail=journey["historical_fail_cross_check"],
+        )
+
+        full_run = tmp_path / f"full-{journey['journey_id']}"
+        portable_run = tmp_path / f"portable-{journey['journey_id']}"
+        grade_requests = _grade_requests(inputs)
+        initialize_readiness_run_storage_v1(full_run, inputs, grade_requests[0])
+        stress._portable_initialize(portable, inputs, portable_run)
+        assert stress._tree(full_run) == stress._tree(portable_run)
+
+        provenance = ReadinessEvaluatorProvenanceV1(
+            provider_name="public-fixture-provider",
+            model_name="public-fixture-model",
+            judge_isolation="scripted_fixture",
+        )
+        portable_provenance = asdict(provenance)
+        operations: list[str] = []
+        while (request := next_readiness_request_v1(full_run)) is not None:
+            portable_request = portable.next_readiness_request_v1(portable_run)
+            assert portable_request == request.model_dump(mode="json")
+            operations.append(request.operation.value)
+            if request.operation in {
+                ReadinessOperationV1.BASELINE_LOCKED_GRADE,
+                ReadinessOperationV1.BASELINE_LOCKED_CONTESTED_GRADE,
+            }:
+                draft = stress._grade_draft(
+                    request,
+                    workflow_tests,
+                    vector["coverage_mode"],
+                    vector["requirement_count"],
+                )
+            elif request.operation is ReadinessOperationV1.SAFETY_REVIEW:
+                draft = stress._safety_draft(
+                    request, workflow_tests, draft_tests, vector
+                )
+            else:
+                draft = workflow_tests._draft(request, grade_mode="met")
+            compiled = compile_readiness_draft_v1(
+                request, copy.deepcopy(draft), provenance
+            )
+            assert isinstance(compiled, CompiledReadinessDraftV1)
+            portable_response = portable.compile_readiness_draft_v1(
+                portable_request,
+                copy.deepcopy(draft),
+                portable_provenance,
+            )
+            assert portable_response == compiled.response.model_dump(mode="json")
+            assert guarded_submit_readiness_response_v1(
+                full_run, compiled.response
+            ).accepted
+            assert portable.guarded_submit_readiness_response_v1(
+                portable_run, portable_response
+            )["accepted"]
+            assert stress._tree(full_run) == stress._tree(portable_run)
+
+        result = json.loads((full_run / "delivery-readiness.json").read_bytes())
+        assert result["delivery_readiness"] == journey["expected_delivery_readiness"]
+        assert result["baseline_locked_strict_equivalent_disposition"] == journey[
+            "expected_strict_equivalent"
+        ]
+        assert result["minimum_lane_weighted_coverage"] == journey[
+            "expected_minimum_lane_weighted_coverage"
+        ]
+        assert verify_readiness_run_v1(full_run).valid
+        assert portable.verify_readiness_run_v1(portable_run)["valid"] is True
+        assert operations.count("baseline_locked_grade") == 2
+        assert operations.count("safety_review") == 2
+        if journey["requires_safety_referee"]:
+            assert operations.count("safety_referee") == 1
+        handoff = (full_run / "attorney-review-handoff.md").read_text(encoding="utf-8")
+        if journey["expected_delivery_readiness"] == "NOT_DELIVERABLE":
+            assert report_text not in handoff
+        else:
+            assert report_text in handoff
+
+        full_status = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "attorney_eval_full.py"),
+                "eval-readiness-status",
+                "--run",
+                str(full_run),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        )
+        portable_status = subprocess.run(
+            [
+                "python3",
+                "-I",
+                "-S",
+                str(ROOT / "scripts" / "harvest_portable.py"),
+                "eval-readiness-status",
+                "--run",
+                str(portable_run),
+            ],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        )
+        assert (
+            portable_status.returncode,
+            portable_status.stdout,
+            portable_status.stderr,
+        ) == (
+            full_status.returncode,
+            full_status.stdout,
+            full_status.stderr,
+        )
+
+
+def test_readiness_guidance_publishes_the_complete_experimental_contract() -> None:
+    warning = (
+        "Results are AI Generated and may contain errors. Output must be validated by an "
+        "attorney before the attorney delivers legal advice."
+    )
+    surfaces = (
+        "README.md",
+        "SKILL.md",
+        "docs/evaluation.md",
+        "references/attorney-evaluation.md",
+        "references/security-and-privacy.md",
+        "docs/release-checklist.md",
+    )
+    combined = "\n".join(
+        (ROOT / relative).read_text(encoding="utf-8") for relative in surfaces
+    )
+    normalized = " ".join(combined.split())
+    assert normalized.count(warning) >= 4
+    for required in (
+        "delivery-readiness-v1",
+        "REVIEW_READY_WITH_GAPS",
+        "NOT_DELIVERABLE",
+        "baseline-locked strict-equivalent",
+        "two fresh baseline-locked grading lanes",
+        "two fresh safety lanes",
+        "0.70",
+        "provisional",
+        "What is missing",
+        "Why it matters",
+        "How to resolve it",
+        "Owner",
+        "Protocol 2.1 remains the default",
+        "not authorization for unreviewed client delivery",
+        "exit `4`",
+        "exit `6`",
+        "at least three and preferably five",
+        "legal_input_fingerprint",
+    ):
+        assert required.casefold() in combined.casefold(), required
 
 
 def test_stable_baseline_operator_and_security_contract_is_published() -> None:

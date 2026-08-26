@@ -102,6 +102,42 @@ establishes local integrity and replay, not legal correctness, completeness,
 currentness, isolation truth, attorney approval authenticity, or report quality.
 This protocol is experimental and always requires qualified-attorney review.
 
+### Experimental delivery-readiness companion
+
+The opt-in `delivery-readiness-v1` companion answers a question separate from the
+strict evaluation result: whether an evidence-bound report is a usable starting
+point for a qualified attorney when every known gap is explicit and actionable.
+Protocol 2.1 remains the default. Delivery readiness does not change a retained
+Protocol 2.2 result, authorize publication, or authorize unreviewed client delivery.
+
+Every report revision receives two fresh baseline-locked grading lanes against the
+same verified stable projection, followed by two fresh safety lanes and a fresh,
+dispute-scoped safety referee when the lanes differ. The resulting
+baseline-locked strict-equivalent `PASS`, `FAIL`, or `INCONCLUSIVE` remains separate
+from the optional historical Protocol 2.2 cross-check and from the delivery tier:
+
+- `HIGH_ASSURANCE` preserves the strict `1.0` critical-recall and `0.90` weighted-
+  coverage floors.
+- `REVIEW_READY_WITH_GAPS` uses the versioned provisional `0.70` minimum-lane floor
+  and requires every gap to be visible, evidence-bound, assigned, and actionable.
+- `NOT_DELIVERABLE` suppresses the report as attorney work product while preserving
+  sealed artifacts and operator-safe remediation codes.
+
+Each gap is rendered under `What is missing`, `Why it matters`, `How to resolve it`,
+and `Owner`. A fresh strict-equivalent `FAIL` remains `FAIL` even when the report is
+`REVIEW_READY_WITH_GAPS`. Exit `0` for that tier means intentional attorney-review
+delivery, not legal correctness; exit `4` means verified nondelivery; exit `5` means
+integrity failure; and a live driver uses exit `6` for a write-free engine pause.
+
+A report-only revision reuses the baseline only when `legal_input_fingerprint` is
+identical. Any source, question, jurisdiction, as-of date, requested-authority,
+client-fact, qualification, compiler, rubric, or policy change requires a new
+baseline. Changing the provisional floor requires a new rubric version and at least
+three and preferably five diverse attorney-reviewed calibration cases. Public
+fixtures are synthetic; restricted calibration records stay outside the repository.
+
+Results are AI Generated and may contain errors. Output must be validated by an attorney before the attorney delivers legal advice.
+
 ### Retained Protocol 2.1 evaluation behavior
 
 New attorney-report evaluations use experimental Protocol 2.1, the new-run default
