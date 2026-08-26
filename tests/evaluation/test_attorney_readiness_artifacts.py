@@ -6,6 +6,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from test_attorney_readiness_drafts import (
@@ -53,6 +54,7 @@ from regulatory_harvest.evaluation.attorney_readiness_compiler import (
 )
 from regulatory_harvest.evaluation.attorney_readiness_drafts import (
     CompiledReadinessDraftV1,
+    ReadinessEvaluatorProvenanceV1,
     compile_readiness_draft_v1,
 )
 from regulatory_harvest.evaluation.attorney_readiness_handoff import (
@@ -92,6 +94,9 @@ def _tree_bytes(root: Path) -> dict[str, bytes]:
 
 def _first_transition_parts(
     tmp_path: Path,
+    *,
+    judge_isolation: Literal["fresh_context", "scripted_fixture"] = "scripted_fixture",
+    context_token_fingerprint: str | None = None,
 ) -> tuple[Path, ReadinessManifestV1, dict[str, bytes], ReadinessManifestV1]:
     from regulatory_harvest.storage import canonical_json_bytes, sha256_digest
 
@@ -100,7 +105,16 @@ def _first_transition_parts(
     first = build_baseline_locked_grade_request_v1(inputs, batches[0])
     run_dir = tmp_path / "readiness-run"
     manifest = initialize_readiness_run_storage_v1(run_dir, inputs, first)
-    compiled = compile_readiness_draft_v1(first, _ordinary_draft(first), _provenance())
+    provenance = (
+        _provenance()
+        if judge_isolation == "scripted_fixture"
+        else ReadinessEvaluatorProvenanceV1(
+            provider_name="public-test-provider",
+            model_name="public-test-model",
+            judge_isolation="fresh_context",
+        )
+    )
+    compiled = compile_readiness_draft_v1(first, _ordinary_draft(first), provenance)
     assert isinstance(compiled, CompiledReadinessDraftV1)
     response = compiled.response
     response_bytes = canonical_json_bytes(response.model_dump(mode="json"))
@@ -114,6 +128,7 @@ def _first_transition_parts(
             "provider_name": response.provider_name,
             "model_name": response.model_name,
             "judge_isolation": response.judge_isolation,
+            "context_token_fingerprint": context_token_fingerprint,
         }
     )
     second = build_baseline_locked_grade_request_v1(inputs, batches[1])
@@ -129,6 +144,76 @@ def _first_transition_parts(
         }
     )
     return run_dir, manifest, files, successor
+
+
+def _commit_first_transition(
+    tmp_path: Path,
+    *,
+    context_token_fingerprint: str | None = None,
+) -> tuple[Path, ReadinessManifestV1]:
+    isolation = "fresh_context" if context_token_fingerprint is not None else "scripted_fixture"
+    run_dir, manifest, files, successor = _first_transition_parts(
+        tmp_path,
+        judge_isolation=isolation,
+        context_token_fingerprint=context_token_fingerprint,
+    )
+    committed = commit_readiness_transition_v1(
+        run_dir,
+        expected_manifest_fingerprint=manifest.manifest_fingerprint,
+        files=files,
+        successor=successor,
+    )
+    return run_dir, committed
+
+
+def _second_transition_parts(
+    run_dir: Path,
+    manifest: ReadinessManifestV1,
+    *,
+    context_token_fingerprint: str,
+) -> tuple[dict[str, bytes], ReadinessManifestV1]:
+    from regulatory_harvest.storage import canonical_json_bytes, sha256_digest
+
+    context = load_verified_readiness_context_v1(run_dir)
+    request = context.pending_request
+    assert request is not None
+    provenance = ReadinessEvaluatorProvenanceV1(
+        provider_name="public-test-provider",
+        model_name="public-test-model",
+        judge_isolation="fresh_context",
+    )
+    compiled = compile_readiness_draft_v1(request, _ordinary_draft(request), provenance)
+    assert isinstance(compiled, CompiledReadinessDraftV1)
+    response = compiled.response
+    response_bytes = canonical_json_bytes(response.model_dump(mode="json"))
+    pending = manifest.pending_call
+    assert pending is not None
+    accepted = pending.model_copy(
+        update={
+            "state": "accepted",
+            "response_artifact_path": f"responses/{pending.call_id}.json",
+            "response_fingerprint": sha256_digest(response_bytes),
+            "provider_name": response.provider_name,
+            "model_name": response.model_name,
+            "judge_isolation": response.judge_isolation,
+            "context_token_fingerprint": context_token_fingerprint,
+        }
+    )
+    next_request = readiness_artifacts._grade_requests(context.inputs)[
+        len(manifest.accepted_calls) + 1
+    ]
+    next_call = _pending_call(next_request)
+    files = {
+        accepted.response_artifact_path: response_bytes,
+        next_call.request_artifact_path: canonical_json_bytes(next_request.model_dump(mode="json")),
+    }
+    successor = manifest.model_copy(
+        update={
+            "accepted_calls": (*manifest.accepted_calls, accepted),
+            "pending_call": next_call,
+        }
+    )
+    return files, successor
 
 
 def test_initialization_seals_exact_admitted_input_and_first_request(
@@ -224,6 +309,201 @@ def test_transition_accepts_exact_compiled_response_and_only_next_request(
     assert committed.accepted_calls == (accepted,)
     context = load_verified_readiness_context_v1(run_dir)
     assert context.pending_request == second
+    assert verify_readiness_run_v1(run_dir).valid is True
+
+
+def test_fresh_context_token_changes_manifest_root_and_survives_replay(
+    tmp_path: Path,
+) -> None:
+    token_fingerprint = "c" * 64
+    run_dir, committed = _commit_first_transition(
+        tmp_path,
+        context_token_fingerprint=token_fingerprint,
+    )
+    accepted = committed.accepted_calls[0]
+    files = {
+        path: data for path, data in _tree_bytes(run_dir).items() if path != READINESS_MANIFEST_PATH
+    }
+    without_token = _with_inventory(
+        committed.model_copy(
+            update={
+                "accepted_calls": (accepted.model_copy(update={"context_token_fingerprint": None}),)
+            }
+        ),
+        files,
+    )
+
+    context = load_verified_readiness_context_v1(run_dir)
+    loaded_manifest, loaded_result = load_verified_readiness_run_v1(run_dir)
+    raw_manifest = json.loads((run_dir / READINESS_MANIFEST_PATH).read_bytes())
+
+    assert committed.manifest_fingerprint != without_token.manifest_fingerprint
+    assert committed.root_hash != without_token.root_hash
+    assert context.manifest.accepted_calls[0].context_token_fingerprint == token_fingerprint
+    assert loaded_manifest.accepted_calls[0].context_token_fingerprint == token_fingerprint
+    assert loaded_result is None
+    assert raw_manifest["accepted_calls"][0]["context_token_fingerprint"] == token_fingerprint
+    assert verify_readiness_run_v1(run_dir).valid is True
+
+
+def test_backward_compatible_none_token_is_omitted_from_raw_manifest(tmp_path: Path) -> None:
+    run_dir, committed = _commit_first_transition(tmp_path)
+
+    raw_manifest = json.loads((run_dir / READINESS_MANIFEST_PATH).read_bytes())
+    context = load_verified_readiness_context_v1(run_dir)
+
+    assert "context_token_fingerprint" not in raw_manifest["accepted_calls"][0]
+    assert committed.accepted_calls[0].context_token_fingerprint is None
+    assert context.manifest.accepted_calls[0].context_token_fingerprint is None
+
+
+def test_noncanonical_explicit_null_token_in_raw_manifest_is_rejected(tmp_path: Path) -> None:
+    from regulatory_harvest.storage import canonical_json_bytes
+
+    run_dir, _ = _commit_first_transition(tmp_path)
+    raw_manifest = json.loads((run_dir / READINESS_MANIFEST_PATH).read_bytes())
+    raw_manifest["accepted_calls"][0]["context_token_fingerprint"] = None
+    (run_dir / READINESS_MANIFEST_PATH).write_bytes(canonical_json_bytes(raw_manifest))
+
+    verification = verify_readiness_run_v1(run_dir)
+
+    assert verification.valid is False
+    assert verification.issues == ("READINESS_ARTIFACT_INVALID",)
+
+
+def test_raw_context_token_tamper_without_original_root_is_rejected(tmp_path: Path) -> None:
+    token_fingerprint = "c" * 64
+    run_dir, _ = _commit_first_transition(
+        tmp_path,
+        context_token_fingerprint=token_fingerprint,
+    )
+    manifest_path = run_dir / READINESS_MANIFEST_PATH
+    original = manifest_path.read_bytes()
+    raw_manifest = json.loads(original)
+    raw_manifest["accepted_calls"][0]["context_token_fingerprint"] = "d" * 64
+    from regulatory_harvest.storage import canonical_json_bytes
+
+    manifest_path.write_bytes(canonical_json_bytes(raw_manifest))
+
+    assert verify_readiness_run_v1(run_dir).valid is False
+
+    manifest_path.write_bytes(original)
+    assert verify_readiness_run_v1(run_dir).valid is True
+
+
+def test_truncated_context_token_is_rejected_after_raw_manifest_reseal(
+    tmp_path: Path,
+) -> None:
+    from regulatory_harvest.storage import canonical_json_bytes, sha256_digest
+
+    run_dir, _ = _commit_first_transition(
+        tmp_path,
+        context_token_fingerprint="c" * 64,
+    )
+    raw_manifest = json.loads((run_dir / READINESS_MANIFEST_PATH).read_bytes())
+    raw_manifest["accepted_calls"][0]["context_token_fingerprint"] = "c" * 63
+    fingerprint_input = {
+        key: value
+        for key, value in raw_manifest.items()
+        if key not in {"manifest_fingerprint", "root_hash"}
+    }
+    raw_manifest["manifest_fingerprint"] = sha256_digest(canonical_json_bytes(fingerprint_input))
+    root_input = {key: value for key, value in raw_manifest.items() if key != "root_hash"}
+    raw_manifest["root_hash"] = sha256_digest(canonical_json_bytes(root_input))
+    (run_dir / READINESS_MANIFEST_PATH).write_bytes(canonical_json_bytes(raw_manifest))
+
+    verification = verify_readiness_run_v1(run_dir)
+
+    assert verification.valid is False
+    assert verification.issues == ("READINESS_ARTIFACT_INVALID",)
+
+
+@pytest.mark.parametrize("replacement", [None, "e" * 64], ids=("drop", "change"))
+def test_resealed_successor_cannot_drop_or_change_an_inherited_context_token(
+    tmp_path: Path,
+    replacement: str | None,
+) -> None:
+    run_dir, committed = _commit_first_transition(
+        tmp_path,
+        context_token_fingerprint="c" * 64,
+    )
+    files, successor = _second_transition_parts(
+        run_dir,
+        committed,
+        context_token_fingerprint="d" * 64,
+    )
+    inherited = successor.accepted_calls[0].model_copy(
+        update={"context_token_fingerprint": replacement}
+    )
+    forged = successor.model_copy(
+        update={"accepted_calls": (inherited, successor.accepted_calls[-1])}
+    )
+    before = _tree_bytes(run_dir)
+
+    with pytest.raises(
+        shared_artifacts.EvaluationIntegrityError,
+        match="READINESS_STALE_TRANSITION",
+    ):
+        commit_readiness_transition_v1(
+            run_dir,
+            expected_manifest_fingerprint=committed.manifest_fingerprint,
+            files=files,
+            successor=forged,
+        )
+
+    assert _tree_bytes(run_dir) == before
+
+
+def test_resealed_fresh_context_call_reorder_is_rejected(tmp_path: Path) -> None:
+    run_dir, first = _commit_first_transition(
+        tmp_path,
+        context_token_fingerprint="c" * 64,
+    )
+    files, successor = _second_transition_parts(
+        run_dir,
+        first,
+        context_token_fingerprint="d" * 64,
+    )
+    second = commit_readiness_transition_v1(
+        run_dir,
+        expected_manifest_fingerprint=first.manifest_fingerprint,
+        files=files,
+        successor=successor,
+    )
+    all_files = {
+        path: data for path, data in _tree_bytes(run_dir).items() if path != READINESS_MANIFEST_PATH
+    }
+    reordered = _with_inventory(
+        second.model_copy(update={"accepted_calls": tuple(reversed(second.accepted_calls))}),
+        all_files,
+    )
+    (run_dir / READINESS_MANIFEST_PATH).write_bytes(_manifest_bytes(reordered))
+
+    verification = verify_readiness_run_v1(run_dir)
+
+    assert verification.valid is False
+    assert verification.issues == ("READINESS_SEMANTIC_REPLAY_INVALID",)
+
+
+def test_external_context_control_ledger_is_not_task7_replay_authority(
+    tmp_path: Path,
+) -> None:
+    run_dir, committed = _commit_first_transition(
+        tmp_path,
+        context_token_fingerprint="c" * 64,
+    )
+    context = load_verified_readiness_context_v1(run_dir)
+    ledger = run_dir.parent / (
+        f".readiness-context-{context.root_identity[0]:x}-{context.root_identity[1]:x}.tokens"
+    )
+
+    assert not ledger.exists()
+    assert verify_readiness_run_v1(run_dir).valid is True
+    ledger.write_bytes(b"I:")
+    assert verify_readiness_run_v1(run_dir).valid is True
+    ledger.write_bytes(
+        (f"I:{committed.accepted_calls[0].request_fingerprint}:{'e' * 64}\n").encode("ascii")
+    )
     assert verify_readiness_run_v1(run_dir).valid is True
 
 
