@@ -21,8 +21,10 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -336,6 +338,15 @@ def _exact_gradeable_projection_wire(
     return raw
 
 
+def _is_trusted_serialization_exclusion(value: BaseModel, field_name: str) -> bool:
+    """Recognize the one exact readiness-owned field omitted from canonical wire."""
+    return (
+        type(value) is ReadinessCallRecordV1
+        and field_name == "context_token_fingerprint"
+        and value.context_token_fingerprint is None
+    )
+
+
 def _wire_snapshot_inner(
     value: object,
     active: set[int],
@@ -385,6 +396,12 @@ def _wire_snapshot_inner(
             if extra:
                 state.update(extra)
             serialized = value.model_dump(mode="json", warnings="error")
+            for field_name in type(value).model_fields:
+                if field_name in state and _is_trusted_serialization_exclusion(
+                    value,
+                    field_name,
+                ):
+                    state.pop(field_name)
             if _has_unmarked_json_array(state, serialized):
                 raise ValueError("model state contains an unmarked JSON array tuple")
             return {
@@ -583,6 +600,12 @@ def _has_unmarked_json_array(value: object, serialized: object) -> bool:
     """Detect tuples whose JSON-list provenance was not established by validation."""
     if isinstance(value, BaseModel):
         state = dict(object.__getattribute__(value, "__dict__"))
+        for field_name in type(value).model_fields:
+            if field_name in state and _is_trusted_serialization_exclusion(
+                value,
+                field_name,
+            ):
+                state.pop(field_name)
         return _has_unmarked_json_array(
             state,
             value.model_dump(mode="json", warnings="error"),
@@ -620,6 +643,8 @@ def _freeze_validated_wire(
             raise ValueError("validated readiness model has invalid serialized state")
         for field_name, field_info in type(value).model_fields.items():
             if field_name not in serialized:
+                if _is_trusted_serialization_exclusion(value, field_name):
+                    continue
                 raise ValueError("validated readiness model is missing serialized state")
             item = getattr(value, field_name)
             frozen = _freeze_validated_wire(
@@ -788,6 +813,10 @@ class ReadinessStrictModelV1(BaseModel):
         serialized = self.model_dump(mode="json", warnings="error")
         for field_name, field_info in type(self).model_fields.items():
             value = getattr(self, field_name)
+            if field_name not in serialized:
+                if _is_trusted_serialization_exclusion(self, field_name):
+                    continue
+                raise ValueError("validated readiness model is missing serialized state")
             frozen = _freeze_validated_wire(
                 value,
                 serialized[field_name],
@@ -1805,6 +1834,7 @@ class ReadinessCallRecordV1(ReadinessStrictModelV1):
     provider_name: str | None = Field(default=None, strict=True)
     model_name: str | None = Field(default=None, strict=True)
     judge_isolation: Literal["fresh_context", "scripted_fixture"] | None = None
+    context_token_fingerprint: Hash | None = None
     dispute_id: SafetyDisputeRef | None = None
 
     _validate_attempt = field_validator("attempt", mode="before")(_strict_attempt)
@@ -1818,6 +1848,23 @@ class ReadinessCallRecordV1(ReadinessStrictModelV1):
         "model_name",
     )(_optional_nonblank)
 
+    @model_serializer(mode="wrap")
+    def serialize_call(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ) -> dict[str, object]:
+        serialized = cast(dict[str, object], handler(self))
+        if self.context_token_fingerprint is None:
+            serialized.pop("context_token_fingerprint", None)
+        return serialized
+
+    @field_validator("context_token_fingerprint", mode="before")
+    @classmethod
+    def validate_context_token_fingerprint(cls, value: object) -> object:
+        if value is not None and type(value) is not str:
+            raise ValueError("context token fingerprint must be a native hash")
+        return value
+
     @model_validator(mode="after")
     def validate_call(self) -> Self:
         provenance = (
@@ -1827,10 +1874,15 @@ class ReadinessCallRecordV1(ReadinessStrictModelV1):
             self.model_name,
             self.judge_isolation,
         )
-        if self.state == "pending" and any(item is not None for item in provenance):
+        if self.state == "pending" and (
+            any(item is not None for item in provenance)
+            or self.context_token_fingerprint is not None
+        ):
             raise ValueError("pending readiness calls must omit response provenance")
         if self.state == "accepted" and any(item is None for item in provenance):
             raise ValueError("accepted readiness calls require complete response provenance")
+        if self.context_token_fingerprint is not None and self.judge_isolation != "fresh_context":
+            raise ValueError("scripted fixture calls must omit context token provenance")
         if self.operation is ReadinessOperationV1.BASELINE_LOCKED_GRADE:
             expected = rf"grade-lane-{self.lane}-GB-{self.lane}-[0-9]{{4}}"
             if (

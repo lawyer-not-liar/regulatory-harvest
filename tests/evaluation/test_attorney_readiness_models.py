@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from test_attorney_baseline_artifacts import _complete_graph
 
 import regulatory_harvest.evaluation.attorney_baseline_models as baseline_models_module
@@ -64,6 +64,7 @@ from regulatory_harvest.evaluation.attorney_readiness_models import (
     validate_readiness_result_v1,
 )
 from regulatory_harvest.evaluation.attorney_v2_models import RequirementGradeV2
+from regulatory_harvest.storage import canonical_json_bytes
 
 HASH = "a" * 64
 ROOT = Path(__file__).resolve().parents[2]
@@ -1423,6 +1424,140 @@ def test_pending_and_accepted_calls_enforce_complete_response_provenance() -> No
     accepted.pop("model_name")
     with pytest.raises(ValidationError, match="accepted readiness calls"):
         ReadinessCallRecordV1.model_validate(accepted)
+
+
+def test_accepted_fresh_context_call_authenticates_its_context_token() -> None:
+    checked = ReadinessCallRecordV1.model_validate(
+        valid_call(state="accepted") | {"context_token_fingerprint": "c" * 64}
+    )
+
+    assert checked.context_token_fingerprint == "c" * 64
+    assert checked.model_dump(mode="json")["context_token_fingerprint"] == "c" * 64
+
+
+def test_external_fresh_context_call_may_omit_context_token_without_changing_wire() -> None:
+    prior_wire = valid_call(state="accepted")
+    checked = ReadinessCallRecordV1.model_validate(prior_wire)
+
+    assert checked.context_token_fingerprint is None
+    assert checked.model_dump(mode="json") == prior_wire
+
+
+def test_context_token_wire_omission_does_not_require_pydantic_212_field_support() -> None:
+    field = ReadinessCallRecordV1.model_fields["context_token_fingerprint"]
+    assert getattr(field, "exclude_if", None) is None
+    checked = ReadinessCallRecordV1.model_validate(valid_call(state="accepted"))
+    assert checked.model_dump(mode="json") == valid_call(state="accepted")
+
+
+def test_scripted_fixture_call_must_omit_context_token() -> None:
+    scripted = valid_call(state="accepted") | {"judge_isolation": "scripted_fixture"}
+    assert ReadinessCallRecordV1.model_validate(scripted).context_token_fingerprint is None
+    with pytest.raises(ValidationError, match="scripted fixture"):
+        ReadinessCallRecordV1.model_validate(scripted | {"context_token_fingerprint": "c" * 64})
+
+
+def test_pending_call_must_omit_context_token() -> None:
+    with pytest.raises(ValidationError, match="pending readiness calls"):
+        ReadinessCallRecordV1.model_validate(valid_call() | {"context_token_fingerprint": "c" * 64})
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    [True, 7, b"a" * 64, "A" * 64, "a" * 63],
+    ids=("bool", "integer", "bytes", "uppercase", "short"),
+)
+def test_context_token_fingerprint_requires_exact_native_hash(fingerprint: object) -> None:
+    with pytest.raises(ValidationError):
+        ReadinessCallRecordV1.model_validate(
+            valid_call(state="accepted") | {"context_token_fingerprint": fingerprint}
+        )
+
+
+def test_context_token_fingerprint_rejects_string_subclasses() -> None:
+    class ExternalString(str):
+        pass
+
+    with pytest.raises(ValidationError, match="native hash"):
+        ReadinessCallRecordV1.model_validate(
+            valid_call(state="accepted") | {"context_token_fingerprint": ExternalString("c" * 64)}
+        )
+
+
+def test_constructed_call_cannot_launder_invalid_context_token() -> None:
+    forged = ReadinessCallRecordV1.model_construct(
+        **(valid_call(state="accepted") | {"context_token_fingerprint": True})
+    )
+
+    with pytest.raises(ValidationError):
+        ReadinessCallRecordV1.model_validate(forged)
+
+
+def test_constructed_external_call_cannot_launder_invalid_context_token() -> None:
+    class ExternalCall(ReadinessCallRecordV1):
+        pass
+
+    forged = ExternalCall.model_construct(
+        **(valid_call(state="accepted") | {"context_token_fingerprint": True})
+    )
+
+    with pytest.raises(ValidationError):
+        ReadinessCallRecordV1.model_validate(forged)
+
+
+def test_external_call_cannot_hide_invalid_context_token_with_serialization_rules() -> None:
+    class ExternalCall(ReadinessCallRecordV1):
+        context_token_fingerprint: object = Field(
+            default=None,
+            exclude_if=lambda _: True,
+        )
+
+    valid_state = dict(ReadinessCallRecordV1.model_validate(valid_call(state="accepted")).__dict__)
+    forged = ExternalCall.model_construct(**(valid_state | {"context_token_fingerprint": True}))
+
+    with pytest.raises(ValidationError):
+        ReadinessManifestV1.model_validate(
+            valid_manifest(pending_call=None, accepted_calls=(forged,))
+        )
+
+
+def test_manifest_detaches_and_freezes_context_token_fingerprint() -> None:
+    original = ReadinessCallRecordV1.model_validate(
+        valid_call(state="accepted") | {"context_token_fingerprint": "c" * 64}
+    )
+    manifest = ReadinessManifestV1.model_validate(
+        valid_manifest(pending_call=None, accepted_calls=(original,))
+    )
+
+    object.__setattr__(original, "context_token_fingerprint", "d" * 64)
+    assert manifest.accepted_calls[0].context_token_fingerprint == "c" * 64
+    with pytest.raises(ValidationError, match="frozen"):
+        manifest.accepted_calls[0].context_token_fingerprint = "e" * 64
+
+
+def test_context_token_fingerprint_changes_manifest_root_input() -> None:
+    without_token = ReadinessManifestV1.model_validate(
+        valid_manifest(
+            pending_call=None,
+            accepted_calls=(valid_call(state="accepted"),),
+        )
+    )
+    with_token = ReadinessManifestV1.model_validate(
+        valid_manifest(
+            pending_call=None,
+            accepted_calls=(
+                valid_call(state="accepted") | {"context_token_fingerprint": "c" * 64},
+            ),
+        )
+    )
+
+    without_root_input = canonical_json_bytes(
+        without_token.model_dump(mode="json", exclude={"root_hash"})
+    )
+    with_root_input = canonical_json_bytes(
+        with_token.model_dump(mode="json", exclude={"root_hash"})
+    )
+    assert sha256(without_root_input).digest() != sha256(with_root_input).digest()
 
 
 def test_manifest_requires_unique_controller_call_ids() -> None:
