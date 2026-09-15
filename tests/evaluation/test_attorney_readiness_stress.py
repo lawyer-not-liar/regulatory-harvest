@@ -1,4 +1,8 @@
-"""Mutation-sensitive public-synthetic stress coverage for portable readiness."""
+"""Public-synthetic legacy dimension stress coverage for portable readiness.
+
+These fixtures explicitly retain the pre-scoped per-field reconciliation policy.
+V3 whole-assessment and review-package behavior has separate focused coverage.
+"""
 
 from __future__ import annotations
 
@@ -360,6 +364,7 @@ def _inputs(
         update={
             "gradeable_baseline": projection,
             "grade_target_fingerprint": projection.binding.grade_target_fingerprint,
+            "safety_response_contract_version": None,
         }
     )
     historical = source.historical_v22

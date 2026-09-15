@@ -39,43 +39,48 @@ def test_public_package_metadata_supports_declared_install_surfaces() -> None:
 
 
 def test_experimental_beta_release_surfaces_are_coherent() -> None:
-    """The prerelease surfaces must describe the bounded readiness companion."""
+    """The current prerelease must describe bounded V3 attorney review without erasing beta.9."""
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs" / "roadmap.md").read_text(encoding="utf-8")
+    beta10_heading = "## [0.1.0-beta.10] - 2026-09-14"
     beta9_heading = "## [0.1.0-beta.9] - 2026-08-26"
-    beta8_heading = "## [0.1.0-beta.8] - 2026-08-24"
-    _, found_beta9_heading, beta9_and_history = changelog.partition(beta9_heading)
-    beta9_section, found_beta8_heading, _ = beta9_and_history.partition(beta8_heading)
-    readme_words = " ".join(readme.split())
-    beta9_changelog_words = " ".join(beta9_section.split())
+    _, found_beta10_heading, beta10_and_history = changelog.partition(beta10_heading)
+    beta10_section, found_beta9_heading, _ = beta10_and_history.partition(beta9_heading)
+    readme_words = " ".join(readme.replace("> ", "").split())
+    beta10_changelog_words = " ".join(beta10_section.split())
     roadmap_words = " ".join(roadmap.split())
     release_surfaces = (
-        readme_words.replace("> ", "").casefold(),
-        beta9_changelog_words.casefold(),
+        readme_words.casefold(),
+        beta10_changelog_words.casefold(),
     )
 
-    assert "v0.1.0-beta.9" in readme
+    assert readme.splitlines()[2].startswith(
+        "> **Experimental beta (`v0.1.0-beta.10`).**"
+    )
     assert "TO_BE_BOUND" not in readme
     assert "packages project version `0.1.0`" in readme_words
     assert "Protocol 2.1 remains the new-run default" in readme_words
+    assert "Protocol 2.2 remains opt-in and experimental" in readme_words
+    assert "No PyPI distribution is published" in readme_words
+    assert (
+        "No performance, benchmark, legal-correctness, or report-quality claim is made"
+        in readme_words
+    )
+    assert (
+        "Subsequent successful verification is not evidence that the underlying issue "
+        "has been repaired"
+        in readme_words
+    )
+    assert found_beta10_heading == beta10_heading
     assert found_beta9_heading == beta9_heading
-    assert found_beta8_heading == beta8_heading
     for release_surface in release_surfaces:
-        assert "protocol 2.2 remains opt-in and experimental" in release_surface
-        assert "stable evaluation baseline" in release_surface
-        assert "delivery-readiness companion" in release_surface
-        assert "report-blind" in release_surface
-        assert "high_assurance" in release_surface
-        assert "review_ready_with_gaps" in release_surface
-        assert "not_deliverable" in release_surface
-        assert "public synthetic validation" in release_surface
-        assert "no private matter rollout validation was performed" in release_surface
-        assert (
-            "no performance, benchmark, legal-correctness, or report-quality claim is made"
-            in release_surface
-        )
-        assert "no pypi distribution is published" in release_surface
+        assert "delivery-readiness" in release_surface
+        assert "ordinary omissions" in release_surface
+        assert "integrity" in release_surface
+        assert "beta.9 tag or artifact" in release_surface
+        assert "saved-run verification refusal remains" in release_surface
+        assert "attorney" in release_surface
     assert "LLM supplies substantive judgments" in roadmap_words
     assert "deterministic code constructs canonical artifacts" in roadmap_words
 

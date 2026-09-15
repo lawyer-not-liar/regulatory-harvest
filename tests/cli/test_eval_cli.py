@@ -2,6 +2,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -87,14 +88,32 @@ _LEGACY_FULL_EVAL_HELP_SHA256 = {
     "eval-gen-verify": "e5060d62065fe30150b275ccf488efb89775930bdb85b202c670b6f8449160f0",
 }
 
+# Python 3.13 changed argparse usage wrapping to keep option/value pairs together.
+# Preserve exact historical output for each supported formatter, not one runtime's
+# incidental wrapping on every Python version.
+_LEGACY_FULL_EVAL_HELP_SHA256_PRE_313 = {
+    **_LEGACY_FULL_EVAL_HELP_SHA256,
+    "eval-baseline-submit-safe": "d079cfed5e2f49c56497857e7313212ea81255f19c1366d128ac0c794a6029b0",
+    "eval-stop-inconclusive": "cd95e7e10d1b83f5d91a8171ead9c6ec3a41d4e3f167cf674b9eb7fb461f0e09",
+    "eval-resume": "87aed0be741959becae0476ae7cf6cbc820dd3091054864997a19a81834c9612",
+    "eval-qualify-init": "8cbdb4ff2b8db09d2b065912201093ccffc0109f370377a1c81b47e56e525367",
+    "eval-gen-init": "0c1ecf36c4fe446395d7965b162ba4f6a9cca7a99155f55e3e9683933bbfca61",
+}
+
 
 def test_legacy_full_evaluation_help_and_default_protocol_are_byte_stable() -> None:
-    for command, expected in _LEGACY_FULL_EVAL_HELP_SHA256.items():
+    expected_hashes = (
+        _LEGACY_FULL_EVAL_HELP_SHA256_PRE_313
+        if sys.version_info < (3, 13)
+        else _LEGACY_FULL_EVAL_HELP_SHA256
+    )
+    for command, expected in expected_hashes.items():
         result = subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "attorney_eval_full.py"), command, "--help"],
             cwd=ROOT,
             check=False,
             capture_output=True,
+            env={**os.environ, "COLUMNS": "80", "NO_COLOR": "1", "PYTHON_COLORS": "0"},
         )
         assert (result.returncode, result.stderr) == (0, b"")
         assert hashlib.sha256(result.stdout).hexdigest() == expected
@@ -1985,7 +2004,10 @@ def test_protocol_22_committed_stable_fixture_runs_full_and_portable_exactly(
     tmp_path: Path,
 ) -> None:
     """Committed drafts directly cover the fragmented terminal lifecycle."""
-    fixture = ATTORNEY_V22_FIXTURE / "stable"
+    # Secure readers intentionally reject hardlinks; checkout/snapshot tools may
+    # hardlink tracked fixtures. Exercise unchanged bytes in a private copy.
+    fixture = tmp_path / "stable-fixture"
+    shutil.copytree(ATTORNEY_V22_FIXTURE / "stable", fixture)
     fixture_before = _run_snapshot(fixture)
     outcomes = []
     for name, runner, portable in (
@@ -2017,7 +2039,8 @@ def test_protocol_22_committed_pause_resume_fixture_is_write_free_then_terminal(
     tmp_path: Path,
 ) -> None:
     """Two invalid committed drafts pause unchanged before a later exact resume."""
-    fixture = ATTORNEY_V22_FIXTURE / "pause-resume"
+    fixture = tmp_path / "pause-resume-fixture"
+    shutil.copytree(ATTORNEY_V22_FIXTURE / "pause-resume", fixture)
     fixture_before = _run_snapshot(fixture)
     outcomes = []
     for name, runner, portable in (

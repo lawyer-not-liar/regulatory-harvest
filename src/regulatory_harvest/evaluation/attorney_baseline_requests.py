@@ -27,7 +27,12 @@ from .attorney_v22_compiler import RUBRIC_V22
 _MAX_FRAGMENT_ITEMS = 5
 _MAX_FRAGMENTS = 128
 _MAX_COMPILED_ITEMS = 640
-_POLICY_PATH = Path(__file__).resolve().parents[3] / "assets" / "evaluation-baseline-policy-v1.json"
+_POLICY_PATH = Path(__file__).with_name("evaluation-baseline-policy-v1.json")
+if not _POLICY_PATH.is_file():
+    # Source checkouts and the universal skill retain the canonical asset layout.
+    _POLICY_PATH = (
+        Path(__file__).resolve().parents[3] / "assets" / "evaluation-baseline-policy-v1.json"
+    )
 _IMPORTANCE_POLICY_BYTES = _POLICY_PATH.read_bytes()
 _IMPORTANCE_POLICY_FINGERPRINT = sha256_digest(_IMPORTANCE_POLICY_BYTES)
 _EVALUATION_RUBRIC_BYTES = canonical_json_bytes(RUBRIC_V22.model_dump(mode="json"))

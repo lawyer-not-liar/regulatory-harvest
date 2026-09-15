@@ -108,6 +108,7 @@ def _write_qualification(
     *,
     language: str = "en",
     limitations: str | None = _DECLARED_LIMITATION,
+    omitted_response_metadata: tuple[str, ...] = (),
 ) -> BaselineInputV1:
     seed = _baseline_input()
     source_payloads = [source.model_dump(mode="json") for source in seed.sources]
@@ -165,16 +166,19 @@ def _write_qualification(
         checks=checks,
         issues=[],
     )
+    response = JudgeResponse(
+        operation=JudgeOperation.ADMIT_CASE,
+        request_fingerprint=request.request_fingerprint,
+        provider_name="private-fixture-provider",
+        model_name="private-fixture-model",
+        judge_isolation=JudgeIsolation.FRESH_CONTEXT,
+        payload=judgment.model_dump(mode="json"),
+    )
     submit_case_qualification(
         run_dir,
-        JudgeResponse(
-            operation=JudgeOperation.ADMIT_CASE,
-            request_fingerprint=request.request_fingerprint,
-            provider_name="private-fixture-provider",
-            model_name="private-fixture-model",
-            judge_isolation=JudgeIsolation.FRESH_CONTEXT,
-            payload=judgment.model_dump(mode="json"),
-        ),
+        response.model_dump(mode="json", exclude=set(omitted_response_metadata))
+        if omitted_response_metadata
+        else response,
     )
     qualification = load_verified_qualification_context(run_dir)
     assert qualification.receipt.readiness.status.value == "ADMITTED", (
@@ -676,12 +680,14 @@ def _make_verified_inputs(
     *,
     language: str = "en",
     limitations: str | None = _DECLARED_LIMITATION,
+    omitted_response_metadata: tuple[str, ...] = (),
 ) -> VerifiedInputsFixture:
     qualification_run = root / "qualification-run"
     baseline_input = _write_qualification(
         qualification_run,
         language=language,
         limitations=limitations,
+        omitted_response_metadata=omitted_response_metadata,
     )
     original = baseline_artifact_tests._baseline_input
     baseline_artifact_tests._baseline_input = lambda: baseline_input
@@ -707,6 +713,86 @@ def _make_verified_inputs(
 @pytest.fixture
 def verified_inputs(tmp_path: Path) -> VerifiedInputsFixture:
     return _make_verified_inputs(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "omitted_metadata", [(), ("response_id",), ("usage",), ("response_id", "usage")]
+)
+@pytest.mark.parametrize("external", [False, True])
+def test_readiness_accepts_verified_qualification_optional_metadata_without_rewriting(
+    tmp_path: Path, omitted_metadata: tuple[str, ...], external: bool
+) -> None:
+    fixture = _make_verified_inputs(tmp_path, omitted_response_metadata=omitted_metadata)
+    before = _tree(fixture.qualification_run_dir)
+    response = json.loads(before["admission-response.json"])
+    assert set(response) == {
+        "schema_version", "operation", "request_fingerprint", "provider_name",
+        "model_name", "judge_isolation", "payload", "response_id", "usage",
+    } - set(omitted_metadata)
+    if "response_id" not in omitted_metadata:
+        assert response["response_id"] is None
+    if "usage" not in omitted_metadata:
+        assert response["usage"] == {}
+    original = load_verified_qualification_context(fixture.qualification_run_dir)
+    if external:
+        report = tmp_path / "external.md"
+        report.write_bytes(fixture.report_text.encode("utf-8"))
+        admitted = build_verified_readiness_input_v1(
+            baseline_run_dir=fixture.baseline_run_dir,
+            qualification_run_dir=fixture.qualification_run_dir,
+            external_report_path=report,
+        )
+    else:
+        admitted = build_verified_readiness_input_v1(**fixture.without_history())
+    assert admitted.qualification_binding.qualification_root == original.manifest.root_hash
+    assert (
+        admitted.qualification_binding.qualification_receipt_fingerprint
+        == original.receipt.receipt_fingerprint
+    )
+    assert _tree(fixture.qualification_run_dir) == before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "unknown", "usage-bool", "usage-string", "response-id", "trimmed-provider",
+        "changed-request", "missing-schema_version", "missing-operation",
+        "missing-request_fingerprint", "missing-provider_name", "missing-model_name",
+        "missing-judge_isolation", "missing-payload",
+    ],
+)
+def test_qualification_optional_defaults_do_not_relax_exact_envelope_validation(
+    verified_inputs: VerifiedInputsFixture, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    context = load_verified_qualification_context(verified_inputs.qualification_run_dir)
+    response = json.loads(context.artifact_bytes["admission-response.json"])
+    del response["response_id"]
+    del response["usage"]
+    if mutation.startswith("missing-"):
+        del response[mutation.removeprefix("missing-")]
+    elif mutation == "unknown":
+        response["unknown"] = "extra"
+    elif mutation == "usage-bool":
+        response["usage"] = {"tokens": True}
+    elif mutation == "usage-string":
+        response["usage"] = {"tokens": "1"}
+    elif mutation == "response-id":
+        response["response_id"] = 7
+    elif mutation == "trimmed-provider":
+        response["provider_name"] = " private-fixture-provider "
+    else:
+        response["request_fingerprint"] = "0" * 64
+    artifacts = dict(context.artifact_bytes)
+    artifacts["admission-response.json"] = canonical_json_bytes(response)
+    monkeypatch.setattr(
+        inputs_module,
+        "load_verified_qualification_context",
+        lambda _: replace(context, artifact_bytes=artifacts),
+    )
+    before = _tree(verified_inputs.qualification_run_dir)
+    with pytest.raises(ReadinessInputError, match="READINESS_QUALIFICATION_INVALID"):
+        build_verified_readiness_input_v1(**verified_inputs.without_history())
+    assert _tree(verified_inputs.qualification_run_dir) == before
 
 
 def _historical_context(

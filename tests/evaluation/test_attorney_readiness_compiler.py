@@ -39,6 +39,7 @@ from regulatory_harvest.evaluation.attorney_readiness_models import (
     BaselineLockedGradeFragmentV1,
     BaselineLockedGraderAggregateV1,
     BaselineLockedStrictEquivalentV1,
+    ExternalReportBindingV1,
     GapFollowUpMatrixV1,
     GapFollowUpRowV1,
     HistoricalV22CrossCheckV1,
@@ -917,6 +918,37 @@ def test_exact_ninety_percent_and_full_critical_recall_are_required_for_high_ass
     _, _, gap_matrix, _, high = _compile(exact, all_met)
     assert gap_matrix.rows == ()
     assert high.delivery_readiness == "HIGH_ASSURANCE"
+
+
+def test_external_report_cannot_claim_high_assurance_without_generation_validation(
+    inputs: VerifiedReadinessInputsV1,
+) -> None:
+    exact = _clean_qualification(_with_requirements(inputs, count=10, importance="supporting"))
+    wire = exact.readiness_input.model_dump(mode="json")
+    wire.update(
+        gradeable_baseline=exact.gradeable_baseline,
+        generation_capsule_root=None,
+        generation_validation=None,
+        external_report_binding=ExternalReportBindingV1(
+            origin="external",
+            report_hash=exact.report_hash,
+            grade_target_fingerprint=exact.readiness_input.grade_target_fingerprint,
+            generation_validation_status="not_performed",
+        ),
+    )
+    external = replace(
+        exact,
+        readiness_input=ReadinessInputV1.model_validate(wire),
+        generation_binding=None,
+        generation_validation=None,
+    )
+    lanes = _lanes(external, ("met",) * 10)
+    strict, _, _, _, result = _compile(external, lanes)
+    assert strict.absolute_disposition == "PASS"
+    assert result.delivery_readiness == "REVIEW_READY_WITH_GAPS"
+    assert result.blocking_codes == ()
+    assert "generation validation was not performed" in result.attorney_review_warning
+    assert "not a report-quality finding" in result.attorney_review_warning
 
 
 def test_critical_recall_below_one_blocks_high_assurance_even_above_ninety_percent(

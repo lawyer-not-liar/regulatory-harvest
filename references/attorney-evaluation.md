@@ -97,16 +97,103 @@ This protocol is experimental and always requires qualified-attorney review.
 ## Experimental delivery-readiness controller
 
 When explicitly requested, initialize `delivery-readiness-v1` as a separate sibling
-graph from a verified baseline, qualification capsule, generation capsule, and
-completed deterministic validation receipt. Protocol 2.1 remains the default. Do not
+graph from a verified baseline and qualification capsule, with either a generation
+capsule plus completed deterministic validation receipt, or an explicitly external
+report. Protocol 2.1 remains the default. Do not
 infer a readiness companion for a retained run, change a default, or treat the result
 as authorization for unreviewed client delivery.
+
+Use `eval-readiness-init --external-report REPORT.md` with `--baseline-run`,
+`--qualification-run`, and `--run` to preserve an existing report's exact UTF-8 bytes.
+Do not combine `--external-report` with `--generation-run` or
+`--validation-receipt`; the generated route requires both latter options together.
+External admission records the report hash, verified grade-target fingerprint, and
+explicit `not_performed` generation-validation status. It never fabricates a
+generation capsule or successful validation receipt. Verification uses
+`external_report_valid`, not `generation_valid`, for this branch.
+
+External reports undergo the same independent grading, safety review, and immutable
+replay. They remain eligible for `NOT_DELIVERABLE` or `REVIEW_READY_WITH_GAPS`;
+`HIGH_ASSURANCE` still requires deterministic generation validation. The result's
+warning identifies this evidence cap separately from any substantive report defect.
+Previously collected human reviews remain applicable only to the same report bytes;
+never require a second review merely to admit those unchanged bytes. This external
+route does not retroactively claim support in previously published builds.
 
 Run two fresh baseline-locked grading lanes against the exact verified projection,
 then two fresh safety lanes. Start one fresh dispute-scoped referee for each safety
 disagreement. Each role and mechanical repair uses a genuinely fresh context. A
 second mechanical refusal is write-free, leaves the exact request pending, and causes
 the live driver to return exit `6`; it is not a substantive nondelivery result.
+
+Newly admitted readiness runs select `readiness-safety-response-v3` in their sealed
+input. Safety and whole-assessment referee requests include the exact
+`safety_response_contract` and its fingerprint. The target is a useful starting point
+for qualified-attorney review of the requested question, not a finished legal opinion
+or a compliance certification. V2 preserves scoring thresholds, the locked baseline,
+and hard accuracy blockers; it changes scoped-prerequisite treatment and reconciliation.
+V3 retains that scope policy and separates observed report disclosure from the
+prominent attorney-review package described below.
+
+Each candidate assessment explicitly uses `scope_status: open_gap` or
+`not_required_for_scope`. Only prerequisites may use the latter, with no blocker and
+evidence-bound reasons explaining why the requested answer does not depend on them.
+For example, missing client facts do not inherently prevent a general regulatory
+briefing, but can prevent a client-specific applicability conclusion. A language
+treatment record is not itself proof of an unresolved translation problem. Do not
+invent a defect to fill an issued candidate. Scope clearance cannot excuse baseline
+omissions, contested requirements, unsupported assertions, or misleading statements.
+
+Resolve every disputed assessment as a whole, including finding existence, from the
+two original choices. The referee receives the question and complete report as context.
+Do not combine one lane's rationale with another's blocker or follow-up. An unresolved
+decision remains fail-closed and reflects unresolved evaluation, not a proven report
+defect. The V2 compiler descriptor separately binds this policy; V1 remains frozen.
+
+Under V3, `visibility` and `disclosure_location` describe the original report,
+not the wrapper that will accompany it. Report an absent disclosure truthfully as
+hidden; do not invent a passage or claim prominence merely to satisfy a format rule.
+Every supplied passage must still bind exactly, and every supplied disclosure
+location must occur in the report. Reviewing-attorney ownership and evidence-bound
+reasons remain required for critical issues. A scope-cleared prerequisite's matrix status is
+`not_required_for_scope`, not resolved, and any follow-up is conditional on expanding
+scope rather than mandatory repair for this briefing.
+
+V3 passage inventories omit ambiguous repeated fragments rather than reject an
+otherwise admissible report. They retain occurrence-unique lines and the exact
+full report as a fallback. Quotations are never normalized; only an allowlisted,
+byte-exact full-report quotation may retain its original boundary whitespace.
+Legacy request inventories remain unchanged.
+
+V3 results bind `review_package_policy: prominent-attorney-issues-v1`. A deliverable
+handoff places every open issue before the unchanged report, explaining what is
+missing, why it matters, its evidence references, owner, and concrete resolution
+test. Original-report observations remain visible separately. An ordinary omission
+may be nonblocking when this complete review package makes it safely reviewable;
+absence of disclosure in the original body alone does not force suppression.
+This is not a declaration that the omission is repaired or the report complete.
+Do not distribute the raw report as though the review wrapper were optional.
+
+All explicit evaluator blockers remain blocking. Substantive unsupported-assertion,
+baseline-contradiction, misleading-authority/currentness, and undisclosed-dispositive-
+fact findings remain blocking even when an evaluator omits the blocker code.
+Coverage floors, misleading completeness claims, unresolved outcome-determinative
+contests, evidence integrity, and actionable follow-up checks are unchanged.
+Accepted prose is not proof of correctness. Never edit a refused draft into acceptance.
+
+Historical V1 and V2 inputs and inputs without this selector retain their exact request bytes.
+Replay and subsequent requests use the recorded selector, not the installed build's
+default. Unknown selectors, altered contracts, and contract/instruction mismatches
+are refused. Never insert a selector into an initialized graph or treat an exhausted
+request as eligible for a third attempt.
+
+A separately identified successor run may reuse a verified baseline and
+already accepted grading responses only when each successor grading request matches
+the original request byte for byte. Submit the retained canonical response unchanged
+through the guarded submission boundary, preserving original provenance and recording
+the reuse explicitly; it is not a fresh grading execution. Keep all unfavorable
+grades and strict-equivalent results. The changed safety request gets fresh isolated
+roles and the same bounded repair allowance; no refused draft enters those roles.
 
 Keep the baseline-locked strict-equivalent disposition separate from both the optional
 historical Protocol 2.2 cross-check and delivery readiness. A fresh `FAIL` remains
@@ -116,9 +203,10 @@ gates pass. Exit `0` then means ready for qualified-attorney review, not legal
 correctness. Verified `NOT_DELIVERABLE` returns exit `4` and suppresses the report as
 attorney work product; integrity failure returns exit `5`.
 
-Render every row under `What is missing`, `Why it matters`, `How to resolve it`, and
-`Owner`. Never invent rationale from a score or code. A visible actionable gap is not
-itself a blocker. Hidden material limitations, unsupported assertions, misleading
+Render open gaps under `What is missing`, `Why it matters`, `How to resolve it`, and
+`Owner`. Present scope-cleared prerequisites as scope decisions and conditional checks,
+not missing work or resolved gaps. Never invent rationale from a score or code. A visible actionable gap is not
+itself a blocker. Material limitations hidden from the review package, unsupported assertions, misleading
 contradictions, unbound dispositive facts, or generic and evidence-unbound rationales
 remain blocking.
 

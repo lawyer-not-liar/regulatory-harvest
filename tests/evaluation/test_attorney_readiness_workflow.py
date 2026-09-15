@@ -416,7 +416,16 @@ async def test_exact_operation_order_fresh_contexts_and_terminal_replay(
         assert "provider_name" not in payload
         assert "model_name" not in payload
         if prompt.request.operation is ReadinessOperationV1.SAFETY_REVIEW:
-            assert "finding_proposals" not in payload
+            from regulatory_harvest.evaluation.attorney_readiness_response_contract import (
+                build_readiness_safety_response_contract_v3,
+            )
+
+            evidence_payload = prompt.request.model_dump(mode="json")["payload"]
+            # The public format descriptor names output fields, not another lane's findings.
+            assert evidence_payload.pop("safety_response_contract") == (
+                build_readiness_safety_response_contract_v3()
+            )
+            assert "finding_proposals" not in repr(evidence_payload).lower()
     assert all(prompt.attempt == 1 for prompt in evaluator.prompts)
     assert len(evaluator.tokens) == len(set(evaluator.tokens)) == len(evaluator.prompts)
     accepted = load_verified_readiness_context_v1(run_dir).manifest.accepted_calls

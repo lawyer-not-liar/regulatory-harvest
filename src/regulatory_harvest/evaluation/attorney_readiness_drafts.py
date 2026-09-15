@@ -35,7 +35,9 @@ from .attorney_readiness_models import (
     BaselineLockedContestedGradeV1,
     BaselineLockedGradeFragmentV1,
     BaselineLockedGraderAggregateV1,
+    ExternalReportBindingV1,
     FollowUpCodeV1,
+    GapOriginV1,
     GapVisibilityV1,
     GenerationValidationBindingV1,
     OwnerRoleV1,
@@ -51,6 +53,22 @@ from .attorney_readiness_models import (
     SafetyRefereeDecisionV1,
     _FrozenDict,
     load_readiness_rubric_v1,
+    validate_whole_assessment_choices,
+)
+from .attorney_readiness_response_contract import (
+    CONSEQUENCES as _CONSEQUENCES,
+)
+from .attorney_readiness_response_contract import (
+    RESOLUTION_ACTIONS as _RESOLUTION_ACTIONS,
+)
+from .attorney_readiness_response_contract import (
+    RESOLUTION_OUTCOMES as _RESOLUTION_OUTCOMES,
+)
+from .attorney_readiness_response_contract import (
+    SPECIFICITY_TERMS as _SPECIFICITY_TERMS,
+)
+from .attorney_readiness_response_contract import (
+    readiness_safety_response_contract,
 )
 from .attorney_v2_models import RequirementGradeV2
 
@@ -68,57 +86,6 @@ _EVIDENCE_TOKEN_RE = re.compile(
 _PRIVATE_PATH_RE = re.compile(
     r"(?i)(?:file:/|[A-Z]:[\\/]|\\\\|/(?:Applications|Library|System|Users|Volumes|"
     r"etc|home|opt|private|root|tmp|usr|var)(?:/|$))"
-)
-_CONSEQUENCES = (
-    "legal conclusion",
-    "applicability",
-    "implementation decision",
-    "deadline",
-    "enforcement exposure",
-    "attorney follow up",
-)
-_RESOLUTION_OUTCOMES = (
-    "evidence",
-    "fact",
-    "legal judgment",
-    "report correction",
-    "correct the report",
-)
-_RESOLUTION_ACTIONS = (
-    "verify",
-    "obtain",
-    "confirm",
-    "correct",
-    "revise",
-    "establish",
-    "resolve",
-    "document",
-)
-_SPECIFICITY_TERMS = frozenset(
-    {
-        "report",
-        "treatment",
-        "evidence",
-        "source",
-        "fact",
-        "conflict",
-        "ambiguity",
-        "ambiguous",
-        "currentness",
-        "language",
-        "missing",
-        "omission",
-        "assertion",
-        "limitation",
-        "interpretation",
-        "authority",
-        "requirement",
-        "gap",
-        "dependency",
-        "support",
-        "establish",
-        "disclose",
-    }
 )
 _REPORT_CONTENT_FINDINGS = frozenset(
     {
@@ -338,6 +305,7 @@ class _ContestedGradeDraftV1(_DraftModel):
 
 
 class _SafetyGapAssessmentDraftV1(_DraftModel):
+    scope_status: Literal["open_gap", "not_required_for_scope"] | None = None
     candidate_id: str
     shortfall_description: str
     rationale_kind: Literal[
@@ -659,7 +627,22 @@ def _request_allowlist(payload: dict[str, object]) -> tuple[str, ...]:
         or any(type(item) is not str for item in cast(list[object], values))
     ):
         raise _ControllerInvariant("request report-passage inventory is invalid")
-    expected = request_builders._report_passage_allowlist(report)
+    if "controller_safety_lane_id" in payload:
+        expected = request_builders._report_passage_allowlist(
+            report, unique_only=_review_package_payload(payload)
+        )
+        if cast(list[str], values) != expected:
+            raise _ControllerInvariant("request report-passage inventory is invalid")
+        return tuple(expected)
+    # Grade packets intentionally have no safety selector. Accept only either exact
+    # canonical inventory; guarded replay still binds the persisted run selector.
+    try:
+        legacy = request_builders._report_passage_allowlist(report)
+    except ValueError:
+        legacy = None
+    if cast(list[str], values) == legacy:
+        return tuple(cast(list[str], values))
+    expected = request_builders._report_passage_allowlist(report, unique_only=True)
     if cast(list[str], values) != expected:
         raise _ControllerInvariant("request report-passage inventory is invalid")
     return tuple(expected)
@@ -743,8 +726,18 @@ def _expected_schema_and_instruction(
         if candidate_ids != tuple(f"GC-{index:04d}" for index in range(1, len(candidate_ids) + 1)):
             raise _ControllerInvariant("safety candidate inventory is invalid")
         return (
-            request_builders._safety_response_schema(candidates, refs, allowlist),
-            request_builders._SAFETY_SYSTEM,
+            request_builders._safety_response_schema(
+                candidates, refs, allowlist, scoped_review=_scoped_review_payload(payload)
+            ),
+            (
+                request_builders._REVIEW_PACKAGE_SAFETY_SYSTEM
+                if _review_package_payload(payload)
+                else request_builders._SCOPED_SAFETY_SYSTEM
+                if _scoped_review_payload(payload)
+                else request_builders._SAFETY_CONTRACT_SYSTEM
+                if "safety_response_contract" in payload
+                else request_builders._SAFETY_SYSTEM
+            ),
         )
     refs_raw = payload.get("evidence_refs")
     if type(refs_raw) is not list or any(
@@ -760,7 +753,13 @@ def _expected_schema_and_instruction(
         raise _ControllerInvariant("referee dispute identity is invalid")
     return (
         request_builders._referee_response_schema(dispute_id, refs),
-        request_builders._referee_system(dispute_kind),
+        (
+            request_builders._review_package_referee_system()
+            if _review_package_payload(payload)
+            else request_builders._scoped_referee_system()
+            if _scoped_review_payload(payload)
+            else request_builders._referee_system(dispute_kind)
+        ),
     )
 
 
@@ -1209,11 +1208,61 @@ def _validate_generation_validation(value: object, *, report_hash: str) -> None:
         raise _ControllerInvariant("request generation validation is invalid")
 
 
+def _validate_report_origin(payload: dict[str, object], *, report_hash: str) -> None:
+    if "external_report_binding" not in payload:
+        _validate_generation_validation(
+            payload.get("generation_validation"), report_hash=report_hash
+        )
+        return
+    raw = payload["external_report_binding"]
+    try:
+        external = ExternalReportBindingV1.model_validate(raw)
+        if (
+            type(raw) is not dict
+            or canonical_json_bytes(external.model_dump(mode="json")) != canonical_json_bytes(raw)
+            or payload.get("generation_validation") is not None
+            or external.report_hash != report_hash
+            or external.grade_target_fingerprint != payload.get("grade_target_fingerprint")
+        ):
+            raise ValueError
+    except (TypeError, ValidationError, ValueError) as error:
+        raise _ControllerInvariant("request external report binding is invalid") from error
+
+
 def _validate_common_request_bindings(
     operation: ReadinessOperationV1,
     payload: dict[str, object],
 ) -> None:
     if operation is ReadinessOperationV1.SAFETY_REFEREE:
+        if _scoped_review_payload(payload):
+            report = payload.get("report_text")
+            question = payload.get("research_question")
+            if (
+                payload.get("dispute_kind") != "assessment"
+                or type(report) is not str
+                or sha256_digest(report.encode("utf-8")) != payload.get("report_hash")
+                or type(question) is not str
+                or not question.strip()
+            ):
+                raise _ControllerInvariant("scoped referee context is invalid")
+            try:
+                validate_whole_assessment_choices(
+                    cast(str, payload["subject_identity"]),
+                    cast(dict[str, object] | None, payload["lane_1_choice"]),
+                    cast(dict[str, object] | None, payload["lane_2_choice"]),
+                    tuple(cast(list[str], payload["evidence_refs"])),
+                    tuple(cast(list[str], payload["disputed_report_passages"])),
+                )
+                if not set(cast(list[str], payload["disputed_report_passages"])).issubset(
+                    request_builders._report_passage_allowlist(
+                        report, unique_only=_review_package_payload(payload)
+                    )
+                ):
+                    raise ValueError("referee report passages are invalid")
+            except (KeyError, TypeError, ValueError) as error:
+                raise _ControllerInvariant("scoped referee choices are invalid") from error
+        elif payload.get("dispute_kind") == "assessment":
+            raise _ControllerInvariant("whole-assessment dispute requires scoped review")
         for field in (
             "grade_target_fingerprint",
             "baseline_fingerprint",
@@ -1222,8 +1271,8 @@ def _validate_common_request_bindings(
             value = payload.get(field)
             if type(value) is not str or _HASH_RE.fullmatch(value) is None:
                 raise _ControllerInvariant("referee request binding is invalid")
-        _validate_generation_validation(
-            payload.get("generation_validation"),
+        _validate_report_origin(
+            payload,
             report_hash=cast(str, payload["report_hash"]),
         )
         dispute_id = payload.get("dispute_id")
@@ -1247,8 +1296,8 @@ def _validate_common_request_bindings(
         or type(cast(dict[str, object], baseline_raw).get("binding")) is not dict
     ):
         raise _ControllerInvariant("request report or baseline binding is invalid")
-    _validate_generation_validation(
-        payload.get("generation_validation"),
+    _validate_report_origin(
+        payload,
         report_hash=report_hash,
     )
     baseline = _verified_baseline(payload)
@@ -1394,6 +1443,19 @@ def _validate_common_request_bindings(
         raise _ControllerInvariant("safety candidate inventory is invalid")
 
 
+def _scoped_review_payload(payload: dict[str, object]) -> bool:
+    contract = payload.get("safety_response_contract")
+    return type(contract) is dict and contract.get("version") in {
+        "readiness-safety-response-v2",
+        "readiness-safety-response-v3",
+    }
+
+
+def _review_package_payload(payload: dict[str, object]) -> bool:
+    contract = payload.get("safety_response_contract")
+    return type(contract) is dict and contract.get("version") == "readiness-safety-response-v3"
+
+
 def _strict_request(request: object) -> _CheckedRequest:
     if type(request) is not ReadinessEvaluatorRequestV1:
         raise _ControllerInvariant("request type is invalid")
@@ -1410,9 +1472,37 @@ def _strict_request(request: object) -> _CheckedRequest:
     if fingerprint != sha256_digest(canonical_json_bytes(descriptor)):
         raise _ControllerInvariant("request fingerprint is invalid")
     payload = raw.get("payload")
-    if type(payload) is not dict or set(cast(dict[str, object], payload)) != _exact_payload_keys(
-        checked.operation
+    expected_keys = _exact_payload_keys(checked.operation)
+    if type(payload) is dict and "external_report_binding" in payload:
+        expected_keys = expected_keys | {"external_report_binding"}
+    if type(payload) is dict and (
+        "safety_response_contract" in payload or "safety_response_contract_fingerprint" in payload
     ):
+        if checked.operation is not ReadinessOperationV1.SAFETY_REVIEW and not (
+            checked.operation is ReadinessOperationV1.SAFETY_REFEREE
+            and _scoped_review_payload(payload)
+        ):
+            raise _ControllerInvariant("safety response contract operation is invalid")
+        raw_contract = payload.get("safety_response_contract")
+        try:
+            safety_contract = readiness_safety_response_contract(
+                raw_contract.get("version") if type(raw_contract) is dict else None
+            )
+        except ValueError as error:
+            raise _ControllerInvariant("safety response contract is invalid") from error
+        if canonical_json_bytes(payload.get("safety_response_contract")) != canonical_json_bytes(
+            safety_contract
+        ) or payload.get("safety_response_contract_fingerprint") != sha256_digest(
+            canonical_json_bytes(safety_contract)
+        ):
+            raise _ControllerInvariant("safety response contract is invalid")
+        expected_keys = expected_keys | {
+            "safety_response_contract",
+            "safety_response_contract_fingerprint",
+        }
+        if checked.operation is ReadinessOperationV1.SAFETY_REFEREE:
+            expected_keys = expected_keys | {"research_question", "report_text"}
+    if type(payload) is not dict or set(cast(dict[str, object], payload)) != expected_keys:
         raise _ControllerInvariant("request payload is invalid")
     expected_schema, expected_instruction = _expected_schema_and_instruction(
         checked.operation, cast(dict[str, object], payload)
@@ -1423,7 +1513,13 @@ def _strict_request(request: object) -> _CheckedRequest:
         or raw.get("system_instructions") != expected_instruction
     ):
         raise _ControllerInvariant("request compiler contract is invalid")
-    contract = request_builders.READINESS_COMPILER_CONTRACT_V1
+    contract = (
+        request_builders.READINESS_COMPILER_CONTRACT_V3
+        if _review_package_payload(payload)
+        else request_builders.READINESS_COMPILER_CONTRACT_V2
+        if _scoped_review_payload(payload)
+        else request_builders.READINESS_COMPILER_CONTRACT_V1
+    )
     key = _schema_key(checked.operation, raw)
     response_contracts = contract["response_contracts"]
     instructions = contract["instructions"]
@@ -1558,6 +1654,7 @@ def _deduplicate_strings(
     *,
     allowed: tuple[str, ...],
     missing_reason: ReadinessDraftReasonCodeV1,
+    exact_full_report: str | None = None,
 ) -> tuple[tuple[str, ...], bool]:
     result: list[str] = []
     for value in values:
@@ -1565,7 +1662,7 @@ def _deduplicate_strings(
             raise _Clarification(ReadinessDraftReasonCodeV1.DRAFT_INVALID)
         if value not in allowed:
             raise _Clarification(missing_reason)
-        if value != value.strip():
+        if value != value.strip() and value != exact_full_report:
             raise _Clarification(ReadinessDraftReasonCodeV1.DRAFT_INVALID)
         if value not in result:
             result.append(value)
@@ -1685,6 +1782,7 @@ def _compile_ordinary(
             grade.report_passages,
             allowed=allowlist,
             missing_reason=ReadinessDraftReasonCodeV1.EVIDENCE_NOT_FOUND,
+            exact_full_report=cast(str, payload["report_text"]),
         )
         normalized = normalized or removed
         rationale = _exact_prose(grade.rationale)
@@ -1744,11 +1842,13 @@ def _compile_contested(
         draft.reviewer_report_passages,
         allowed=allowlist,
         missing_reason=ReadinessDraftReasonCodeV1.EVIDENCE_NOT_FOUND,
+        exact_full_report=cast(str, payload["report_text"]),
     )
     auditor, auditor_removed = _deduplicate_strings(
         draft.auditor_report_passages,
         allowed=allowlist,
         missing_reason=ReadinessDraftReasonCodeV1.EVIDENCE_NOT_FOUND,
+        exact_full_report=cast(str, payload["report_text"]),
     )
     values = {
         "protocol_version": "delivery-readiness-v1",
@@ -1831,12 +1931,25 @@ def _compile_assessment(
     *,
     all_refs: tuple[str, ...],
     allowlist: tuple[str, ...],
+    scoped_review: bool = False,
+    review_package: bool = False,
+    exact_full_report: str | None = None,
 ) -> tuple[SafetyGapAssessmentV1, bool]:
+    if not scoped_review and "scope_status" in item.model_fields_set:
+        raise _Clarification(ReadinessDraftReasonCodeV1.DRAFT_INVALID)
+    if scoped_review != (item.scope_status is not None):
+        raise _Clarification(ReadinessDraftReasonCodeV1.COVERAGE_INVALID)
+    scope_cleared = item.scope_status == "not_required_for_scope"
+    if scope_cleared and (
+        candidate.origin is not GapOriginV1.PREREQUISITE or item.blocking_code is not None
+    ):
+        raise _Clarification(ReadinessDraftReasonCodeV1.COVERAGE_INVALID)
     refs, ref_removed = _deduplicate_evidence(item.evidence_refs, allowed=all_refs)
     passages, passage_removed = _deduplicate_strings(
         item.report_passages,
         allowed=allowlist,
         missing_reason=ReadinessDraftReasonCodeV1.EVIDENCE_NOT_FOUND,
+        exact_full_report=exact_full_report,
     )
     rationale_kind = RationaleKindV1(item.rationale_kind)
     mentioned_refs = _validate_rationale(
@@ -1857,7 +1970,11 @@ def _compile_assessment(
     if not set(refs).intersection(candidate.evidence_refs):
         raise _Clarification(ReadinessDraftReasonCodeV1.RATIONALE_EVIDENCE_UNBOUND)
     if candidate.importance is BaselineImportanceV1.CRITICAL:
-        if item.visibility != GapVisibilityV1.PROMINENT.value:
+        if (
+            not scope_cleared
+            and not review_package
+            and item.visibility != GapVisibilityV1.PROMINENT.value
+        ):
             raise _Clarification(ReadinessDraftReasonCodeV1.CRITICAL_VISIBILITY_INVALID)
         if item.owner_role not in {
             OwnerRoleV1.REVIEWING_ATTORNEY.value,
@@ -1866,6 +1983,7 @@ def _compile_assessment(
             raise _Clarification(ReadinessDraftReasonCodeV1.CRITICAL_OWNER_INVALID)
     strict = SafetyGapAssessmentV1(
         candidate_id=candidate.candidate_id,
+        scope_status=item.scope_status,
         shortfall_description=_exact_prose(item.shortfall_description),
         rationale_kind=rationale_kind,
         why_unresolved=_exact_prose(item.why_unresolved),
@@ -1889,12 +2007,15 @@ def _compile_finding(
     *,
     all_refs: tuple[str, ...],
     allowlist: tuple[str, ...],
+    review_package: bool = False,
+    exact_full_report: str | None = None,
 ) -> tuple[SafetyFindingProposalV1, bool]:
     refs, ref_removed = _deduplicate_evidence(item.evidence_refs, allowed=all_refs)
     passages, passage_removed = _deduplicate_strings(
         item.report_passages,
         allowed=allowlist,
         missing_reason=ReadinessDraftReasonCodeV1.EVIDENCE_NOT_FOUND,
+        exact_full_report=exact_full_report,
     )
     finding_kind = SafetyFindingKindV1(item.finding_kind)
     if finding_kind in _REPORT_CONTENT_FINDINGS and not passages:
@@ -1921,7 +2042,7 @@ def _compile_finding(
     ):
         raise _Clarification(ReadinessDraftReasonCodeV1.REFERENCE_UNKNOWN)
     if item.blocking_code is not None or finding_kind in _REPORT_CONTENT_FINDINGS:
-        if item.visibility != GapVisibilityV1.PROMINENT.value:
+        if not review_package and item.visibility != GapVisibilityV1.PROMINENT.value:
             raise _Clarification(ReadinessDraftReasonCodeV1.CRITICAL_VISIBILITY_INVALID)
         if item.owner_role not in {
             OwnerRoleV1.REVIEWING_ATTORNEY.value,
@@ -1970,6 +2091,9 @@ def _compile_safety(
             candidate,
             all_refs=all_refs,
             allowlist=allowlist,
+            scoped_review=_scoped_review_payload(payload),
+            review_package=_review_package_payload(payload),
+            exact_full_report=cast(str, payload["report_text"]),
         )
         prior = assessments.get(item.candidate_id)
         if prior is not None:
@@ -1989,6 +2113,8 @@ def _compile_safety(
             finding_item,
             all_refs=all_refs,
             allowlist=allowlist,
+            review_package=_review_package_payload(payload),
+            exact_full_report=cast(str, payload["report_text"]),
         )
         identity = (strict_finding.finding_kind, strict_finding.subject_id)
         prior_finding = findings.get(identity)

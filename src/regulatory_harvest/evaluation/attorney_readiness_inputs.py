@@ -56,7 +56,6 @@ from .attorney_models import (
     CaseAdmissionJudgment,
     EvaluationSource,
     JudgeOperation,
-    JudgeResponse,
     QualificationCase,
     QualificationManifest,
     QualificationReceipt,
@@ -64,14 +63,19 @@ from .attorney_models import (
 )
 from .attorney_qualification import (
     VerifiedQualificationContext,
+    _validate_response_value,
     load_verified_qualification_context,
 )
 from .attorney_readiness_models import (
+    ExternalReportBindingV1,
     GenerationValidationBindingV1,
     HistoricalV22CrossCheckV1,
     ReadinessInputV1,
     ReadinessRubricV1,
     load_readiness_rubric_v1,
+)
+from .attorney_readiness_response_contract import (
+    READINESS_SAFETY_RESPONSE_CONTRACT_VERSION_V3,
 )
 from .attorney_v2_models import AbsoluteDispositionV2
 from .attorney_v22_artifacts import load_verified_v22_context
@@ -720,8 +724,8 @@ class VerifiedReadinessInputsV1:
     source_record: tuple[EvaluationSource, ...]
     qualification_binding: QualificationReadinessBindingV1
     qualification_limits: QualificationLimitsV1
-    generation_binding: GenerationCapsuleBindingV1
-    generation_validation: GenerationValidationBindingV1
+    generation_binding: GenerationCapsuleBindingV1 | None
+    generation_validation: GenerationValidationBindingV1 | None
     readiness_rubric: ReadinessRubricV1
     readiness_rubric_bytes: bytes
     strict_equivalent_scoring_contract_bytes: bytes
@@ -941,10 +945,10 @@ def _load_qualification_limits(
             raise ValueError("qualification does not bind the verified baseline")
 
         response_raw = _canonical_document_object(response_bytes, code=code)
-        response = JudgeResponse.model_validate(response_raw)
-        if canonical_json_bytes(response.model_dump(mode="json", warnings="error")) != (
-            response_bytes
-        ):
+        # Preserve the qualification verifier's exact supplied-key wire contract:
+        # optional response_id/usage defaults must not be inserted into accepted bytes.
+        response, submitted_response_bytes = _validate_response_value(response_raw)
+        if submitted_response_bytes != response_bytes:
             raise ValueError("qualification response is not exact")
         judgment = CaseAdmissionJudgment.model_validate(response.payload)
         if canonical_json_bytes(
@@ -1692,12 +1696,18 @@ def build_verified_readiness_input_v1(
     *,
     baseline_run_dir: Path,
     qualification_run_dir: Path,
-    generation_run_dir: Path,
-    validation_receipt_path: Path,
+    generation_run_dir: Path | None = None,
+    validation_receipt_path: Path | None = None,
+    external_report_path: Path | None = None,
     historical_v22_run_dir: Path | None = None,
     historical_anonymous_label: Literal["A", "B"] | None = None,
 ) -> VerifiedReadinessInputsV1:
     """Verify and bind all readiness inputs without creating or modifying a run."""
+    external = external_report_path is not None
+    if (external and (generation_run_dir is not None or validation_receipt_path is not None)) or (
+        not external and (generation_run_dir is None or validation_receipt_path is None)
+    ):
+        raise _fail("READINESS_REPORT_ARGUMENTS_INVALID")
     baseline_context, projection = _load_verified_baseline(baseline_run_dir)
     qualification_limits = _load_qualification_limits(
         qualification_run_dir,
@@ -1711,10 +1721,34 @@ def build_verified_readiness_input_v1(
     if label_supplied and historical_anonymous_label not in {"A", "B"}:
         raise _fail("READINESS_HISTORICAL_ARGUMENTS_INVALID")
 
-    report_text, report_bytes, generation_binding = _load_verified_generation(
-        generation_run_dir,
-        projection,
-    )
+    generation_binding = None
+    generation_validation = None
+    external_binding = None
+    if external_report_path is not None:
+        try:
+            report_path = Path(os.path.abspath(external_report_path))
+            with _open_validation_reader(report_path.parent) as reader:
+                report_bytes = reader.read_artifact(report_path.name, max_bytes=_MAX_REPORT_BYTES)
+                reader.assert_root_identity()
+            report_text = report_bytes.decode("utf-8")
+            if not report_text.strip():
+                raise ValueError("external report is empty")
+        except (OSError, UnicodeError, ValueError, EvaluationIntegrityError) as error:
+            raise _fail("READINESS_EXTERNAL_REPORT_INVALID", error) from error
+        external_binding = ExternalReportBindingV1(
+            origin="external",
+            report_hash=sha256_digest(report_bytes),
+            grade_target_fingerprint=projection.binding.grade_target_fingerprint,
+            generation_validation_status="not_performed",
+        )
+    else:
+        assert generation_run_dir is not None and validation_receipt_path is not None
+        report_text, report_bytes, generation_binding = _load_verified_generation(
+            generation_run_dir, projection
+        )
+        generation_validation = _load_generation_validation(
+            validation_receipt_path, generation_report_bytes=report_bytes
+        )
     qualification_limits = _validate_qualification_public_projection(
         qualification_limits,
         forbidden_payloads=(
@@ -1726,11 +1760,7 @@ def build_verified_readiness_input_v1(
         ),
     )
     report_hash = sha256_digest(report_bytes)
-    generation_validation = _load_generation_validation(
-        validation_receipt_path,
-        generation_report_bytes=report_bytes,
-    )
-    if generation_validation.report_hash != report_hash:
+    if generation_validation is not None and generation_validation.report_hash != report_hash:
         raise _fail("READINESS_VALIDATION_RECEIPT_INVALID")
 
     historical: HistoricalV22CrossCheckV1 | None = None
@@ -1757,11 +1787,15 @@ def build_verified_readiness_input_v1(
         grade_target_fingerprint=projection.binding.grade_target_fingerprint,
         report_text=report_text,
         report_hash=report_hash,
-        generation_capsule_root=generation_binding.capsule_root,
+        generation_capsule_root=(
+            None if generation_binding is None else generation_binding.capsule_root
+        ),
         generation_validation=generation_validation,
+        external_report_binding=external_binding,
         readiness_rubric_fingerprint=sha256_digest(rubric_bytes),
         strict_equivalent_scoring_contract_fingerprint=sha256_digest(scoring_bytes),
         historical_v22_cross_check=historical,
+        safety_response_contract_version=READINESS_SAFETY_RESPONSE_CONTRACT_VERSION_V3,
     )
     return VerifiedReadinessInputsV1(
         readiness_input=readiness_input,

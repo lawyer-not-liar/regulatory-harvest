@@ -101,6 +101,7 @@ READINESS_PACKAGE_PATHS = (
     "src/regulatory_harvest/evaluation/attorney_readiness_inputs.py",
     "src/regulatory_harvest/evaluation/attorney_readiness_models.py",
     "src/regulatory_harvest/evaluation/attorney_readiness_requests.py",
+    "src/regulatory_harvest/evaluation/attorney_readiness_response_contract.py",
     "src/regulatory_harvest/evaluation/attorney_readiness_workflow.py",
     "src/regulatory_harvest/evaluation/readiness-rubric-v1.json",
 )
@@ -731,8 +732,8 @@ def test_skill_build_refuses_each_missing_readiness_runtime_input(
         skill_builder._runtime_files()
 
 
-def test_installed_wheel_exposes_exact_readiness_rubric_resource(tmp_path: Path) -> None:
-    """Dropping package JSON data would make installed readiness policy unavailable."""
+def test_installed_wheel_exposes_exact_evaluation_policy_resources(tmp_path: Path) -> None:
+    """Missing policy data or checkout-relative loaders break wheel-only evaluation."""
     wheel_dir = tmp_path / "wheel"
     built = subprocess.run(
         ["uv", "build", "--wheel", "--out-dir", str(wheel_dir)],
@@ -780,6 +781,62 @@ def test_installed_wheel_exposes_exact_readiness_rubric_resource(tmp_path: Path)
         bytes.fromhex(probe.stdout.strip())
         == (ROOT / "src/regulatory_harvest/evaluation/readiness-rubric-v1.json").read_bytes()
     )
+    baseline_probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; from importlib.resources import files;"
+                "from regulatory_harvest.evaluation import attorney_baseline_input as inputs;"
+                "from regulatory_harvest.evaluation import attorney_baseline_requests as requests;"
+                "print(json.dumps(["
+                "(files('regulatory_harvest')/'evaluation'/"
+                "'evaluation-baseline-policy-v1.json').read_bytes().hex(),"
+                "inputs._baseline_policy_bytes().hex(),"
+                "requests._IMPORTANCE_POLICY_BYTES.hex()]))"
+            ),
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(installed_root)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert baseline_probe.returncode == 0, baseline_probe.stderr
+    expected_policy = (ROOT / "assets/evaluation-baseline-policy-v1.json").read_bytes().hex()
+    assert json.loads(baseline_probe.stdout) == [expected_policy] * 3
+    evaluation_output = tmp_path / "legalbench-evaluation.json"
+    evaluation = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "regulatory_harvest.cli",
+            "eval",
+            "legalbench-rag",
+            "--dataset",
+            str(ROOT / "tests/fixtures/legalbench-mini"),
+            "--predictions",
+            str(ROOT / "tests/fixtures/legalbench-mini/predictions.jsonl"),
+            "--output",
+            str(evaluation_output),
+            "--json",
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(installed_root)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert evaluation.returncode == 0, evaluation.stdout + evaluation.stderr
+    payload = json.loads(evaluation.stdout)
+    assert payload == {
+        "cases": 1,
+        "macro_f1": 1.0,
+        "micro_f1": 1.0,
+        "ok": True,
+        "output": str(evaluation_output),
+    }
+    assert evaluation_output.is_file()
 
 
 def test_extracted_skill_runs_all_readiness_help_and_public_terminal_journeys(

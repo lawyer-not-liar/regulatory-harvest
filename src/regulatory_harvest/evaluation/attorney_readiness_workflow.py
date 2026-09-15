@@ -85,6 +85,8 @@ from .attorney_readiness_requests import (
     build_safety_lane_request_v1,
     build_safety_referee_request_v1,
     readiness_compiler_contract_fingerprint_v1,
+    readiness_compiler_contract_fingerprint_v2,
+    readiness_compiler_contract_fingerprint_v3,
 )
 
 READINESS_EXTERNAL_RESPONSE_INVALID = "READINESS_EXTERNAL_RESPONSE_INVALID"
@@ -280,8 +282,9 @@ def initialize_readiness_v1(
     *,
     baseline_run_dir: Path,
     qualification_run_dir: Path,
-    generation_run_dir: Path,
-    validation_receipt_path: Path,
+    generation_run_dir: Path | None = None,
+    validation_receipt_path: Path | None = None,
+    external_report_path: Path | None = None,
     historical_v22_run_dir: Path | None = None,
     historical_anonymous_label: Literal["A", "B"] | None = None,
 ) -> ReadinessRunStateV1:
@@ -290,14 +293,18 @@ def initialize_readiness_v1(
         qualification_run_dir=qualification_run_dir,
         generation_run_dir=generation_run_dir,
         validation_receipt_path=validation_receipt_path,
+        external_report_path=external_report_path,
         historical_v22_run_dir=historical_v22_run_dir,
         historical_anonymous_label=historical_anonymous_label,
     )
     source_roots: tuple[Path, ...] = (
         baseline_run_dir,
         qualification_run_dir,
-        generation_run_dir,
     )
+    if generation_run_dir is not None:
+        source_roots = (*source_roots, generation_run_dir)
+    if external_report_path is not None:
+        source_roots = (*source_roots, external_report_path)
     if historical_v22_run_dir is not None:
         source_roots = (*source_roots, historical_v22_run_dir)
     _validate_output_separation(output_dir, source_roots)
@@ -614,7 +621,15 @@ def _event(
     lane = request.payload.get("lane")
     return ReadinessTelemetryEventV1(
         protocol_version="delivery-readiness-v1",
-        compiler_contract_fingerprint=readiness_compiler_contract_fingerprint_v1(),
+        compiler_contract_fingerprint=(
+            readiness_compiler_contract_fingerprint_v3()
+            if context.inputs.readiness_input.safety_response_contract_version
+            == "readiness-safety-response-v3"
+            else readiness_compiler_contract_fingerprint_v2()
+            if context.inputs.readiness_input.safety_response_contract_version
+            == "readiness-safety-response-v2"
+            else readiness_compiler_contract_fingerprint_v1()
+        ),
         scoring_contract_fingerprint=(
             context.inputs.readiness_input.strict_equivalent_scoring_contract_fingerprint
         ),

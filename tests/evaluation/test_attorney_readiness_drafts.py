@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -64,12 +65,17 @@ def inputs(tmp_path: Path) -> VerifiedReadinessInputsV1:
 @pytest.fixture(scope="module")
 def safety_inputs(tmp_path_factory: pytest.TempPathFactory) -> VerifiedReadinessInputsV1:
     fixture = _make_verified_inputs(tmp_path_factory.mktemp("task-4-verified-inputs"))
-    return build_verified_readiness_input_v1(
+    verified = build_verified_readiness_input_v1(
         baseline_run_dir=fixture.baseline_run_dir,
         qualification_run_dir=fixture.qualification_run_dir,
         generation_run_dir=fixture.generation_run_dir,
         validation_receipt_path=fixture.validation_receipt_path,
     )
+    # These tests exercise the retained field-level response contract. V2 scope and
+    # whole-assessment behavior have separate full/portable workflow regressions.
+    return replace(verified, readiness_input=verified.readiness_input.model_copy(
+        update={"safety_response_contract_version": None}
+    ))
 
 
 def _verified_grader_lanes(
@@ -310,9 +316,15 @@ def _finding_draft(request: ReadinessEvaluatorRequestV1) -> dict[str, object]:
 
 def _safety_draft(request: ReadinessEvaluatorRequestV1) -> dict[str, object]:
     candidates = cast(tuple[dict[str, object], ...], request.payload["gap_candidates"])
+    contract = request.payload.get("safety_response_contract", {})
+    scoped = contract.get("version") in {
+        "readiness-safety-response-v2", "readiness-safety-response-v3"
+    }
     return {
         "candidate_assessments": [
-            _assessment_draft(item, passage=_passage(request)) for item in candidates
+            {**_assessment_draft(item, passage=_passage(request)),
+             **({"scope_status": "open_gap"} if scoped else {})}
+            for item in candidates
         ],
         "finding_proposals": [_finding_draft(request)],
     }

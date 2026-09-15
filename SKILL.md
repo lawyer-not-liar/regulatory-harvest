@@ -126,8 +126,13 @@ Keep these results separate:
 The provisional middle-tier minimum is exact `0.70` in the worse fresh grading lane.
 Do not relabel its strict `FAIL` as `PASS`. Every open row must identify `What is
 missing`, `Why it matters`, `How to resolve it`, and `Owner`. A visible actionable
-gap is not automatically blocking; a hidden gap, unsupported assertion, misleading
-contradiction, invalid rationale, or unbound dispositive fact is blocking.
+gap is not automatically blocking. Newly admitted V3 runs distinguish original-report
+visibility from the review package: an ordinary omission may remain nonblocking when
+every open issue is prominently explained before the report with evidence, an owner,
+and a resolution test. Preserve truthful original-report visibility; never invent
+disclosure to pass evaluation. Unsupported assertions, misleading contradictions,
+invalid rationales, unbound dispositive facts, and other substantive blockers remain
+blocking. V1/V2 runs retain their recorded disclosure rules and exact replay.
 
 Exit `0` includes verified review-ready attorney-review delivery, exit `4` is verified
 `NOT_DELIVERABLE`, exit `5` is integrity failure, and exit `6` is the live driver's

@@ -4,6 +4,25 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 
 ## [Unreleased]
 
+## [0.1.0-beta.10] - 2026-09-14
+
+- Newly admitted delivery-readiness runs use the V3 safety contract and a
+  prominent attorney-issue wrapper around the unchanged report. Original-report
+  disclosure remains truthful; ordinary omissions can remain reviewable when
+  their significance, evidence, owner, and follow-up are explicit and actionable.
+- Preserve material accuracy blockers, coverage floors, integrity checks, and
+  retained V1/V2 replay behavior. Review-ready is not permission for unreviewed
+  client delivery or a claim of legal correctness.
+- Distinguish scope-inapplicable prerequisites from resolved issues; avoid
+  treating negative completeness warnings as affirmative completeness claims.
+- Admit repeated report passages through exact, unambiguous V3 passage choices
+  and the unchanged full-report fallback.
+- This is a distinct experimental prerelease, not a replacement for the beta.9 tag or
+  artifact. Protocol 2.1 remains the default; attorney review remains required.
+- Enabled private vulnerability reporting and defined latest-prerelease security
+  maintenance. An intermittent saved-run verification refusal remains unresolved;
+  integrity failures must not be bypassed.
+
 ## [0.1.0-beta.9] - 2026-08-26
 
 - Added the opt-in stable evaluation baseline and delivery-readiness companion.
@@ -186,7 +205,8 @@ All notable changes to Regulatory Harvest will be recorded here. The project fol
 - The GitHub prerelease packages the unchanged `0.1.0` engine. No PyPI
   distribution is published.
 
-[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.9...HEAD
+[Unreleased]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.10...HEAD
+[0.1.0-beta.10]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.9...v0.1.0-beta.10
 [0.1.0-beta.9]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.8...v0.1.0-beta.9
 [0.1.0-beta.8]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.7...v0.1.0-beta.8
 [0.1.0-beta.7]: https://github.com/lawyer-not-liar/regulatory-harvest/compare/v0.1.0-beta.6...v0.1.0-beta.7

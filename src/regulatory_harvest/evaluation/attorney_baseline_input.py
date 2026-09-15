@@ -30,7 +30,12 @@ from .attorney_models import ReadinessStatus
 from .attorney_qualification import load_verified_qualification_context
 from .attorney_v22_compiler import RUBRIC_V22
 
-_POLICY_PATH = Path(__file__).resolve().parents[3] / "assets" / "evaluation-baseline-policy-v1.json"
+_POLICY_PATH = Path(__file__).with_name("evaluation-baseline-policy-v1.json")
+if not _POLICY_PATH.is_file():
+    # Source checkouts and the universal skill retain the canonical asset layout.
+    _POLICY_PATH = (
+        Path(__file__).resolve().parents[3] / "assets" / "evaluation-baseline-policy-v1.json"
+    )
 
 
 class BaselineInputError(ValueError):

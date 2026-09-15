@@ -224,8 +224,10 @@ def _parser() -> argparse.ArgumentParser:
     readiness_init_parser = subparsers.add_parser("eval-readiness-init")
     readiness_init_parser.add_argument("--baseline-run", required=True)
     readiness_init_parser.add_argument("--qualification-run", required=True)
-    readiness_init_parser.add_argument("--generation-run", required=True)
-    readiness_init_parser.add_argument("--validation-receipt", required=True)
+    readiness_source = readiness_init_parser.add_mutually_exclusive_group(required=True)
+    readiness_source.add_argument("--generation-run")
+    readiness_source.add_argument("--external-report", default=argparse.SUPPRESS)
+    readiness_init_parser.add_argument("--validation-receipt")
     readiness_init_parser.add_argument("--run", required=True)
     readiness_init_parser.add_argument("--historical-v22-run")
     readiness_init_parser.add_argument("--historical-report-label", choices=("A", "B"))
@@ -1540,6 +1542,12 @@ def _run_readiness_command(args: argparse.Namespace) -> int:
     run = _physical_run_path(args.run)
     try:
         if args.command == "eval-readiness-init":
+            external_report = getattr(args, "external_report", None)
+            if (args.generation_run is None) != (args.validation_receipt is None):
+                raise EvaluationCliInputError(
+                    "READINESS_INPUT_INVALID",
+                    "Generation run and validation receipt must be supplied together.",
+                )
             historical_run_value = getattr(args, "historical_v22_run", None)
             historical_label = getattr(args, "historical_report_label", None)
             if (historical_run_value is None) != (historical_label is None):
@@ -1551,16 +1559,21 @@ def _run_readiness_command(args: argparse.Namespace) -> int:
                 run,
                 baseline_run_dir=_physical_run_path(args.baseline_run),
                 qualification_run_dir=_physical_run_path(args.qualification_run),
-                generation_run_dir=_physical_run_path(args.generation_run),
-                validation_receipt_path=_physical_run_path(args.validation_receipt),
+                generation_run_dir=(
+                    None if args.generation_run is None else _physical_run_path(args.generation_run)
+                ),
+                validation_receipt_path=(
+                    None
+                    if args.validation_receipt is None
+                    else _physical_run_path(args.validation_receipt)
+                ),
+                external_report_path=(None if external_report is None else Path(external_report)),
                 historical_v22_run_dir=(
                     None
                     if historical_run_value is None
                     else _physical_run_path(historical_run_value)
                 ),
-                historical_anonymous_label=cast(
-                    Literal["A", "B"] | None, historical_label
-                ),
+                historical_anonymous_label=cast(Literal["A", "B"] | None, historical_label),
             )
             context = load_verified_readiness_context_v1(run)
             _eval_json(_readiness_status_payload(context))

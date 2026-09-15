@@ -11,7 +11,7 @@ import json
 import math
 import re
 import warnings
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime, time
 from enum import Enum, StrEnum
 from pathlib import Path
@@ -339,11 +339,33 @@ def _exact_gradeable_projection_wire(
 
 
 def _is_trusted_serialization_exclusion(value: BaseModel, field_name: str) -> bool:
-    """Recognize the one exact readiness-owned field omitted from canonical wire."""
+    """Recognize exact readiness-owned fields omitted from historical wire."""
     return (
-        type(value) is ReadinessCallRecordV1
-        and field_name == "context_token_fingerprint"
-        and value.context_token_fingerprint is None
+        (
+            type(value) is ReadinessCallRecordV1
+            and field_name == "context_token_fingerprint"
+            and value.context_token_fingerprint is None
+        )
+        or (
+            type(value) is ReadinessInputV1
+            and field_name == "external_report_binding"
+            and value.external_report_binding is None
+        )
+        or (
+            type(value) is ReadinessInputV1
+            and field_name == "safety_response_contract_version"
+            and value.safety_response_contract_version is None
+        )
+        or (
+            type(value) is SafetyGapAssessmentV1
+            and field_name == "scope_status"
+            and value.scope_status is None
+        )
+        or (
+            type(value) is DeliveryReadinessResultV1
+            and field_name == "review_package_policy"
+            and value.review_package_policy is None
+        )
     )
 
 
@@ -1096,19 +1118,46 @@ class HistoricalV22CrossCheckV1(ReadinessStrictModelV1):
         return _unique_nonblank(values, location="historical reason codes")
 
 
+class ExternalReportBindingV1(ReadinessStrictModelV1):
+    """Exact external evidence identity, without a claim of generation validation."""
+
+    origin: Literal["external"]
+    report_hash: Hash
+    grade_target_fingerprint: Hash
+    generation_validation_status: Literal["not_performed"]
+
+
 class ReadinessInputV1(ReadinessStrictModelV1):
     protocol_version: Literal["delivery-readiness-v1"]
     gradeable_baseline: GradeableBaselineProjectionV1
     grade_target_fingerprint: Hash
     report_text: str = Field(strict=True)
     report_hash: Hash
-    generation_capsule_root: Hash
-    generation_validation: GenerationValidationBindingV1
+    generation_capsule_root: Hash | None
+    generation_validation: GenerationValidationBindingV1 | None
+    external_report_binding: ExternalReportBindingV1 | None = None
     readiness_rubric_fingerprint: Hash
     strict_equivalent_scoring_contract_fingerprint: Hash
     historical_v22_cross_check: HistoricalV22CrossCheckV1 | None = None
+    safety_response_contract_version: (
+        Literal[
+            "readiness-safety-response-v1",
+            "readiness-safety-response-v2",
+            "readiness-safety-response-v3",
+        ]
+        | None
+    ) = None
 
     _validate_report = field_validator("report_text")(_preserve_nonblank)
+
+    @model_serializer(mode="wrap")
+    def serialize_input(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        serialized = cast(dict[str, object], handler(self))
+        if self.external_report_binding is None:
+            serialized.pop("external_report_binding", None)
+        if self.safety_response_contract_version is None:
+            serialized.pop("safety_response_contract_version", None)
+        return serialized
 
     @model_validator(mode="after")
     def validate_input_bindings(self) -> Self:
@@ -1117,8 +1166,19 @@ class ReadinessInputV1(ReadinessStrictModelV1):
             != self.gradeable_baseline.binding.grade_target_fingerprint
         ):
             raise ValueError("readiness input grade target must match its verified projection")
-        if self.report_hash != self.generation_validation.report_hash:
-            raise ValueError("readiness input report hash must match generation validation")
+        external = self.external_report_binding
+        if external is None:
+            if self.generation_capsule_root is None or self.generation_validation is None:
+                raise ValueError("generated readiness input requires generation evidence")
+            if self.report_hash != self.generation_validation.report_hash:
+                raise ValueError("readiness input report hash must match generation validation")
+        elif (
+            self.generation_capsule_root is not None
+            or self.generation_validation is not None
+            or external.report_hash != self.report_hash
+            or external.grade_target_fingerprint != self.grade_target_fingerprint
+        ):
+            raise ValueError("external readiness binding must match without generation evidence")
         _attest_projection(self.gradeable_baseline)
         return self
 
@@ -1375,6 +1435,7 @@ class SafetyGapCandidateV1(ReadinessStrictModelV1):
 
 class SafetyGapAssessmentV1(ReadinessStrictModelV1):
     candidate_id: GapCandidateRef
+    scope_status: Literal["open_gap", "not_required_for_scope"] | None = None
     shortfall_description: str = Field(strict=True)
     rationale_kind: RationaleKindV1
     why_unresolved: str = Field(strict=True)
@@ -1387,6 +1448,19 @@ class SafetyGapAssessmentV1(ReadinessStrictModelV1):
     follow_up_code: FollowUpCodeV1
     resolution_test: str = Field(strict=True)
     owner_role: OwnerRoleV1
+
+    @model_serializer(mode="wrap")
+    def serialize_assessment(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        serialized = cast(dict[str, object], handler(self))
+        if self.scope_status is None:
+            serialized.pop("scope_status", None)
+        return serialized
+
+    @model_validator(mode="after")
+    def validate_scope_blocker(self) -> Self:
+        if self.scope_status == "not_required_for_scope" and self.blocking_code is not None:
+            raise ValueError("scope-cleared prerequisite cannot carry a report blocker")
+        return self
 
     _validate_required_text = field_validator(
         "shortfall_description",
@@ -1464,6 +1538,7 @@ class SafetyLaneResponseV1(ReadinessStrictModelV1):
 
 
 _SafetyDisputeKindV1 = Literal[
+    "assessment",
     "finding_existence",
     "rationale",
     "evidence_binding",
@@ -1493,6 +1568,12 @@ def _choice_nonblank(value: object) -> bool:
 
 
 def _validate_dispute_choice(kind: str, choice: dict[str, object]) -> None:
+    if kind == "assessment":
+        model = SafetyGapAssessmentV1 if "candidate_id" in choice else SafetyFindingProposalV1
+        checked = model.model_validate(json.loads(canonical_json_bytes(choice)))
+        if canonical_json_bytes(checked) != canonical_json_bytes(choice):
+            raise ValueError("whole-assessment choice must be exact")
+        return
     if set(choice) != _DISPUTE_CHOICE_KEYS[kind]:
         raise ValueError("safety dispute choice has fields outside its disputed dimension")
     if kind == "finding_existence":
@@ -1538,6 +1619,44 @@ def _validate_dispute_choice(kind: str, choice: dict[str, object]) -> None:
         raise ValueError("safety dispute choice has an invalid dimension value")
 
 
+def validate_whole_assessment_choices(
+    subject_identity: str,
+    first: dict[str, object] | None,
+    second: dict[str, object] | None,
+    evidence_refs: tuple[str, ...],
+    report_passages: tuple[str, ...],
+) -> None:
+    """Bind whole choices to one subject and their exact ordered evidence union."""
+    refs: list[str] = []
+    passages: list[str] = []
+    if first is None and second is None:
+        raise ValueError("whole-assessment dispute needs a choice")
+    for choice in (first, second):
+        if choice is None:
+            if not subject_identity.startswith("finding:"):
+                raise ValueError("only findings may have an absent choice")
+            continue
+        _validate_dispute_choice("assessment", choice)
+        if "candidate_id" in choice:
+            identity = f"candidate:{choice['candidate_id']}"
+            if choice.get("scope_status") not in {"open_gap", "not_required_for_scope"}:
+                raise ValueError("whole candidate assessment requires scope status")
+        else:
+            identity = f"finding:{choice['finding_kind']}:{choice['subject_id']}"
+        if identity != subject_identity:
+            raise ValueError("whole-assessment choice belongs to another subject")
+        for ref in cast(Sequence[str], choice["evidence_refs"]):
+            if ref not in refs:
+                refs.append(ref)
+        for passage in cast(Sequence[str], choice["report_passages"]):
+            if passage not in passages:
+                passages.append(passage)
+    if tuple(refs) != evidence_refs or tuple(passages) != report_passages:
+        raise ValueError("whole-assessment evidence must match its exact choice union")
+    if canonical_json_bytes(first) == canonical_json_bytes(second):
+        raise ValueError("whole-assessment choices must differ")
+
+
 class SafetyDisputeV1(ReadinessStrictModelV1):
     dispute_id: SafetyDisputeRef
     canonical_order: int = Field(ge=0, lt=_MAX_FINDINGS, strict=True)
@@ -1576,6 +1695,10 @@ class SafetyDisputeV1(ReadinessStrictModelV1):
         if self.dispute_kind == "finding_existence":
             if (first is None) == (second is None):
                 raise ValueError("finding-existence disputes require exactly one absent choice")
+        elif self.dispute_kind == "assessment":
+            validate_whole_assessment_choices(
+                self.subject_identity, first, second, self.evidence_refs, self.report_passages
+            )
         elif first is None or second is None:
             raise ValueError("nonexistence is valid only for finding-existence disputes")
         for choice in (first, second):
@@ -1712,7 +1835,7 @@ class GapFollowUpRowV1(ReadinessStrictModelV1):
     follow_up_code: FollowUpCodeV1
     resolution_test: str = Field(strict=True)
     owner_role: OwnerRoleV1
-    status: Literal["open", "resolved"]
+    status: Literal["open", "resolved", "not_required_for_scope"]
     referee_dispute_id: str | None = Field(default=None, strict=True)
     row_fingerprint: Hash
 
@@ -1768,6 +1891,7 @@ class GapFollowUpMatrixV1(ReadinessStrictModelV1):
 
 class DeliveryReadinessResultV1(ReadinessStrictModelV1):
     protocol_version: Literal["delivery-readiness-v1"]
+    review_package_policy: Literal["prominent-attorney-issues-v1"] | None = None
     baseline_locked_strict_equivalent_disposition: AbsoluteDispositionV2
     historical_v22_strict_disposition: AbsoluteDispositionV2 | None
     historical_v22_cross_check_status: HistoricalV22CrossCheckStatusV1
@@ -1780,6 +1904,13 @@ class DeliveryReadinessResultV1(ReadinessStrictModelV1):
     blocking_codes: tuple[str, ...]
     attorney_review_warning: str = Field(strict=True)
     result_fingerprint: Hash
+
+    @model_serializer(mode="wrap")
+    def serialize_result(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        serialized = cast(dict[str, object], handler(self))
+        if self.review_package_policy is None:
+            serialized.pop("review_package_policy", None)
+        return serialized
 
     _validate_warning = field_validator("attorney_review_warning")(_nonblank)
 
@@ -1936,7 +2067,7 @@ class ReadinessManifestV1(ReadinessStrictModelV1):
     protocol_version: Literal["delivery-readiness-v1"] = READINESS_PROTOCOL_V1
     grade_target_fingerprint: Hash
     report_hash: Hash
-    generation_capsule_root: Hash
+    generation_capsule_root: Hash | None
     readiness_rubric_fingerprint: Hash
     strict_equivalent_scoring_contract_fingerprint: Hash
     phase: ReadinessPhaseV1
@@ -2016,6 +2147,7 @@ class ReadinessVerificationV1(ReadinessStrictModelV1):
             "evaluation_valid",
             "full_parity_valid",
             "generation_valid",
+            "external_report_valid",
             "integrity_valid",
             "parity_contract_valid",
             "portable_parity_valid",

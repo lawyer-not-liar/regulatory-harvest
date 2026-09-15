@@ -529,7 +529,9 @@ def _persisted_input_bytes(inputs: VerifiedReadinessInputsV1) -> bytes:
         },
         "qualification_binding": asdict(inputs.qualification_binding),
         "qualification_limits": asdict(inputs.qualification_limits),
-        "generation_binding": asdict(inputs.generation_binding),
+        "generation_binding": (
+            None if inputs.generation_binding is None else asdict(inputs.generation_binding)
+        ),
     }
     try:
         data = canonical_json_bytes(payload)
@@ -557,6 +559,18 @@ def _inputs_from_file(data: bytes, rubric_bytes: bytes) -> VerifiedReadinessInpu
     )
     if raw["schema_version"] != "delivery-readiness-input-v1":
         raise _error("INPUT_VERSION")
+    external_keys = (
+        ("external_report_binding",)
+        if type(raw["readiness_input"]) is dict
+        and "external_report_binding" in raw["readiness_input"]
+        else ()
+    )
+    safety_contract_keys = (
+        ("safety_response_contract_version",)
+        if type(raw["readiness_input"]) is dict
+        and "safety_response_contract_version" in raw["readiness_input"]
+        else ()
+    )
     readiness_raw = _exact_dict(
         raw["readiness_input"],
         (
@@ -570,9 +584,15 @@ def _inputs_from_file(data: bytes, rubric_bytes: bytes) -> VerifiedReadinessInpu
             "report_hash",
             "report_text",
             "strict_equivalent_scoring_contract_fingerprint",
+            *external_keys,
+            *safety_contract_keys,
         ),
         location="readiness_input",
     )
+    if external_keys and readiness_raw["external_report_binding"] is None:
+        raise _error("INPUT_INVALID")
+    if safety_contract_keys and readiness_raw["safety_response_contract_version"] is None:
+        raise _error("INPUT_INVALID")
     projection_raw = _exact_dict(
         readiness_raw["gradeable_baseline"],
         (
@@ -626,26 +646,28 @@ def _inputs_from_file(data: bytes, rubric_bytes: bytes) -> VerifiedReadinessInpu
         ),
         qualification_readiness=binding_raw["qualification_readiness"],  # type: ignore[arg-type]
     )
-    generation_raw = _exact_dict(
-        raw["generation_binding"],
-        tuple(field.name for field in fields(GenerationCapsuleBindingV1)),
-        location="generation_binding",
-    )
-    generation_binding = GenerationCapsuleBindingV1(
-        capsule_root=cast(str, generation_raw["capsule_root"]),
-        capture_fingerprint=cast(str, generation_raw["capture_fingerprint"]),
-        request_fingerprint=cast(str, generation_raw["request_fingerprint"]),
-        response_fingerprint=cast(str, generation_raw["response_fingerprint"]),
-        report_hash=cast(str, generation_raw["report_hash"]),
-        source_hashes=_string_pairs(
-            generation_raw["source_hashes"], location="generation_source_hashes"
-        ),
-        client_facts_hash=cast(str | None, generation_raw["client_facts_hash"]),
-        generator_artifact_hashes=_string_pairs(
-            generation_raw["generator_artifact_hashes"],
-            location="generator_artifact_hashes",
-        ),
-    )
+    generation_binding = None
+    if raw["generation_binding"] is not None:
+        generation_raw = _exact_dict(
+            raw["generation_binding"],
+            tuple(field.name for field in fields(GenerationCapsuleBindingV1)),
+            location="generation_binding",
+        )
+        generation_binding = GenerationCapsuleBindingV1(
+            capsule_root=cast(str, generation_raw["capsule_root"]),
+            capture_fingerprint=cast(str, generation_raw["capture_fingerprint"]),
+            request_fingerprint=cast(str, generation_raw["request_fingerprint"]),
+            response_fingerprint=cast(str, generation_raw["response_fingerprint"]),
+            report_hash=cast(str, generation_raw["report_hash"]),
+            source_hashes=_string_pairs(
+                generation_raw["source_hashes"], location="generation_source_hashes"
+            ),
+            client_facts_hash=cast(str | None, generation_raw["client_facts_hash"]),
+            generator_artifact_hashes=_string_pairs(
+                generation_raw["generator_artifact_hashes"],
+                location="generator_artifact_hashes",
+            ),
+        )
     rubric = load_readiness_rubric_v1()
     if rubric_bytes != canonical_json_bytes(rubric.model_dump(mode="json", warnings="error")):
         raise _error("RUBRIC_BYTES")
@@ -777,10 +799,17 @@ def _graph_fingerprint(files: Mapping[str, bytes]) -> str:
 
 
 def _runtime_verification(files: Mapping[str, bytes]) -> ReadinessVerificationV1:
+    persisted = _parse_canonical_json(files[READINESS_INPUT_PATH], location=READINESS_INPUT_PATH)
+    external = cast(dict[str, object], persisted)["readiness_input"]
+    external = cast(dict[str, object], external).get("external_report_binding") is not None
+    checks = tuple(
+        "external_report_valid" if external and key == "generation_valid" else key
+        for key in _INTERNAL_CHECKS
+    )
     descriptor = {
         "protocol_version": "delivery-readiness-v1",
         "valid": True,
-        "checks": {key: True for key in _INTERNAL_CHECKS},
+        "checks": {key: True for key in checks},
         "issues": [],
         "graph_fingerprint": _graph_fingerprint(files),
     }

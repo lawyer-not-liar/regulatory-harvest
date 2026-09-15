@@ -1,12 +1,11 @@
 # Regulatory Harvest
 
-> **Experimental beta (`v0.1.0-beta.9`).** Beta.9 adds an opt-in stable
-> evaluation baseline and delivery-readiness companion. It grades each exact
-> report revision against one report-blind, source-derived baseline, then compiles
-> two independent grading and safety lanes plus referee decisions into
-> `HIGH_ASSURANCE`, `REVIEW_READY_WITH_GAPS`, or `NOT_DELIVERABLE`. Public
-> synthetic validation covered the full and portable runtimes and deterministic
-> release artifacts; no private matter rollout validation was performed.
+> **Experimental beta (`v0.1.0-beta.10`).** The opt-in
+> delivery-readiness companion targets a useful starting point for a qualified
+> attorney. Newly admitted V3 runs place every open evaluator issue prominently
+> before the unchanged report, with its significance, evidence, owner, and next
+> action. Ordinary omissions need not suppress an actionable review package;
+> material accuracy, coverage, and integrity blockers remain blocking.
 > Protocol 2.2 remains opt-in and experimental, and Protocol 2.1 remains the
 > new-run default. No performance, benchmark, legal-correctness, or report-quality
 > claim is made.
@@ -14,11 +13,15 @@
 > errors. Output must be validated by an attorney before the attorney delivers
 > legal advice.
 
-The GitHub prerelease label `v0.1.0-beta.9` packages project version `0.1.0`.
-The beta suffix describes the release channel. This release builds on exact
-merge commit `ad157f677ee220dca5a064783c1cc40f9d13c47d`. Protocol 2.2 remains
-opt-in and experimental; Protocol 2.1 remains the new-run default. No PyPI
-distribution is published.
+The prerelease label `v0.1.0-beta.10` packages project version `0.1.0`.
+It is a distinct experimental version, not a replacement for the beta.9 tag or
+artifact. Protocol 2.2 remains opt-in and experimental; Protocol 2.1
+remains the new-run default. No PyPI distribution is published.
+
+Known limitation: an intermittent saved-run verification refusal remains under
+investigation. Do not bypass verification or deliver an unverified artifact;
+retain the original files for diagnosis. Subsequent successful verification is
+not evidence that the underlying issue has been repaired.
 
 Regulatory Harvest is an installable research skill for attorneys. Ask a legal question in ordinary language, attach your sources or authorize current web research, and receive a cited Markdown briefing plus a machine-verifiable evidence bundle.
 

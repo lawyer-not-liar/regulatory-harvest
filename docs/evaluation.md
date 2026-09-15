@@ -203,8 +203,14 @@ qualified attorney may use the report as a starting point; it is not authorizati
 unreviewed client delivery and is not a legal-correctness finding.
 
 Every gap row preserves the exact evidence and renders `What is missing`, `Why it
-matters`, `How to resolve it`, and `Owner`. Critical shortfalls require prominent
-disclosure and reviewing-attorney or outside-counsel ownership. `NOT_DELIVERABLE`
+matters`, `How to resolve it`, and `Owner`. Newly admitted runs use the V3 safety
+contract: original-report visibility is an observation, while every open issue is
+prominently presented before the report in the attorney-review package. An ordinary
+omission need not suppress a useful starting point when that package makes it safely
+reviewable. Critical shortfalls retain reviewing-attorney or outside-counsel ownership.
+All explicit blockers and substantive accuracy findings remain blocking; the coverage
+floor is unchanged. Historical V1/V2 graphs keep their recorded disclosure rules.
+`NOT_DELIVERABLE`
 suppresses the report from the ordinary handoff but preserves sealed artifacts and
 operator-safe remediation codes.
 

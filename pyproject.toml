@@ -63,6 +63,9 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/regulatory_harvest"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"assets/evaluation-baseline-policy-v1.json" = "regulatory_harvest/evaluation/evaluation-baseline-policy-v1.json"
+
 [tool.hatch.build.targets.sdist]
 exclude = [
   "/.hypothesis",

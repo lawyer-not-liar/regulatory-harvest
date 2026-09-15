@@ -39,7 +39,7 @@ The scanner has a small path, finding-code, and exact-value allowlist for synthe
 Before declaring the candidate technically verified:
 
 1. Build the universal skill ZIP twice from the same clean committed snapshot and confirm identical file counts, byte lengths, and SHA-256 hashes.
-2. Confirm both archives and both clean extractions have one `regulatory-harvest/` root and contain `SKILL.md`, the runtime engine, runner, assets, references, license, notices, README, and package metadata. In particular, require the qualification module and template; both delivery-readiness templates; the canonical readiness rubric; all eight readiness model, input, request, draft, compiler, handoff, artifact, and workflow modules; the readiness documentation and references; and the full and portable evaluator and skill runners.
+2. Confirm both archives and both clean extractions have one `regulatory-harvest/` root and contain `SKILL.md`, the runtime engine, runner, assets, references, license, notices, README, and package metadata. In particular, require the qualification module and template; both delivery-readiness templates; the canonical readiness rubric; all nine readiness model, input, request, response-contract, draft, compiler, handoff, artifact, and workflow modules; the readiness documentation and references; and the full and portable evaluator and skill runners.
 3. Confirm the skill name matches the archive root and the description remains at or below Claude Desktop's 200-character limit.
 4. Confirm the archive excludes Git state, worktrees, tests, internal plans, caches, generated matters, prior distributions, and private records.
 5. Extract the ZIP into a clean directory and run `prepare` and `finalize` in both source modes with site packages disabled and package-index access blocked, without importing the development checkout.
@@ -52,7 +52,7 @@ Before declaring the candidate technically verified:
 12. Confirm one external report yields an absolute result with `comparison: null`; two external reports or a mixed external/capsule pair cannot be represented as a formal build comparison.
 13. Confirm the generation capsule actually invokes or loads the exact digest-verified runnable build it records. Merely hashing an unused archive is not a build evaluation.
 14. Review `references/security-and-privacy.md`; confirm the evaluation directory is access-controlled, non-public, and non-synced, and that no secrets, environment files, configuration, Git state, or unrelated records were captured.
-15. Upload that exact ZIP to Claude Desktop with code execution enabled and exercise both source modes.
+15. Upload that exact ZIP to the user's selected Claude surface (web or Desktop) with code execution enabled and exercise both source modes. Record the exact surface tested; a web test does not establish Desktop-specific behavior.
 16. Install the same folder or ZIP in Codex and exercise both source modes.
 17. Install the built wheel in a new environment outside the checkout, load `evaluation/readiness-rubric-v1.json` through `importlib.resources`, require its bytes to equal the source policy asset, and run the offline CLI example.
 18. Run the synthetic LegalBench-RAG evaluation.

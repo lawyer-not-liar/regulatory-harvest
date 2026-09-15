@@ -2,7 +2,9 @@
 
 ## Reporting a vulnerability
 
-Until a public security contact is configured, do not include exploit details, credentials, private documents, or personal information in a public issue. Contact the repository owner privately. A public release must replace this paragraph with a monitored security contact or GitHub private vulnerability reporting instructions.
+Report suspected vulnerabilities through [GitHub private vulnerability reporting](https://github.com/lawyer-not-liar/regulatory-harvest/security/advisories/new). Private vulnerability reporting is enabled for this repository and routes reports to its maintainers.
+
+Include the affected version, impact, and a minimal synthetic reproduction when possible. Do not include credentials, client or matter documents, personal information, or unrelated private files. Do not publish exploit details in a public issue. This experimental project does not promise a response-time or remediation service level.
 
 ## Security model
 
@@ -51,4 +53,10 @@ The Markdown renderer escapes untrusted metadata, reduces local paths to file na
 
 ## Supported versions
 
-Security fixes are applied to the latest unreleased `main` branch until the first public version is published. Define a supported-version table before making a public release.
+| Version | Security maintenance |
+| --- | --- |
+| Latest published `0.1.0-beta.*` prerelease | Current experimental maintenance target; fixes may require upgrading to a newer prerelease. |
+| Earlier, superseded prereleases | No separate backports; upgrade to the latest prerelease. |
+| Unreleased `main` | Development only; not a published release or a stability guarantee. |
+
+No stable release is currently supported. Experimental status does not remove the requirement for attorney review or justify bypassing integrity failures.

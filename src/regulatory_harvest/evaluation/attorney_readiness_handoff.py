@@ -16,6 +16,9 @@ from regulatory_harvest.evaluation.attorney_baseline_models import (
     BaselineImportanceV1,
     ImportanceBasisV1,
 )
+from regulatory_harvest.evaluation.attorney_readiness_compiler import (
+    _contradictory_completeness_claim_v3,
+)
 from regulatory_harvest.evaluation.attorney_readiness_models import (
     DeliveryReadinessResultV1,
     DeliveryReadinessTierV1,
@@ -32,8 +35,16 @@ from regulatory_harvest.evaluation.attorney_readiness_models import (
     RequirementMatrixV1,
     load_readiness_rubric_v1,
 )
+from regulatory_harvest.evaluation.attorney_readiness_requests import (
+    EXTERNAL_REPORT_REVIEW_WARNING_SUFFIX,
+)
 from regulatory_harvest.evaluation.attorney_v2_models import AbsoluteDispositionV2
 from regulatory_harvest.storage import canonical_json_bytes, sha256_digest
+
+from .attorney_readiness_response_contract import (
+    HARD_REVIEW_FINDING_CODES,
+    REVIEW_PACKAGE_POLICY_V1,
+)
 
 _MAX_DEPTH = 32
 _MAX_NODES = 100_000
@@ -335,6 +346,12 @@ def _validate_delivery_semantics(
         return
     if result.minimum_lane_weighted_coverage < rubric.review_ready_weighted_coverage_floor:
         raise _invalid()
+    if (
+        result.review_package_policy == REVIEW_PACKAGE_POLICY_V1
+        and any(row.status == "open" for row in gaps.rows)
+        and _contradictory_completeness_claim_v3(report)
+    ):
+        raise _invalid()
 
     def lane_disposition(
         observations: Sequence[tuple[BaselineImportanceV1, RequirementDispositionV1]],
@@ -368,6 +385,12 @@ def _validate_delivery_semantics(
         raise _invalid()
 
     for gap_row in gaps.rows:
+        review_package = result.review_package_policy == REVIEW_PACKAGE_POLICY_V1
+        scope_cleared = (
+            gap_row.status == "not_required_for_scope"
+            and gap_row.origin is GapOriginV1.PREREQUISITE
+            and gap_row.blocking_code is None
+        )
         prose = (
             gap_row.shortfall_description,
             gap_row.why_unresolved,
@@ -377,11 +400,27 @@ def _validate_delivery_semantics(
         if (
             any(_generic(item) for item in prose)
             or not gap_row.evidence_refs
-            or gap_row.visibility is GapVisibilityV1.HIDDEN
-            or gap_row.disclosure_location is None
-            or gap_row.disclosure_location not in report
-            or not gap_row.report_passages
+            or (
+                not scope_cleared
+                and not review_package
+                and (
+                    gap_row.visibility is GapVisibilityV1.HIDDEN
+                    or gap_row.disclosure_location is None
+                    or gap_row.disclosure_location not in report
+                    or not gap_row.report_passages
+                )
+            )
             or any(report.count(passage) != 1 for passage in gap_row.report_passages)
+            or (
+                review_package
+                and gap_row.disclosure_location is not None
+                and gap_row.disclosure_location not in report
+            )
+            or (
+                review_package
+                and gap_row.origin is GapOriginV1.SAFETY_FINDING
+                and gap_row.kind in HARD_REVIEW_FINDING_CODES
+            )
             or gap_row.blocking_code is not None
         ):
             raise _invalid()
@@ -406,7 +445,11 @@ def _validate_delivery_semantics(
             ):
                 raise _invalid()
         if gap_row.importance is BaselineImportanceV1.CRITICAL and (
-            gap_row.visibility is not GapVisibilityV1.PROMINENT
+            (
+                gap_row.status != "not_required_for_scope"
+                and not review_package
+                and gap_row.visibility is not GapVisibilityV1.PROMINENT
+            )
             or gap_row.owner_role
             not in {OwnerRoleV1.REVIEWING_ATTORNEY, OwnerRoleV1.OUTSIDE_COUNSEL}
         ):
@@ -513,6 +556,7 @@ def _validate_delivery_semantics(
     )
     high_eligible = (
         fresh is AbsoluteDispositionV2.PASS
+        and result.attorney_review_warning == rubric.attorney_review_warning
         and all(
             score >= rubric.high_assurance_weighted_coverage_floor
             for score in result.lane_weighted_coverage
@@ -563,10 +607,22 @@ def _validate_bindings(
         or checked_result.requirement_matrix_fingerprint != requirements.matrix_fingerprint
         or checked_result.gap_matrix_fingerprint != gaps.matrix_fingerprint
         or checked_result.attorney_review_warning
-        != load_readiness_rubric_v1().attorney_review_warning
+        not in {
+            load_readiness_rubric_v1().attorney_review_warning,
+            load_readiness_rubric_v1().attorney_review_warning
+            + EXTERNAL_REPORT_REVIEW_WARNING_SUFFIX,
+        }
         or checked_result.minimum_lane_weighted_coverage
         != min(checked_result.lane_weighted_coverage)
-        or any(row.status != "open" for row in gaps.rows)
+        or any(
+            row.status != "open"
+            and not (
+                row.status == "not_required_for_scope"
+                and row.origin is GapOriginV1.PREREQUISITE
+                and row.blocking_code is None
+            )
+            for row in gaps.rows
+        )
     ):
         raise _invalid()
 
@@ -663,6 +719,8 @@ def _requirement_matrix_markdown(matrix: RequirementMatrixV1) -> str:
 def _prioritized_actions(rows: Sequence[GapFollowUpRowV1]) -> str:
     groups: dict[tuple[FollowUpCodeV1, OwnerRoleV1], list[GapFollowUpRowV1]] = {}
     for row in rows:
+        if row.status == "not_required_for_scope":
+            continue
         groups.setdefault((row.follow_up_code, row.owner_role), []).append(row)
 
     def priority(
@@ -722,17 +780,30 @@ def _gap_matrix_markdown(matrix: GapFollowUpMatrixV1) -> str:
                 f"- Referee dispute: {_cell(row.referee_dispute_id)}",
                 f"- Row fingerprint: `{row.row_fingerprint}`",
                 "",
-                "#### What is missing",
+                (
+                    "#### Scope decision"
+                    if row.status == "not_required_for_scope"
+                    else "#### What is missing"
+                ),
                 "",
                 _cell(row.shortfall_description),
                 "",
-                "Why unresolved: " + _cell(row.why_unresolved),
+                (
+                    "Scope rationale: "
+                    if row.status == "not_required_for_scope"
+                    else "Why unresolved: "
+                )
+                + _cell(row.why_unresolved),
                 "",
                 "#### Why it matters",
                 "",
                 _cell(row.why_it_matters),
                 "",
-                "#### How to resolve it",
+                (
+                    "#### Conditional check before expanding scope"
+                    if row.status == "not_required_for_scope"
+                    else "#### How to resolve it"
+                ),
                 "",
                 _cell(row.resolution_test),
                 "",
@@ -743,6 +814,38 @@ def _gap_matrix_markdown(matrix: GapFollowUpMatrixV1) -> str:
         )
     if not matrix.rows:
         lines.extend(("", "No open gap row is recorded."))
+    return "\n".join(lines)
+
+
+def _prominent_attorney_issues(rows: Sequence[GapFollowUpRowV1]) -> str:
+    lines = [
+        "## Prominent open attorney issues",
+        "",
+        "These flags belong to the review package, not the original report. "
+        "All listed issues remain open; attorney review is required.",
+    ]
+    for row in rows:
+        if row.status != "open":
+            continue
+        lines.extend(
+            (
+                "",
+                f"### {row.gap_id}: {_cell(row.subject_id)}",
+                "",
+                "- Issue: " + _cell(row.shortfall_description),
+                "- Why unresolved: " + _cell(row.why_unresolved),
+                "- Effect on the scoped answer: " + _cell(row.why_it_matters),
+                "- Evidence references: " + _items(row.evidence_refs),
+                "- Owner: `" + row.owner_role.value + "`",
+                "- Follow-up: `" + row.follow_up_code.value + "`",
+                "- Concrete resolution test: " + _cell(row.resolution_test),
+                "- Observed original-report visibility: `" + row.visibility.value + "`",
+                "- Observed original-report disclosure: " + _cell(row.disclosure_location),
+                "- Observed original-report passages: " + _items(row.report_passages),
+            )
+        )
+    if not any(row.status == "open" for row in rows):
+        lines.extend(("", "No open attorney issue is recorded."))
     return "\n".join(lines)
 
 
@@ -841,6 +944,11 @@ def render_attorney_review_handoff_v1(
             else ""
         ),
         _evaluation_context(checked_result),
+        *(
+            [_prominent_attorney_issues(gaps.rows)]
+            if checked_result.review_package_policy == REVIEW_PACKAGE_POLICY_V1
+            else []
+        ),
         _report_markdown(report),
         _requirement_matrix_markdown(requirements),
     ]

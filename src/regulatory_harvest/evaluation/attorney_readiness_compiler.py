@@ -62,6 +62,11 @@ from .attorney_readiness_requests import (
     READINESS_STRICT_EQUIVALENT_SCORING_FINGERPRINT_V1,
     build_baseline_locked_grade_batches_v1,
     build_safety_disputes_v1,
+    readiness_attorney_review_warning_v1,
+)
+from .attorney_readiness_response_contract import (
+    HARD_REVIEW_FINDING_CODES,
+    REVIEW_PACKAGE_POLICY_V1,
 )
 from .attorney_v2_models import AbsoluteDispositionV2
 
@@ -372,7 +377,7 @@ def aggregate_baseline_locked_grader_lane_v1(
         expected_contests
     ):
         raise ValueError("grade fragment coverage is invalid")
-    allowlist = set(_requests._report_passage_allowlist(checked.report_text))
+    allowlist = set(_requests._readiness_report_passage_allowlist(checked))
     fragments: list[BaselineLockedGradeFragmentV1] = []
     contests: list[BaselineLockedContestedGradeV1] = []
     try:
@@ -726,6 +731,20 @@ def _unresolved_dispute_blockers(
     lane_1: SafetyGapAssessmentV1 | SafetyFindingProposalV1 | None,
     lane_2: SafetyGapAssessmentV1 | SafetyFindingProposalV1 | None,
 ) -> tuple[str, ...]:
+    if dispute.dispute_kind == "assessment":
+        blockers = tuple(
+            dict.fromkeys(
+                code
+                for record in (lane_1, lane_2)
+                if record is not None
+                for code in (
+                    (_FINDING_BLOCKER[record.finding_kind],)
+                    if isinstance(record, SafetyFindingProposalV1)
+                    else (() if record.blocking_code is None else (record.blocking_code,))
+                )
+            )
+        )
+        return blockers or ("GAP_RATIONALE_INVALID",)
     if dispute.dispute_kind == "finding_existence":
         record = lane_1 if lane_1 is not None else lane_2
         if isinstance(record, SafetyFindingProposalV1):
@@ -782,6 +801,15 @@ def reconcile_safety_lanes_v1(
         or tuple(item.candidate_id for item in second.candidate_assessments) != expected_ids
     ):
         raise ValueError("safety candidate coverage is invalid")
+    for response in (first, second):
+        for candidate, assessment in zip(
+            exact_candidates, response.candidate_assessments, strict=True
+        ):
+            if assessment.scope_status == "not_required_for_scope" and (
+                candidate.origin is not GapOriginV1.PREREQUISITE
+                or assessment.blocking_code is not None
+            ):
+                raise ValueError("only a nonblocking prerequisite may be scope-cleared")
     decisions = tuple(
         _strict_model(SafetyRefereeDecisionV1, value, label="safety referee decision")
         for value in referee_decisions
@@ -819,13 +847,17 @@ def reconcile_safety_lanes_v1(
             if identity not in reconciled and second_record is not None:
                 reconciled[identity] = second_record
             current = reconciled.get(identity)
-            if current is not None and current.blocking_code is None:
+            if (
+                dispute.dispute_kind != "assessment"
+                and current is not None
+                and current.blocking_code is None
+            ):
                 raw = current.model_dump(mode="json")
                 raw["blocking_code"] = dispute_blockers[0]
                 reconciled[identity] = type(current).model_validate(raw)
             continue
         chosen = first_record if decision.disposition == "lane_1" else second_record
-        if dispute.dispute_kind == "finding_existence":
+        if dispute.dispute_kind in {"finding_existence", "assessment"}:
             if chosen is None:
                 reconciled.pop(identity, None)
             else:
@@ -858,7 +890,13 @@ def reconcile_safety_lanes_v1(
         item.blocking_code for item in assessment_rows if item.blocking_code is not None
     )
     blockers.extend(item.blocking_code for item in finding_rows if item.blocking_code is not None)
-    blockers.extend(_FINDING_BLOCKER[item.finding_kind] for item in finding_rows)
+    blockers.extend(
+        _FINDING_BLOCKER[item.finding_kind]
+        for item in finding_rows
+        if checked.readiness_input.safety_response_contract_version
+        != "readiness-safety-response-v3"
+        or item.finding_kind.value in HARD_REVIEW_FINDING_CODES
+    )
     ordered_blockers = tuple(
         code for code in checked.readiness_rubric.blocking_codes if code in set(blockers)
     )
@@ -1189,7 +1227,12 @@ def compile_gap_follow_up_matrix_v1(
                 follow_up_code=content.follow_up_code,
                 resolution_test=content.resolution_test,
                 owner_role=content.owner_role,
-                status="open",
+                status=(
+                    "not_required_for_scope"
+                    if isinstance(content, SafetyGapAssessmentV1)
+                    and content.scope_status == "not_required_for_scope"
+                    else "open"
+                ),
                 referee_dispute_id=None,
             )
         )
@@ -1318,6 +1361,50 @@ def _contradictory_completeness_claim(value: str) -> bool:
     )
 
 
+def _contradictory_completeness_claim_v3(value: str) -> bool:
+    """Check assertions, not locally negated warnings or prospective instructions.
+
+    This bounded lexical guard supplements evaluator judgments; it is not a general
+    language parser. Keep the retained V1/V2 predicate unchanged for historical replay.
+    """
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = re.sub(r"n['\u2019]t\b", " not", normalized)
+    for sentence in re.findall(r"[^.!?;\n]+[.!?;\n]?", normalized):
+        if sentence.rstrip().endswith("?"):
+            continue
+        clauses = re.split(
+            r"\b(?:but|however|yet)\b|"
+            r",\s*(?=(?:not|no|all|each|every|this|the report)\b)|"
+            r"\band\s+(?=(?:no|all|each|every|this|the report|addresses|covers|"
+            r"resolves|settles)\b)",
+            sentence,
+        )
+        for clause in clauses:
+            if not _contradictory_completeness_claim(clause):
+                continue
+            words = " ".join(re.findall(r"\w+", clause))
+            if re.match(
+                r"^(?:if|unless|until|verify|confirm|ensure|check|establish|resolve|"
+                r"obtain|document)\b",
+                words,
+            ):
+                continue
+            completion = re.search(
+                r"\b(?:address\w*|comprehensive\w*|cover\w*|definitive|resolve\w*|"
+                r"settle\w*|remain\w*)\b",
+                words,
+            )
+            prefix = words[: completion.start()] if completion is not None else words
+            if re.search(
+                r"\b(?:not(?! only\b)|never|cannot|no assurance|no guarantee|"
+                r"must|should|need to|needs to|required to)\b",
+                prefix,
+            ):
+                continue
+            return True
+    return False
+
+
 def _gap_blockers(
     inputs: VerifiedReadinessInputsV1,
     requirement_matrix: RequirementMatrixV1,
@@ -1326,7 +1413,12 @@ def _gap_blockers(
     safety: ReconciledSafetyReviewV1,
 ) -> tuple[str, ...]:
     blockers: list[str] = []
-    blockers.extend(_FINDING_BLOCKER[finding.finding_kind] for finding in safety.finding_proposals)
+    blockers.extend(
+        _FINDING_BLOCKER[finding.finding_kind]
+        for finding in safety.finding_proposals
+        if inputs.readiness_input.safety_response_contract_version != "readiness-safety-response-v3"
+        or finding.finding_kind.value in HARD_REVIEW_FINDING_CODES
+    )
     allowed_refs = {
         cast(str, handle["evidence_ref"]) for handle in _requests._evidence_handles(inputs)
     }
@@ -1449,12 +1541,37 @@ def _gap_blockers(
         )
         expected = expected_content.get(identity)
         metadata = expected_metadata.get(identity)
-        if row.status != "open":
+        scope_cleared = (
+            inputs.readiness_input.safety_response_contract_version
+            in {"readiness-safety-response-v2", "readiness-safety-response-v3"}
+            and row.origin is GapOriginV1.PREREQUISITE
+            and isinstance(expected, SafetyGapAssessmentV1)
+            and expected.scope_status == "not_required_for_scope"
+            and expected.blocking_code is None
+            and row.status == "not_required_for_scope"
+        )
+        if row.status != ("not_required_for_scope" if scope_cleared else "open"):
             blockers.append("FALSE_RESOLUTION")
+        if (
+            isinstance(expected, SafetyGapAssessmentV1)
+            and expected.scope_status == "not_required_for_scope"
+            and not scope_cleared
+        ):
+            blockers.append("INTEGRITY_OR_PROVENANCE_INVALID")
         if row.blocking_code is not None and row.blocking_code in _BLOCKING_CODES:
             blockers.append(row.blocking_code)
         elif row.blocking_code is not None:
             blockers.append("INTEGRITY_OR_PROVENANCE_INVALID")
+        review_package = (
+            inputs.readiness_input.safety_response_contract_version
+            == "readiness-safety-response-v3"
+        )
+        if (
+            review_package
+            and row.origin is GapOriginV1.SAFETY_FINDING
+            and row.kind in HARD_REVIEW_FINDING_CODES
+        ):
+            blockers.append(row.kind)
         prose = (
             row.shortfall_description,
             row.why_unresolved,
@@ -1469,15 +1586,31 @@ def _gap_blockers(
         ):
             blockers.append("GAP_RATIONALE_INVALID")
         if (
-            row.visibility is GapVisibilityV1.HIDDEN
-            or row.disclosure_location is None
-            or not row.disclosure_location.strip()
-            or not row.report_passages
-            or any(inputs.report_text.count(passage) != 1 for passage in row.report_passages)
+            not scope_cleared
+            and not review_package
+            and (
+                row.visibility is GapVisibilityV1.HIDDEN
+                or row.disclosure_location is None
+                or not row.disclosure_location.strip()
+                or not row.report_passages
+                or any(inputs.report_text.count(passage) != 1 for passage in row.report_passages)
+            )
+        ):
+            blockers.append("HIDDEN_MATERIAL_GAP")
+        if review_package and (
+            any(inputs.report_text.count(passage) != 1 for passage in row.report_passages)
+            or (
+                row.disclosure_location is not None
+                and row.disclosure_location not in inputs.report_text
+            )
         ):
             blockers.append("HIDDEN_MATERIAL_GAP")
         if row.importance is BaselineImportanceV1.CRITICAL and (
-            row.visibility is not GapVisibilityV1.PROMINENT
+            (
+                not scope_cleared
+                and not review_package
+                and row.visibility is not GapVisibilityV1.PROMINENT
+            )
             or row.owner_role not in {OwnerRoleV1.REVIEWING_ATTORNEY, OwnerRoleV1.OUTSIDE_COUNSEL}
         ):
             blockers.append("CRITICAL_DISCLOSURE_INVALID")
@@ -1536,7 +1669,11 @@ def _gap_blockers(
             blockers.append("MISSING_REQUIRED_FOLLOW_UP")
     if strict.outcome_determinative_contested_ids:
         blockers.append("OUTCOME_DETERMINATIVE_CONTEST")
-    if gap_matrix.rows and _contradictory_completeness_claim(inputs.report_text):
+    if any(row.status == "open" for row in gap_matrix.rows) and (
+        _contradictory_completeness_claim_v3(inputs.report_text)
+        if inputs.readiness_input.safety_response_contract_version == "readiness-safety-response-v3"
+        else _contradictory_completeness_claim(inputs.report_text)
+    ):
         blockers.append("HIDDEN_MATERIAL_GAP")
     return tuple(blockers)
 
@@ -1672,6 +1809,7 @@ def derive_delivery_readiness_v1(
         and high_weight_met
         and high_critical_met
         and not high_disqualifying_gap
+        and checked.generation_validation is not None
         and checked.generation_validation.status == "completed"
         and checked.generation_validation.evidence_precision_valid
         and checked.generation_validation.proposition_coverage_valid
@@ -1688,6 +1826,12 @@ def derive_delivery_readiness_v1(
         DeliveryReadinessResultV1,
         "result_fingerprint",
         protocol_version="delivery-readiness-v1",
+        review_package_policy=(
+            REVIEW_PACKAGE_POLICY_V1
+            if checked.readiness_input.safety_response_contract_version
+            == "readiness-safety-response-v3"
+            else None
+        ),
         baseline_locked_strict_equivalent_disposition=strict.absolute_disposition,
         historical_v22_strict_disposition=historical_disposition,
         historical_v22_cross_check_status=historical_status,
@@ -1698,7 +1842,7 @@ def derive_delivery_readiness_v1(
         requirement_matrix_fingerprint=requirements.matrix_fingerprint,
         gap_matrix_fingerprint=gaps.matrix_fingerprint,
         blocking_codes=ordered_blockers,
-        attorney_review_warning=checked.readiness_rubric.attorney_review_warning,
+        attorney_review_warning=readiness_attorney_review_warning_v1(checked),
     )
 
 

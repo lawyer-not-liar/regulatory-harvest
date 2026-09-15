@@ -77,6 +77,7 @@ READINESS_ARCHIVE_REQUIREMENTS = frozenset(
         "src/regulatory_harvest/evaluation/attorney_readiness_inputs.py",
         "src/regulatory_harvest/evaluation/attorney_readiness_models.py",
         "src/regulatory_harvest/evaluation/attorney_readiness_requests.py",
+        "src/regulatory_harvest/evaluation/attorney_readiness_response_contract.py",
         "src/regulatory_harvest/evaluation/attorney_readiness_workflow.py",
         "src/regulatory_harvest/evaluation/readiness-rubric-v1.json",
     }
